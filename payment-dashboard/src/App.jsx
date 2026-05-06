@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import freighterApi from '@stellar/freighter-api'
 import * as StellarSdk from 'stellar-sdk'
 
@@ -7,6 +7,7 @@ const TREASURY_ADDRESS = 'GAAFWEZKDYPXLTQGKQ3F23TXWYQUDAYTDW7P7VUQSVJFW2GWC4Y6LW
 const TOKEN_ADDRESS = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC'
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 const DEFAULT_FEDERATION_DOMAIN = 'localhost'
+const HORIZON_BASE = 'https://horizon-testnet.stellar.org'
 
 const normalizeNameTag = (value) => {
   const trimmed = value.trim()
@@ -37,6 +38,18 @@ const formatUsername = (value) => {
   }
 
   return value.split('*')[0]
+}
+
+const formatShortAddress = (value) => {
+  if (!value) {
+    return ''
+  }
+
+  if (value.length < 10) {
+    return value
+  }
+
+  return `${value.substring(0, 4)}...${value.substring(52)}`
 }
 
 const NAV_STORAGE_KEY = 'stellar-nav-open'
@@ -75,10 +88,84 @@ const useNavState = () => {
   return [isNavOpen, setIsNavOpen]
 }
 
+const useWalletMenu = () => {
+  const menuRef = useRef(null)
+  const [isOpen, setIsOpen] = useState(false)
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (menuRef.current && !menuRef.current.contains(event.target)) {
+        setIsOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
+  return { menuRef, isOpen, setIsOpen }
+}
+
 function App() {
   const [activeView, setActiveView] = useState('dashboard')
   const [userPublicKey, setUserPublicKey] = useState('')
   const [registrationState, setRegistrationState] = useState('unknown')
+
+  const handleConnectWallet = async () => {
+    const status = await freighterApi.isConnected()
+    const isInstalled = status.isConnected !== undefined ? status.isConnected : status
+
+    if (!isInstalled) {
+      return { ok: false, error: 'Freighter is not installed or locked.' }
+    }
+
+    const response = await freighterApi.requestAccess()
+    if (response.error) {
+      return { ok: false, error: 'Wallet connection failed.' }
+    }
+
+    setUserPublicKey(response.address)
+    return { ok: true, address: response.address }
+  }
+
+  const handleDisconnectWallet = () => {
+    setUserPublicKey('')
+  }
+
+  const [balance, setBalance] = useState(null)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [balanceError, setBalanceError] = useState('')
+
+  const loadBalance = async () => {
+    if (!userPublicKey) {
+      setBalance(null)
+      setBalanceError('')
+      return
+    }
+
+    setIsRefreshing(true)
+    setBalanceError('')
+    try {
+      const response = await fetch(`${HORIZON_BASE}/accounts/${userPublicKey}`)
+      if (!response.ok) {
+        throw new Error(`Horizon error (${response.status}).`)
+      }
+
+      const data = await response.json()
+      const nativeBalance = data?.balances?.find((item) => item.asset_type === 'native')
+      const value = nativeBalance?.balance
+      setBalance(value ? Number(value) : null)
+    } catch (error) {
+      setBalance(null)
+      setBalanceError(error.message || 'Unable to load balance.')
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
+  useEffect(() => {
+    loadBalance()
+  }, [userPublicKey])
 
   useEffect(() => {
     const syncView = () => {
@@ -162,6 +249,9 @@ function App() {
   if (activeView === 'help') {
     return (
       <HelpPage
+        userPublicKey={userPublicKey}
+        onConnectWallet={handleConnectWallet}
+        onDisconnectWallet={handleDisconnectWallet}
         onDashboardClick={() => handleNavigate('dashboard')}
         onAnalyticsClick={() => handleNavigate('analytics')}
         onHistoryClick={() => handleNavigate('history')}
@@ -174,6 +264,9 @@ function App() {
   if (activeView === 'analytics') {
     return (
       <AnalyticsPage
+        userPublicKey={userPublicKey}
+        onConnectWallet={handleConnectWallet}
+        onDisconnectWallet={handleDisconnectWallet}
         onDashboardClick={() => handleNavigate('dashboard')}
         onHistoryClick={() => handleNavigate('history')}
         onHelpClick={() => handleNavigate('help')}
@@ -186,6 +279,11 @@ function App() {
   if (activeView === 'history') {
     return (
       <HistoryPage
+        userPublicKey={userPublicKey}
+        setUserPublicKey={setUserPublicKey}
+        onConnectWallet={handleConnectWallet}
+        onDisconnectWallet={handleDisconnectWallet}
+        onRefreshBalance={loadBalance}
         onDashboardClick={() => handleNavigate('dashboard')}
         onAnalyticsClick={() => handleNavigate('analytics')}
         onHelpClick={() => handleNavigate('help')}
@@ -199,6 +297,12 @@ function App() {
     <Dashboard
       userPublicKey={userPublicKey}
       setUserPublicKey={setUserPublicKey}
+      onConnectWallet={handleConnectWallet}
+      onDisconnectWallet={handleDisconnectWallet}
+      balance={balance}
+      isRefreshing={isRefreshing}
+      balanceError={balanceError}
+      onRefreshBalance={loadBalance}
       onRegisterClick={() => handleNavigate('register')}
       onAnalyticsClick={() => handleNavigate('analytics')}
       onHistoryClick={() => handleNavigate('history')}
@@ -212,6 +316,12 @@ function App() {
 function Dashboard({
   userPublicKey,
   setUserPublicKey,
+  onConnectWallet,
+  onDisconnectWallet,
+  balance,
+  isRefreshing,
+  balanceError,
+  onRefreshBalance,
   onRegisterClick,
   onAnalyticsClick,
   onHistoryClick,
@@ -220,6 +330,7 @@ function Dashboard({
   canRegister,
 }) {
   const [isNavOpen, setIsNavOpen] = useNavState()
+  const { menuRef, isOpen: isWalletMenuOpen, setIsOpen: setIsWalletMenuOpen } = useWalletMenu()
   const closeNav = () => {
     sessionStorage.setItem(NAV_STORAGE_KEY, 'false')
     setIsNavOpen(false)
@@ -233,6 +344,7 @@ function Dashboard({
   const [amount, setAmount] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
   const [isReceiving, setIsReceiving] = useState(false)
+  const [activeBalancePanel, setActiveBalancePanel] = useState('')
   const [receiveAddress, setReceiveAddress] = useState('')
   const [receiveTag, setReceiveTag] = useState('')
   const [receiveStatus, setReceiveStatus] = useState({
@@ -306,23 +418,13 @@ function Dashboard({
     loadReceiveDetails()
   }, [userPublicKey])
 
-
   const handleConnect = async () => {
-    const status = await freighterApi.isConnected()
-    const isInstalled = status.isConnected !== undefined ? status.isConnected : status
-
-    if (!isInstalled) {
-      displayMessage('Freighter is not installed or locked.', '#DC2626', '#FEE2E2')
+    const result = await onConnectWallet()
+    if (!result.ok) {
+      displayMessage(result.error || 'Wallet connection failed.', '#DC2626', '#FEE2E2')
       return
     }
 
-    const response = await freighterApi.requestAccess()
-    if (response.error) {
-      displayMessage('Wallet connection failed.', '#DC2626', '#FEE2E2')
-      return
-    }
-
-    setUserPublicKey(response.address)
     displayMessage('Wallet connected.', '#059669', '#D1FAE5')
   }
 
@@ -428,6 +530,8 @@ function Dashboard({
       if (result.status === 'PENDING' || result.status === 'SUCCESS') {
         displayMessage('Payment successful!', '#059669', '#D1FAE5')
         setAmount('')
+        onRefreshBalance()
+        window.dispatchEvent(new Event('stellar:tx-update'))
       } else {
         throw new Error(`Blockchain rejected transaction: ${result.status}`)
       }
@@ -450,6 +554,12 @@ function Dashboard({
     } catch (error) {
       displayReceiveMessage('Copy failed. Please copy manually.', '#DC2626', '#FEE2E2')
     }
+  }
+
+  const handleDisconnect = () => {
+    setIsWalletMenuOpen(false)
+    onDisconnectWallet()
+    displayMessage('Wallet disconnected.', '#1F2937', '#F3F4F6')
   }
 
   return (
@@ -482,6 +592,11 @@ function Dashboard({
           <h3>Support</h3>
           <p>Need a hand? Open the help panel for quick answers.</p>
         </div>
+        {userPublicKey && (
+          <button type="button" className="disconnect-button" onClick={handleDisconnect}>
+            Disconnect wallet
+          </button>
+        )}
       </aside>
 
       <main className="main">
@@ -506,51 +621,82 @@ function Dashboard({
           <div className="topbar-actions">
             <span className="chip">Today: May 4</span>
             <span className="chip">Testnet</span>
+            <div className="wallet-menu" ref={menuRef}>
+              <button
+                type="button"
+                className="connect-pill"
+                onClick={() => {
+                  if (userPublicKey) {
+                    setIsWalletMenuOpen((prev) => !prev)
+                  } else {
+                    handleConnect()
+                  }
+                }}
+                aria-expanded={isWalletMenuOpen}
+              >
+                {userPublicKey
+                  ? `Connected: ${formatShortAddress(userPublicKey)}`
+                  : 'Connect wallet'}
+              </button>
+              {userPublicKey && isWalletMenuOpen && (
+                <div className="wallet-dropdown">
+                  <button type="button" onClick={handleDisconnect}>
+                    Disconnect wallet
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </section>
 
-        <section className="grid columns-3">
-          <div className="card reveal">
+        <section className="grid columns-1 balance-grid">
+          <div className="card reveal balance-card">
             <div className="card-header">
               <h2>Current balance</h2>
-              <span className="badge">+3.8% week</span>
-            </div>
-            <div className="metric">12,480.25 <span>XLM</span></div>
-            <div className="spark"></div>
-          </div>
-          <div className="card reveal">
-            <div className="card-header">
-              <h2>Routing volume</h2>
-              <span className="badge">12 routes</span>
-            </div>
-            <div className="metric">88,904 <span>XLM</span></div>
-            <div className="spark"></div>
-          </div>
-          <div className="card reveal">
-            <div className="card-header">
-              <h2>Avg confirmation</h2>
-              <span className="badge">Stable</span>
-            </div>
-            <div className="metric">3.9s <span>network</span></div>
-            <div className="spark"></div>
-          </div>
-        </section>
-
-        <section className="card payment-card reveal">
-          <div>
-            <div className="card-header">
-              <h2>Send payment</h2>
-              <span className="tag">Secure routing</span>
-            </div>
-            {!userPublicKey && (
-              <button type="button" onClick={handleConnect}>
-                1. Connect wallet
+              <button
+                type="button"
+                className={`refresh-button ${isRefreshing ? 'is-loading' : ''}`}
+                onClick={onRefreshBalance}
+                disabled={!userPublicKey || isRefreshing}
+                aria-label="Refresh balance"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+                  <path d="M20 4v6h-6" />
+                </svg>
               </button>
-            )}
-            {walletLabel && <div className="wallet-status">{walletLabel}</div>}
-
-            {userPublicKey && (
-              <div>
+            </div>
+            {balanceError && <div className="balance-error">{balanceError}</div>}
+            <div className="metric">
+              {balance !== null ? balance.toLocaleString(undefined, {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+              }) : '--'}{' '}
+              <span>XLM</span>
+            </div>
+            <div className="spark"></div>
+            <div className="balance-tabs">
+              <button
+                type="button"
+                className={activeBalancePanel === 'transfer' ? 'is-active' : ''}
+                onClick={() => setActiveBalancePanel('transfer')}
+              >
+                Transfer
+              </button>
+              <button
+                type="button"
+                className={activeBalancePanel === 'receive' ? 'is-active' : ''}
+                onClick={() => setActiveBalancePanel('receive')}
+              >
+                Receive
+              </button>
+            </div>
+            {activeBalancePanel === 'transfer' && (
+              <div className="balance-panel">
+                {!userPublicKey && (
+                  <div className="wallet-status">Connect your wallet to make a transfer.</div>
+                )}
+                {walletLabel && <div className="wallet-status">{walletLabel}</div>}
                 <label>Recipient username or address</label>
                 <input
                   type="text"
@@ -558,7 +704,7 @@ function Dashboard({
                   onChange={(event) => setNameTag(event.target.value)}
                   placeholder="e.g., walzeem or G..."
                   autoComplete="off"
-                  disabled={isProcessing}
+                  disabled={!userPublicKey || isProcessing}
                 />
 
                 <label>Amount (XLM)</label>
@@ -569,20 +715,64 @@ function Dashboard({
                   placeholder="0.00"
                   min="0.01"
                   step="0.01"
-                  disabled={isProcessing}
+                  disabled={!userPublicKey || isProcessing}
                 />
 
                 <button
                   type="button"
                   className="accent-btn"
                   onClick={handleLookup}
-                  disabled={isProcessing}
+                  disabled={!userPublicKey || isProcessing}
                 >
-                  {isProcessing ? 'Processing...' : '2. Verify & Pay'}
+                  {isProcessing ? 'Processing...' : 'Transfer'}
                 </button>
               </div>
             )}
-
+            {activeBalancePanel === 'receive' && (
+              <div className="balance-panel">
+                {!userPublicKey && (
+                  <div className="wallet-status">Connect your wallet to view receive details.</div>
+                )}
+                {userPublicKey && receiveAddress && (
+                  <div className="receive-panel">
+                    {receiveTag && (
+                      <div className="wallet-status">
+                        Username: {formatUsername(receiveTag)}
+                      </div>
+                    )}
+                    <div className="wallet-status">
+                      Address: {receiveAddress}
+                    </div>
+                    <div className="inline-actions">
+                      {receiveTag && (
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={() => handleCopy(formatUsername(receiveTag), 'Username')}
+                          disabled={isReceiving}
+                        >
+                          Copy username
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => handleCopy(receiveAddress, 'Address')}
+                        disabled={isReceiving}
+                      >
+                        Copy address
+                      </button>
+                    </div>
+                    <div className="qr-card">
+                      <img
+                        src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(receiveAddress)}`}
+                        alt="Wallet address QR code"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
             {status.text && (
               <div
                 id="status-box"
@@ -592,73 +782,6 @@ function Dashboard({
               </div>
             )}
           </div>
-          <div className="payment-cta">
-            <h3>Instant name resolution</h3>
-            <p>
-              Verify Stellar name tags, auto-route fees, and keep every payment
-              traceable in one place.
-            </p>
-            <div className="grid columns-2">
-              <div className="card hint-card">
-                <h3>Trusted routing</h3>
-                <p>Each transfer is simulated before you sign.</p>
-              </div>
-              <div className="card hint-card">
-                <h3>Always compliant</h3>
-                <p>Routing fees are applied to treasury automatically.</p>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="card reveal">
-          <div className="card-header">
-            <h2>Receive payment</h2>
-            <span className="tag">Shareable address</span>
-          </div>
-          {!userPublicKey && (
-            <div className="wallet-status">Connect your wallet to view your receive details.</div>
-          )}
-          {userPublicKey && receiveAddress && (
-            <div className="receive-result">
-              {receiveTag && (
-                <div className="wallet-status">
-                  Username: {formatUsername(receiveTag)}
-                </div>
-              )}
-              <div className="wallet-status">
-                Address: {receiveAddress}
-              </div>
-              <div className="inline-actions">
-                {receiveTag && (
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    onClick={() => handleCopy(formatUsername(receiveTag), 'Username')}
-                    disabled={isReceiving}
-                  >
-                    Copy username
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => handleCopy(receiveAddress, 'Address')}
-                  disabled={isReceiving}
-                >
-                  Copy address
-                </button>
-              </div>
-            </div>
-          )}
-          {receiveStatus.text && (
-            <div
-              id="status-box"
-              style={{ color: receiveStatus.color, backgroundColor: receiveStatus.bgColor }}
-            >
-              {receiveStatus.text}
-            </div>
-          )}
         </section>
 
       </main>
@@ -676,6 +799,9 @@ function Dashboard({
 }
 
 function HelpPage({
+  userPublicKey,
+  onConnectWallet,
+  onDisconnectWallet,
   onDashboardClick,
   onAnalyticsClick,
   onHistoryClick,
@@ -683,6 +809,8 @@ function HelpPage({
   canRegister,
 }) {
   const [isNavOpen, setIsNavOpen] = useNavState()
+  const [isConnecting, setIsConnecting] = useState(false)
+  const { menuRef, isOpen: isWalletMenuOpen, setIsOpen: setIsWalletMenuOpen } = useWalletMenu()
   const closeNav = () => {
     sessionStorage.setItem(NAV_STORAGE_KEY, 'false')
     setIsNavOpen(false)
@@ -691,6 +819,15 @@ function HelpPage({
     sessionStorage.setItem(NAV_STORAGE_KEY, 'false')
     setIsNavOpen(false)
     action()
+  }
+
+  const handleConnect = async () => {
+    setIsConnecting(true)
+    try {
+      await onConnectWallet()
+    } finally {
+      setIsConnecting(false)
+    }
   }
   return (
     <div className={`dashboard ${isNavOpen ? 'nav-open' : ''}`}>
@@ -722,6 +859,11 @@ function HelpPage({
           <h3>Contact</h3>
           <p>Need a real person? Open a ticket from your wallet settings.</p>
         </div>
+        {userPublicKey && (
+          <button type="button" className="disconnect-button" onClick={onDisconnectWallet}>
+            Disconnect wallet
+          </button>
+        )}
       </aside>
 
       <main className="main">
@@ -744,6 +886,34 @@ function HelpPage({
           <div className="topbar-actions">
             <span className="chip">Updated May 5</span>
             <span className="chip">Testnet</span>
+            <div className="wallet-menu" ref={menuRef}>
+              <button
+                type="button"
+                className="connect-pill"
+                onClick={() => {
+                  if (userPublicKey) {
+                    setIsWalletMenuOpen((prev) => !prev)
+                  } else {
+                    handleConnect()
+                  }
+                }}
+                disabled={isConnecting}
+                aria-expanded={isWalletMenuOpen}
+              >
+                {userPublicKey
+                  ? `Connected: ${formatShortAddress(userPublicKey)}`
+                  : isConnecting
+                    ? 'Connecting...'
+                    : 'Connect wallet'}
+              </button>
+              {userPublicKey && isWalletMenuOpen && (
+                <div className="wallet-dropdown">
+                  <button type="button" onClick={onDisconnectWallet}>
+                    Disconnect wallet
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </section>
 
@@ -801,6 +971,9 @@ function HelpPage({
 }
 
 function AnalyticsPage({
+  userPublicKey,
+  onConnectWallet,
+  onDisconnectWallet,
   onDashboardClick,
   onHistoryClick,
   onHelpClick,
@@ -808,6 +981,8 @@ function AnalyticsPage({
   canRegister,
 }) {
   const [isNavOpen, setIsNavOpen] = useNavState()
+  const [isConnecting, setIsConnecting] = useState(false)
+  const { menuRef, isOpen: isWalletMenuOpen, setIsOpen: setIsWalletMenuOpen } = useWalletMenu()
   const closeNav = () => {
     sessionStorage.setItem(NAV_STORAGE_KEY, 'false')
     setIsNavOpen(false)
@@ -816,6 +991,15 @@ function AnalyticsPage({
     sessionStorage.setItem(NAV_STORAGE_KEY, 'false')
     setIsNavOpen(false)
     action()
+  }
+
+  const handleConnect = async () => {
+    setIsConnecting(true)
+    try {
+      await onConnectWallet()
+    } finally {
+      setIsConnecting(false)
+    }
   }
   return (
     <div className={`dashboard ${isNavOpen ? 'nav-open' : ''}`}>
@@ -847,6 +1031,11 @@ function AnalyticsPage({
           <h3>Exports</h3>
           <p>Download detailed reports from the analytics console.</p>
         </div>
+        {userPublicKey && (
+          <button type="button" className="disconnect-button" onClick={onDisconnectWallet}>
+            Disconnect wallet
+          </button>
+        )}
       </aside>
 
       <main className="main">
@@ -869,6 +1058,34 @@ function AnalyticsPage({
           <div className="topbar-actions">
             <span className="chip">Last 24 hours</span>
             <span className="chip">Testnet</span>
+            <div className="wallet-menu" ref={menuRef}>
+              <button
+                type="button"
+                className="connect-pill"
+                onClick={() => {
+                  if (userPublicKey) {
+                    setIsWalletMenuOpen((prev) => !prev)
+                  } else {
+                    handleConnect()
+                  }
+                }}
+                disabled={isConnecting}
+                aria-expanded={isWalletMenuOpen}
+              >
+                {userPublicKey
+                  ? `Connected: ${formatShortAddress(userPublicKey)}`
+                  : isConnecting
+                    ? 'Connecting...'
+                    : 'Connect wallet'}
+              </button>
+              {userPublicKey && isWalletMenuOpen && (
+                <div className="wallet-dropdown">
+                  <button type="button" onClick={onDisconnectWallet}>
+                    Disconnect wallet
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </section>
 
@@ -948,6 +1165,11 @@ function AnalyticsPage({
 }
 
 function HistoryPage({
+  userPublicKey,
+  setUserPublicKey,
+  onConnectWallet,
+  onDisconnectWallet,
+  onRefreshBalance,
   onDashboardClick,
   onAnalyticsClick,
   onHelpClick,
@@ -955,6 +1177,13 @@ function HistoryPage({
   canRegister,
 }) {
   const [isNavOpen, setIsNavOpen] = useNavState()
+  const [isConnecting, setIsConnecting] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
+  const [historyError, setHistoryError] = useState('')
+  const [history, setHistory] = useState([])
+  const [expandedId, setExpandedId] = useState(null)
+  const [refreshIndex, setRefreshIndex] = useState(0)
+  const { menuRef, isOpen: isWalletMenuOpen, setIsOpen: setIsWalletMenuOpen } = useWalletMenu()
   const closeNav = () => {
     sessionStorage.setItem(NAV_STORAGE_KEY, 'false')
     setIsNavOpen(false)
@@ -964,6 +1193,150 @@ function HistoryPage({
     setIsNavOpen(false)
     action()
   }
+
+  const handleConnect = async () => {
+    setIsConnecting(true)
+    try {
+      const result = await onConnectWallet()
+      if (result?.address) {
+        setUserPublicKey(result.address)
+      }
+    } finally {
+      setIsConnecting(false)
+    }
+  }
+  const handleDisconnect = () => {
+    onDisconnectWallet()
+  }
+
+  const loadHistory = useCallback(async (signal) => {
+    if (!userPublicKey) {
+      setHistory([])
+      setHistoryError('')
+      return
+    }
+
+    setIsLoading(true)
+    setHistoryError('')
+    try {
+      const response = await fetch(
+        `${HORIZON_BASE}/accounts/${userPublicKey}/payments?order=desc&limit=25`,
+        { signal, cache: 'no-store' },
+      )
+      if (!response.ok) {
+        throw new Error(`Horizon error (${response.status}).`)
+      }
+
+      const data = await response.json()
+      const records = data?._embedded?.records ?? []
+      const filtered = records.filter((record) =>
+        [
+          'payment',
+          'path_payment_strict_receive',
+          'path_payment_strict_send',
+          'create_account',
+          'account_merge',
+          'invoke_host_function',
+        ].includes(record.type),
+      )
+      const formatted = filtered
+        .flatMap((record) => {
+          if (record.type === 'invoke_host_function' && record.asset_balance_changes?.length) {
+            const changes = record.asset_balance_changes
+              .filter((change) => change.asset_type === 'native')
+              .filter((change) => change.from === userPublicKey || change.to === userPublicKey)
+
+            return changes.map((change, index) => {
+              const direction = change.from === userPublicKey ? 'Sent' : 'Received'
+              const counterparty = change.from === userPublicKey ? change.to : change.from
+              const amount = `${change.amount} XLM`
+              const status = record.transaction_successful === false ? 'Failed' : 'Success'
+              const explorerLink = record.transaction_hash
+                ? `https://stellar.expert/explorer/testnet/tx/${record.transaction_hash}`
+                : ''
+
+              return {
+                id: `${record.id}-${index}`,
+                counterparty: counterparty || 'Unknown',
+                direction,
+                amount,
+                status,
+                type: record.type,
+                createdAt: record.created_at,
+                transactionHash: record.transaction_hash,
+                asset: 'XLM',
+                explorerLink,
+              }
+            })
+          }
+
+          const isSender = record.from === userPublicKey || record.account === userPublicKey
+          const isReceiver = record.to === userPublicKey || record.into === userPublicKey
+          const direction = isSender && !isReceiver ? 'Sent' : isReceiver ? 'Received' : 'Sent'
+          const counterparty =
+            direction === 'Sent'
+              ? record.to || record.into || record.account || 'Unknown'
+              : record.from || record.funder || record.account || 'Unknown'
+
+          const asset = record.asset_type === 'native' ? 'XLM' : record.asset_code || 'Asset'
+          const rawAmount = record.amount || record.starting_balance || ''
+          const amount = rawAmount ? `${rawAmount} ${asset}` : '-'
+          const status = record.transaction_successful === false ? 'Failed' : 'Success'
+          const explorerLink = record.transaction_hash
+            ? `https://stellar.expert/explorer/testnet/tx/${record.transaction_hash}`
+            : ''
+
+          return [
+            {
+              id: String(record.id),
+              counterparty,
+              direction,
+              amount,
+              status,
+              type: record.type,
+              createdAt: record.created_at,
+              transactionHash: record.transaction_hash,
+              asset,
+              explorerLink,
+            },
+          ]
+        })
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+
+      const latest = formatted[0]
+      if (latest?.status === 'Success') {
+        const lastSeen = sessionStorage.getItem('stellar-last-tx')
+        const latestKey = `${latest.transactionHash || latest.id}-${latest.amount}`
+        if (latestKey !== lastSeen) {
+          sessionStorage.setItem('stellar-last-tx', latestKey)
+          onRefreshBalance()
+        }
+      }
+
+      setHistory(formatted)
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        setHistoryError(error.message || 'Unable to load transaction history.')
+      }
+    } finally {
+      setIsLoading(false)
+    }
+  }, [onRefreshBalance, userPublicKey])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    loadHistory(controller.signal)
+    return () => controller.abort()
+  }, [loadHistory, refreshIndex, userPublicKey])
+
+  useEffect(() => {
+    const handleUpdate = () => {
+      setRefreshIndex((value) => value + 1)
+    }
+
+    window.addEventListener('stellar:tx-update', handleUpdate)
+    return () => window.removeEventListener('stellar:tx-update', handleUpdate)
+  }, [])
   return (
     <div className={`dashboard ${isNavOpen ? 'nav-open' : ''}`}>
       <button
@@ -994,6 +1367,11 @@ function HistoryPage({
           <h3>Filters</h3>
           <p>Sort by status, amount, or corridor.</p>
         </div>
+        {userPublicKey && (
+          <button type="button" className="disconnect-button" onClick={onDisconnectWallet}>
+            Disconnect wallet
+          </button>
+        )}
       </aside>
 
       <main className="main">
@@ -1010,51 +1388,137 @@ function HistoryPage({
             <span />
           </button>
           <div>
-            <h2 className="headline">Transfer history</h2>
-            <p className="subtle">Track routing outcomes and audit every send.</p>
+            <h2 className="headline">Transaction history</h2>
+            <p className="subtle">Connect your wallet to review recent transactions.</p>
           </div>
           <div className="topbar-actions">
             <span className="chip">Last 24 hours</span>
             <span className="chip">Testnet</span>
+            <div className="wallet-menu" ref={menuRef}>
+              <button
+                type="button"
+                className="connect-pill"
+                onClick={() => {
+                  if (userPublicKey) {
+                    setIsWalletMenuOpen((prev) => !prev)
+                  } else {
+                    handleConnect()
+                  }
+                }}
+                disabled={isConnecting}
+                aria-expanded={isWalletMenuOpen}
+              >
+                {userPublicKey
+                  ? `Connected: ${formatShortAddress(userPublicKey)}`
+                  : isConnecting
+                    ? 'Connecting...'
+                    : 'Connect wallet'}
+              </button>
+              {userPublicKey && isWalletMenuOpen && (
+                <div className="wallet-dropdown">
+                  <button type="button" onClick={handleDisconnect}>
+                    Disconnect wallet
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </section>
 
         <section className="card reveal">
           <div className="card-header">
-            <h2>Recent transfers</h2>
-            <span className="chip">Latest</span>
+            <h2>Recent transactions</h2>
+            <div className="history-actions">
+              <span className="chip">Latest</span>
+              <button
+                type="button"
+                className={`refresh-button ${isLoading ? 'is-loading' : ''}`}
+                onClick={() => setRefreshIndex((value) => value + 1)}
+                disabled={!userPublicKey || isLoading}
+                aria-label="Refresh history"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+                  <path d="M20 4v6h-6" />
+                </svg>
+              </button>
+            </div>
           </div>
-          <table className="history-table">
-            <thead>
-              <tr>
-                <th>Recipient</th>
-                <th>Amount</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>orbit*stellar.org</td>
-                <td>1,240 XLM</td>
-                <td>Success</td>
-              </tr>
-              <tr>
-                <td>neon*fundable</td>
-                <td>420 XLM</td>
-                <td>Pending</td>
-              </tr>
-              <tr>
-                <td>flux*anchor</td>
-                <td>3,880 XLM</td>
-                <td>Success</td>
-              </tr>
-              <tr>
-                <td>delta*bridge</td>
-                <td>255 XLM</td>
-                <td>Success</td>
-              </tr>
-            </tbody>
-          </table>
+          {!userPublicKey && (
+            <div className="wallet-status">
+              Connect your wallet to view your transaction history.
+              <button type="button" onClick={handleConnect} disabled={isConnecting}>
+                {isConnecting ? 'Connecting...' : 'Connect wallet'}
+              </button>
+            </div>
+          )}
+          {userPublicKey && isLoading && (
+            <div className="wallet-status">Loading transactions...</div>
+          )}
+          {userPublicKey && historyError && (
+            <div className="wallet-status">{historyError}</div>
+          )}
+          {userPublicKey && !isLoading && !historyError && history.length === 0 && (
+            <div className="wallet-status">No transactions found for this wallet.</div>
+          )}
+          {userPublicKey && !isLoading && !historyError && history.length > 0 && (
+            <table className="history-table">
+              <thead>
+                <tr>
+                  <th>Counterparty</th>
+                  <th>Direction</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((entry) => (
+                  <Fragment key={entry.id}>
+                    <tr>
+                      <td>{entry.counterparty}</td>
+                      <td>{entry.direction}</td>
+                      <td>{entry.amount}</td>
+                      <td>{entry.status}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="details-button"
+                          onClick={() =>
+                            setExpandedId((current) => (current === entry.id ? null : entry.id))
+                          }
+                        >
+                          {expandedId === entry.id ? 'Hide' : 'View'}
+                        </button>
+                      </td>
+                    </tr>
+                    {expandedId === entry.id && (
+                      <tr className="details-row">
+                        <td colSpan={5}>
+                          <div className="details-panel">
+                            <div><strong>Type:</strong> {entry.type}</div>
+                            <div><strong>Asset:</strong> {entry.asset}</div>
+                            <div><strong>Time:</strong> {new Date(entry.createdAt).toLocaleString()}</div>
+                            <div>
+                              <strong>Hash:</strong>{' '}
+                              {entry.transactionHash || 'Unavailable'}
+                            </div>
+                            {entry.explorerLink && (
+                              <div>
+                                <a className="details-link" href={entry.explorerLink} target="_blank" rel="noreferrer">
+                                  View on Stellar Expert
+                                </a>
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+          )}
         </section>
       </main>
       <MobileNav
