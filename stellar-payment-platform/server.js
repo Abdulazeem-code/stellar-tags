@@ -11,6 +11,7 @@ const PDFDocument = require('pdfkit');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const registrationRoutes = require("./src/routes/registrationRoutes");
 
 const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
@@ -228,6 +229,8 @@ app.get('/federation', etagCache, async (req, res, next) => {
     return next(dbError);
   }
 });
+
+app.use("/api/federation", registrationRoutes);
 
 const VALID_MEMO_TYPES = ['text', 'id', 'hash'];
 const MEMO_ID_RE = /^\d+$/;
