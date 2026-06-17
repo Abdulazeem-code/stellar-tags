@@ -17,7 +17,6 @@ const loadStellarSdk = () => {
   if (!stellarSdkPromise) {
     stellarSdkPromise = import('@stellar/stellar-sdk')
   }
-
   return stellarSdkPromise
 }
 
