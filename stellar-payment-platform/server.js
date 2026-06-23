@@ -3,6 +3,18 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
+const { z } = require('zod');
+
+const stellarAddress = z.string().regex(/^G[A-Z2-7]{55}$/, 'Must be a valid Stellar Ed25519 public key (starts with G, 56 chars)');
+
+const registerSchema = z.object({
+  username: z.string().regex(/^[a-zA-Z0-9]{3,18}$/, 'Username must be 3-18 alphanumeric characters'),
+  address: stellarAddress,
+});
+
+const lookupSchema = z.object({
+  address: stellarAddress,
+});
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -72,12 +84,13 @@ app.get('/federation', (req, res) => {
 });
 
 app.post('/register', (req, res) => {
-  const username = normalizeNameTag(req.body.username);
-  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
-
-  if (!username || !address) {
-    return res.status(400).json({ detail: 'username and address are required' });
+  const parsed = registerSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ detail: parsed.error.errors.map((e) => `${e.path[0]}: ${e.message}`).join('; ') });
   }
+
+  const username = normalizeNameTag(parsed.data.username);
+  const address = parsed.data.address;
 
   db.get(
     'SELECT username FROM username_registry WHERE address = ?',
@@ -111,11 +124,12 @@ app.post('/register', (req, res) => {
 });
 
 app.get('/lookup', (req, res) => {
-  const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
-
-  if (!address) {
-    return res.status(400).json({ detail: "Missing 'address' parameter" });
+  const parsed = lookupSchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ detail: parsed.error.errors.map((e) => `${e.path[0]}: ${e.message}`).join('; ') });
   }
+
+  const address = parsed.data.address;
 
   db.get(
     'SELECT username FROM username_registry WHERE address = ?',
