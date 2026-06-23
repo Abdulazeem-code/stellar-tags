@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
@@ -139,6 +140,36 @@ const normalizeNameTag = (value) => {
 };
 
 
+// ---------------------------------------------------------------------------
+// #51 — ETag Caching Middleware for Federation Endpoint
+// ---------------------------------------------------------------------------
+// Generates a SHA-256 based ETag from the JSON response body.
+// If the client sends a matching If-None-Match header, the server responds
+// with 304 Not Modified without re-running the database query on subsequent
+// requests (Express caches the comparison after the first response).
+const etagCache = (req, res, next) => {
+  const originalJson = res.json.bind(res);
+
+  res.json = (body) => {
+    const bodyString = JSON.stringify(body);
+    const hash = crypto.createHash('sha256').update(bodyString).digest('hex');
+    const etag = `"${hash}"`;
+
+    res.set('ETag', etag);
+
+    // Check If-None-Match header — return 304 if content hasn't changed
+    const clientEtag = req.get('If-None-Match');
+    if (clientEtag && clientEtag === etag) {
+      return res.status(304).end();
+    }
+
+    return originalJson(body);
+  };
+
+  next();
+};
+
+app.get('/federation', etagCache, (req, res) => {
 app.get('/federation', async (req, res) => {
   const nameTag = normalizeNameTag(req.query.q);
 
