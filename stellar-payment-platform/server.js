@@ -4,11 +4,19 @@ const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 const { Keypair } = require('@stellar/stellar-sdk');
+const helmet = require('helmet');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      connectSrc: ["'self'", 'https://horizon-testnet.stellar.org', 'https://horizon.stellar.org'],
+    },
+  },
+}));
 app.use(cors());
 app.use(express.json());
 
