@@ -6,13 +6,20 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "listener": "node horizonListener.js"
+    "listener": "node horizonListener.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:studio": "prisma studio",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
+    "@prisma/client": "^6.1.0",
     "@stellar/stellar-sdk": "^16.0.1",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "generic-pool": "^3.9.0",
-    "sqlite3": "^5.1.7"
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "prisma": "^6.1.0"
   }
 }
