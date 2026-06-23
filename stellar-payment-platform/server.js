@@ -39,6 +39,8 @@ db.serialize(() => {
       created_at TEXT NOT NULL
     )`,
   );
+  db.run(`CREATE INDEX IF NOT EXISTS idx_username_registry_username ON username_registry (username)`);
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_username_registry_address ON username_registry (address)`);
 });
 
 app.get('/federation', (req, res) => {
