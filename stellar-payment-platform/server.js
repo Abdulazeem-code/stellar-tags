@@ -138,7 +138,23 @@ const normalizeNameTag = (value) => {
   return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
 };
 
-app.get('/federation', async (req, res) => {
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'data', 'registrations.db');
+fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+const db = new sqlite3.Database(dbPath);
+db.serialize(() => {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS username_registry (
+      username TEXT PRIMARY KEY,
+      address TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+  );
+  db.run(`CREATE INDEX IF NOT EXISTS idx_username_registry_username ON username_registry (username)`);
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_username_registry_address ON username_registry (address)`);
+});
+
+app.get('/federation', (req, res) => {
   const nameTag = normalizeNameTag(req.query.q);
 
   if (!nameTag) {
