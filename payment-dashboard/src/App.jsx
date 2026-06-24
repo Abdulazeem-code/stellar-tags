@@ -1,7 +1,8 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import freighterApi from '@stellar/freighter-api'
+import { useLatencyTracker } from './useLatencyTracker'
+import LatencyGauge from './LatencyGauge'
 import { useDebounce } from './useDebounce'
- ui/scroll-to-top
 import ScrollToTop from './ScrollToTop'
 
 
@@ -371,6 +372,9 @@ function Dashboard({
     bgColor: '#F3F4F6',
   })
 
+  // Initialize latency tracker for real-time API monitoring
+  const latencyTracker = useLatencyTracker(API_BASE)
+
   const walletLabel = userPublicKey
     ? `Connected: ${userPublicKey.substring(0, 5)}...${userPublicKey.substring(51)}`
     : ''
@@ -662,6 +666,10 @@ function Dashboard({
           </div>
           <div className="topbar-actions">
             <span className="chip">Testnet</span>
+            <LatencyGauge 
+              latency={latencyTracker.latency}
+              status={latencyTracker.status}
+            />
             <div className="wallet-menu" ref={menuRef}>
               <button
                 type="button"
