@@ -287,9 +287,7 @@ app.post('/register', async (req, res, next) => {
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
 
   if (!username || !address) {
-    const error = new Error('username and address are required');
-    error.statusCode = 400;
-    return next(error);
+    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
