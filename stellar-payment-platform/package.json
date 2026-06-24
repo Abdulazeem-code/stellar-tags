@@ -19,7 +19,8 @@
     "generic-pool": "^3.9.0",
     "node-cron": "4.5.0",
     "pdfkit": "^0.15.2",
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.7",
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "jest": "^29.7.0",

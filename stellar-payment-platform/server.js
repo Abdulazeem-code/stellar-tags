@@ -8,6 +8,7 @@ const sqlite3 = require('sqlite3').verbose();
 const { Horizon } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { correlationId } = require('./middleware/correlation');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -40,6 +41,10 @@ const corsOptions = {
   credentials: true,
   optionsSuccessStatus: 204
 };
+
+// #31 — Attach a correlation ID to every request before anything else runs so
+// all downstream middleware, handlers and logs can reference the same trace.
+app.use(correlationId);
 
 app.use(cors(corsOptions));
 app.use(express.json());
@@ -562,11 +567,14 @@ app.use((err, req, res, next) => {
 
   if (statusCode === 500) {
     const errorId = crypto.randomUUID();
-    console.error(`[Error ID: ${errorId}]`, err);
+    // #31 — Prefix error logs with the correlation ID so a single API call can
+    // be traced across every log line it produced.
+    console.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
     return res.status(500).json({
       success: false,
       error: 'Internal Server Error',
-      reference_id: errorId
+      reference_id: errorId,
+      correlation_id: req.correlationId
     });
   }
 
