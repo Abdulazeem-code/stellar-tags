@@ -187,16 +187,9 @@ db.serialize(() => {
 // Start the weekly background job that prunes/flags stale registrations.
 scheduleCleanupJob(db);
 
-app.get('/federation', (req, res) => {
-app.get('/federation', async (req, res) => {
-
 // ---------------------------------------------------------------------------
 // #51 — ETag Caching Middleware for Federation Endpoint
 // ---------------------------------------------------------------------------
-// Generates a SHA-256 based ETag from the JSON response body.
-// If the client sends a matching If-None-Match header, the server responds
-// with 304 Not Modified without re-running the database query on subsequent
-// requests (Express caches the comparison after the first response).
 const etagCache = (req, res, next) => {
   const originalJson = res.json.bind(res);
 
@@ -351,16 +344,13 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-// #49 — Error handling middleware for payload size limit violations
-// Express emits a 'entity.too.large' error type when the JSON body exceeds the limit.
-// This middleware catches it and returns a clean 413 JSON response.
 app.use((err, req, res, next) => {
   if (err.type === 'entity.too.large') {
     const error = new Error('Payload too large. Maximum allowed size is 10kb.');
     error.statusCode = 413;
     return next(error);
   }
-  next();
+  next(err);
 });
 
 // Global error handling middleware
@@ -387,7 +377,6 @@ if (require.main === module) {
     }
   });
 
-  // Graceful shutdown — drain the connection pool
   const shutdown = async () => {
     console.log('\nShutting down gracefully...');
     await dbPool.drain();
