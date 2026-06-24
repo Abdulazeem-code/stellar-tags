@@ -149,12 +149,6 @@ function App() {
   const [balanceError, setBalanceError] = useState('')
 
   const loadBalance = async () => {
-    if (!userPublicKey) {
-      setBalance(null)
-      setBalanceError('')
-      return
-    }
-
     setIsRefreshing(true)
     setBalanceError('')
     try {
@@ -176,7 +170,11 @@ function App() {
   }
 
   useEffect(() => {
-    loadBalance()
+    if (!userPublicKey) {
+      return
+    }
+    const run = async () => { await loadBalance() }
+    run()
   }, [userPublicKey])
 
   useEffect(() => {
@@ -384,10 +382,7 @@ function Dashboard({
 
   useEffect(() => {
     if (!userPublicKey) {
-      setReceiveAddress('')
-      setReceiveTag('')
-      displayReceiveMessage('Connect your wallet to reveal your receive details.', '#1F2937', '#F3F4F6')
-      onRegistrationStateChange('unknown')
+      Promise.resolve().then(() => onRegistrationStateChange('unknown'))
       return
     }
 
@@ -1393,11 +1388,10 @@ function HistoryPage({
 
   const loadHistory = useCallback(async (signal) => {
     if (!userPublicKey) {
-      setHistory([])
-      setHistoryError('')
       return
     }
 
+    await Promise.resolve()
     setIsLoading(true)
     setHistoryError('')
     try {
@@ -1507,7 +1501,8 @@ function HistoryPage({
 
   useEffect(() => {
     const controller = new AbortController()
-    loadHistory(controller.signal)
+    const run = async () => { await loadHistory(controller.signal) }
+    run()
     return () => controller.abort()
   }, [loadHistory, refreshIndex, userPublicKey])
 
