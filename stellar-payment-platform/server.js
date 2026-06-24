@@ -52,6 +52,29 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
+// #56 — Strip prototype pollution keys from request body and query
+const PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+const sanitize = (obj) => {
+  if (obj === null || typeof obj !== 'object') return obj;
+  for (const key of Object.keys(obj)) {
+    if (PROTO_KEYS.has(key)) {
+      delete obj[key];
+    } else {
+      sanitize(obj[key]);
+    }
+  }
+  return obj;
+};
+
+const sanitizeProtoPollution = (req, _res, next) => {
+  sanitize(req.body);
+  sanitize(req.query);
+  next();
+};
+
+app.use(sanitizeProtoPollution);
+
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
@@ -620,4 +643,4 @@ if (require.main === module) {
   process.on('SIGINT',  (sig) => gracefulShutdown(server, dbPool, sig));
 }
 
-module.exports = { app, poolGet, poolAll, gracefulShutdown, rejectNestedObjects };
+module.exports = { app, poolGet, poolAll, gracefulShutdown, rejectNestedObjects, sanitizeProtoPollution };
