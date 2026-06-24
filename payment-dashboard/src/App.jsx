@@ -1,7 +1,9 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import freighterApi from '@stellar/freighter-api'
 import { useDebounce } from './useDebounce'
+ security/sanitize-memos
 import ScrollToTop from './ScrollToTop'
+
 
 const CONTRACT_ID = 'CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER'
 const TREASURY_ADDRESS = 'GAAFWEZKDYPXLTQGKQ3F23TXWYQUDAYTDW7P7VUQSVJFW2GWC4Y6LWST'
@@ -763,11 +765,11 @@ function Dashboard({
                 <div className="form-actions">
                   <button
                     type="button"
-                    className="accent-btn"
+                    className="accent-btn disabled:opacity-50 disabled:cursor-not-allowed"
                     onClick={handleLookup}
-                    disabled={!userPublicKey || isProcessing}
+                    disabled={!userPublicKey || isProcessing || !amount || Number(amount) <= 0}
                   >
-                    {isProcessing ? 'Processing...' : 'Transfer'}
+                    {isProcessing ? <LoadingSpinner /> : 'Transfer'}
                   </button>
                   <button
                     type="button"
@@ -2025,7 +2027,7 @@ function RegistrationPage({ userPublicKey, setUserPublicKey, onBack, onRegistere
             </span>
           </div>
           <button className="primary-button" type="submit" disabled={isSubmitting}>
-            {isSubmitting ? 'Reserving...' : 'Reserve username'}
+            {isSubmitting ? <LoadingSpinner /> : 'Reserve username'}
           </button>
         </form>
         <div className={`status-card ${status.tone}`}>

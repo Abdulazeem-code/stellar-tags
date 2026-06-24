@@ -3,6 +3,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { promisify } = require('util');
 const sqlite3 = require('sqlite3').verbose();
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const dotenv = require('dotenv');
@@ -81,13 +82,50 @@ const parseDbPath = (raw) => {
 const dbConfig = parseDbPath(rawDbPath);
 fs.mkdirSync(path.dirname(dbConfig.filePath), { recursive: true });
 
+const attachAsyncDbMethods = (db) => {
+  if (typeof db.get === 'function') {
+    db.getAsync = promisify(db.get.bind(db));
+  }
+  if (typeof db.run === 'function') {
+    db.runAsync = promisify(db.run.bind(db));
+  }
+  if (typeof db.all === 'function') {
+    db.allAsync = promisify(db.all.bind(db));
+  }
+  return db;
+};
+
+const getAsync = async (db, sql, params = []) => {
+  if (typeof db.getAsync === 'function') {
+    return db.getAsync(sql, params);
+  }
+  return promisify(db.get.bind(db))(sql, params);
+};
+
+const runAsync = async (db, sql, params = []) => {
+  if (typeof db.runAsync === 'function') {
+    return db.runAsync(sql, params);
+  }
+  return promisify(db.run.bind(db))(sql, params);
+};
+
+const allAsync = async (db, sql, params = []) => {
+  if (typeof db.allAsync === 'function') {
+    return db.allAsync(sql, params);
+  }
+  return promisify(db.all.bind(db))(sql, params);
+};
+
 const dbPool = genericPool.createPool(
   {
     create: () =>
       new Promise((resolve, reject) => {
         const connection = new sqlite3.Database(dbConfig.filePath, (err) => {
           if (err) return reject(err);
-          connection.run('PRAGMA journal_mode=WAL', () => resolve(connection));
+          attachAsyncDbMethods(connection);
+          connection.runAsync('PRAGMA journal_mode=WAL')
+            .then(() => resolve(connection))
+            .catch(reject);
         });
       }),
     destroy: (connection) =>
@@ -104,40 +142,31 @@ const dbPool = genericPool.createPool(
 );
 
 const poolGet = (sql, params) =>
-  dbPool.acquire().then(
-    (conn) =>
-      new Promise((resolve, reject) => {
-        conn.get(sql, params, (err, row) => {
-          dbPool.release(conn);
-          if (err) return reject(err);
-          resolve(row);
-        });
-      }),
-  );
+  dbPool.acquire().then(async (conn) => {
+    try {
+      return await getAsync(conn, sql, params);
+    } finally {
+      dbPool.release(conn);
+    }
+  });
 
 const poolRun = (sql, params) =>
-  dbPool.acquire().then(
-    (conn) =>
-      new Promise((resolve, reject) => {
-        conn.run(sql, params, function runCb(err) {
-          dbPool.release(conn);
-          if (err) return reject(err);
-          resolve(this);
-        });
-      }),
-  );
+  dbPool.acquire().then(async (conn) => {
+    try {
+      return await runAsync(conn, sql, params);
+    } finally {
+      dbPool.release(conn);
+    }
+  });
 
 const poolAll = (sql, params) =>
-  dbPool.acquire().then(
-    (conn) =>
-      new Promise((resolve, reject) => {
-        conn.all(sql, params, (err, rows) => {
-          dbPool.release(conn);
-          if (err) return reject(err);
-          resolve(rows);
-        });
-      }),
-  );
+  dbPool.acquire().then(async (conn) => {
+    try {
+      return await allAsync(conn, sql, params);
+    } finally {
+      dbPool.release(conn);
+    }
+  });
 
 (async () => {
   try {
@@ -174,16 +203,21 @@ const normalizeNameTag = (value) => {
 const dbPath = process.env.DB_PATH || path.join(__dirname, 'data', 'registrations.db');
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-const db = new sqlite3.Database(dbPath);
-db.serialize(() => {
-  db.run(
-    `CREATE TABLE IF NOT EXISTS username_registry (
-      username TEXT PRIMARY KEY,
-      address TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )`,
-  );
-});
+const db = attachAsyncDbMethods(new sqlite3.Database(dbPath));
+
+(async () => {
+  try {
+    await db.runAsync(
+      `CREATE TABLE IF NOT EXISTS username_registry (
+        username TEXT PRIMARY KEY,
+        address TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`,
+    );
+  } catch (err) {
+    console.error('Failed to initialize direct database schema:', err);
+  }
+})();
 
 // Start the weekly background job that prunes/flags stale registrations.
 scheduleCleanupJob(db);
@@ -247,12 +281,18 @@ app.get('/federation', etagCache, async (req, res, next) => {
   }
 });
 
+const { StrKey } = require('@stellar/stellar-sdk');
+
 app.post('/register', async (req, res, next) => {
   const username = normalizeNameTag(xss(req.body.username));
   const address = typeof req.body.address === 'string' ? xss(req.body.address.trim()) : '';
 
   if (!username || !address) {
-    const error = new Error('username and address are required');
+    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
+  }
+
+  if (!StrKey.isValidEd25519PublicKey(address)) {
+    const error = new Error('Invalid Stellar Public Key format.');
     error.statusCode = 400;
     return next(error);
   }

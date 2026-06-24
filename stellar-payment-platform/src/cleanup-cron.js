@@ -1,4 +1,5 @@
 const cron = require('node-cron');
+const { promisify } = require('util');
 
 /**
  * Number of days after which a registration is considered stale.
@@ -33,51 +34,51 @@ const ACTIVE_NETWORK_ADDRESSES = new Set([
  * @returns {Promise<{pruned: number, flagged: number}>}
  */
 function runCleanup(db) {
-  return new Promise((resolve, reject) => {
+  const runAsync = typeof db.runAsync === 'function'
+    ? db.runAsync.bind(db)
+    : promisify(db.run.bind(db));
+
+  const getAsync = typeof db.getAsync === 'function'
+    ? db.getAsync.bind(db)
+    : promisify(db.get.bind(db));
+
+  return (async () => {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - STALE_THRESHOLD_DAYS);
     const cutoffIso = cutoff.toISOString();
 
     // Ensure the flagged_at column exists (idempotent migration).
-    db.run(
-      `ALTER TABLE username_registry ADD COLUMN flagged_at TEXT`,
-      () => {
-        // Ignore errors – the column likely already exists.
+    try {
+      await runAsync(
+        `ALTER TABLE username_registry ADD COLUMN flagged_at TEXT`,
+      );
+    } catch (_err) {
+      // Ignore errors – the column likely already exists.
+    }
 
-        // 1. Delete stale rows that are NOT active network addresses.
-        db.run(
-          `DELETE FROM username_registry
-           WHERE created_at < ?
-             AND address NOT IN (${[...ACTIVE_NETWORK_ADDRESSES].map(() => '?').join(',')})`,
-          [cutoffIso, ...ACTIVE_NETWORK_ADDRESSES],
-          function (deleteErr) {
-            if (deleteErr) {
-              return reject(deleteErr);
-            }
-
-            const pruned = this.changes;
-
-            // 2. Flag stale rows that ARE active network addresses.
-            db.run(
-              `UPDATE username_registry
-               SET flagged_at = ?
-               WHERE created_at < ?
-                 AND address IN (${[...ACTIVE_NETWORK_ADDRESSES].map(() => '?').join(',')})
-                 AND flagged_at IS NULL`,
-              [new Date().toISOString(), cutoffIso, ...ACTIVE_NETWORK_ADDRESSES],
-              function (flagErr) {
-                if (flagErr) {
-                  return reject(flagErr);
-                }
-
-                resolve({ pruned, flagged: this.changes });
-              },
-            );
-          },
-        );
-      },
+    // 1. Delete stale rows that are NOT active network addresses.
+    await runAsync(
+      `DELETE FROM username_registry
+       WHERE created_at < ?
+         AND address NOT IN (${[...ACTIVE_NETWORK_ADDRESSES].map(() => '?').join(',')})`,
+      [cutoffIso, ...ACTIVE_NETWORK_ADDRESSES],
     );
-  });
+    const pruneResult = await getAsync('SELECT changes() AS changes');
+    const pruned = pruneResult?.changes || 0;
+
+    // 2. Flag stale rows that ARE active network addresses.
+    await runAsync(
+      `UPDATE username_registry
+       SET flagged_at = ?
+       WHERE created_at < ?
+         AND address IN (${[...ACTIVE_NETWORK_ADDRESSES].map(() => '?').join(',')})
+         AND flagged_at IS NULL`,
+      [new Date().toISOString(), cutoffIso, ...ACTIVE_NETWORK_ADDRESSES],
+    );
+    const flagResult = await getAsync('SELECT changes() AS changes');
+
+    return { pruned, flagged: flagResult?.changes || 0 };
+  })();
 }
 
 /**
