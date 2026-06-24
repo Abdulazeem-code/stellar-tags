@@ -324,6 +324,33 @@ app.use((err, _req, res, _next) => {
   return res.status(500).json({ detail: 'Internal server error' });
 });
 
+const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
+
+let isShuttingDown = false;
+
+const gracefulShutdown = (server, pool, signal) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+
+  const timer = setTimeout(() => {
+    console.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+
+  server.close(async () => {
+    clearTimeout(timer);
+    try {
+      await pool.drain();
+      await pool.clear();
+    } catch (err) {
+      console.error('Error draining DB pool during shutdown:', err);
+    }
+    process.exit(0);
+  });
+};
+
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server successfully initialized on port ${PORT}`);
@@ -336,18 +363,10 @@ if (require.main === module) {
       process.exit(1);
     }
   });
-    
 
-    // Graceful shutdown — drain the connection pool
-    const shutdown = async () => {
-      console.log('\nShutting down gracefully...');
-      await dbPool.drain();
-      await dbPool.clear();
-      server.close(() => process.exit(0));
-    };
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, dbPool, sig));
+  process.on('SIGINT',  (sig) => gracefulShutdown(server, dbPool, sig));
 }
 
 // Export for testing and for the Horizon listener
-module.exports = { app, poolGet, poolAll };
+module.exports = { app, poolGet, poolAll, gracefulShutdown };
