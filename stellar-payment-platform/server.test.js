@@ -7,6 +7,14 @@ jest.mock('fs', () => ({
   mkdirSync: jest.fn(),
 }));
 
+jest.mock('@stellar/stellar-sdk', () => ({
+  Horizon: { Server: jest.fn() },
+}));
+
+jest.mock('pdfkit', () => jest.fn());
+
+jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+
 jest.mock('sqlite3', () => ({
   verbose: () => ({
     Database: jest.fn().mockImplementation((_path, cb) => {
