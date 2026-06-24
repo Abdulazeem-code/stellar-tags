@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "listener": "node horizonListener.js"
+    "listener": "node horizonListener.js",
+    "test": "jest"
+  },
+  "jest": {
+    "testEnvironment": "node"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.0.1",
@@ -15,5 +19,9 @@
     "express": "^4.21.2",
     "generic-pool": "^3.9.0",
     "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
   }
 }
