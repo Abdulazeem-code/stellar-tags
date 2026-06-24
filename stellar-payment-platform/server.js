@@ -343,6 +343,10 @@ app.get('/users', async (req, res, next) => {
   }
 });
 
+app.get('/api/v1/time', (_req, res) => {
+  res.status(200).json({ time: new Date().toISOString() });
+});
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
