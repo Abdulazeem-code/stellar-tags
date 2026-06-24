@@ -273,7 +273,7 @@ app.post('/register', async (req, res, next) => {
       [username, address, new Date().toISOString()],
     );
 
-    return res.json({ ok: true, username, address });
+    return res.status(201).json({ ok: true, username, address, federation_address: `${username}*${process.env.DOMAIN || 'localhost'}` });
   } catch (error) {
     if (error.message && error.message.includes('UNIQUE')) {
       const conflictError = new Error('Username already registered');
