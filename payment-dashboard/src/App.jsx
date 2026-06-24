@@ -755,14 +755,24 @@ function Dashboard({
                   disabled={!userPublicKey || isProcessing}
                 />
 
-                <button
-                  type="button"
-                  className="accent-btn"
-                  onClick={handleLookup}
-                  disabled={!userPublicKey || isProcessing}
-                >
-                  {isProcessing ? 'Processing...' : 'Transfer'}
-                </button>
+                <div className="form-actions">
+                  <button
+                    type="button"
+                    className="accent-btn"
+                    onClick={handleLookup}
+                    disabled={!userPublicKey || isProcessing}
+                  >
+                    {isProcessing ? 'Processing...' : 'Transfer'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => { setNameTag(''); setAmount(''); }}
+                    disabled={isProcessing}
+                  >
+                    Clear
+                  </button>
+                </div>
               </div>
             )}
             {activeBalancePanel === 'receive' && (
