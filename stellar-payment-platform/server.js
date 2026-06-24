@@ -295,6 +295,8 @@ app.get('/federation', etagCache, async (req, res, next) => {
 });
 
 const { StrKey } = require('@stellar/stellar-sdk');
+const Filter = require('bad-words');
+const filter = new Filter();
 
 app.post('/register', async (req, res, next) => {
   const username = normalizeNameTag(req.body.username);
@@ -303,6 +305,12 @@ app.post('/register', async (req, res, next) => {
 
   if (!username || !address) {
     return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
+  }
+
+  // Extract the username part before the * for profanity check
+  const usernameOnly = username.split('*')[0];
+  if (filter.isProfane(usernameOnly)) {
+    return res.status(400).json({ error: 'Username contains restricted words' });
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
