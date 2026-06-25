@@ -90,6 +90,10 @@ const USER_DATABASE = {
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
+let cachedCount = 0;
+let lastFetched = 0;
+let statsFetchPromise = null;
+
 const normalizeNameTag = (value) => {
   const trimmed = typeof value === 'string' ? value.trim() : '';
   if (!trimmed) {
@@ -373,6 +377,33 @@ app.get('/users', async (req, res, next) => {
   }
 });
 
+app.get('/stats', async (req, res, next) => {
+  const now = Date.now();
+
+  try {
+    if (now - lastFetched > 60_000) {
+      if (!statsFetchPromise) {
+        statsFetchPromise = prisma.user.count()
+          .then((count) => {
+            cachedCount = count;
+            lastFetched = Date.now();
+            return count;
+          })
+          .finally(() => {
+            statsFetchPromise = null;
+          });
+      }
+      await statsFetchPromise;
+    }
+
+    return res.json({ totalUsers: cachedCount });
+  } catch {
+    const statsError = new Error('Failed to fetch user statistics');
+    statsError.statusCode = 500;
+    return next(statsError);
+  }
+});
+
 app.get('/.well-known/stellar.toml', cors({ origin: '*' }), (_req, res) => {
   res.setHeader('Content-Type', 'text/plain');
   res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
@@ -457,6 +488,7 @@ app.use((err, _req, _res, next) => {
 
 // Global error handling middleware
 app.use((err, _req, res, _next) => {
+  void _next;
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 

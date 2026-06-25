@@ -1,4 +1,3 @@
-/* global jest, describe, test, expect, beforeEach, afterEach, beforeAll */
 'use strict';
 
 jest.mock('dotenv', () => ({ config: jest.fn() }));
@@ -296,6 +295,66 @@ describe('GET /users — pagination and search', () => {
     const res = await request(app).get('/users?search=alice');
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('data');
+  });
+});
+
+describe('GET /stats — cached total user count', () => {
+  let request;
+  let app;
+  let prisma;
+  let dateNowSpy;
+
+  beforeEach(() => {
+    jest.resetModules();
+    ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
+    request = require('supertest');
+
+    prisma.user.count.mockReset();
+    dateNowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('returns totalUsers and queries the database once on first request', async () => {
+    prisma.user.count.mockResolvedValue(4);
+
+    const res = await request(app).get('/stats');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ totalUsers: 4 });
+    expect(prisma.user.count).toHaveBeenCalledTimes(1);
+  });
+
+  test('reuses the cached count for requests within 60 seconds', async () => {
+    prisma.user.count.mockResolvedValue(4);
+
+    await request(app).get('/stats');
+    expect(prisma.user.count).toHaveBeenCalledTimes(1);
+
+    prisma.user.count.mockResolvedValue(10);
+    dateNowSpy.mockReturnValue(1_030_000);
+
+    const res = await request(app).get('/stats');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ totalUsers: 4 });
+    expect(prisma.user.count).toHaveBeenCalledTimes(1);
+  });
+
+  test('refreshes the cached count after 60 seconds', async () => {
+    prisma.user.count.mockResolvedValueOnce(4).mockResolvedValueOnce(10);
+
+    await request(app).get('/stats');
+    expect(prisma.user.count).toHaveBeenCalledTimes(1);
+
+    dateNowSpy.mockReturnValue(1_061_000);
+    const res = await request(app).get('/stats');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ totalUsers: 10 });
+    expect(prisma.user.count).toHaveBeenCalledTimes(2);
   });
 });
 
