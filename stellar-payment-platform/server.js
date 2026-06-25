@@ -373,6 +373,22 @@ app.get('/users', async (req, res, next) => {
   }
 });
 
+app.get('/api/v1/users/recent', async (_req, res, next) => {
+  try {
+    const recentUsers = await prisma.user.findMany({
+      select: { username: true, address: true },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+    });
+
+    return res.status(200).json(recentUsers);
+  } catch {
+    const recentError = new Error('Failed to fetch recent users');
+    recentError.statusCode = 500;
+    return next(recentError);
+  }
+});
+
 app.get('/.well-known/stellar.toml', cors({ origin: '*' }), (_req, res) => {
   res.setHeader('Content-Type', 'text/plain');
   res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
