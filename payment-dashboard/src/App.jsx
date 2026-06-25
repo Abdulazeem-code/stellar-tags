@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { formatDistanceToNow } from 'date-fns'
 import freighterApi from '@stellar/freighter-api'
 import { useLatencyTracker } from './useLatencyTracker'
 import LatencyGauge from './LatencyGauge'
@@ -1808,6 +1809,7 @@ function HistoryPage({
             <table className="history-table">
               <thead>
                 <tr>
+                  <th>Time</th>
                   <th>Counterparty</th>
                   <th>Direction</th>
                   <th>Amount</th>
@@ -1819,6 +1821,7 @@ function HistoryPage({
                 {history.map((entry) => (
                   <Fragment key={entry.id}>
                     <tr>
+                      <td>{formatDistanceToNow(new Date(entry.createdAt), { addSuffix: true })}</td>
                       <td>{formatShortAddress(entry.counterparty)}</td>
                       <td>{entry.direction}</td>
                       <td>{entry.amount}</td>
@@ -1837,12 +1840,12 @@ function HistoryPage({
                     </tr>
                     {expandedId === entry.id && (
                       <tr className="details-row">
-                        <td colSpan={5}>
+                        <td colSpan={6}>
                           <div className="details-panel">
                             <div><strong>Type:</strong> {entry.type}</div>
                             <div><strong>Counterparty:</strong> {entry.counterparty}</div>
                             <div><strong>Asset:</strong> {entry.asset}</div>
-                            <div><strong>Time:</strong> {new Date(entry.createdAt).toLocaleString()}</div>
+                            <div><strong>Time:</strong> {formatDistanceToNow(new Date(entry.createdAt), { addSuffix: true })}</div>
                             <div>
                               <strong>Hash:</strong>{' '}
                               {entry.transactionHash || 'Unavailable'}
