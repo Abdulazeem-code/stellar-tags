@@ -204,6 +204,9 @@ app.get('/federation', etagCache, async (req, res, next) => {
 });
 
 app.post('/register', async (req, res, next) => {
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
+  }
   const username = normalizeNameTag(req.body.username);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
 

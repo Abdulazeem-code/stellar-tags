@@ -1,4 +1,3 @@
-/* global jest, describe, test, expect, beforeEach, afterEach, beforeAll */
 'use strict';
 
 jest.mock('dotenv', () => ({ config: jest.fn() }));
@@ -302,7 +301,6 @@ describe('GET /users — pagination and search', () => {
 describe('POST /register — block secret keys', () => {
   let request;
   let app;
-  let mockConn;
 
   beforeEach(() => {
     jest.resetModules();
@@ -315,36 +313,6 @@ describe('POST /register — block secret keys', () => {
     }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-
-    jest.mock('sqlite3', () => ({
-      verbose: () => ({
-        Database: jest.fn().mockImplementation((_path, cb) => {
-          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
-          if (cb) cb(null);
-          return db;
-        }),
-      }),
-    }));
-
-    mockConn = {
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 1, changes: 1 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, null);
-      }),
-    };
-
-    jest.mock('generic-pool', () => ({
-      createPool: jest.fn(() => ({
-        acquire: jest.fn().mockResolvedValue(mockConn),
-        release: jest.fn(),
-        drain: jest.fn().mockResolvedValue(undefined),
-        clear: jest.fn().mockResolvedValue(undefined),
-      })),
-    }));
 
     ({ app } = require('./server'));
     request = require('supertest');
@@ -386,6 +354,30 @@ describe('POST /register — block secret keys', () => {
       ok: true,
       username: 'alice*localhost',
       address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ'
+    });
+  });
+
+  test('rejects registration if Content-Type header is not application/json', async () => {
+    const res = await request(app)
+      .post('/register')
+      .set('Content-Type', 'text/plain')
+      .send('username=alice&address=GBCDEFGHIJKLMNOPQRSTUVWXYZ');
+
+    expect(res.status).toBe(415);
+    expect(res.body).toEqual({
+      error: "Unsupported Media Type. Please send application/json"
+    });
+  });
+
+  test('rejects registration if Content-Type header is missing', async () => {
+    const res = await request(app)
+      .post('/register')
+      .unset('Content-Type')
+      .send('some-raw-payload');
+
+    expect(res.status).toBe(415);
+    expect(res.body).toEqual({
+      error: "Unsupported Media Type. Please send application/json"
     });
   });
 });
