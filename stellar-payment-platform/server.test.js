@@ -1,51 +1,32 @@
+/* global jest, describe, test, expect, beforeEach, afterEach, beforeAll */
 'use strict';
 
 jest.mock('dotenv', () => ({ config: jest.fn() }));
 
-jest.mock('fs', () => ({
-  ...jest.requireActual('fs'),
-  mkdirSync: jest.fn(),
-}));
-
 jest.mock('@stellar/stellar-sdk', () => ({
   Horizon: { Server: jest.fn() },
+  StrKey: { isValidEd25519PublicKey: jest.fn(() => true) },
 }));
 
 jest.mock('pdfkit', () => jest.fn());
 
+// The cleanup cron schedules a recurring job at module load — stub it so the
+// test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn(function (...args) {
-          const fn = args.find((a) => typeof a === 'function');
-          if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-        }),
-        serialize: jest.fn((fn) => fn && fn()),
-        close: jest.fn((cb) => cb && cb()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
-}));
-
-jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call({ lastID: 1, changes: 1 }, null);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
-  })),
+// Prisma is mocked so the suite never touches a real database.
+jest.mock('./prismaClient', () => ({
+  prisma: {
+    user: {
+      findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      findMany: jest.fn(),
+      count: jest.fn(),
+      create: jest.fn(),
+    },
+    $transaction: jest.fn((ops) => Promise.all(ops)),
+    $disconnect: jest.fn().mockResolvedValue(undefined),
+  },
 }));
 
 describe('gracefulShutdown', () => {
@@ -212,64 +193,19 @@ describe('rejectNestedObjects middleware', () => {
 describe('GET /lookup — pagination and search', () => {
   let request;
   let app;
+  let prisma;
 
   const VALID_ADDRESS = 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ';
 
   beforeEach(() => {
     jest.resetModules();
-
-    jest.mock('dotenv', () => ({ config: jest.fn() }));
-    jest.mock('fs', () => ({ ...jest.requireActual('fs'), mkdirSync: jest.fn() }));
-    jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
-    jest.mock('pdfkit', () => jest.fn());
-    jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-
-    jest.mock('sqlite3', () => ({
-      verbose: () => ({
-        Database: jest.fn().mockImplementation((_path, cb) => {
-          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
-          if (cb) cb(null);
-          return db;
-        }),
-      }),
-    }));
-
-    const mockConn = {
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (sql.includes('COUNT(*)')) {
-          if (fn) fn(null, { total: 2 });
-        } else if (sql.includes('WHERE address =')) {
-          if (fn) fn(null, { username: 'alice*localhost' });
-        } else {
-          if (fn) fn(null, null);
-        }
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        const rows = [
-          { username: 'alice*localhost', address: VALID_ADDRESS, created_at: '2024-01-01T00:00:00.000Z' },
-          { username: 'bob*localhost', address: 'GBOB0000000000000000000000000000000000000000000000000000', created_at: '2024-01-02T00:00:00.000Z' },
-        ];
-        if (fn) fn(null, rows);
-      }),
-    };
-
-    jest.mock('generic-pool', () => ({
-      createPool: jest.fn(() => ({
-        acquire: jest.fn().mockResolvedValue(mockConn),
-        release: jest.fn(),
-        drain: jest.fn().mockResolvedValue(undefined),
-        clear: jest.fn().mockResolvedValue(undefined),
-      })),
-    }));
-
     ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
     request = require('supertest');
+
+    prisma.user.findUnique.mockReset();
+    prisma.user.findMany.mockReset();
+    prisma.user.count.mockReset();
   });
 
   afterEach(() => {
@@ -282,14 +218,30 @@ describe('GET /lookup — pagination and search', () => {
   });
 
   test('exact address lookup returns single record (backward compat)', async () => {
+ #54-Refactor-API-Route-Architecture-to-Support-Explicit-Versioning-(/api/v1)-FIX
     const res = await request(app).get(`/api/v1/lookup?address=${VALID_ADDRESS}`);
+
+    prisma.user.findUnique.mockResolvedValue({ username: 'alice*localhost' });
+
+    const res = await request(app).get(`/lookup?address=${VALID_ADDRESS}`);
+ main
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ username: 'alice*localhost', address: VALID_ADDRESS });
     expect(res.body).not.toHaveProperty('data');
   });
 
   test('search mode returns paginated metadata block', async () => {
+ #54-Refactor-API-Route-Architecture-to-Support-Explicit-Versioning-(/api/v1)-FIX
     const res = await request(app).get('/api/v1/lookup?search=alice&page=1&limit=10');
+
+    prisma.user.count.mockResolvedValue(2);
+    prisma.user.findMany.mockResolvedValue([
+      { username: 'alice*localhost', address: VALID_ADDRESS, createdAt: new Date('2024-01-01T00:00:00.000Z') },
+      { username: 'bob*localhost', address: 'GBOB0000000000000000000000000000000000000000000000000000', createdAt: new Date('2024-01-02T00:00:00.000Z') },
+    ]);
+
+    const res = await request(app).get('/lookup?search=alice&page=1&limit=10');
+ main
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('data');
     expect(res.body).toHaveProperty('totalCount');
@@ -298,7 +250,14 @@ describe('GET /lookup — pagination and search', () => {
   });
 
   test('search mode defaults page to 1 and limit to 10 when omitted', async () => {
+ #54-Refactor-API-Route-Architecture-to-Support-Explicit-Versioning-(/api/v1)-FIX
     const res = await request(app).get('/api/v1/lookup?search=alice');
+
+    prisma.user.count.mockResolvedValue(2);
+    prisma.user.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/lookup?search=alice');
+ main
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ currentPage: 1 });
   });
@@ -307,13 +266,65 @@ describe('GET /lookup — pagination and search', () => {
 describe('GET /users — pagination and search', () => {
   let request;
   let app;
+  let prisma;
+
+  beforeEach(() => {
+    jest.resetModules();
+    ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
+    request = require('supertest');
+
+    prisma.user.findMany.mockReset();
+    prisma.user.count.mockReset();
+
+    prisma.user.count.mockResolvedValue(25);
+    prisma.user.findMany.mockResolvedValue(
+      Array.from({ length: 10 }, (_, i) => ({
+        username: `user${i}*localhost`,
+        address: `G${'A'.repeat(55)}${i}`,
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+      })),
+    );
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('returns paginated metadata block with default page and limit', async () => {
+    const res = await request(app).get('/users');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ totalCount: 25, currentPage: 1 });
+    expect(Array.isArray(res.body.data)).toBe(true);
+  });
+
+  test('respects explicit page and limit query params', async () => {
+    const res = await request(app).get('/users?page=3&limit=5');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ currentPage: 3 });
+  });
+
+  test('accepts search query param without error', async () => {
+    const res = await request(app).get('/users?search=alice');
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('data');
+  });
+});
+
+describe('POST /register — block secret keys', () => {
+  let request;
+  let app;
+  let mockConn;
 
   beforeEach(() => {
     jest.resetModules();
 
     jest.mock('dotenv', () => ({ config: jest.fn() }));
     jest.mock('fs', () => ({ ...jest.requireActual('fs'), mkdirSync: jest.fn() }));
-    jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
+    jest.mock('@stellar/stellar-sdk', () => ({
+      Horizon: { Server: jest.fn() },
+      StrKey: { isValidEd25519PublicKey: jest.fn((addr) => addr && (addr.startsWith('G') || addr.startsWith('S') || addr.startsWith('s'))) }
+    }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
@@ -327,23 +338,14 @@ describe('GET /users — pagination and search', () => {
       }),
     }));
 
-    const mockConn = {
+    mockConn = {
       run: jest.fn((sql, params, cb) => {
         const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
+        if (fn) fn.call({ lastID: 1, changes: 1 }, null);
       }),
       get: jest.fn((sql, params, cb) => {
         const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, { total: 25 });
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        const rows = Array.from({ length: 10 }, (_, i) => ({
-          username: `user${i}*localhost`,
-          address: `G${'A'.repeat(55)}${i}`,
-          created_at: '2024-01-01T00:00:00.000Z',
-        }));
-        if (fn) fn(null, rows);
+        if (fn) fn(null, null);
       }),
     };
 
@@ -364,6 +366,7 @@ describe('GET /users — pagination and search', () => {
     jest.restoreAllMocks();
   });
 
+ #54-Refactor-API-Route-Architecture-to-Support-Explicit-Versioning-(/api/v1)-FIX
   test('returns paginated metadata block with default page and limit', async () => {
     const res = await request(app).get('/api/v1/users');
     expect(res.status).toBe(200);
@@ -381,5 +384,41 @@ describe('GET /users — pagination and search', () => {
     const res = await request(app).get('/api/v1/users?search=alice');
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('data');
+
+  test('blocks registration if address starts with S (uppercase)', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'alice', address: 'SBCDEFGHIJKLMNOPQRSTUVWXYZ' });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
+    });
+  });
+
+  test('blocks registration if address starts with s (lowercase)', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'alice', address: 'sBCDEFGHIJKLMNOPQRSTUVWXYZ' });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
+    });
+  });
+
+  test('allows registration and continues flow if address starts with G', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'alice', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({
+      ok: true,
+      username: 'alice*localhost',
+      address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ'
+    });
+ main
   });
 });
+
