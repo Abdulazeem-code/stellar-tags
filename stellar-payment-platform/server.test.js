@@ -378,6 +378,9 @@ describe('POST /register — block secret keys', () => {
     expect(res.status).toBe(415);
     expect(res.body).toEqual({
       error: "Unsupported Media Type. Please send application/json"
+    });
+  });
+
   test('rejects 1-character local username payload', async () => {
     const res = await request(app)
       .post('/register')
