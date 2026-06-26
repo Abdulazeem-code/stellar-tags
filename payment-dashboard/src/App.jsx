@@ -1,15 +1,16 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
-import freighterApi from "@stellar/freighter-api";
-import { useLatencyTracker } from "./useLatencyTracker";
-import LatencyGauge from "./LatencyGauge";
-import { useDebounce } from "./useDebounce";
-import ScrollToTop from "./ScrollToTop";
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import freighterApi from '@stellar/freighter-api'
+import { useLatencyTracker } from './useLatencyTracker'
+import LatencyGauge from './LatencyGauge'
+import NetworkBadge from './NetworkBadge'
+import { useDebounce } from './useDebounce'
+import ScrollToTop from './ScrollToTop'
+import LoadingSpinner from './components/LoadingSpinner'
 
-const CONTRACT_ID = "CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER";
-const TREASURY_ADDRESS =
-  "GAAFWEZKDYPXLTQGKQ3F23TXWYQUDAYTDW7P7VUQSVJFW2GWC4Y6LWST";
-const TOKEN_ADDRESS =
-  "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+const CONTRACT_ID = 'CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER'
+const TREASURY_ADDRESS = 'GAAFWEZKDYPXLTQGKQ3F23TXWYQUDAYTDW7P7VUQSVJFW2GWC4Y6LWST'
+const TOKEN_ADDRESS = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC'
 const API_BASE = "https://stellar-tags-production.up.railway.app";
 const DEFAULT_FEDERATION_DOMAIN = "localhost";
 const HORIZON_BASE = "https://horizon-testnet.stellar.org";
@@ -870,8 +871,8 @@ function Dashboard({
             </p>
           </div>
           <div className="topbar-actions">
-            <span className="chip">Testnet</span>
-            <LatencyGauge
+            <NetworkBadge />
+            <LatencyGauge 
               latency={latencyTracker.latency}
               status={latencyTracker.status}
             />
@@ -1618,7 +1619,7 @@ function AnalyticsPage({
             </p>
           </div>
           <div className="topbar-actions">
-            <span className="chip">Testnet</span>
+            <NetworkBadge />
             <div className="wallet-menu" ref={menuRef}>
               <button
                 type="button"
@@ -1973,7 +1974,7 @@ function HistoryPage({
           </div>
           <div className="topbar-actions">
             <span className="chip">Last 24 hours</span>
-            <span className="chip">Testnet</span>
+            <NetworkBadge />
             <div className="wallet-menu" ref={menuRef}>
               <button
                 type="button"
@@ -2219,7 +2220,7 @@ function MobileNav({
   );
 }
 
-const USERNAME_REGEX = /^[a-zA-Z0-9_\-]+$/;
+const USERNAME_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 function RegistrationPage({
   userPublicKey,
