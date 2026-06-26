@@ -190,9 +190,6 @@ app.get('/federation', etagCache, async (req, res, next) => {
   }
 });
 
-const { StrKey } = require('@stellar/stellar-sdk');
-const Filter = require('bad-words');
-const filter = new Filter();
 // Initialise profanity filter once at module load (reused across requests).
 const profanityFilter = new Filter();
 
@@ -208,10 +205,7 @@ app.post('/register', async (req, res, next) => {
     return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
   }
 
-  // Extract the username part before the * for profanity check
-  const usernameOnly = username.split('*')[0];
-  if (filter.isProfane(usernameOnly)) {
-    return res.status(400).json({ error: 'Username contains restricted words' });
+  // Extract the username part before the * for profanity check and length validation
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
 
   if (usernameLocalPart.length < 3) {
