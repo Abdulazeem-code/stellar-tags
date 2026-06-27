@@ -793,6 +793,11 @@ function Dashboard({
     }
   };
 
+  const handleMaxClick = () => {
+    const maxSpendable = Math.max(0, parseFloat(balance) - 1.00001)
+    setAmount(maxSpendable.toFixed(5).toString())
+  }
+
   const handleDisconnect = () => {
     setIsWalletMenuOpen(false);
     onDisconnectWallet();
@@ -989,6 +994,9 @@ function Dashboard({
                   placeholder="0.00"
                   disabled={!userPublicKey || isProcessing}
                 />
+                {balance !== null && Number(amount) > 0 && Number(amount) > balance && (
+                  <p className="balance-error">Insufficient XLM balance.</p>
+                )}
 
                 <div className="form-actions">
                   <button
@@ -999,7 +1007,8 @@ function Dashboard({
                       !userPublicKey ||
                       isProcessing ||
                       !amount ||
-                      Number(amount) <= 0
+                      Number(amount) <= 0 ||
+                      (balance !== null && Number(amount) > balance)
                     }
                   >
                     {isProcessing ? <LoadingSpinner /> : "Transfer"}
@@ -2220,7 +2229,7 @@ function MobileNav({
   );
 }
 
-const USERNAME_REGEX = /^[a-zA-Z0-9_\-]+$/;
+const USERNAME_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 function RegistrationPage({
   userPublicKey,
