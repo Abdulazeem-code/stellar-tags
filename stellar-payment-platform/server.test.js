@@ -30,7 +30,7 @@ jest.mock('sqlite3', () => ({
       return db;
     }),
   }),
-}));
+}), { virtual: true });
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
@@ -232,7 +232,7 @@ describe('GET /lookup — pagination and search', () => {
           return db;
         }),
       }),
-    }));
+    }), { virtual: true });
 
     const mockConn = {
       run: jest.fn((sql, params, cb) => {
@@ -325,7 +325,7 @@ describe('GET /users — pagination and search', () => {
           return db;
         }),
       }),
-    }));
+    }), { virtual: true });
 
     const mockConn = {
       run: jest.fn((sql, params, cb) => {
