@@ -2,6 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 require('dotenv').config();
+const rateLimit = require('express-rate-limit');
+const RedisStore = require('rate-limit-redis');
+const { createClient } = require('redis');
+const xss = require('xss');
 
 const { Horizon, StrKey } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
@@ -9,11 +13,26 @@ const { Prisma } = require('@prisma/client');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const Filter = require('bad-words');
+const dotenv = require('dotenv');
+const timeout = require('connect-timeout');
+
+dotenv.config();
+
+const genericPool = require('generic-pool');
 
 const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
 
 const app = express();
+
+app.use(timeout('10s'));
+app.use((err, req, res, next) => {
+  if (req.timedout) {
+    return res.status(503).json({ error: 'Service Unavailable' });
+  }
+  next(err);
+});
+
 app.set('query parser', 'simple');
 const PORT = process.env.PORT || 5000;
 // Ensure to add the value for STELLAR_TAG_DOMAIN in the env file
@@ -38,7 +57,25 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+const redisClient = process.env.REDIS_URL ? createClient({
+  url: process.env.REDIS_URL
+}) : null;
+if (redisClient) {
+  redisClient.connect().catch(console.error);
+}
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use(cors(corsOptions));
+app.use(limiter);
 // #49 — Enforce strict 10kb JSON payload size limit to prevent DoS via oversized payloads
 app.use(express.json({ limit: '10kb' }));
 app.use((err, _req, res, next) => {
@@ -228,7 +265,8 @@ app.post('/register', async (req, res, next) => {
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
-  const username = normalizeNameTag(req.body.username);
+  const safeUsername = xss(req.body.username);
+  const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
   const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
   const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
@@ -267,9 +305,14 @@ app.post('/register', async (req, res, next) => {
   // Convert to lowercase for case-insensitive storage
   const normalizedUsername = username.toLowerCase();
 
+  const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
+  if (RESERVED_NAMES.includes(normalizedUsername)) {
+    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+  }
+
   try {
     const existing = await prisma.user.findUnique({
-      where: { address },
+      where: { address }
     });
 
     if (existing) {
@@ -302,6 +345,8 @@ app.post('/register', async (req, res, next) => {
     return next(registrationError);
   }
 });
+
+app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
 app.get('/lookup', async (req, res, next) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
@@ -414,7 +459,8 @@ app.get('/users', async (req, res, next) => {
   }
 });
 
-app.get('/.well-known/stellar.toml', cors({ origin: '*' }), (_req, res) => {
+app.get('/.well-known/stellar.toml', (_req, res) => {
+  res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
   res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
 });
@@ -497,7 +543,7 @@ app.use((err, _req, _res, next) => {
 });
 
 // Global error handling middleware
-app.use((err, _req, res, _next) => {
+app.use((err, _req, res) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
@@ -544,6 +590,14 @@ const gracefulShutdown = (server, pool, signal) => {
     process.exit(0);
   });
 };
+app.use((err, req, res) => {
+  // 1. Print the full error stack trace to the console (Viewable in Vercel Logs)
+  console.error('\n❌ CRITICAL BACKEND ERROR:');
+  console.error(err.stack);
+  console.error('============================\n');
+
+  // 2. Determine the status code (default to 500 Internal Server Error)
+  const statusCode = err.statusCode || 500;
 
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {
