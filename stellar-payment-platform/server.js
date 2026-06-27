@@ -13,18 +13,34 @@ require('dotenv').config();
 const rateLimit = require('express-rate-limit');
 const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
+const xss = require('xss');
 
 const { Horizon, StrKey } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const dotenv = require('dotenv');
+const timeout = require('connect-timeout');
+
+dotenv.config();
+
+const genericPool = require('generic-pool');
 
 const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
  main
 
 const app = express();
+
+app.use(timeout('10s'));
+app.use((err, req, res, next) => {
+  if (req.timedout) {
+    return res.status(503).json({ error: 'Service Unavailable' });
+  }
+  next(err);
+});
+
 app.set('query parser', 'simple');
 const PORT = process.env.PORT || 5000;
 // Ensure to add the value for STELLAR_TAG_DOMAIN in the env file
@@ -270,7 +286,8 @@ app.post('/register', async (req, res, next) => {
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
-  const username = normalizeNameTag(req.body.username);
+  const safeUsername = xss(req.body.username);
+  const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
   const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
   const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
@@ -302,9 +319,14 @@ app.post('/register', async (req, res, next) => {
   // Convert to lowercase for case-insensitive storage
   const normalizedUsername = username.toLowerCase();
 
+  const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
+  if (RESERVED_NAMES.includes(normalizedUsername)) {
+    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+  }
+
   try {
     const existing = await prisma.user.findUnique({
-      where: { address },
+      where: { address }
     });
 
     if (existing) {
@@ -337,6 +359,8 @@ app.post('/register', async (req, res, next) => {
     return next(registrationError);
   }
 });
+
+app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
 app.get('/lookup', async (req, res, next) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
@@ -450,7 +474,8 @@ app.get('/users', async (req, res, next) => {
 });
  main
 
-app.get('/.well-known/stellar.toml', cors({ origin: '*' }), (_req, res) => {
+app.get('/.well-known/stellar.toml', (_req, res) => {
+  res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
   res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/api/v1/federation"\n');
 });
