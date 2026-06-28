@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
 import toast from 'react-hot-toast';
 import { useLatencyTracker } from '../useLatencyTracker';
@@ -52,6 +52,7 @@ function Dashboard({
     action()
   }
   const [nameTag, setNameTag] = useState('')
+  const recipientRef = useRef(null);
   const debouncedNameTag = useDebounce(nameTag, 300)
   const [amount, setAmount] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
@@ -144,6 +145,10 @@ function Dashboard({
 
     loadReceiveDetails();
   }, [userPublicKey, onRegistrationStateChange]);
+
+  useEffect(() => {
+    recipientRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     if (!debouncedNameTag || !userPublicKey) {
@@ -544,6 +549,7 @@ function Dashboard({
                 )}
                 <label>Recipient username or address</label>
                 <input
+                  ref={recipientRef}
                   type="text"
                   value={nameTag}
                   onChange={(event) => setNameTag(event.target.value)}
