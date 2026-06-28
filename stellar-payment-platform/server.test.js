@@ -305,6 +305,7 @@ describe('GET /lookup — pagination and search', () => {
     prisma.user.findUnique.mockReset();
     prisma.user.findMany.mockReset();
     prisma.user.count.mockReset();
+    prisma.$transaction = jest.fn();
   });
 
   afterEach(() => {
@@ -331,6 +332,10 @@ describe('GET /lookup — pagination and search', () => {
       { username: 'alice*localhost', address: VALID_ADDRESS, createdAt: new Date('2024-01-01T00:00:00.000Z') },
       { username: 'bob*localhost', address: 'GBOB0000000000000000000000000000000000000000000000000000', createdAt: new Date('2024-01-02T00:00:00.000Z') },
     ]);
+    prisma.$transaction.mockResolvedValue([2, [
+      { username: 'alice*localhost', address: VALID_ADDRESS, createdAt: new Date('2024-01-01T00:00:00.000Z') },
+      { username: 'bob*localhost', address: 'GBOB0000000000000000000000000000000000000000000000000000', createdAt: new Date('2024-01-02T00:00:00.000Z') },
+    ]]);
 
     const res = await request(app).get('/lookup?search=alice&page=1&limit=10');
     expect(res.status).toBe(200);
@@ -343,6 +348,7 @@ describe('GET /lookup — pagination and search', () => {
   test('search mode defaults page to 1 and limit to 10 when omitted', async () => {
     prisma.user.count.mockResolvedValue(2);
     prisma.user.findMany.mockResolvedValue([]);
+    prisma.$transaction.mockResolvedValue([2, []]);
 
     const res = await request(app).get('/lookup?search=alice');
     expect(res.status).toBe(200);
@@ -418,6 +424,11 @@ describe('GET /users — pagination and search', () => {
         createdAt: new Date('2024-01-01T00:00:00.000Z'),
       })),
     );
+    prisma.$transaction = jest.fn().mockResolvedValue([25, Array.from({ length: 10 }, (_, i) => ({
+      username: `user${i}*localhost`,
+      address: `G${'A'.repeat(55)}${i}`,
+      createdAt: new Date('2024-01-01T00:00:00.000Z'),
+    }))]);
   });
 
   afterEach(() => {
