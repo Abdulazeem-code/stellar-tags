@@ -38,31 +38,6 @@ async function runCleanup(prisma) {
 
   const activeAddresses = [...ACTIVE_NETWORK_ADDRESSES];
 
- #54-Refactor-API-Route-Architecture-to-Support-Explicit-Versioning-(/api/v1)-FIX
-  return (async () => {
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - STALE_THRESHOLD_DAYS);
-    const cutoffIso = cutoff.toISOString();
-
-    // Ensure the flagged_at column exists (idempotent migration).
-    try {
-      await runAsync(
-        `ALTER TABLE username_registry ADD COLUMN flagged_at TEXT`,
-      );
-    } catch {
-      // Ignore errors – the column likely already exists.
-    }
-
-    // 1. Delete stale rows that are NOT active network addresses.
-    await runAsync(
-      `DELETE FROM username_registry
-       WHERE created_at < ?
-         AND address NOT IN (${[...ACTIVE_NETWORK_ADDRESSES].map(() => '?').join(',')})`,
-      [cutoffIso, ...ACTIVE_NETWORK_ADDRESSES],
-    );
-    const pruneResult = await getAsync('SELECT changes() AS changes');
-    const pruned = pruneResult?.changes || 0;
-
   // 1. Delete stale rows that are NOT active network addresses.
   const pruneResult = await prisma.user.deleteMany({
     where: {
@@ -70,7 +45,6 @@ async function runCleanup(prisma) {
       address: { notIn: activeAddresses },
     },
   });
- main
 
   // 2. Flag stale rows that ARE active network addresses.
   const flagResult = await prisma.user.updateMany({
