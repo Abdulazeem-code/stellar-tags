@@ -113,6 +113,22 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
       memo: null,
     });
 
+    // Default verifier behavior: assume signature verifies unless a test
+    // overrides this with mockResolvedValue or mockRejectedValue.
+    verifyMultiSignerThreshold.mockResolvedValue({
+      success: true,
+      accountId: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
+      operationType: 'management',
+      requiredThreshold: 1,
+      totalWeight: 1,
+      signatureCount: 1,
+      uniqueSignerCount: 1,
+      signatures: [{ publicKey: 'GFAKE', weight: 1, isValid: true }],
+      thresholds: { low_threshold: 1, med_threshold: 2, high_threshold: 3 },
+      signerCount: 1,
+      errorMessage: null,
+    });
+
     // Mock pool
     const genericPool = require('generic-pool');
     mockPool = await genericPool.createPool().acquire();
