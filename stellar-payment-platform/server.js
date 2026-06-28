@@ -1,22 +1,36 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-require('dotenv').config();
-
+const rateLimit = require('express-rate-limit');
+const RedisStore = require('rate-limit-redis');
+const { createClient } = require('redis');
+const xss = require('xss');
 const { Horizon, StrKey } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
-const { Prisma } = require('@prisma/client');
 const { prisma } = require('./prismaClient');
+const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const Filter = require('bad-words');
+const dotenv = require('dotenv');
+const timeout = require('connect-timeout');
+
+require('dotenv').config();
 
 const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
 
 const app = express();
+
+app.use(timeout('10s'));
+app.use((err, req, res, next) => {
+  if (req.timedout) {
+    return res.status(503).json({ error: 'Service Unavailable' });
+  }
+  next(err);
+});
+
 app.set('query parser', 'simple');
 const PORT = process.env.PORT || 5000;
-// Ensure to add the value for STELLAR_TAG_DOMAIN in the env file
 const STELLAR_TAG_DOMAIN = process.env.STELLAR_TAG_DOMAIN;
 
 const allowedOrigins = [
@@ -38,8 +52,26 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+const redisClient = process.env.REDIS_URL ? createClient({
+  url: process.env.REDIS_URL
+}) : null;
+if (redisClient) {
+  redisClient.connect().catch(console.error);
+}
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
 app.use(cors(corsOptions));
-// #49 — Enforce strict 10kb JSON payload size limit to prevent DoS via oversized payloads
+app.use(limiter);
 app.use(express.json({ limit: '10kb' }));
 app.use((err, _req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
@@ -48,10 +80,6 @@ app.use((err, _req, res, next) => {
   next(err);
 });
 
-// ---------------------------------------------------------------------------
-// Reject nested objects/arrays in query and body params (NoSQL-style injection
-// hardening — every accepted parameter must be a primitive value).
-// ---------------------------------------------------------------------------
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
@@ -72,16 +100,6 @@ const rejectNestedObjects = (req, res, next) => {
 
 app.use(rejectNestedObjects);
 
-// ---------------------------------------------------------------------------
-// Database — PostgreSQL via Prisma ORM
-// ---------------------------------------------------------------------------
-// The legacy raw sqlite3 layer (manual generic-pool, hand-written SQL and
-// schema bootstrap) has been replaced by the Prisma Client. Prisma owns its
-// own connection pool, configurable through the DATABASE_URL query string
-// (e.g. ?connection_limit=10&pool_timeout=5). The schema lives in
-// prisma/schema.prisma and is applied with `npm run prisma:migrate`.
-
-// Start the weekly background job that prunes/flags stale registrations.
 scheduleCleanupJob(prisma);
 
 const USER_DATABASE = {
@@ -123,9 +141,6 @@ const etagCache = (req, res, next) => {
   next();
 };
 
-// ---------------------------------------------------------------------------
-// #81 — SEP-0002: Handle type=id Federation Queries
-// ---------------------------------------------------------------------------
 app.get('/federation', etagCache, async (req, res, next) => {
   const { q, type } = req.query;
   const queryValue = typeof q === 'string' ? q.trim() : '';
@@ -140,7 +155,7 @@ app.get('/federation', etagCache, async (req, res, next) => {
     if (type === 'id') {
       const row = await prisma.user.findFirst({
         where: { address: { equals: queryValue, mode: 'insensitive' } },
-        select: { username: true, address: true },
+        select: { username: true, address: true, memoType: true, memo: true },
       });
 
       if (!row) {
@@ -150,18 +165,22 @@ app.get('/federation', etagCache, async (req, res, next) => {
       }
 
       return res.json({
+      const response = {
         stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
         account_id: row.address,
-        memo_type: 'text',
-        memo: 'PlatformPayment',
-      });
+      };
+      if (row.memoType) {
+        response.memo_type = row.memoType;
+        response.memo = row.memo;
+      }
+      return res.json(response);
     } else if (type === 'name' || !type) {
       const nameTag = normalizeNameTag(queryValue);
       const queryName = nameTag.toLowerCase();
 
       const row = await prisma.user.findUnique({
         where: { username: queryName },
-        select: { address: true },
+        select: { address: true, memoType: true, memo: true },
       });
 
       const address = row?.address || USER_DATABASE[queryName];
@@ -172,12 +191,15 @@ app.get('/federation', etagCache, async (req, res, next) => {
         return next(notFoundError);
       }
 
-      return res.json({
+      const response = {
         stellar_address: address,
         account_id: address,
-        memo_type: 'text',
-        memo: 'PlatformPayment',
-      });
+      };
+      if (row?.memoType) {
+        response.memo_type = row.memoType;
+        response.memo = row.memo;
+      }
+      return res.json(response);
     } else {
       return res.status(400).json({
         error: "Unsupported query type. Supported types: 'id', 'name'",
@@ -192,10 +214,53 @@ app.get('/federation', etagCache, async (req, res, next) => {
 
 // Initialise profanity filter once at module load (reused across requests).
 const profanityFilter = new Filter();
+const VALID_MEMO_TYPES = ['text', 'id', 'hash'];
+const MEMO_ID_RE = /^\d+$/;
+const MEMO_HASH_RE = /^[0-9a-fA-F]{64}$/;
 
+const validateMemo = (memoType, memo) => {
+  if (!memoType && !memo) return null;
+  if (memoType && !memo) return 'memo is required when memo_type is provided.';
+  if (!memoType && memo) return 'memo_type is required when memo is provided.';
+  if (!VALID_MEMO_TYPES.includes(memoType)) {
+    return `memo_type must be one of: ${VALID_MEMO_TYPES.join(', ')}.`;
+  }
+  if (memoType === 'text' && Buffer.byteLength(memo, 'utf8') > 28) {
+    return 'memo of type text must not exceed 28 bytes.';
+  }
+  if (memoType === 'id') {
+    if (!MEMO_ID_RE.test(memo) || BigInt(memo) > 18446744073709551615n) {
+      return 'memo of type id must be a valid 64-bit unsigned integer.';
+    }
+  }
+  if (memoType === 'hash' && !MEMO_HASH_RE.test(memo)) {
+    return 'memo of type hash must be a 64-character hex string (32 bytes).';
+  }
+  return null;
+};
+
+/**
+ * Registration endpoint with multi-signer threshold verification
+ * 
+ * For single-signer accounts:
+ * - Signature must be the account's public key or a registered signer
+ * - Basic validation of address format
+ * 
+ * For multi-signer accounts (enterprise):
+ * - Fetches account signers and thresholds from Horizon
+ * - Validates that provided signature(s) meet minimum threshold
+ * - Ensures authorization requirements are satisfied
+ */
 app.post('/register', async (req, res, next) => {
-  const username = normalizeNameTag(req.body.username);
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
+  }
+  const safeUsername = xss(req.body.username);
+  const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
+  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
+  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
+  const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
 
   if (address.toUpperCase().startsWith('S')) {
     return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
@@ -223,12 +288,29 @@ app.post('/register', async (req, res, next) => {
     return next(error);
   }
 
-  // Convert to lowercase for case-insensitive storage
+  const memoError = validateMemo(memoType, memo);
+  if (memoError) {
+    return res.status(400).json({ error: memoError });
+  }
+
+  // Signature is optional for legacy single-signer registrations.
+  // If provided, validate its format and run multi-signer verification.
+  if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
+    const error = new Error('Invalid Stellar Public Key format.');
+    error.statusCode = 400;
+    return next(error);
+  }
+
   const normalizedUsername = username.toLowerCase();
+
+  const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
+  if (RESERVED_NAMES.includes(normalizedUsername)) {
+    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+  }
 
   try {
     const existing = await prisma.user.findUnique({
-      where: { address },
+      where: { address }
     });
 
     if (existing) {
@@ -237,8 +319,27 @@ app.post('/register', async (req, res, next) => {
       return next(conflictError);
     }
 
+    let verificationResult = null;
+    if (signature) {
+      verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+        operationType: 'management',
+      });
+
+      if (!verificationResult.success) {
+        const verificationError = new Error(
+          verificationResult.errorMessage || 'Signature verification failed'
+        );
+        verificationError.statusCode = 401;
+        throw verificationError;
+      }
+    }
+
     await prisma.user.create({
-      data: { username: normalizedUsername, address },
+      data: {
+        username: normalizedUsername,
+        address,
+        ...(memoType && { memoType, memo }),
+      },
     });
 
     return res.status(201).json({
@@ -246,23 +347,43 @@ app.post('/register', async (req, res, next) => {
       username: normalizedUsername,
       address,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      ...(verificationResult && {
+        verification: {
+          accountId: verificationResult.accountId,
+          signerCount: verificationResult.signerCount,
+          thresholdMet: verificationResult.success,
+          requiredThreshold: verificationResult.requiredThreshold,
+          providedWeight: verificationResult.totalWeight,
+        },
+      }),
+      ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    // P2002 — unique constraint violation (username or address already taken)
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-      const target = error.meta?.target;
-      const isAddress = Array.isArray(target)
-        ? target.includes('address')
-        : typeof target === 'string' && target.includes('address');
-      const conflictError = new Error(isAddress ? 'Address already registered' : 'Username already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
     }
-    const registrationError = new Error('Failed to save registration');
+    
+    // Handle verification errors
+    if (error.message && error.message.includes('Account not found')) {
+      const notFoundError = new Error(`Account not found on Horizon: ${address}`);
+      notFoundError.statusCode = 404;
+      return next(notFoundError);
+    }
+
+    // Handle signature verification errors
+    if (error.statusCode === 401) {
+      return next(error);
+    }
+
+    // Handle other errors
+    console.error('Registration error:', error.message);
+    const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
   }
 });
+
+app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
 app.get('/lookup', async (req, res, next) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
@@ -274,7 +395,6 @@ app.get('/lookup', async (req, res, next) => {
     return next(error);
   }
 
-  // Exact lookup by address — original behaviour, returns a single record
   if (address) {
     try {
       const row = await prisma.user.findUnique({
@@ -296,7 +416,6 @@ app.get('/lookup', async (req, res, next) => {
     }
   }
 
-  // Paginated search by partial username or address
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
   const skip = (page - 1) * limit;
@@ -375,7 +494,8 @@ app.get('/users', async (req, res, next) => {
   }
 });
 
-app.get('/.well-known/stellar.toml', cors({ origin: '*' }), (_req, res) => {
+app.get('/.well-known/stellar.toml', (_req, res) => {
+  res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
   res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
 });
@@ -447,7 +567,6 @@ app.get('/api/v1/receipts/:txHash', async (req, res) => {
   doc.end();
 });
 
-// #49 — Payload size limit violations are normalised into the global handler.
 app.use((err, _req, _res, next) => {
   if (err.type === 'entity.too.large') {
     const error = new Error('Payload too large. Maximum allowed size is 10kb.');
@@ -457,8 +576,7 @@ app.use((err, _req, _res, next) => {
   next(err);
 });
 
-// Global error handling middleware
-app.use((err, _req, res, _next) => {
+app.use((err, _req, res, next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
@@ -505,7 +623,16 @@ const gracefulShutdown = (server, pool, signal) => {
     process.exit(0);
   });
 };
+app.use((err, req, res) => {
+  console.error(err.stack);
+  const statusCode = err.statusCode || 500;
 
+  res.status(statusCode).json({
+    success: false,
+    message: err.message || 'Internal Server Error',
+    detail: process.env.NODE_ENV === 'development' ? err.stack : 'Check server logs for details'
+  });
+});
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server successfully initialized on port ${PORT}`);
@@ -518,8 +645,6 @@ if (require.main === module) {
     }
   });
 
-  // Adapt the Prisma client to the drain()/clear() contract gracefulShutdown
-  // expects: there is no separate pool to drain, so disconnect on clear().
   const prismaPool = {
     drain: () => Promise.resolve(),
     clear: () => prisma.$disconnect(),
