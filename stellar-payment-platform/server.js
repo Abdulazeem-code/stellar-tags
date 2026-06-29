@@ -209,10 +209,14 @@ app.get('/federation', etagCache, async (req, res, next) => {
   }
 });
 
-test/integration-suite
-const { StrKey } = require('@stellar/stellar-sdk');
 
-app.post(['/register', '/api/v1/register'], async (req, res, next) => {
+
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
+  }
+
+  const safeUsername = xss(req.body.username);
+  const username = normalizeNameTag(safeUsername);
 const VALID_MEMO_TYPES = ['text', 'id', 'hash'];
 const MEMO_ID_RE = /^\d+$/;
 const MEMO_HASH_RE = /^[0-9a-fA-F]{64}$/;
@@ -238,29 +242,13 @@ const validateMemo = (memoType, memo) => {
   return null;
 };
 
-app.post('/register', async (req, res, next) => {
-test/integration-suite
- main
-  if (!req.is('application/json')) {
-    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
-  }
-
-main
-  const username = normalizeNameTag(req.body.username);
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
-
+  const username = normalizeNameTag(safeUsername);
+  const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
   const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
   const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
-
-  if (address.toUpperCase().startsWith('S')) {
-    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
-  }
-
-  if (!username || !address) {
-    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
-  }
 
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
   if (usernameLocalPart.length < 3) {
@@ -322,6 +310,80 @@ main
 });
 
 
+app.post(['/register', '/api/v1/register'], async (req, res, next) => {
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
+  }
+
+  const safeUsername = xss(req.body.username);
+  const username = normalizeNameTag(safeUsername);
+  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
+  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
+  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
+
+  if (address.toUpperCase().startsWith('S')) {
+    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
+  }
+
+  if (!username || !address) {
+    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
+  }
+
+  const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
+  if (usernameLocalPart.length < 3) {
+    return res.status(400).json({ error: "Username must be at least 3 characters long." });
+  }
+
+  if (!StrKey.isValidEd25519PublicKey(address)) {
+    const error = new Error('Invalid Stellar Public Key format.');
+    error.statusCode = 400;
+    return next(error);
+  }
+
+  const memoError = validateMemo(memoType, memo);
+  if (memoError) {
+    return res.status(400).json({ error: memoError });
+  }
+
+  const normalizedUsername = username.toLowerCase();
+
+  const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
+  if (RESERVED_NAMES.includes(normalizedUsername)) {
+    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+  }
+
+  try {
+    const existing = await prisma.user.findUnique({ where: { address } });
+    if (existing) {
+      const conflictError = new Error('Address already registered');
+      conflictError.statusCode = 409;
+      return next(conflictError);
+    }
+
+    await prisma.user.create({
+      data: {
+        username: normalizedUsername,
+        address,
+        ...(memoType && { memoType, memo }),
+      },
+    });
+
+    return res.status(201).json({
+      ok: true,
+      username: normalizedUsername,
+      address,
+      federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      ...(memoType && { memo_type: memoType, memo }),
+    });
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+    }
+    const registrationError = new Error('Failed to save registration');
+    registrationError.statusCode = 500;
+    return next(registrationError);
+  }
+});
 app.get(['/lookup', '/api/v1/lookup'], async (req, res, next) => {
 
 app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
@@ -463,49 +525,45 @@ app.use((err, _req, _res, next) => {
 app.use((err, _req, res, next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
+// Global error handling middleware
+app.use((err, req, res, next) => {
+   console.error('\n❌ CRITICAL BACKEND ERROR:');
+   console.error(err.stack);
+   console.error('============================\n');
 
-  if (statusCode === 500) {
-    const errorId = crypto.randomUUID();
-    console.error(`[Error ID: ${errorId}]`, err);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      reference_id: errorId,
-    });
-  }
+   const statusCode = err.statusCode || 500;
 
-  return res.status(statusCode).json({
-    success: false,
-    error: errorMessage,
-    statusCode,
-  });
+   res.status(statusCode).json({
+     success: false,
+     message: err.message || 'Internal Server Error',
+     detail: process.env.NODE_ENV === 'development' ? err.stack : 'Check server logs for details'
+   });
 });
 
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
-
 let isShuttingDown = false;
 
 const gracefulShutdown = (server, pool, signal) => {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
+   if (isShuttingDown) return;
+   isShuttingDown = true;
 
-  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+   console.log(`\nReceived ${signal}. Shutting down gracefully...`);
 
-  const timer = setTimeout(() => {
-    console.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
-    process.exit(1);
-  }, SHUTDOWN_TIMEOUT_MS);
+   const timer = setTimeout(() => {
+     console.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
+     process.exit(1);
+   }, SHUTDOWN_TIMEOUT_MS);
 
-  server.close(async () => {
-    clearTimeout(timer);
-    try {
-      await pool.drain();
-      await pool.clear();
-    } catch (err) {
-      console.error('Error draining DB pool during shutdown:', err);
-    }
-    process.exit(0);
-  });
+   server.close(async () => {
+     clearTimeout(timer);
+     try {
+       await pool.drain();
+       await pool.clear();
+     } catch (err) {
+       console.error('Error draining DB pool during shutdown:', err);
+     }
+     process.exit(0);
+   });
 };
 app.use((err, req, res) => {
   console.error(err.stack);
@@ -516,29 +574,29 @@ app.use((err, req, res) => {
     detail: process.env.NODE_ENV === 'development' ? err.stack : 'Check server logs for details'
   });
 });
-if (require.main === module) {
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server successfully initialized on port ${PORT}`);
-  });
 
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
-      process.exit(1);
-    }
-  });
+if (require.main === module) {
+   const server = app.listen(PORT, '0.0.0.0', () => {
+     console.log(`Server successfully initialized on port ${PORT}`);
+   });
+
+   server.on('error', (e) => {
+     if (e.code === 'EADDRINUSE') {
+       console.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+       process.exit(1);
+     }
+   });
 
   const prismaPool = {
     drain: () => Promise.resolve(),
     clear: () => prisma.$disconnect(),
   };
+   const prismaPool = {
+     drain: () => Promise.resolve(),
+     clear: () => prisma.$disconnect(),
+   };
 
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prismaPool, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prismaPool, sig));
+   process.on('SIGTERM', (sig) => gracefulShutdown(server, prismaPool, sig));
+   process.on('SIGINT', (sig) => gracefulShutdown(server, prismaPool, sig));
 }
 
- test/integration-suite
-module.exports = { app, poolGet, poolAll, poolRun, dbPool, db, gracefulShutdown, rejectNestedObjects };
-
-module.exports = { app, prisma, gracefulShutdown, rejectNestedObjects };
- main
