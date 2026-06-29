@@ -1,11 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
+import toast from 'react-hot-toast';
 import { useLatencyTracker } from '../useLatencyTracker';
 import LatencyGauge from '../LatencyGauge';
 import NetworkBadge from '../NetworkBadge';
 import { useDebounce } from '../useDebounce';
 import ScrollToTop from '../ScrollToTop';
-import LoadingSpinner from '../components/LoadingSpinner';
 import MobileNav from './MobileNav';
 import {
   API_BASE,
@@ -52,11 +52,14 @@ function Dashboard({
     action()
   }
   const [nameTag, setNameTag] = useState('')
+  const recipientRef = useRef(null);
   const debouncedNameTag = useDebounce(nameTag, 300)
   const [amount, setAmount] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
   const [isReceiving, setIsReceiving] = useState(false)
   const [activeBalancePanel, setActiveBalancePanel] = useState('')
+  const [showBalance, setShowBalance] = useState(true)
   const [receiveAddress, setReceiveAddress] = useState('')
   const [receiveTag, setReceiveTag] = useState('')
   const [receiveStatus, setReceiveStatus] = useState({
@@ -145,6 +148,10 @@ function Dashboard({
   }, [userPublicKey, onRegistrationStateChange]);
 
   useEffect(() => {
+    recipientRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
     if (!debouncedNameTag || !userPublicKey) {
       return;
     }
@@ -194,24 +201,20 @@ function Dashboard({
   const handleLookup = async () => {
     if (isSubmitting) return;
     setIsSubmitting(true);
-    
+
     const recipientInput = nameTag.trim();
     const amountValue = parseFloat(amount);
 
     if (!amountValue || Number.isNaN(amountValue) || amountValue <= 0) {
-      displayMessage(
-        "Please enter a valid amount greater than zero.",
-        "#DC2626",
-        "#FEE2E2",
-      );
+      toast.error("Please enter a valid amount greater than zero.");
+      setIsSubmitting(false);
       return;
     }
 
     setIsProcessing(true);
+    const toastId = toast.loading("Verifying recipient...");
 
     try {
-      // --- PHASE 1: RECIPIENT RESOLUTION ---
-      displayMessage("Verifying recipient...", "#1F2937", "#F3F4F6");
       const resolved = await resolveRecipient(recipientInput);
       if (resolved.error)
         throw new Error(`Resolution error: ${resolved.error}`);
@@ -229,12 +232,7 @@ function Dashboard({
         recipientAddress = data.account_id;
       }
 
-      // --- PHASE 2: TRANSACTION ASSEMBLY ---
-      displayMessage(
-        "Simulating smart contract execution...",
-        "#1F2937",
-        "#F3F4F6",
-      );
+      toast.loading("Simulating smart contract execution...", { id: toastId });
       const StellarSdk = await loadStellarSdk();
       const amountStroops = BigInt(Math.floor(amountValue * 10000000));
 
@@ -260,7 +258,6 @@ function Dashboard({
         .setTimeout(300)
         .build();
 
-      // --- PHASE 3: RPC SIMULATION ---
       let preparedTransaction;
       try {
         preparedTransaction = await server.prepareTransaction(transaction);
@@ -274,12 +271,7 @@ function Dashboard({
         throw new Error(`Simulation failed: ${err.message}`, { cause: err });
       }
 
-      // --- PHASE 4: WALLET SIGNATURE ---
-      displayMessage(
-        "Please approve the transaction in your wallet.",
-        "#0052FF",
-        "#EFF6FF",
-      );
+      toast.loading("Approve the transaction in your wallet...", { id: toastId });
       let signedXdrResponse;
       try {
         signedXdrResponse = await freighterApi.signTransaction(
@@ -296,44 +288,68 @@ function Dashboard({
         });
       }
 
-      // --- PHASE 5: BLOCKCHAIN SUBMISSION ---
-      displayMessage("Submitting to Stellar Testnet...", "#D97706", "#FEF3C7");
-      try {
-        const finalXdr =
-          typeof signedXdrResponse === "string"
-            ? signedXdrResponse
-            : signedXdrResponse.signedTxXdr || signedXdrResponse;
+      toast.loading("Submitting to Stellar Testnet...", { id: toastId });
+      const finalXdr =
+        typeof signedXdrResponse === "string"
+          ? signedXdrResponse
+          : signedXdrResponse.signedTxXdr || signedXdrResponse;
 
-        const rpcResponse = await fetch("https://soroban-testnet.stellar.org", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "sendTransaction",
-            params: { transaction: finalXdr },
-          }),
-        });
+      const rpcResponse = await fetch("https://soroban-testnet.stellar.org", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "sendTransaction",
+          params: { transaction: finalXdr },
+        }),
+      });
 
-        const rpcData = await rpcResponse.json();
-        if (rpcData.error)
-          throw new Error(`RPC Error: ${rpcData.error.message}`);
+      const rpcData = await rpcResponse.json();
+      if (rpcData.error)
+        throw new Error(`RPC Error: ${rpcData.error.message}`);
 
-        const status = rpcData.result?.status;
-        if (status === "PENDING" || status === "SUCCESS") {
-          displayMessage("Payment successful!", "#059669", "#D1FAE5");
-          setAmount("");
-          onRefreshBalance();
-          window.dispatchEvent(new Event("stellar:tx-update"));
-        } else {
-          throw new Error(
-            `Blockchain rejected transaction: ${status || "Unknown"}`,
-          );
-        }
-      } catch (err) {
-        throw new Error(`Submission failed: ${err.message}`, { cause: err });
+      const txStatus = rpcData.result?.status;
+      if (txStatus === "PENDING" || txStatus === "SUCCESS") {
+        const txHash = rpcData.result?.hash;
+        const explorerUrl = txHash
+          ? `https://stellar.expert/explorer/testnet/tx/${txHash}`
+          : null;
+
+        toast.success(
+          (t) => (
+            <span>
+              Payment successful!
+              {explorerUrl && (
+                <>
+                  {' '}
+                  <a
+                    href={explorerUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: '#0052FF', fontWeight: 600 }}
+                    onClick={() => toast.dismiss(t.id)}
+                  >
+                    View on Stellar Expert
+                  </a>
+                </>
+              )}
+            </span>
+          ),
+          { id: toastId, duration: 8000 },
+        );
+
+        displayMessage("Payment successful!", "#059669", "#D1FAE5");
+        setAmount("");
+        onRefreshBalance();
+        window.dispatchEvent(new Event("stellar:tx-update"));
+      } else {
+        throw new Error(
+          `Blockchain rejected transaction: ${txStatus || "Unknown"}`,
+        );
       }
     } catch (error) {
+      toast.error(error.message || "Transaction failed.", { id: toastId });
       displayMessage(
         error.message || "A critical error occurred.",
         "#DC2626",
@@ -499,12 +515,28 @@ function Dashboard({
             )}
             <div className="metric">
               {balance !== null
-                ? balance.toLocaleString(undefined, {
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 2,
-                  })
+                ? showBalance
+                  ? balance.toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })
+                  : "***"
                 : "--"}{" "}
               <span>XLM</span>
+              <button
+                type="button"
+                className="privacy-toggle"
+                onClick={() => setShowBalance(!showBalance)}
+                aria-label={showBalance ? "Hide balance" : "Show balance"}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  {showBalance ? (
+                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-7-11-9 0-2.3 1.52-4.58 3.88-6.35M21 9c0 2 0 7-9 7-.71 0-1.4-.07-2.07-.2M21 3l-6 6m6 6l6 6" />
+                  ) : (
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 15a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3z" />
+                  )}
+                </svg>
+              </button>
             </div>
             <div className="balance-tabs">
               <button
@@ -534,6 +566,7 @@ function Dashboard({
                 )}
                 <label>Recipient username or address</label>
                 <input
+                  ref={recipientRef}
                   type="text"
                   value={nameTag}
                   onChange={(event) => setNameTag(event.target.value)}
