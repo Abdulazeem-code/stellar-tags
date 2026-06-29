@@ -36,6 +36,6 @@ describe('GET /federation', () => {
       .query({ q: 'nonexistentuser*localhost' });
 
     expect(res.statusCode).toBe(404);
-    expect(res.body).toHaveProperty('detail');
+    expect(res.body).toHaveProperty('error');
   });
 });
