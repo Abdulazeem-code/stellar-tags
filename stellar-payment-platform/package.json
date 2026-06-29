@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "jest --forceExit",
+"test": "jest --forceExit",
     "test:integration": "TEST_API_URL=http://localhost:5001 jest --forceExit --testPathPattern=integration",
     "listener": "node horizonListener.js",
     "db:seed": "node scripts/seed.js",
@@ -15,6 +15,9 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "postinstall": "prisma generate"
+  },
+  "jest": {
+    "testEnvironment": "node"
   },
   "dependencies": {
     "@faker-js/faker": "^10.5.0",

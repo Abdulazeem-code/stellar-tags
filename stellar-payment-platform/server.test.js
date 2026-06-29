@@ -743,3 +743,90 @@ describe('GET /federation — memo fields in response', () => {
   });
 });
 
+
+describe('API v1 routing', () => {
+  let request;
+  let app;
+
+  let prisma;
+
+  beforeEach(() => {
+    jest.resetModules();
+    jest.mock('dotenv', () => ({ config: jest.fn() }));
+    jest.mock('fs', () => ({ ...jest.requireActual('fs'), mkdirSync: jest.fn() }));
+    jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
+    jest.mock('pdfkit', () => jest.fn());
+    jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+
+    jest.mock('sqlite3', () => ({
+      verbose: () => ({
+        Database: jest.fn().mockImplementation((_path, cb) => {
+          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
+          if (cb) cb(null);
+          return db;
+        }),
+      }),
+    }));
+
+    const mockConn = {
+      run: jest.fn((sql, params, cb) => {
+        const fn = typeof params === 'function' ? params : cb;
+        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
+      }),
+      get: jest.fn((sql, params, cb) => {
+        const fn = typeof params === 'function' ? params : cb;
+        if (fn) fn(null, { total: 2 });
+      }),
+      all: jest.fn((sql, params, cb) => {
+        const fn = typeof params === 'function' ? params : cb;
+        if (fn) fn(null, [
+          { username: 'alice*localhost', address: 'GABC', created_at: '2024-01-01T00:00:00.000Z' },
+        ]);
+      }),
+    };
+
+    jest.mock('generic-pool', () => ({
+      createPool: jest.fn(() => ({
+        acquire: jest.fn().mockResolvedValue(mockConn),
+        release: jest.fn(),
+        drain: jest.fn().mockResolvedValue(undefined),
+        clear: jest.fn().mockResolvedValue(undefined),
+      })),
+    }));
+
+    ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
+    request = require('supertest');
+
+    prisma.user.count.mockReset();
+    prisma.user.findMany.mockReset();
+    prisma.$transaction.mockReset();
+    prisma.user.count.mockResolvedValue(2);
+    prisma.user.findMany.mockResolvedValue([
+      { username: 'alice*localhost', address: 'GABC', createdAt: new Date('2024-01-01T00:00:00.000Z') },
+    ]);
+    prisma.$transaction.mockResolvedValue([2, [
+      { username: 'alice*localhost', address: 'GABC', createdAt: new Date('2024-01-01T00:00:00.000Z') },
+    ]]);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('GET /api/v1/lookup returns 400 without params', async () => {
+    const res = await request(app).get('/api/v1/lookup');
+    expect(res.status).toBe(400);
+  });
+
+  test('GET /api/v1/users returns paginated data', async () => {
+    const res = await request(app).get('/api/v1/users');
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.data)).toBe(true);
+  });
+
+  test('GET /api/v1/federation returns 400 without q param', async () => {
+    const res = await request(app).get('/api/v1/federation');
+    expect(res.status).toBe(400);
+  });
+});

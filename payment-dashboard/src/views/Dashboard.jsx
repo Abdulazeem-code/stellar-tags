@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
 import toast from 'react-hot-toast';
 import { useLatencyTracker } from '../useLatencyTracker';
@@ -52,12 +52,14 @@ function Dashboard({
     action()
   }
   const [nameTag, setNameTag] = useState('')
+  const recipientRef = useRef(null);
   const debouncedNameTag = useDebounce(nameTag, 300)
   const [amount, setAmount] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isReceiving, setIsReceiving] = useState(false)
   const [activeBalancePanel, setActiveBalancePanel] = useState('')
+  const [showBalance, setShowBalance] = useState(true)
   const [receiveAddress, setReceiveAddress] = useState('')
   const [receiveTag, setReceiveTag] = useState('')
   const [receiveStatus, setReceiveStatus] = useState({
@@ -144,6 +146,10 @@ function Dashboard({
 
     loadReceiveDetails();
   }, [userPublicKey, onRegistrationStateChange]);
+
+  useEffect(() => {
+    recipientRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     if (!debouncedNameTag || !userPublicKey) {
@@ -509,12 +515,28 @@ function Dashboard({
             )}
             <div className="metric">
               {balance !== null
-                ? balance.toLocaleString(undefined, {
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 2,
-                  })
+                ? showBalance
+                  ? balance.toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })
+                  : "***"
                 : "--"}{" "}
               <span>XLM</span>
+              <button
+                type="button"
+                className="privacy-toggle"
+                onClick={() => setShowBalance(!showBalance)}
+                aria-label={showBalance ? "Hide balance" : "Show balance"}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  {showBalance ? (
+                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-7-11-9 0-2.3 1.52-4.58 3.88-6.35M21 9c0 2 0 7-9 7-.71 0-1.4-.07-2.07-.2M21 3l-6 6m6 6l6 6" />
+                  ) : (
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 15a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3z" />
+                  )}
+                </svg>
+              </button>
             </div>
             <div className="balance-tabs">
               <button
@@ -544,6 +566,7 @@ function Dashboard({
                 )}
                 <label>Recipient username or address</label>
                 <input
+                  ref={recipientRef}
                   type="text"
                   value={nameTag}
                   onChange={(event) => setNameTag(event.target.value)}
