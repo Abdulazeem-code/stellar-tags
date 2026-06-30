@@ -13,6 +13,18 @@ jest.mock('pdfkit', () => jest.fn());
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
+// bad-words ships as ESM; Jest runs in CJS mode — mock the module so the
+// test suite can require server.js without a transform error.
+jest.mock('bad-words', () => {
+  return jest.fn().mockImplementation(() => ({
+    isProfane: jest.fn(() => false),
+  }));
+});
+jest.mock('@prisma/client', () => ({
+  Prisma: { PrismaClientKnownRequestError: class extends Error {} },
+}));
+
+// Prisma is mocked so the suite never touches a real database.
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
