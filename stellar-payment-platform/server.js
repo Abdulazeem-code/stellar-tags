@@ -11,8 +11,11 @@ const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
 const v1Router = require('./src/routes/v1');
+const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
+const xss = require('xss');
+const { StrKey } = require('@stellar/stellar-sdk');
 
-require('dotenv').config();
+dotenv.config();
 
 const app = express();
 
@@ -161,8 +164,6 @@ app.get('/federation', etagCache, async (req, res, next) => {
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
-
-      return res.json({
       const response = {
         stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
         account_id: row.address,
@@ -316,7 +317,6 @@ app.post('/register', async (req, res, next) => {
       conflictError.statusCode = 409;
       return next(conflictError);
     }
-
     let verificationResult = null;
     if (signature) {
       verificationResult = await verifyMultiSignerThreshold(address, [signature], {

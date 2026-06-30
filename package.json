@@ -18,5 +18,8 @@
   "lint-staged": {
     "stellar-payment-platform/**/*.js": "eslint",
     "payment-dashboard/**/*.{js,jsx}": "npm --prefix payment-dashboard run lint"
+  },
+  "dependencies": {
+    "xss": "^1.0.15"
   }
 }
