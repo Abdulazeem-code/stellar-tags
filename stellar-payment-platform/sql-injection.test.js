@@ -25,6 +25,13 @@ jest.mock('@stellar/stellar-sdk', () => ({
 }));
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
+// bad-words ships as ESM; Jest runs in CJS mode — mock to avoid transform errors.
+jest.mock('bad-words', () => {
+  return jest.fn().mockImplementation(() => ({
+    isProfane: jest.fn(() => false),
+  }));
+});
+
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
