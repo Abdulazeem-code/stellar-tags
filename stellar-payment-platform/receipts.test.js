@@ -34,6 +34,13 @@ jest.mock('dotenv', () => ({ config: jest.fn() }));
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
+// bad-words ships as ESM; Jest runs in CJS mode — mock it to avoid transform errors.
+jest.mock('bad-words', () => {
+  return jest.fn().mockImplementation(() => ({
+    isProfane: jest.fn(() => false),
+  }));
+});
+
 // The receipts endpoint never touches the database, but loading server.js does
 // instantiate the Prisma client — mock it so no real connection is created.
 jest.mock('./prismaClient', () => ({
