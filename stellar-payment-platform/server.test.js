@@ -497,9 +497,8 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'alice', address: 'SBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
-    });
+    expect(res.body.status).toBe('fail');
+    expect(res.body.data.address).toContain("Never share your Secret Key");
   });
 
   test('blocks registration if address starts with s (lowercase)', async () => {
@@ -508,9 +507,8 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'alice', address: 'sBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
-    });
+    expect(res.body.status).toBe('fail');
+    expect(res.body.data.address).toContain("Never share your Secret Key");
   });
 
   test('allows registration and continues flow if address starts with G', async () => {
@@ -519,11 +517,9 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'alice', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({
-      ok: true,
-      username: 'alice*localhost',
-      address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ'
-    });
+    expect(res.body.status).toBe('success');
+    expect(res.body.data.username).toBe('alice*localhost');
+    expect(res.body.data.address).toBe('GBCDEFGHIJKLMNOPQRSTUVWXYZ');
   });
 
   test('rejects registration if Content-Type header is not application/json', async () => {
@@ -533,9 +529,8 @@ describe('POST /register — block secret keys', () => {
       .send('username=alice&address=GBCDEFGHIJKLMNOPQRSTUVWXYZ');
 
     expect(res.status).toBe(415);
-    expect(res.body).toEqual({
-      error: "Unsupported Media Type. Please send application/json"
-    });
+    expect(res.body.status).toBe('fail');
+    expect(res.body.data.contentType).toContain("Unsupported Media Type");
   });
 
   test('rejects registration if Content-Type header is missing', async () => {
@@ -545,9 +540,8 @@ describe('POST /register — block secret keys', () => {
       .send('some-raw-payload');
 
     expect(res.status).toBe(415);
-    expect(res.body).toEqual({
-      error: "Unsupported Media Type. Please send application/json"
-    });
+    expect(res.body.status).toBe('fail');
+    expect(res.body.data.contentType).toContain("Unsupported Media Type");
   });
 
   test('rejects 1-character local username payload', async () => {
@@ -556,9 +550,8 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'a', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Username must be at least 3 characters long."
-    });
+    expect(res.body.status).toBe('fail');
+    expect(res.body.data.username).toContain("Username must be at least 3 characters long.");
   });
 
   test('rejects 2-character local username payload', async () => {
@@ -567,9 +560,8 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'ab', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Username must be at least 3 characters long."
-    });
+    expect(res.body.status).toBe('fail');
+    expect(res.body.data.username).toContain("Username must be at least 3 characters long.");
   });
 
   test('rejects 2-character local username payload with domain suffix', async () => {
@@ -578,9 +570,8 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'ab*domain.com', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Username must be at least 3 characters long."
-    });
+    expect(res.body.status).toBe('fail');
+    expect(res.body.data.username).toContain("Username must be at least 3 characters long.");
   });
 
   test('allows 3-character username payload', async () => {
@@ -589,11 +580,9 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'abc', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({
-      ok: true,
-      username: 'abc*localhost',
-      address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ'
-    });
+    expect(res.body.status).toBe('success');
+    expect(res.body.data.username).toBe('abc*localhost');
+    expect(res.body.data.address).toBe('GBCDEFGHIJKLMNOPQRSTUVWXYZ');
   });
 });
 

@@ -26,8 +26,9 @@ describe('GET /federation', () => {
       .query({ q: 'client*localhost' });
 
     expect(res.statusCode).toBe(200);
-    expect(res.body).toHaveProperty('stellar_address');
-    expect(res.body).toHaveProperty('account_id');
+    expect(res.body.status).toBe('success');
+    expect(res.body.data).toHaveProperty('stellar_address');
+    expect(res.body.data).toHaveProperty('account_id');
   });
 
   it('returns 404 for an unknown user', async () => {
@@ -36,6 +37,7 @@ describe('GET /federation', () => {
       .query({ q: 'nonexistentuser*localhost' });
 
     expect(res.statusCode).toBe(404);
-    expect(res.body).toHaveProperty('error');
+    expect(res.body.status).toBe('fail');
+    expect(res.body).toHaveProperty('data');
   });
 });

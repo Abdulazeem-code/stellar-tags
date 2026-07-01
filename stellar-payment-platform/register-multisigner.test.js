@@ -200,10 +200,10 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(201);
-      expect(response.body.ok).toBe(true);
-      expect(response.body.username).toBe('alice*localhost');
-      expect(response.body.address).toBe(accountId);
-      expect(response.body.verification.thresholdMet).toBe(true);
+      expect(response.body.status).toBe('success');
+      expect(response.body.data.username).toBe('alice*localhost');
+      expect(response.body.data.address).toBe(accountId);
+      expect(response.body.data.verification.thresholdMet).toBe(true);
       expect(verifyMultiSignerThreshold).toHaveBeenCalledWith(
         accountId,
         [accountId],
@@ -238,8 +238,9 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(401);
-      expect(response.body.error).toBeDefined();
-      expect(response.body.error).toMatch(/Signature verification failed|Insufficient signing weight/);
+      expect(response.body.status).toBe('fail');
+      expect(response.body.data.signature).toBeDefined();
+      expect(response.body.data.signature).toMatch(/Signature verification failed|Insufficient signing weight/);
     });
   });
 
@@ -307,7 +308,8 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(401);
-      expect(response.body.error).toContain('Insufficient signing weight');
+      expect(response.body.status).toBe('fail');
+      expect(response.body.data.signature).toContain('Insufficient signing weight');
     });
   });
 
@@ -326,7 +328,8 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(409);
-      expect(response.body.error).toContain('Address already registered');
+      expect(response.body.status).toBe('fail');
+      expect(response.body.data.address).toContain('Address already registered');
     });
 
     it('should handle account not found error', async () => {
@@ -345,7 +348,8 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(404);
-      expect(response.body.error).toContain('Account not found on Horizon');
+      expect(response.body.status).toBe('fail');
+      expect(response.body.data.address).toContain('Account not found on Horizon');
     });
   });
 
@@ -376,7 +380,8 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(201);
-      expect(response.body.verification).toEqual({
+      expect(response.body.status).toBe('success');
+      expect(response.body.data.verification).toEqual({
         accountId,
         signerCount: 1,
         thresholdMet: true,
@@ -411,7 +416,8 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(201);
-      expect(response.body.federation_address).toMatch(/^alice\*/);
+      expect(response.body.status).toBe('success');
+      expect(response.body.data.federation_address).toMatch(/^alice\*/);
     });
   });
 
@@ -442,7 +448,8 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(201);
-      expect(response.body.username).toBe('alice*localhost');
+      expect(response.body.status).toBe('success');
+      expect(response.body.data.username).toBe('alice*localhost');
     });
   });
 });

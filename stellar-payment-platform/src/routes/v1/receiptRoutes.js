@@ -1,6 +1,7 @@
 const express = require('express');
 const { Horizon } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
+const { fail, error: jsendError } = require('../../utils/jsend');
 
 const router = express.Router();
 
@@ -11,7 +12,7 @@ router.get('/receipts/:txHash', async (req, res) => {
   const { txHash } = req.params;
 
   if (!TX_HASH_RE.test(txHash)) {
-    return res.status(400).json({ detail: 'Invalid transaction hash format' });
+    return res.status(400).json(fail({ txHash: 'Invalid transaction hash format' }));
   }
 
   let tx;
@@ -25,9 +26,9 @@ router.get('/receipts/:txHash', async (req, res) => {
     ]);
   } catch (err) {
     if (err && err.response && err.response.status === 404) {
-      return res.status(404).json({ detail: 'Transaction not found' });
+      return res.status(404).json(fail({ txHash: 'Transaction not found' }));
     }
-    return res.status(500).json({ detail: 'Failed to fetch transaction' });
+    return res.status(500).json(jsendError('Failed to fetch transaction'));
   }
 
   const timestamp = tx.created_at
