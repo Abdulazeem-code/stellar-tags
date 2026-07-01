@@ -3,6 +3,7 @@ const { StrKey } = require('@stellar/stellar-sdk');
 require('dotenv').config();
 
 const { prisma } = require('../prismaClient');
+const logger = require('../logger');
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 const SEED_COUNT = 50;
@@ -36,8 +37,7 @@ const normalizeNameTag = (value) => {
 
 const seedDatabase = async () => {
   try {
-    console.log('Starting database seeding...');
-    console.log(`Generating ${SEED_COUNT} mock entries...`);
+    logger.info({ seedCount: SEED_COUNT }, 'Starting database seeding');
 
     let inserted = 0;
     let skipped = 0;
@@ -52,27 +52,21 @@ const seedDatabase = async () => {
           data: { username, address, createdAt },
         });
         inserted++;
-        console.log(`✓ Inserted: ${username} -> ${address}`);
+        logger.debug({ username, address }, 'Inserted');
       } catch (error) {
-        // P2002 — unique constraint violation (duplicate username or address)
         if (error.code === 'P2002') {
           skipped++;
-          console.log(`⊘ Skipped (duplicate): ${username}`);
+          logger.debug({ username }, 'Skipped duplicate');
         } else {
-          console.error(`✗ Error inserting ${username}:`, error.message);
+          logger.error({ username, err: error.message }, 'Insert failed');
         }
       }
     }
 
-    console.log('\n=== Seeding Complete ===');
-    console.log(`Total entries generated: ${SEED_COUNT}`);
-    console.log(`Successfully inserted: ${inserted}`);
-    console.log(`Skipped (duplicates): ${skipped}`);
-
     const count = await prisma.user.count();
-    console.log(`Total entries in database: ${count}`);
+    logger.info({ total: SEED_COUNT, inserted, skipped, dbCount: count }, 'Seeding complete');
   } catch (error) {
-    console.error('Fatal error during seeding:', error);
+    logger.fatal({ err: error }, 'Fatal error during seeding');
     process.exitCode = 1;
   } finally {
     await prisma.$disconnect();
