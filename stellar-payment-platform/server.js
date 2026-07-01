@@ -336,7 +336,8 @@ const verifyFreighterRegistrationSignature = ({
   signerAddress,
 }) => {
   const message = `register:${username}:${address}`;
-  const keypair = Keypair.fromPublicKey(address);
+  const claimedSigner = signerAddress || address;
+  const keypair = Keypair.fromPublicKey(claimedSigner);
 
   let signatureBuffer;
   if (Buffer.isBuffer(signature)) {
@@ -353,10 +354,15 @@ const verifyFreighterRegistrationSignature = ({
     throw error;
   }
 
-  const claimedSigner = signerAddress || address;
   if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
     const error = new Error('Invalid signer address format.');
     error.statusCode = 400;
+    throw error;
+  }
+
+  if (claimedSigner !== address) {
+    const error = new Error('Signer address does not match the connected wallet.');
+    error.statusCode = 401;
     throw error;
   }
 
