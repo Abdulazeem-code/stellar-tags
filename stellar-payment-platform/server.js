@@ -7,6 +7,7 @@ const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const Filter = require('bad-words');
+const { success, fail, error: jsendError } = require('./src/utils/jsend');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
@@ -518,28 +519,6 @@ app.use((err, _req, _res, next) => {
   next(err);
 });
 
-// Global error handling middleware
-// eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
-  const statusCode = err.statusCode || 500;
-  const errorMessage = err.message || 'Internal server error';
-
-  if (statusCode === 500) {
-    const errorId = crypto.randomUUID();
-    console.error(`[Error ID: ${errorId}]`, err);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      reference_id: errorId,
-    });
-  }
-
-  return res.status(statusCode).json({
-    success: false,
-    error: errorMessage,
-    statusCode: statusCode,
-  });
-});
 
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
@@ -567,17 +546,16 @@ const gracefulShutdown = (server, pool, signal) => {
   });
 };
 
-
-
-app.use((err, req, res) => {
-  console.error(err.stack);
+// Global JSend error handling middleware
+app.use((err, req, res, next) => {
   const statusCode = err.statusCode || 500;
 
-  res.status(statusCode).json({
-    success: false,
-    message: err.message || 'Internal Server Error',
-    detail: process.env.NODE_ENV === 'development' ? err.stack : 'Check server logs for details'
-  });
+  if (statusCode === 500) {
+    console.error(err);
+    return res.status(500).json(jsendError('Internal Server Error'));
+  }
+
+  return res.status(statusCode).json(fail({ message: err.message }));
 });
 
 if (require.main === module) {

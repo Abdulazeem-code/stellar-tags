@@ -1,6 +1,7 @@
 const express = require('express');
 const { prisma } = require('../../../prismaClient');
 const { normalizeNameTag, etagCache, USER_DATABASE } = require('../../db');
+const { success, fail, error: jsendError } = require('../../utils/jsend');
 
 const router = express.Router();
 
@@ -9,9 +10,7 @@ router.get('/federation', etagCache, async (req, res, next) => {
   const queryValue = typeof q === 'string' ? q.trim() : '';
 
   if (!queryValue) {
-    const error = new Error("Missing 'q' parameter");
-    error.statusCode = 400;
-    return next(error);
+    return res.status(400).json(fail({ q: "Missing 'q' parameter" }));
   }
 
   try {
@@ -22,9 +21,7 @@ router.get('/federation', etagCache, async (req, res, next) => {
       });
 
       if (!row) {
-        const notFoundError = new Error('Address not found');
-        notFoundError.statusCode = 404;
-        return next(notFoundError);
+        return res.status(404).json(fail({ address: 'Address not found' }));
       }
 
       const response = {
@@ -35,7 +32,7 @@ router.get('/federation', etagCache, async (req, res, next) => {
         response.memo_type = row.memoType;
         response.memo = row.memo;
       }
-      return res.json(response);
+      return res.json(success(response));
     } else if (type === 'name' || !type) {
       const nameTag = normalizeNameTag(queryValue);
       const queryName = nameTag.toLowerCase();
@@ -48,9 +45,7 @@ router.get('/federation', etagCache, async (req, res, next) => {
       const address = row?.address || USER_DATABASE[queryName];
 
       if (!address) {
-        const notFoundError = new Error('Name tag not found');
-        notFoundError.statusCode = 404;
-        return next(notFoundError);
+        return res.status(404).json(fail({ name: 'Name tag not found' }));
       }
 
       const response = {
@@ -61,16 +56,13 @@ router.get('/federation', etagCache, async (req, res, next) => {
         response.memo_type = row.memoType;
         response.memo = row.memo;
       }
-      return res.json(response);
+      return res.json(success(response));
     } else {
-      return res.status(400).json({
-        error: "Unsupported query type. Supported types: 'id', 'name'",
-      });
+      return res.status(400).json(fail({ type: "Unsupported query type. Supported types: 'id', 'name'" }));
     }
-  } catch {
-    const dbError = new Error('Database lookup failed');
-    dbError.statusCode = 500;
-    return next(dbError);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json(jsendError('Database lookup failed'));
   }
 });
 

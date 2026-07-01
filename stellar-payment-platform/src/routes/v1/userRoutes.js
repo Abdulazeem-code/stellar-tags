@@ -4,6 +4,7 @@ const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
+const { success, fail, error: jsendError } = require('../../utils/jsend');
 
 const router = express.Router();
 
@@ -34,7 +35,7 @@ const validateMemo = (memoType, memo) => {
 
 router.post('/register', async (req, res, next) => {
   if (!req.is('application/json')) {
-    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
+    return res.status(415).json(fail({ contentType: "Unsupported Media Type. Please send application/json" }));
   }
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
@@ -44,40 +45,36 @@ router.post('/register', async (req, res, next) => {
   const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
 
   if (address.toUpperCase().startsWith('S')) {
-    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
+    return res.status(400).json(fail({ address: "Never share your Secret Key. Please register using your Public Key (starts with G)." }));
   }
 
   if (!username || !address) {
-    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
+    return res.status(400).json(fail({ fields: 'Missing required fields: username and address are both required.' }));
   }
 
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
   if (usernameLocalPart.length < 3) {
-    return res.status(400).json({ error: "Username must be at least 3 characters long." });
+    return res.status(400).json(fail({ username: "Username must be at least 3 characters long." }));
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
-    const error = new Error('Invalid Stellar Public Key format.');
-    error.statusCode = 400;
-    return next(error);
+    return res.status(400).json(fail({ address: 'Invalid Stellar Public Key format.' }));
   }
 
   const memoError = validateMemo(memoType, memo);
   if (memoError) {
-    return res.status(400).json({ error: memoError });
+    return res.status(400).json(fail({ memo: memoError }));
   }
 
   if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
-    const error = new Error('Invalid Stellar Public Key format.');
-    error.statusCode = 400;
-    return next(error);
+    return res.status(400).json(fail({ signature: 'Invalid Stellar Public Key format.' }));
   }
 
   const normalizedUsername = username.toLowerCase();
 
   const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
   if (RESERVED_NAMES.includes(normalizedUsername)) {
-    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+    return res.status(403).json(fail({ username: "This username is reserved and cannot be registered." }));
   }
 
   try {
@@ -86,9 +83,7 @@ router.post('/register', async (req, res, next) => {
     });
 
     if (existing) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+      return res.status(409).json(fail({ address: 'Address already registered' }));
     }
 
     let verificationResult = null;
@@ -98,11 +93,7 @@ router.post('/register', async (req, res, next) => {
       });
 
       if (!verificationResult.success) {
-        const verificationError = new Error(
-          verificationResult.errorMessage || 'Signature verification failed'
-        );
-        verificationError.statusCode = 401;
-        throw verificationError;
+        return res.status(401).json(fail({ signature: verificationResult.errorMessage || 'Signature verification failed' }));
       }
     }
 
@@ -114,8 +105,7 @@ router.post('/register', async (req, res, next) => {
       },
     });
 
-    return res.status(201).json({
-      ok: true,
+    return res.status(201).json(success({
       username: normalizedUsername,
       address,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
@@ -129,26 +119,18 @@ router.post('/register', async (req, res, next) => {
         },
       }),
       ...(memoType && { memo_type: memoType, memo }),
-    });
+    }));
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
-      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+      return res.status(409).json(fail({ username: 'Username is already taken. Please choose another.' }));
     }
     
     if (error.message && error.message.includes('Account not found')) {
-      const notFoundError = new Error(`Account not found on Horizon: ${address}`);
-      notFoundError.statusCode = 404;
-      return next(notFoundError);
-    }
-
-    if (error.statusCode === 401) {
-      return next(error);
+      return res.status(404).json(fail({ address: `Account not found on Horizon: ${address}` }));
     }
 
     console.error('Registration error:', error.message);
-    const registrationError = new Error(`Registration verification failed: ${error.message}`);
-    registrationError.statusCode = 500;
-    return next(registrationError);
+    return res.status(500).json(jsendError(`Registration verification failed: ${error.message}`));
   }
 });
 
@@ -177,7 +159,7 @@ router.get('/lookup', async (req, res, next) => {
         return next(notFoundError);
       }
 
-      return res.json({ username: row.username, address });
+      return res.json(success({ username: row.username, address }));
     } catch {
       const dbError = new Error('Database lookup failed');
       dbError.statusCode = 500;
@@ -214,7 +196,7 @@ router.get('/lookup', async (req, res, next) => {
       created_at: user.createdAt.toISOString(),
     }));
 
-    return res.json({ data, totalCount, totalPages, currentPage: page });
+    return res.json(success({ data, totalCount, totalPages, currentPage: page }));
   } catch {
     const dbError = new Error('Database lookup failed');
     dbError.statusCode = 500;
@@ -255,7 +237,7 @@ router.get('/users', async (req, res, next) => {
       created_at: user.createdAt.toISOString(),
     }));
 
-    res.json({ data, totalCount, totalPages, currentPage: page });
+    res.json(success({ data, totalCount, totalPages, currentPage: page }));
   } catch {
     const dbError = new Error('Database error');
     dbError.statusCode = 500;
