@@ -14,7 +14,7 @@ const v1Router = require('./src/routes/v1');
 const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
-const { StrKey } = require('@stellar/stellar-sdk');
+const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 
 dotenv.config();
 
@@ -329,6 +329,40 @@ const validateMemo = (memoType, memo) => {
   return null;
 };
 
+const verifyFreighterRegistrationSignature = ({
+  username,
+  address,
+  signature,
+  signerAddress,
+}) => {
+  const message = `register:${username}:${address}`;
+  const keypair = Keypair.fromPublicKey(address);
+
+  let signatureBuffer;
+  if (Buffer.isBuffer(signature)) {
+    signatureBuffer = signature;
+  } else if (typeof signature === 'string') {
+    signatureBuffer = Buffer.from(signature, 'base64');
+  } else {
+    throw new Error('Invalid message signature format.');
+  }
+
+  if (!keypair.verify(Buffer.from(message, 'utf8'), signatureBuffer)) {
+    const error = new Error('Signature verification failed.');
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const claimedSigner = signerAddress || address;
+  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
+    const error = new Error('Invalid signer address format.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return claimedSigner;
+};
+
 /**
  * Registration endpoint with multi-signer threshold verification
  * 
@@ -351,6 +385,7 @@ app.post('/register', async (req, res, next) => {
   const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
   const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
   const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
+  const signerAddress = typeof req.body.signerAddress === 'string' ? req.body.signerAddress.trim() : '';
 
   if (address.toUpperCase().startsWith('S')) {
     return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
@@ -383,14 +418,6 @@ app.post('/register', async (req, res, next) => {
     return res.status(400).json({ error: memoError });
   }
 
-  // Signature is optional for legacy single-signer registrations.
-  // If provided, validate its format and run multi-signer verification.
-  if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
-    const error = new Error('Invalid Stellar Public Key format.');
-    error.statusCode = 400;
-    return next(error);
-  }
-
   const normalizedUsername = username.toLowerCase();
 
   const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
@@ -417,18 +444,43 @@ app.post('/register', async (req, res, next) => {
       conflictError.statusCode = 409;
       return next(conflictError);
     }
+
     let verificationResult = null;
     if (signature) {
-      verificationResult = await verifyMultiSignerThreshold(address, [signature], {
-        operationType: 'management',
-      });
+      const isLegacyPublicKeyFlow =
+        StrKey.isValidEd25519PublicKey(signature) && !signerAddress;
 
-      if (!verificationResult.success) {
-        const verificationError = new Error(
-          verificationResult.errorMessage || 'Signature verification failed'
-        );
-        verificationError.statusCode = 401;
-        throw verificationError;
+      if (isLegacyPublicKeyFlow) {
+        verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+          operationType: 'management',
+        });
+
+        if (!verificationResult.success) {
+          const verificationError = new Error(
+            verificationResult.errorMessage || 'Signature verification failed'
+          );
+          verificationError.statusCode = 401;
+          throw verificationError;
+        }
+      } else {
+        const claimedSigner = verifyFreighterRegistrationSignature({
+          username: normalizedUsername,
+          address,
+          signature,
+          signerAddress,
+        });
+
+        verificationResult = await verifyMultiSignerThreshold(address, [claimedSigner], {
+          operationType: 'management',
+        });
+
+        if (!verificationResult.success) {
+          const verificationError = new Error(
+            verificationResult.errorMessage || 'Signature verification failed'
+          );
+          verificationError.statusCode = 401;
+          throw verificationError;
+        }
       }
     }
 

@@ -112,6 +112,7 @@ function RegistrationPage({
     );
 
     let signature;
+    let signerAddress;
     try {
       const message = `register:${normalizedUsername}:${userPublicKey}`;
       const result = await freighterApi.signMessage(message, {
@@ -119,6 +120,7 @@ function RegistrationPage({
       });
       if (result.error) throw new Error(result.error);
       signature = result.signedMessage;
+      signerAddress = result.signerAddress;
     } catch (err) {
       setStatusMessage(err.message || "Signature request cancelled.", "error");
       return;
@@ -136,12 +138,15 @@ function RegistrationPage({
           username: normalizedUsername,
           address: userPublicKey,
           signature,
+          signerAddress,
         }),
       })
         .then(async (response) => {
           const data = await response.json().catch(() => null);
           if (!response.ok) {
-            throw new Error((data && data.detail) || "Registration failed.");
+            throw new Error(
+              (data && (data.error || data.detail || data.message)) || "Registration failed.",
+            );
           }
 
           return data;
