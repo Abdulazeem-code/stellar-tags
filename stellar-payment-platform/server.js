@@ -111,6 +111,10 @@ const USER_DATABASE = {
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
+let cachedCount = 0;
+let lastFetched = 0;
+let statsFetchPromise = null;
+
 const normalizeNameTag = (value) => {
   const trimmed = typeof value === 'string' ? value.trim() : '';
   if (!trimmed) {
@@ -721,6 +725,7 @@ app.use((err, _req, _res, next) => {
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
+  void _next;
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
