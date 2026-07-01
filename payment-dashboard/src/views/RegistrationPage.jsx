@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
-import LoadingSpinner from '../components/LoadingSpinner';
 import { API_BASE, normalizeNameTag } from './shared';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;

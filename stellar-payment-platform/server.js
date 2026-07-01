@@ -485,39 +485,141 @@ app.get('/users', async (req, res, next) => {
       created_at: user.createdAt.toISOString(),
     }));
 
-    res.json({ data, totalCount, totalPages, currentPage: page });
-  } catch {
-    const dbError = new Error('Database error');
-    dbError.statusCode = 500;
-    return next(dbError);
+    return res.json(success({ data, totalCount, totalPages, currentPage: page }));
+  } catch (err) {
+    return next(err);
   }
 });
-// Mount v1 router for both legacy paths and explicit API versioning
-app.use('/', v1Router);
-app.use('/api/v1', v1Router);
+// ...
+app.post('/register', async (req, res, next) => {
+  if (!req.is('application/json')) {
+    return res.status(415).json(fail({ contentType: "Unsupported Media Type. Please send application/json" }));
+  }
+  const safeUsername = xss(req.body.username);
+  const username = normalizeNameTag(safeUsername);
+  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
+  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
+  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
+  const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
 
-app.get('/.well-known/stellar.toml', (_req, res) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.setHeader('Content-Type', 'text/plain');
-  res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
-});
+  if (address.toUpperCase().startsWith('S')) {
+    return res.status(400).json(fail({ address: "Never share your Secret Key. Please register using your Public Key (starts with G)." }));
+  }
 
-app.get('/api/v1/time', (_req, res) => {
-  res.status(200).json({ time: new Date().toISOString() });
-});
+  if (!username || !address) {
+    return res.status(400).json(fail({ fields: 'Missing required fields: username and address are both required.' }));
+  }
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
-});
+  // Extract the username part before the * for profanity check and length validation
+  const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
 
-app.use((err, _req, _res, next) => {
-  if (err.type === 'entity.too.large') {
-    const error = new Error('Payload too large. Maximum allowed size is 10kb.');
-    error.statusCode = 413;
+  if (usernameLocalPart.length < 3) {
+    return res.status(400).json(fail({ username: "Username must be at least 3 characters long." }));
+  }
+
+  // Reject usernames containing profanity or offensive words.
+  if (profanityFilter.isProfane(usernameLocalPart)) {
+    return res.status(400).json(fail({ username: 'Username contains restricted words' }));
+  }
+
+  if (!StrKey.isValidEd25519PublicKey(address)) {
+    const error = new Error('Invalid Stellar Public Key format.');
+    error.statusCode = 400;
     return next(error);
   }
-  next(err);
+
+  const memoError = validateMemo(memoType, memo);
+  if (memoError) {
+    return res.status(400).json(fail({ memo: memoError }));
+  }
+
+  // Signature is optional for legacy single-signer registrations.
+  // If provided, validate its format and run multi-signer verification.
+  if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
+    const error = new Error('Invalid Stellar Public Key format.');
+    error.statusCode = 400;
+    return next(error);
+  }
+
+  const normalizedUsername = username.toLowerCase();
+
+  const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
+  if (RESERVED_NAMES.includes(normalizedUsername)) {
+    return res.status(403).json(fail({ username: "This username is reserved and cannot be registered." }));
+  }
+
+  try {
+    const existing = await prisma.user.findUnique({
+      where: { address }
+    });
+
+    if (existing) {
+      return res.status(409).json(fail({ address: 'Address already registered' }));
+    }
+    let verificationResult = null;
+    if (signature) {
+      verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+        operationType: 'management',
+      });
+
+      if (!verificationResult.success) {
+        const verificationError = new Error(
+          verificationResult.errorMessage || 'Signature verification failed'
+        );
+        verificationError.statusCode = 401;
+        throw verificationError;
+      }
+    }
+
+    await prisma.user.create({
+      data: {
+        username: normalizedUsername,
+        address,
+        ...(memoType && { memoType, memo }),
+      },
+    });
+
+    return res.status(201).json(success({
+      username: normalizedUsername,
+      address,
+      federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      ...(verificationResult && {
+        verification: {
+          accountId: verificationResult.accountId,
+          signerCount: verificationResult.signerCount,
+          thresholdMet: verificationResult.success,
+          requiredThreshold: verificationResult.requiredThreshold,
+          providedWeight: verificationResult.totalWeight,
+        },
+      }),
+      ...(memoType && { memo_type: memoType, memo }),
+    }));
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+      return res.status(409).json(fail({ username: 'Username is already taken. Please choose another.' }));
+    }
+    
+    // Handle verification errors
+    if (error.message && error.message.includes('Account not found')) {
+      const notFoundError = new Error(`Account not found on Horizon: ${address}`);
+      notFoundError.statusCode = 404;
+      return next(notFoundError);
+    }
+
+    // Handle signature verification errors
+    if (error.statusCode === 401) {
+      return next(error);
+    }
+
+    // Handle other errors
+    console.error('Registration error:', error.message);
+    const registrationError = new Error(`Registration verification failed: ${error.message}`);
+    registrationError.statusCode = 500;
+    return next(registrationError);
+  }
 });
+
+app.all('/register', (req, res) => res.status(405).json(fail({ method: "Method Not Allowed" })));
 
 
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
