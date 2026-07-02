@@ -34,6 +34,7 @@ const STELLAR_TAG_DOMAIN = process.env.STELLAR_TAG_DOMAIN;
 
 const allowedOrigins = [
   'http://localhost:5173',
+  'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
 ];
@@ -348,7 +349,15 @@ const verifyFreighterRegistrationSignature = ({
     throw new Error('Invalid message signature format.');
   }
 
-  if (!keypair.verify(Buffer.from(message, 'utf8'), signatureBuffer)) {
+  // --- SEP-0053 Verification Logic ---
+  // Freighter adds a specific prefix and hashes the payload before signing
+  const prefix = Buffer.from('Stellar Signed Message:\n', 'utf8');
+  const messageBytes = Buffer.from(message, 'utf8');
+  const payload = Buffer.concat([prefix, messageBytes]);
+  const messageHash = crypto.createHash('sha256').update(payload).digest();
+
+  // Verify against the hashed payload, not the raw string!
+  if (!keypair.verify(messageHash, signatureBuffer)) {
     const error = new Error('Signature verification failed.');
     error.statusCode = 401;
     throw error;
@@ -470,9 +479,8 @@ app.post('/register', async (req, res, next) => {
         }
       } else {
         const claimedSigner = verifyFreighterRegistrationSignature({
-          // 👇 Use the exact raw strings the frontend signed
-          username: req.body.username, 
-          address: req.body.address,   
+          username: req.body.username,
+          address: req.body.address, // Make sure this is using the raw body too!
           signature,
           signerAddress,
         });
