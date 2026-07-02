@@ -514,7 +514,7 @@ function Dashboard({
               <div className="balance-error">{balanceError}</div>
             )}
             <div className="metric">
-              {balance !== null
+              {userPublicKey && balance !== null
                 ? showBalance
                   ? balance.toLocaleString(undefined, {
                       minimumFractionDigits: 2,
