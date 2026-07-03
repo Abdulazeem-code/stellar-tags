@@ -6,6 +6,7 @@ const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { correlationId } = require('./middleware/correlation');
 const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
