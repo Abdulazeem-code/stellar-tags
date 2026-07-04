@@ -6,6 +6,7 @@ const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { correlationId } = require('./middleware/correlation');
 const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
@@ -52,6 +53,9 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+// #31 — Attach a correlation ID to every request before anything else runs so
+// all downstream middleware, handlers and logs can reference the same trace.
+app.use(correlationId);
 const redisClient = process.env.REDIS_URL ? createClient({
   url: process.env.REDIS_URL
 }) : null;
@@ -735,11 +739,14 @@ app.use((err, _req, res, _next) => {
 
   if (statusCode === 500) {
     const errorId = crypto.randomUUID();
-    console.error(`[Error ID: ${errorId}]`, err);
+    // #31 — Prefix error logs with the correlation ID so a single API call can
+    // be traced across every log line it produced.
+    console.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
     return res.status(500).json({
       success: false,
       error: 'Internal Server Error',
       reference_id: errorId,
+      correlation_id: req.correlationId
     });
   }
 

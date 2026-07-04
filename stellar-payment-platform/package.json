@@ -36,6 +36,7 @@
     "rate-limit-redis": "^4.2.0",
     "redis": "^4.7.0",
     "sqlite3": "^5.1.7",
+    "uuid": "^9.0.1",
     "xss": "^1.0.15"
   },
   "devDependencies": {
