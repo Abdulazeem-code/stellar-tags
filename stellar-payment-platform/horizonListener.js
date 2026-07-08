@@ -1,21 +1,7 @@
-// ---------------------------------------------------------------------------
-// #52 — SSE Horizon Listener for Real-Time Payment Detection
-// ---------------------------------------------------------------------------
-// This background service connects to the Stellar Horizon network using
-// Server-Sent Events (SSE) to monitor incoming payments for all public keys
-// registered in the local federation database.
-//
-// Usage:
-//   npm run listener                  (testnet, default)
-//   HORIZON_NETWORK=public npm run listener  (mainnet)
-// ---------------------------------------------------------------------------
-
 const { Horizon } = require('@stellar/stellar-sdk');
 const { prisma } = require('./prismaClient');
+const logger = require('./logger');
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
 
 const HORIZON_URLS = {
@@ -24,20 +10,10 @@ const HORIZON_URLS = {
 };
 
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000; // Re-check for new accounts every 60s
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
-// ---------------------------------------------------------------------------
-// Horizon Server Instance
-// ---------------------------------------------------------------------------
 const horizon = new Horizon.Server(HORIZON_URL);
-
-// Track active streams so we can clean up on shutdown
 const activeStreams = new Map();
-
-// ---------------------------------------------------------------------------
-// Formatting Helpers
-// ---------------------------------------------------------------------------
-const timestamp = () => new Date().toISOString();
 
 const formatPayment = (payment, trackedAccount) => {
   const direction = payment.to === trackedAccount ? 'INCOMING' : 'OUTGOING';
@@ -46,32 +22,22 @@ const formatPayment = (payment, trackedAccount) => {
       ? 'XLM'
       : `${payment.asset_code}:${payment.asset_issuer}`;
 
-  return [
-    `[${timestamp()}] 💸 ${direction} PAYMENT DETECTED`,
-    `  Account:     ${trackedAccount}`,
-    `  From:        ${payment.from}`,
-    `  To:          ${payment.to}`,
-    `  Amount:      ${payment.amount} ${asset}`,
-    `  Tx Hash:     ${payment.transaction_hash}`,
-    `  Created:     ${payment.created_at}`,
-    '  ─────────────────────────────────────────',
-  ].join('\n');
+  return {
+    direction,
+    account: trackedAccount,
+    from: payment.from,
+    to: payment.to,
+    amount: payment.amount,
+    asset,
+    txHash: payment.transaction_hash,
+    createdAt: payment.created_at,
+  };
 };
 
-// ---------------------------------------------------------------------------
-// Stream Management
-// ---------------------------------------------------------------------------
-
-/**
- * Open a payment SSE stream for a single Stellar account.
- * Returns the stream close function.
- */
 const watchAccount = (accountId) => {
-  if (activeStreams.has(accountId)) {
-    return; // Already watching
-  }
+  if (activeStreams.has(accountId)) return;
 
-  console.log(`[${timestamp()}] 👁️  Watching payments for ${accountId}`);
+  logger.info({ accountId }, 'Watching payments');
 
   const closeStream = horizon
     .payments()
@@ -79,27 +45,18 @@ const watchAccount = (accountId) => {
     .cursor('now')
     .stream({
       onmessage: (payment) => {
-        // Only log payment operations (ignore account_merge, etc.)
         if (payment.type === 'payment' || payment.type_i === 1) {
-          console.log(formatPayment(payment, accountId));
+          logger.info({ payment: formatPayment(payment, accountId) }, 'Payment detected');
         }
       },
       onerror: (error) => {
-        console.error(
-          `[${timestamp()}] ⚠️  Stream error for ${accountId}:`,
-          error?.message || error,
-        );
-        // The SDK handles automatic reconnection for SSE streams
+        logger.error({ accountId, err: error?.message || error }, 'Stream error');
       },
     });
 
   activeStreams.set(accountId, closeStream);
 };
 
-/**
- * Query the local database for all registered public keys and open
- * streams for any that aren't already being watched.
- */
 const syncWatchedAccounts = async () => {
   try {
     const rows = await prisma.user.findMany({
@@ -109,38 +66,31 @@ const syncWatchedAccounts = async () => {
 
     const currentAddresses = new Set(rows.map((r) => r.address));
 
-    // Start watching new accounts
     for (const { address } of rows) {
       if (!activeStreams.has(address)) {
         watchAccount(address);
       }
     }
 
-    // Stop watching removed accounts
     for (const [address, closeFn] of activeStreams) {
       if (!currentAddresses.has(address)) {
-        console.log(`[${timestamp()}] 🛑 Stopped watching removed account ${address}`);
+        logger.info({ address }, 'Stopped watching removed account');
         if (typeof closeFn === 'function') closeFn();
         activeStreams.delete(address);
       }
     }
 
-    console.log(
-      `[${timestamp()}] 📡 Actively monitoring ${activeStreams.size} account(s)`,
-    );
+    logger.info({ count: activeStreams.size }, 'Actively monitoring accounts');
   } catch (err) {
-    console.error(`[${timestamp()}] ❌ Failed to sync watched accounts:`, err.message);
+    logger.error({ err: err.message }, 'Failed to sync watched accounts');
   }
 };
 
-// ---------------------------------------------------------------------------
-// Graceful Shutdown
-// ---------------------------------------------------------------------------
 const shutdown = async () => {
-  console.log(`\n[${timestamp()}] Shutting down Horizon listener...`);
+  logger.info('Shutting down Horizon listener');
   for (const [address, closeFn] of activeStreams) {
     if (typeof closeFn === 'function') closeFn();
-    console.log(`  Closed stream for ${address}`);
+    logger.info({ address }, 'Closed stream');
   }
   activeStreams.clear();
   await prisma.$disconnect();
@@ -150,25 +100,18 @@ const shutdown = async () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 const main = async () => {
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('  Stellar Horizon Payment Listener');
-  console.log(`  Network:  ${NETWORK.toUpperCase()}`);
-  console.log(`  Horizon:  ${HORIZON_URL}`);
-  console.log(`  Poll:     every ${POLL_INTERVAL_MS / 1000}s for new accounts`);
-  console.log('═══════════════════════════════════════════════════════');
+  logger.info({
+    network: NETWORK.toUpperCase(),
+    horizonUrl: HORIZON_URL,
+    pollIntervalSec: POLL_INTERVAL_MS / 1000,
+  }, 'Stellar Horizon Payment Listener starting');
 
-  // Initial sync
   await syncWatchedAccounts();
-
-  // Periodically check for newly registered accounts
   setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
 };
 
 main().catch((err) => {
-  console.error('Fatal error starting Horizon listener:', err);
+  logger.fatal({ err }, 'Fatal error starting Horizon listener');
   process.exit(1);
 });
