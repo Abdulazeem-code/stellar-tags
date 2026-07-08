@@ -1,3 +1,4 @@
+require('./config/envCheck');
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -33,11 +34,20 @@ app.set('query parser', 'simple');
 const PORT = process.env.PORT || 5000;
 const STELLAR_TAG_DOMAIN = process.env.STELLAR_TAG_DOMAIN;
 
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      connectSrc: ["'self'", 'https://horizon-testnet.stellar.org', 'https://horizon.stellar.org'],
+    },
+  },
+}));
+
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
   'https://stellar-tags.vercel.app',
-  STELLAR_TAG_DOMAIN,
+  STELLAR_TAG_DOMAIN
 ];
 
 const corsOptions = {
@@ -50,7 +60,7 @@ const corsOptions = {
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-  optionsSuccessStatus: 204,
+  optionsSuccessStatus: 204
 };
 
 // #31 — Attach a correlation ID to every request before anything else runs so
@@ -75,6 +85,8 @@ const limiter = rateLimit({
 });
 
 app.use(cors(corsOptions));
+app.use(express.json());
+
 app.use(limiter);
 app.use(express.json({ limit: '10kb' }));
 app.use((err, _req, res, next) => {
