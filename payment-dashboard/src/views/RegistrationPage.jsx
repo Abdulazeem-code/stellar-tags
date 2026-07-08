@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
-import LoadingSpinner from '../components/LoadingSpinner';
 import { API_BASE, normalizeNameTag } from './shared';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
@@ -113,15 +112,30 @@ function RegistrationPage({
     );
 
     let signature;
+    let signerAddress;
     try {
       const message = `register:${normalizedUsername}:${userPublicKey}`;
+      
       const result = await freighterApi.signMessage(message, {
         address: userPublicKey,
       });
-      if (result.error) throw new Error(result.error);
-      signature = result.signedMessage;
+      
+      if (result && result.error) throw new Error(result.error);
+      
+      // Extract the signature properly! 
+      // It returns the string directly, but we check both formats just in case.
+      signature = typeof result === 'string' ? result : result.signedMessage;
+      
+      if (!signature) {
+        throw new Error("Failed to capture signature from Freighter.");
+      }
+
+      // Freighter signs using the currently connected wallet
+      signerAddress = userPublicKey; 
+      
     } catch (err) {
       setStatusMessage(err.message || "Signature request cancelled.", "error");
+      setIsSubmitting(false);
       return;
     }
 
@@ -137,12 +151,15 @@ function RegistrationPage({
           username: normalizedUsername,
           address: userPublicKey,
           signature,
+          signerAddress,
         }),
       })
         .then(async (response) => {
           const data = await response.json().catch(() => null);
           if (!response.ok) {
-            throw new Error((data && data.detail) || "Registration failed.");
+            throw new Error(
+              (data && (data.error || data.detail || data.message)) || "Registration failed.",
+            );
           }
 
           return data;

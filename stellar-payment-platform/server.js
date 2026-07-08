@@ -7,14 +7,16 @@ const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { correlationId } = require('./middleware/correlation');
 const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
 const v1Router = require('./src/routes/v1');
 const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
+const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
-const { StrKey } = require('@stellar/stellar-sdk');
+const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 
 dotenv.config();
 
@@ -34,6 +36,7 @@ const STELLAR_TAG_DOMAIN = process.env.STELLAR_TAG_DOMAIN;
 
 const allowedOrigins = [
   'http://localhost:5173',
+  'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
 ];
@@ -51,6 +54,9 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+// #31 — Attach a correlation ID to every request before anything else runs so
+// all downstream middleware, handlers and logs can reference the same trace.
+app.use(correlationId);
 const redisClient = process.env.REDIS_URL ? createClient({
   url: process.env.REDIS_URL
 }) : null;
@@ -142,6 +148,84 @@ const etagCache = (req, res, next) => {
   next();
 };
 
+const shouldFallbackToLocalRegistry = (error) => {
+  const code = typeof error?.code === 'string' ? error.code : '';
+  const message = typeof error?.message === 'string' ? error.message : '';
+
+  return (
+    code.startsWith('P10') ||
+    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
+    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
+  );
+};
+
+const getLocalUserByAddress = async (address) =>
+  poolGet(
+    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
+    [address],
+  );
+
+const getLocalUserByUsername = async (username) =>
+  poolGet(
+    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+    [username],
+  );
+
+const listLocalUsers = async (search, page, limit) => {
+  const searchPattern = `%${search}%`;
+  const skip = (page - 1) * limit;
+  const rows = await poolAll(
+    `SELECT username, address, created_at
+     FROM username_registry
+     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`,
+    [searchPattern, searchPattern, limit, skip],
+  );
+
+  const countRow = await poolGet(
+    `SELECT COUNT(*) AS totalCount
+     FROM username_registry
+     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE`,
+    [searchPattern, searchPattern],
+  );
+
+  const totalCount = Number(countRow?.totalCount || 0);
+
+  return {
+    data: rows.map((user) => ({
+      username: user.username,
+      address: user.address,
+      created_at: user.created_at,
+    })),
+    totalCount,
+    totalPages: Math.ceil(totalCount / limit),
+    currentPage: page,
+  };
+};
+
+const registerLocalUser = async ({ username, address }) => {
+  const existingByAddress = await getLocalUserByAddress(address);
+  if (existingByAddress) {
+    const conflictError = new Error('Address already registered');
+    conflictError.statusCode = 409;
+    throw conflictError;
+  }
+
+  const existingByUsername = await getLocalUserByUsername(username);
+  if (existingByUsername) {
+    const conflictError = new Error('Username is already taken. Please choose another.');
+    conflictError.statusCode = 409;
+    throw conflictError;
+  }
+
+  await poolRun(
+    `INSERT INTO username_registry (username, address, created_at)
+     VALUES (?, ?, ?)`,
+    [username, address, new Date().toISOString()],
+  );
+};
+
 app.get('/federation', etagCache, async (req, res, next) => {
   const { q, type } = req.query;
   const queryValue = typeof q === 'string' ? q.trim() : '';
@@ -177,10 +261,22 @@ app.get('/federation', etagCache, async (req, res, next) => {
       const nameTag = normalizeNameTag(queryValue);
       const queryName = nameTag.toLowerCase();
 
-      const row = await prisma.user.findUnique({
-        where: { username: queryName },
-        select: { address: true, memoType: true, memo: true },
-      });
+      let row = null;
+      try {
+        row = await prisma.user.findUnique({
+          where: { username: queryName },
+          select: { address: true, memoType: true, memo: true },
+        });
+      } catch (error) {
+        if (!shouldFallbackToLocalRegistry(error)) {
+          throw error;
+        }
+
+        const localRow = await getLocalUserByUsername(queryName);
+        row = localRow
+          ? { address: localRow.address, memoType: null, memo: null }
+          : null;
+      }
 
       const address = row?.address || USER_DATABASE[queryName];
 
@@ -238,6 +334,54 @@ const validateMemo = (memoType, memo) => {
   return null;
 };
 
+const verifyFreighterRegistrationSignature = ({
+  username,
+  address,
+  signature,
+  signerAddress,
+}) => {
+  const message = `register:${username}:${address}`;
+  const claimedSigner = signerAddress || address;
+  const keypair = Keypair.fromPublicKey(claimedSigner);
+
+  let signatureBuffer;
+  if (Buffer.isBuffer(signature)) {
+    signatureBuffer = signature;
+  } else if (typeof signature === 'string') {
+    signatureBuffer = Buffer.from(signature, 'base64');
+  } else {
+    throw new Error('Invalid message signature format.');
+  }
+
+  // --- SEP-0053 Verification Logic ---
+  // Freighter adds a specific prefix and hashes the payload before signing
+  const prefix = Buffer.from('Stellar Signed Message:\n', 'utf8');
+  const messageBytes = Buffer.from(message, 'utf8');
+  const payload = Buffer.concat([prefix, messageBytes]);
+  const messageHash = crypto.createHash('sha256').update(payload).digest();
+
+  // Verify against the hashed payload, not the raw string!
+  if (!keypair.verify(messageHash, signatureBuffer)) {
+    const error = new Error('Signature verification failed.');
+    error.statusCode = 401;
+    throw error;
+  }
+
+  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
+    const error = new Error('Invalid signer address format.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (claimedSigner !== address) {
+    const error = new Error('Signer address does not match the connected wallet.');
+    error.statusCode = 401;
+    throw error;
+  }
+
+  return claimedSigner;
+};
+
 /**
  * Registration endpoint with multi-signer threshold verification
  * 
@@ -260,6 +404,7 @@ app.post('/register', async (req, res, next) => {
   const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
   const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
   const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
+  const signerAddress = typeof req.body.signerAddress === 'string' ? req.body.signerAddress.trim() : '';
 
   if (address.toUpperCase().startsWith('S')) {
     return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
@@ -292,14 +437,6 @@ app.post('/register', async (req, res, next) => {
     return res.status(400).json({ error: memoError });
   }
 
-  // Signature is optional for legacy single-signer registrations.
-  // If provided, validate its format and run multi-signer verification.
-  if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
-    const error = new Error('Invalid Stellar Public Key format.');
-    error.statusCode = 400;
-    return next(error);
-  }
-
   const normalizedUsername = username.toLowerCase();
 
   const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
@@ -308,37 +445,91 @@ app.post('/register', async (req, res, next) => {
   }
 
   try {
-    const existing = await prisma.user.findUnique({
-      where: { address }
-    });
+    let existing = null;
+    try {
+      existing = await prisma.user.findUnique({
+        where: { address },
+      });
+    } catch (error) {
+      if (!shouldFallbackToLocalRegistry(error)) {
+        throw error;
+      }
+
+      existing = await getLocalUserByAddress(address);
+    }
 
     if (existing) {
       const conflictError = new Error('Address already registered');
       conflictError.statusCode = 409;
       return next(conflictError);
     }
+
     let verificationResult = null;
     if (signature) {
-      verificationResult = await verifyMultiSignerThreshold(address, [signature], {
-        operationType: 'management',
-      });
+      const isLegacyPublicKeyFlow =
+        StrKey.isValidEd25519PublicKey(signature) && !signerAddress;
 
-      if (!verificationResult.success) {
-        const verificationError = new Error(
-          verificationResult.errorMessage || 'Signature verification failed'
-        );
-        verificationError.statusCode = 401;
-        throw verificationError;
+      if (isLegacyPublicKeyFlow) {
+        verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+          operationType: 'management',
+        });
+
+        if (!verificationResult.success) {
+          const verificationError = new Error(
+            verificationResult.errorMessage || 'Signature verification failed'
+          );
+          verificationError.statusCode = 401;
+          throw verificationError;
+        }
+      } else {
+        const claimedSigner = verifyFreighterRegistrationSignature({
+          username: req.body.username,
+          address: req.body.address, // Make sure this is using the raw body too!
+          signature,
+          signerAddress,
+        });
+
+        verificationResult = {
+          success: true,
+          accountId: claimedSigner,
+          operationType: 'message',
+          requiredThreshold: 1,
+          totalWeight: 1,
+          signatureCount: 1,
+          uniqueSignerCount: 1,
+          signatures: [
+            {
+              publicKey: claimedSigner,
+              weight: 1,
+              isValid: true,
+            },
+          ],
+          thresholds: {
+            low_threshold: 1,
+            med_threshold: 1,
+            high_threshold: 1,
+          },
+          signerCount: 1,
+          errorMessage: null,
+        };
       }
     }
 
-    await prisma.user.create({
-      data: {
-        username: normalizedUsername,
-        address,
-        ...(memoType && { memoType, memo }),
-      },
-    });
+    try {
+      await prisma.user.create({
+        data: {
+          username: normalizedUsername,
+          address,
+          ...(memoType && { memoType, memo }),
+        },
+      });
+    } catch (error) {
+      if (!shouldFallbackToLocalRegistry(error)) {
+        throw error;
+      }
+
+      await registerLocalUser({ username: normalizedUsername, address });
+    }
 
     return res.status(201).json({
       ok: true,
@@ -395,10 +586,19 @@ app.get('/lookup', async (req, res, next) => {
 
   if (address) {
     try {
-      const row = await prisma.user.findUnique({
-        where: { address },
-        select: { username: true },
-      });
+      let row = null;
+      try {
+        row = await prisma.user.findUnique({
+          where: { address },
+          select: { username: true },
+        });
+      } catch (error) {
+        if (!shouldFallbackToLocalRegistry(error)) {
+          throw error;
+        }
+
+        row = await getLocalUserByAddress(address);
+      }
 
       if (!row) {
         const notFoundError = new Error('Username not found for this address');
@@ -426,24 +626,37 @@ app.get('/lookup', async (req, res, next) => {
   };
 
   try {
-    const [totalCount, rows] = await prisma.$transaction([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-      }),
-    ]);
+    let response = null;
+    try {
+      const [totalCount, rows] = await prisma.$transaction([
+        prisma.user.count({ where }),
+        prisma.user.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          skip,
+          take: limit,
+        }),
+      ]);
 
-    const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
-    }));
+      response = {
+        data: rows.map((user) => ({
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt.toISOString(),
+        })),
+        totalCount,
+        totalPages: Math.ceil(totalCount / limit),
+        currentPage: page,
+      };
+    } catch (error) {
+      if (!shouldFallbackToLocalRegistry(error)) {
+        throw error;
+      }
 
-    return res.json({ data, totalCount, totalPages, currentPage: page });
+      response = await listLocalUsers(search, page, limit);
+    }
+
+    return res.json(response);
   } catch {
     const dbError = new Error('Database lookup failed');
     dbError.statusCode = 500;
@@ -526,11 +739,14 @@ app.use((err, _req, res, _next) => {
 
   if (statusCode === 500) {
     const errorId = crypto.randomUUID();
-    logger.error({ err, errorId }, 'Unhandled server error');
+    // #31 — Prefix error logs with the correlation ID so a single API call can
+    // be traced across every log line it produced.
+    console.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
     return res.status(500).json({
       success: false,
       error: 'Internal Server Error',
       reference_id: errorId,
+      correlation_id: req.correlationId
     });
   }
 
@@ -567,18 +783,6 @@ const gracefulShutdown = (server, pool, signal) => {
   });
 };
 
-
-
-app.use((err, req, res) => {
-  console.error(err.stack);
-  const statusCode = err.statusCode || 500;
-
-  res.status(statusCode).json({
-    success: false,
-    message: err.message || 'Internal Server Error',
-    detail: process.env.NODE_ENV === 'development' ? err.stack : 'Check server logs for details'
-  });
-});
 
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {

@@ -671,17 +671,18 @@ function Dashboard({
                     </div>
                   </div>
                 )}
-              </div>
-            )}
-            {receiveStatus.text && (
-              <div
-                id="receive-status-box"
-                style={{
-                  color: receiveStatus.color,
-                  backgroundColor: receiveStatus.bgColor,
-                }}
-              >
-                {receiveStatus.text}
+                {receiveStatus.text && (
+                  <div
+                    id="receive-status-box"
+                    style={{
+                      color: receiveStatus.color,
+                      backgroundColor: receiveStatus.bgColor,
+                      marginTop: "16px", // Adds a little breathing room below the QR code!
+                    }}
+                  >
+                    {receiveStatus.text}
+                  </div>
+                )}
               </div>
             )}
             {status.text && (
