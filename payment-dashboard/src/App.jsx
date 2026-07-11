@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
 import { Toaster } from 'react-hot-toast';
 import LoadingSpinner from './components/LoadingSpinner';
-import { HORIZON_BASE } from './views/shared';
+import { HORIZON_BASE, API_BASE } from './views/shared';
 
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
 const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
@@ -56,9 +56,7 @@ const [activeView, setActiveView] = useState('dashboard')
 
     const publicKey = response.address;
     try {
-      const apiUrl = import.meta.env.VITE_API_BASE || 'http://localhost:5000';
-      
-      const dbResponse = await fetch(`${apiUrl}/lookup?address=${publicKey}`);
+      const dbResponse = await fetch(`${API_BASE}/lookup?address=${publicKey}`);
       
       if (dbResponse.ok) {
         setRegistrationState("existing");
@@ -68,7 +66,7 @@ const [activeView, setActiveView] = useState('dashboard')
     } catch (error) {
       console.error("Failed to verify wallet with database:", error);
     }
-    
+
     localStorage.setItem("walletPublicKey", publicKey);
     setUserPublicKey(publicKey);
     return { ok: true, address: publicKey };
