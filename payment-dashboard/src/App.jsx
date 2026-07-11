@@ -62,7 +62,8 @@ const [activeView, setActiveView] = useState('dashboard')
   const handleDisconnectWallet = () => {
     localStorage.removeItem('walletPublicKey')
     setUserPublicKey('')
-  }
+    setBalance(null);
+  };
 
   const [balance, setBalance] = useState(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -89,7 +90,7 @@ const [activeView, setActiveView] = useState('dashboard')
     } finally {
       setIsRefreshing(false);
     }
-  }, [userPublicKey]);
+  }, [userPublicKey, setBalance, setIsRefreshing, setBalanceError]);
 
   useEffect(() => {
     if (!userPublicKey) {
