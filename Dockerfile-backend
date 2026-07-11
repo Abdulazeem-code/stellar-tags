@@ -2,7 +2,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 COPY stellar-payment-platform/package*.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 COPY stellar-payment-platform/ .
 RUN npx prisma generate
 EXPOSE 5000
