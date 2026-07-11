@@ -166,6 +166,12 @@ function RegistrationPage({
         })
         .then(() => {
           setStatusMessage("Username reserved and saved.", "success");
+          
+          setTimeout(() => {
+            if (typeof onRegistered === 'function') {
+              onRegistered();
+            }
+          }, 1500);
         })
         .catch((error) => {
           setStatusMessage(error.message || "Registration failed.", "error");
