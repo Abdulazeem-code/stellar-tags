@@ -17,7 +17,7 @@ router.get('/federation', etagCache, async (req, res, next) => {
   try {
     if (type === 'id') {
       const row = await prisma.user.findFirst({
-        where: { address: { equals: queryValue, mode: 'insensitive' } },
+        where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
         select: { username: true, address: true, memoType: true, memo: true },
       });
 
@@ -40,8 +40,8 @@ router.get('/federation', etagCache, async (req, res, next) => {
       const nameTag = normalizeNameTag(queryValue);
       const queryName = nameTag.toLowerCase();
 
-      const row = await prisma.user.findUnique({
-        where: { username: queryName },
+      const row = await prisma.user.findFirst({
+        where: { username: queryName, deletedAt: null },
         select: { address: true, memoType: true, memo: true },
       });
 

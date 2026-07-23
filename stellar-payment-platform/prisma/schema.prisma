@@ -23,7 +23,12 @@ model User {
   memo      String?
   createdAt DateTime  @default(now()) @map("created_at")
   flaggedAt DateTime? @map("flagged_at")
+  // #18 — Soft-delete timestamp. NULL means the record is active; a non-null
+  // value means the account was unregistered and should be excluded from all
+  // normal lookups.
+  deletedAt DateTime? @map("deleted_at")
 
   @@map("username_registry")
   @@index([username])
+  @@index([deletedAt])
 }

@@ -81,8 +81,8 @@ router.post('/register', async (req, res, next) => {
   }
 
   try {
-    const existing = await prisma.user.findUnique({
-      where: { address }
+    const existing = await prisma.user.findFirst({
+      where: { address, deletedAt: null },
     });
 
     if (existing) {
@@ -154,6 +154,43 @@ router.post('/register', async (req, res, next) => {
 
 router.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
+// #18 — Soft-delete endpoint. Sets deleted_at to now() instead of running a
+// hard DELETE so the row is preserved for historical auditing.
+router.delete('/register/:username', async (req, res, next) => {
+  const username = normalizeNameTag(
+    typeof req.params.username === 'string' ? req.params.username.trim() : '',
+  ).toLowerCase();
+
+  if (!username) {
+    const error = new Error('Missing username parameter');
+    error.statusCode = 400;
+    return next(error);
+  }
+
+  try {
+    const existing = await prisma.user.findFirst({
+      where: { username, deletedAt: null },
+    });
+
+    if (!existing) {
+      const notFoundError = new Error('Username not found or already deleted');
+      notFoundError.statusCode = 404;
+      return next(notFoundError);
+    }
+
+    await prisma.user.update({
+      where: { username },
+      data: { deletedAt: new Date() },
+    });
+
+    return res.status(200).json({ ok: true, username, deleted: true });
+  } catch {
+    const dbError = new Error('Failed to unregister account');
+    dbError.statusCode = 500;
+    return next(dbError);
+  }
+});
+
 router.get('/lookup', async (req, res, next) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
   const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
@@ -166,8 +203,8 @@ router.get('/lookup', async (req, res, next) => {
 
   if (address) {
     try {
-      const row = await prisma.user.findUnique({
-        where: { address },
+      const row = await prisma.user.findFirst({
+        where: { address, deletedAt: null },
         select: { username: true },
       });
 
@@ -190,6 +227,7 @@ router.get('/lookup', async (req, res, next) => {
   const skip = (page - 1) * limit;
 
   const where = {
+    deletedAt: null,
     OR: [
       { username: { contains: search, mode: 'insensitive' } },
       { address: { contains: search, mode: 'insensitive' } },
@@ -230,12 +268,13 @@ router.get('/users', async (req, res, next) => {
 
   const where = search
     ? {
+        deletedAt: null,
         OR: [
           { username: { contains: search, mode: 'insensitive' } },
           { address: { contains: search, mode: 'insensitive' } },
         ],
       }
-    : {};
+    : { deletedAt: null };
 
   try {
     const [totalCount, rows] = await prisma.$transaction([

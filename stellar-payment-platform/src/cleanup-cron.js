@@ -38,12 +38,15 @@ async function runCleanup(prisma) {
 
   const activeAddresses = [...ACTIVE_NETWORK_ADDRESSES];
 
-  // 1. Delete stale rows that are NOT active network addresses.
-  const pruneResult = await prisma.user.deleteMany({
+  // 1. Soft-delete stale rows that are NOT active network addresses.
+  // #18 — Use soft deletes so historical records are preserved for auditing.
+  const pruneResult = await prisma.user.updateMany({
     where: {
       createdAt: { lt: cutoff },
       address: { notIn: activeAddresses },
+      deletedAt: null,
     },
+    data: { deletedAt: new Date() },
   });
 
   // 2. Flag stale rows that ARE active network addresses.
