@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
-import freighterApi from '@stellar/freighter-api';
-import { API_BASE, normalizeNameTag } from './shared';
+import { API_BASE, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -51,30 +50,25 @@ function RegistrationPage({
     checkExisting();
   }, [userPublicKey, onRegistered]);
 
+  // 2. Updated to use the universal walletKit modal instead of Freighter specifically
   const handleConnect = async () => {
     setIsConnecting(true);
     try {
-      const connectionStatus = await freighterApi.isConnected();
-      const isInstalled =
-        connectionStatus.isConnected !== undefined
-          ? connectionStatus.isConnected
-          : connectionStatus;
-
-      if (!isInstalled) {
-        setStatusMessage("Freighter is not installed or locked.", "error");
-        return;
-      }
-
-      const response = await freighterApi.requestAccess();
-      if (response.error) {
-        setStatusMessage("Wallet connection failed.", "error");
-        return;
-      }
-
-      setUserPublicKey(response.address);
-      setStatusMessage("Wallet connected. Pick your username.", "success");
+      await walletKit.openModal({
+        onWalletSelected: async (option) => {
+          walletKit.setWallet(option.id);
+          const addressResponse = await walletKit.getAddress();
+          
+          const publicKey = typeof addressResponse === 'string' 
+            ? addressResponse 
+            : addressResponse.address;
+          
+          setUserPublicKey(publicKey);
+          setStatusMessage(`Wallet connected. Pick your username.`, "success");
+        }
+      });
     } catch {
-      setStatusMessage("Unable to connect to Freighter.", "error");
+      setStatusMessage("Wallet connection cancelled or failed.", "error");
     } finally {
       setIsConnecting(false);
     }
@@ -106,8 +100,9 @@ function RegistrationPage({
     }
 
     setIsSubmitting(true);
+    // 3. Removed the hardcoded Freighter text
     setStatusMessage(
-      "Approve the signature request in Freighter...",
+      "Approve the signature request in your wallet...", 
       "neutral",
     );
 
@@ -116,25 +111,34 @@ function RegistrationPage({
     try {
       const message = `register:${normalizedUsername}:${userPublicKey}`;
       
-      const result = await freighterApi.signMessage(message, {
-        address: userPublicKey,
-      });
+      // 4. Use walletKit to sign the data dynamically based on the selected wallet
+      // Note: Some wallet kit versions wrap this differently. If signBlob is unavailable, 
+      // check your specific @creit.tech/stellar-wallets-kit version docs for message signing.
+      const result = await walletKit.signBlob 
+        ? await walletKit.signBlob(message) 
+        : await walletKit.signMessage(message, { address: userPublicKey });
       
       if (result && result.error) throw new Error(result.error);
       
-      // Extract the signature properly! 
-      // It returns the string directly, but we check both formats just in case.
-      signature = typeof result === 'string' ? result : result.signedMessage;
+      signature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
       
       if (!signature) {
-        throw new Error("Failed to capture signature from Freighter.");
+        throw new Error("Failed to capture signature from wallet.");
       }
 
-      // Freighter signs using the currently connected wallet
       signerAddress = userPublicKey; 
       
     } catch (err) {
-      setStatusMessage(err.message || "Signature request cancelled.", "error");
+      // Check if it's the specific LOBSTR unsupported error
+      if (err.message && err.message.includes("signMessage")) {
+        setStatusMessage(
+          "LOBSTR does not support registration signatures. Please click 'Back to dashboard' to skip this step, or connect with Freighter.", 
+          "error"
+        );
+      } else {
+        // Handle all other normal errors
+        setStatusMessage(err.message || "Signature request cancelled.", "error");
+      }
       setIsSubmitting(false);
       return;
     }
@@ -161,7 +165,6 @@ function RegistrationPage({
               (data && (data.error || data.detail || data.message)) || "Registration failed.",
             );
           }
-
           return data;
         })
         .then(() => {
@@ -224,8 +227,9 @@ function RegistrationPage({
             <p>Secure a username that resolves to your wallet instantly.</p>
           </div>
           <div>
+            {/* 5. Removed hardcoded Freighter marketing copy */}
             <h3>Seamless onboarding</h3>
-            <p>Freighter brings you in with a single approval.</p>
+            <p>Connect your preferred wallet with a single approval.</p>
           </div>
           <div>
             <h3>Verified presence</h3>
@@ -290,8 +294,8 @@ function RegistrationPage({
             Back to dashboard
           </button>
           <p>Wallet required to finalize registration.</p>
+          {/* 6. Removed hardcoded Freighter badge */}
           <div className="badge-row">
-            <span>Freighter</span>
             <span>Stellar Testnet</span>
             <span>Secure</span>
           </div>

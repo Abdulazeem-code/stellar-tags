@@ -1,3 +1,11 @@
+import { 
+  StellarWalletsKit, 
+  WalletNetwork,
+  FreighterModule, 
+  xBullModule,
+  AlbedoModule,
+  LobstrModule
+} from '@creit.tech/stellar-wallets-kit';
 import { useEffect, useRef, useState } from 'react';
 
 export const CONTRACT_ID = 'CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER';
@@ -118,3 +126,15 @@ export const useWalletMenu = () => {
 
   return { menuRef, isOpen, setIsOpen };
 };
+
+// Initialize the multi-wallet kit with strictly V1 syntax
+export const walletKit = new StellarWalletsKit({
+  network: WalletNetwork.TESTNET, 
+  selectedWalletId: 'freighter',
+  modules: [
+    new FreighterModule(),
+    new xBullModule(),
+    new AlbedoModule(),
+    new LobstrModule()
+  ],
+});

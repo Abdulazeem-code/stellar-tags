@@ -603,7 +603,10 @@ app.get('/lookup', async (req, res, next) => {
       }
 
       return res.json({ username: row.username, address });
-    } catch {
+    } catch (err) {  // <-- 1. Add (err) here
+      // 2. Add this console.log to print the exact reason Prisma is failing
+      console.error("🚨 ACTUAL PRISMA ERROR:", err); 
+      
       const dbError = new Error('Database lookup failed');
       dbError.statusCode = 500;
       return next(dbError);

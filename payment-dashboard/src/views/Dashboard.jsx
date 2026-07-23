@@ -129,7 +129,8 @@ function Dashboard({
             "#D97706",
             "#FEF3C7",
           );
-          onRegistrationStateChange("new");
+          // Change "new" to "skipped" to break the infinite redirect loop
+          onRegistrationStateChange("skipped"); 
           return;
         }
 

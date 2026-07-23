@@ -1,8 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
-import freighterApi from '@stellar/freighter-api';
+
 import { Toaster } from 'react-hot-toast';
 import LoadingSpinner from './components/LoadingSpinner';
-import { HORIZON_BASE, API_BASE } from './views/shared';
+import { HORIZON_BASE, API_BASE, walletKit } from './views/shared';
 
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
 const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
@@ -41,35 +41,42 @@ const [activeView, setActiveView] = useState('dashboard')
   }, []);
 
   const handleConnectWallet = async () => {
-    const status = await freighterApi.isConnected();
-    const isInstalled =
-      status.isConnected !== undefined ? status.isConnected : status;
-
-    if (!isInstalled) {
-      return { ok: false, error: "Freighter is not installed or locked." };
-    }
-
-    const response = await freighterApi.requestAccess();
-    if (response.error) {
-      return { ok: false, error: "Wallet connection failed." };
-    }
-
-    const publicKey = response.address;
     try {
-      const dbResponse = await fetch(`${API_BASE}/lookup?address=${publicKey}`);
-      
-      if (dbResponse.ok) {
-        setRegistrationState("existing");
-      } else if (dbResponse.status === 404) {
-        setRegistrationState("new");
-      }
-    } catch (error) {
-      console.error("Failed to verify wallet with database:", error);
-    }
+      await walletKit.openModal({
+        onWalletSelected: async (option) => {
+          try {
+            walletKit.setWallet(option.id);
+            const addressResponse = await walletKit.getAddress();
+            
+            // Extract the key carefully to avoid the initialization error
+            const publicKey = typeof addressResponse === 'string' 
+              ? addressResponse 
+              : addressResponse.address;
+            
+            // Now that publicKey is officially created, we can fetch the user
+            const dbResponse = await fetch(`${API_BASE}/api/user/${publicKey}`);
+            
+            if (dbResponse.ok) {
+              setRegistrationState("existing");
+            } else if (dbResponse.status === 404) {
+              setRegistrationState("new");
+            }
 
-    localStorage.setItem("walletPublicKey", publicKey);
-    setUserPublicKey(publicKey);
-    return { ok: true, address: publicKey };
+            // Save the address to state so the UI updates
+            localStorage.setItem("walletPublicKey", publicKey);
+            setUserPublicKey(publicKey);
+            
+          } catch (err) {
+            console.error("Wallet connection failed:", err);
+          }
+        },
+      });
+
+      return { ok: true };
+    } catch (error) {
+      console.error("User closed modal or an error occurred:", error);
+      return { ok: false, error: "Wallet connection process cancelled." };
+    }
   };
 
   const handleDisconnectWallet = () => {
@@ -186,7 +193,7 @@ const [activeView, setActiveView] = useState('dashboard')
     [activeView, handleNavigate],
   );
 
-  if (activeView === "register" && registrationState === "new") {
+  if (activeView === "register" && (registrationState === "new" || registrationState === "skipped")) {
     return (
       <>
         {isOffline && (
@@ -211,7 +218,10 @@ const [activeView, setActiveView] = useState('dashboard')
         <RegistrationPage
           userPublicKey={userPublicKey}
           setUserPublicKey={setUserPublicKey}
-          onBack={() => handleNavigate("dashboard")}
+          onBack={() => {
+            setRegistrationState("skipped"); // This breaks the loop!
+            handleNavigate("dashboard");
+          }}
           onRegistered={() => handleRegistrationStateChange("existing")}
         />
         </Suspense>
@@ -249,7 +259,7 @@ const [activeView, setActiveView] = useState('dashboard')
           onAnalyticsClick={() => handleNavigate("analytics")}
           onHistoryClick={() => handleNavigate("history")}
           onRegisterClick={() => handleNavigate("register")}
-          canRegister={registrationState === "new"}
+          canRegister={registrationState !== "existing"}
         />
         </Suspense>
       </>
