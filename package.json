@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "start": "npm --prefix stellar-payment-platform start",
     "lint": "eslint .",
     "prepare": "husky",
     "load:test": "artillery run artillery.yml"
