@@ -4,17 +4,15 @@ FROM node:20-alpine
 # Set working directory inside the container
 WORKDIR /app
 
-# Copy package files first to leverage Docker cache
-COPY package*.json ./
-
-# Install dependencies (using legacy peer deps to avoid any conflict hiccups)
-RUN npm install --legacy-peer-deps
-
-# Copy the rest of the application code
+# Copy all project files into the container
 COPY . .
+
+# Install root dependencies AND backend-specific dependencies
+RUN npm install --legacy-peer-deps
+RUN npm install --prefix stellar-payment-platform --legacy-peer-deps
 
 # Expose the backend port (update if your app uses a different port)
 EXPOSE 5000
 
-# Start the application
+# Start the application from the backend directory
 CMD ["npm", "--prefix", "stellar-payment-platform", "start"]
