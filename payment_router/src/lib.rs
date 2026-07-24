@@ -1,5 +1,12 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, log, token, Address, Env};
+use soroban_sdk::{contract, contracttype, contractimpl, log, token, Address, Env};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Admin,
+    MaxLimit,
+}
 
 #[contract]
 pub struct PaymentRouter;
@@ -11,6 +18,23 @@ impl PaymentRouter {
     const XLM_DECIMALS: i128 = 10_000_000;
     const FEE_CAP_XLM: i128 = 30;
     const FEE_CAP: i128 = Self::FEE_CAP_XLM * Self::XLM_DECIMALS;
+    const VERSION: u32 = 1;
+
+    pub fn init(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    pub fn set_max_limit(env: Env, admin: Address, limit: i128) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != current_admin {
+            panic!("not admin");
+        }
+        env.storage().instance().set(&DataKey::MaxLimit, &limit);
+    }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
@@ -47,6 +71,12 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
+        if let Some(max_limit) = env.storage().instance().get::<_, i128>(&DataKey::MaxLimit) {
+            if amount > max_limit {
+                panic!("amount exceeds max limit");
+            }
+        }
+
         // 2. Calculate the split
         let mut fee_amount = (amount * Self::FEE_BPS) / Self::BPS_DIVISOR;
         if fee_amount > Self::FEE_CAP {
@@ -71,4 +101,13 @@ impl PaymentRouter {
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to Anchor");
     }
+
+    /// Returns the contract version.
+    /// This can be used by frontends to verify compatibility.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
+    }
 }
+
+#[cfg(test)]
+mod test;
