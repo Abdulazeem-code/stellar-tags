@@ -108,3 +108,6 @@ impl PaymentRouter {
         Self::VERSION
     }
 }
+
+#[cfg(test)]
+mod test;
