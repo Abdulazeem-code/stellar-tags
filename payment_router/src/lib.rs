@@ -36,6 +36,12 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::MaxLimit, &limit);
     }
 
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        current_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
     /// The fee is calculated as a percentage (`FEE_BPS` / 10,000) of the `amount`,
