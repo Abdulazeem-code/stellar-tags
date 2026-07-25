@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol, IntoVal};
 
 #[contract]
 pub struct PaymentRouter;
@@ -43,8 +43,7 @@ impl PaymentRouter {
     /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
     ///
     /// # Events
-    /// This function does not emit custom contract events natively via `env.events().publish(...)`, but it
-    /// internally logs success messages. The underlying token transfers will emit their respective standard transfer events.
+    /// Emits 'payment_failed' event with reason if validation fails due to bounds or limits.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -56,8 +55,19 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
-        // 2. Validate the requested payment amount
-        if amount <= 0 || amount > Self::MAX_AMOUNT {
+        // 2. Validate the requested payment amount and publish event on bounds/limits failure
+        if amount <= 0 {
+            env.events().publish(
+                (Symbol::new(&env, "payment_failed"),),
+                Symbol::new(&env, "amount_invalid"),
+            );
+            return Err(Error::LimitExceeded);
+        }
+        if amount > Self::MAX_AMOUNT {
+            env.events().publish(
+                (Symbol::new(&env, "payment_failed"),),
+                Symbol::new(&env, "limit_exceeded"),
+            );
             return Err(Error::LimitExceeded);
         }
 
@@ -71,17 +81,17 @@ impl PaymentRouter {
         }
         let recipient_amount = amount - fee_amount;
 
-        // 3. Initialize the token client for the specific currency
+        // 4. Initialize the token client for the specific currency
         let token_client = token::Client::new(&env, &token_address);
 
-        // 4. Transfer the platform fee to your treasury
+        // 5. Transfer the platform fee to your treasury
         // The client moves funds directly from the sender to the treasury
         token_client.transfer(&sender, &platform_treasury, &fee_amount);
 
-        // 5. Transfer the remaining balance to the recipient (the Anchor)
+        // 6. Transfer the remaining balance to the recipient (the Anchor)
         token_client.transfer(&sender, &recipient, &recipient_amount);
 
-        // 6. Log success for testing
+        // 7. Log success for testing
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to Anchor");
 
@@ -92,5 +102,83 @@ impl PaymentRouter {
     /// This can be used by frontends to verify compatibility.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{Env, Address, Symbol, IntoVal};
+
+    #[test]
+    fn test_route_payment_amount_invalid() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
+        let token_address = Address::generate(&env);
+
+        let result = client.try_route_payment(
+            &sender,
+            &recipient,
+            &platform_treasury,
+            &token_address,
+            &0,
+        );
+
+        assert!(result.is_err());
+        
+        assert_eq!(
+            env.events().all(),
+            soroban_sdk::vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "payment_failed"),).into_val(&env),
+                    Symbol::new(&env, "amount_invalid").into_val(&env)
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn test_route_payment_limit_exceeded() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
+        let token_address = Address::generate(&env);
+
+        let result = client.try_route_payment(
+            &sender,
+            &recipient,
+            &platform_treasury,
+            &token_address,
+            &(PaymentRouter::MAX_AMOUNT + 1),
+        );
+
+        assert!(result.is_err());
+
+        assert_eq!(
+            env.events().all(),
+            soroban_sdk::vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "payment_failed"),).into_val(&env),
+                    Symbol::new(&env, "limit_exceeded").into_val(&env)
+                )
+            ]
+        );
     }
 }
