@@ -18,6 +18,9 @@ const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
+const { registerValidator } = require('./src/validators/registerValidator');
+const { validate } = require('./src/middleware/validate');
+const { validationResult } = require('express-validator');
 
 dotenv.config();
 
@@ -415,6 +418,24 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
+
+  // Run express-validator chains manually
+  for (const validator of registerValidator) {
+    await validator.run(req);
+  }
+  
+  // Check for validation errors
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(422).json({
+      success: false,
+      errors: errors.array().map(err => ({
+        field: err.path,
+        message: err.msg,
+      })),
+    });
+  }
+
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
