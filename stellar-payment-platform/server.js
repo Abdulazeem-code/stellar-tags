@@ -7,6 +7,7 @@ const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const { correlationId } = require('./middleware/correlation');
+const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
@@ -394,7 +395,7 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', async (req, res, next) => {
+app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }

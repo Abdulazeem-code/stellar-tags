@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, log, token, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env};
 
 #[derive(Clone)]
 #[soroban_sdk::contracttype]
@@ -17,19 +17,51 @@ enum DataKey {
 #[contract]
 pub struct PaymentRouter;
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    LimitExceeded = 1,
+}
+
 #[contractimpl]
 impl PaymentRouter {
     const FEE_BPS: i128 = 40;
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100k tokens with 7 decimals
     const BPS_DIVISOR: i128 = 10_000;
     const XLM_DECIMALS: i128 = 10_000_000;
     const FEE_CAP_XLM: i128 = 30;
     const FEE_CAP: i128 = Self::FEE_CAP_XLM * Self::XLM_DECIMALS;
+    const VERSION: u32 = 1;
 
     // Limits
     const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // Example limit
     const SECONDS_IN_24H: u64 = 24 * 3600;
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// The fee is calculated as a percentage (`FEE_BPS` / 10,000) of the `amount`,
+    /// capped at `FEE_CAP`. The platform fee is transferred to `platform_treasury`,
+    /// and the remaining balance is transferred to `recipient`.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the payment. Must authorize the transaction.
+    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
+    /// * `platform_treasury` - The address where the platform fee will be deposited.
+    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
+    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
+    ///
+    /// # Return Value
+    /// Returns `Ok(())` when successful.
+    ///
+    /// # Errors
+    /// * `Error::LimitExceeded` if the amount is out of supported bounds.
+    /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
+    /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
+    ///
+    /// # Events
+    /// This function does not emit custom contract events natively via `env.events().publish(...)`, but it
+    /// internally logs success messages. The underlying token transfers will emit their respective standard transfer events.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -37,7 +69,7 @@ impl PaymentRouter {
         platform_treasury: Address,
         token_address: Address,
         amount: i128,
-    ) {
+    ) -> Result<(), Error> {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
@@ -60,6 +92,12 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::UserSpending(sender.clone()), &spending);
 
         // 2. Calculate the split
+        // 2. Validate the requested payment amount
+        if amount <= 0 || amount > Self::MAX_AMOUNT {
+            return Err(Error::LimitExceeded);
+        }
+
+        // 3. Calculate the split
         let mut fee_amount = (amount * Self::FEE_BPS) / Self::BPS_DIVISOR;
         if fee_amount > Self::FEE_CAP {
             fee_amount = Self::FEE_CAP;
@@ -82,5 +120,13 @@ impl PaymentRouter {
         // 6. Log success for testing
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to Anchor");
+
+        Ok(())
+    }
+
+    /// Returns the contract version.
+    /// This can be used by frontends to verify compatibility.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
     }
 }
