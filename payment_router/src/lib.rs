@@ -1,12 +1,19 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, log, token, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env};
 
 #[contract]
 pub struct PaymentRouter;
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    LimitExceeded = 1,
+}
+
 #[contractimpl]
 impl PaymentRouter {
     const FEE_BPS: i128 = 40;
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100k tokens with 7 decimals
     const BPS_DIVISOR: i128 = 10_000;
     const XLM_DECIMALS: i128 = 10_000_000;
     const FEE_CAP_XLM: i128 = 30;
@@ -27,9 +34,10 @@ impl PaymentRouter {
     /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
     ///
     /// # Return Value
-    /// This function does not return a value.
+    /// Returns `Ok(())` when successful.
     ///
     /// # Errors
+    /// * `Error::LimitExceeded` if the amount is out of supported bounds.
     /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
     /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
     ///
@@ -43,11 +51,16 @@ impl PaymentRouter {
         platform_treasury: Address,
         token_address: Address,     // The ID of the asset being sent (e.g., NGNC or USDC)
         amount: i128,
-    ) {
+    ) -> Result<(), Error> {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
-        // 2. Calculate the split
+        // 2. Validate the requested payment amount
+        if amount <= 0 || amount > Self::MAX_AMOUNT {
+            return Err(Error::LimitExceeded);
+        }
+
+        // 3. Calculate the split
         let mut fee_amount = (amount * Self::FEE_BPS) / Self::BPS_DIVISOR;
         if fee_amount > Self::FEE_CAP {
             fee_amount = Self::FEE_CAP;
@@ -70,5 +83,7 @@ impl PaymentRouter {
         // 6. Log success for testing
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to Anchor");
+
+        Ok(())
     }
 }
