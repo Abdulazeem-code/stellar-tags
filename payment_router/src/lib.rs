@@ -18,9 +18,16 @@ pub enum RouterError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
 }
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env};
 
 #[contract]
 pub struct PaymentRouter;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    LimitExceeded = 1,
+}
 
 #[contractimpl]
 impl PaymentRouter {
@@ -101,6 +108,13 @@ impl PaymentRouter {
             .get(&DataKey::UserVolume(user))
             .unwrap_or(0)
     }
+    const FEE_BPS: i128 = 40;
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100k tokens with 7 decimals
+    const BPS_DIVISOR: i128 = 10_000;
+    const XLM_DECIMALS: i128 = 10_000_000;
+    const FEE_CAP_XLM: i128 = 30;
+    const FEE_CAP: i128 = Self::FEE_CAP_XLM * Self::XLM_DECIMALS;
+    const VERSION: u32 = 1;
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
@@ -118,10 +132,11 @@ impl PaymentRouter {
     /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
     ///
     /// # Return Value
-    /// This function does not return a value.
+    /// Returns `Ok(())` when successful.
     ///
     /// # Errors
     /// * Fails if the contract has not been initialized.
+    /// * `Error::LimitExceeded` if the amount is out of supported bounds.
     /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
     /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
     ///
@@ -163,6 +178,19 @@ impl PaymentRouter {
         let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
+    ) -> Result<(), Error> {
+        // 1. Verify the sender authorized this transaction
+        sender.require_auth();
+
+        // 2. Validate the requested payment amount
+        if amount <= 0 || amount > Self::MAX_AMOUNT {
+            return Err(Error::LimitExceeded);
+        }
+
+        // 3. Calculate the split
+        let mut fee_amount = (amount * Self::FEE_BPS) / Self::BPS_DIVISOR;
+        if fee_amount > Self::FEE_CAP {
+            fee_amount = Self::FEE_CAP;
         }
         if fee_amount > amount {
             fee_amount = amount;
@@ -204,5 +232,9 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(RouterError::NotInitialized)
+    /// Returns the contract version.
+    /// This can be used by frontends to verify compatibility.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
     }
 }

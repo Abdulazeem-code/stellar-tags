@@ -7,3 +7,6 @@ node_modules/
 
 # Legacy SQLite database (replaced by PostgreSQL/Prisma)
 data/*.db
+
+# Rotating log files (#294)
+logs/
