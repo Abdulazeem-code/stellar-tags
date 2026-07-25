@@ -1,6 +1,9 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, log, token, Address, Env};
 
+#[cfg(test)]
+mod mock_token;
+
 #[contract]
 pub struct PaymentRouter;
 
