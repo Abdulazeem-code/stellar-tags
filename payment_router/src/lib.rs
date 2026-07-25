@@ -128,6 +128,12 @@ impl PaymentRouter {
         Ok(())
     }
 
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        current_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     const VERSION: u32 = 1;
 
