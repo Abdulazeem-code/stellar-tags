@@ -6,6 +6,7 @@ use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, En
 #[repr(u32)]
 pub enum Error {
     Unauthorized = 1,
+    InsufficientBalance = 2,
 }
 // ... (rest of the code)
 #[contract]
@@ -65,6 +66,10 @@ impl PaymentRouter {
 
         // 3. Initialize the token client for the specific currency
         let token_client = token::Client::new(&env, &token_address);
+        
+        if token_client.balance(&sender) < amount {
+            return Err(Error::InsufficientBalance);
+        }
 
         // 4. Transfer the platform fee to your treasury
         // The client moves funds directly from the sender to the treasury
