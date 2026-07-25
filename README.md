@@ -162,6 +162,32 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `PORT` - (Optional) The port for the Node.js server to listen on. Defaults to `5000`.
 - `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default) or `public`.
 - `STELLAR_TAG_DOMAIN` - (Optional) Extra origin to add to the CORS allow-list.
+- `LOG_DIR` - (Optional) Directory for the rotating log files. Defaults to `stellar-payment-platform/logs`.
+- `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
+- `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
+- `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
+
+## Logging
+
+The server logs through a shared [Winston](https://github.com/winstonjs/winston) logger
+(`stellar-payment-platform/src/logger.js`). Import it instead of calling `console` directly:
+
+```js
+const { logger } = require('./src/logger');
+
+logger.info('Registered tag', { correlationId: req.correlationId, tag });
+logger.error(err);
+```
+
+Log records are written as JSON to `stellar-payment-platform/logs/`:
+
+- `application-YYYY-MM-DD.log` - everything at `LOG_LEVEL` and above.
+- `error-YYYY-MM-DD.log` - errors only, so incidents are easy to find.
+
+Both files rotate **daily and whenever they pass 20MB**, older files are gzipped, and
+anything beyond the retention window is deleted, so logs cannot exhaust the disk. A
+human-readable copy is also printed to the console (silenced when `NODE_ENV=test`, which
+also disables file output so test runs leave no logs behind).
 
 ## Detailed Endpoint Documentation
 

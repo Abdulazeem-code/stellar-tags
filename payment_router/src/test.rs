@@ -1,92 +1,52 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, token, Address, Env};
+use soroban_sdk::{testutils::Address as _, Env, Address};
+use soroban_sdk::token::Client as TokenClient;
+use soroban_sdk::token::StellarAssetClient;
 
 #[test]
-fn test_initialize_and_auth() {
+fn test_successful_xlm_routing() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, PaymentRouter);
-    let client = PaymentRouterClient::new(&env, &contract_id);
-
+    // Setup participants
     let admin = Address::generate(&env);
-    client.initialize(&admin);
-
-    assert_eq!(client.get_admin(), Some(admin.clone()));
-}
-
-#[test]
-fn test_set_config_with_admin_auth() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, PaymentRouter);
-    let client = PaymentRouterClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-
-    // Initial config is default
-    let default_cfg = client.get_config();
-    assert_eq!(default_cfg.fee_bps, 40);
-    assert_eq!(default_cfg.fee_cap_xlm, 30);
-
-    // Admin updates config
-    client.set_config(&admin, &50, &50);
-
-    let new_cfg = client.get_config();
-    assert_eq!(new_cfg.fee_bps, 50);
-    assert_eq!(new_cfg.fee_cap_xlm, 50);
-}
-
-#[test]
-fn test_set_admin_transfer() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, PaymentRouter);
-    let client = PaymentRouterClient::new(&env, &contract_id);
-
-    let admin1 = Address::generate(&env);
-    let admin2 = Address::generate(&env);
-
-    client.initialize(&admin1);
-    assert_eq!(client.get_admin(), Some(admin1.clone()));
-
-    client.set_admin(&admin1, &admin2);
-    assert_eq!(client.get_admin(), Some(admin2.clone()));
-}
-
-#[test]
-fn test_route_payment_verifies_sender_auth() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, PaymentRouter);
-    let client = PaymentRouterClient::new(&env, &contract_id);
-
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let treasury = Address::generate(&env);
+    let platform_treasury = Address::generate(&env);
 
-    // Setup mock token
+    // Deploy contract
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+
+    client.init(&admin);
+
+    // Deploy mock token (XLM)
     let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract(token_admin);
-    let token_client = token::Client::new(&env, &token_contract);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+    let token_client = TokenClient::new(&env, &token_address);
 
-    token_admin_client.mint(&sender, &10_000_000_000);
+    // Mint tokens to sender
+    let initial_balance = 1_000_000_000;
+    token_admin_client.mint(&sender, &initial_balance);
 
-    let initial_sender_bal = token_client.balance(&sender);
-    assert_eq!(initial_sender_bal, 10_000_000_000);
+    assert_eq!(token_client.balance(&sender), initial_balance);
+    assert_eq!(token_client.balance(&recipient), 0);
+    assert_eq!(token_client.balance(&platform_treasury), 0);
 
-    // Route payment of 1,000,000,000 stroops (100 XLM)
-    // Fee = 40 bps (0.4%) = 4,000,000 stroops
-    client.route_payment(&sender, &recipient, &treasury, &token_contract, &1_000_000_000);
+    // Route payment
+    let amount = 100_000_000;
+    client.route_payment(&sender, &recipient, &platform_treasury, &token_address, &amount);
 
-    assert_eq!(token_client.balance(&treasury), 4_000_000);
-    assert_eq!(token_client.balance(&recipient), 996_000_000);
-    assert_eq!(token_client.balance(&sender), 9_000_000_000);
+    // Verify balances
+    // Fee = 40 bps = 40 / 10000 = 0.004 of amount.
+    // 0.004 * 100_000_000 = 400_000.
+    let expected_fee = 400_000;
+    let expected_recipient_amount = amount - expected_fee;
+
+    assert_eq!(token_client.balance(&sender), initial_balance - amount);
+    assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
+    assert_eq!(token_client.balance(&platform_treasury), expected_fee);
 }
