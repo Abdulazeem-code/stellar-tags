@@ -1,5 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, log, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, log, token, Address, Env};
+
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    Paused,
+}
 
 #[contract]
 pub struct PaymentRouter;
@@ -11,6 +17,36 @@ impl PaymentRouter {
     const XLM_DECIMALS: i128 = 10_000_000;
     const FEE_CAP_XLM: i128 = 30;
     const FEE_CAP: i128 = Self::FEE_CAP_XLM * Self::XLM_DECIMALS;
+
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("not admin");
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+    }
+
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("not admin");
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
@@ -32,6 +68,7 @@ impl PaymentRouter {
     /// # Errors
     /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
     /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
+    /// * Fails if the contract is paused.
     ///
     /// # Events
     /// This function does not emit custom contract events natively via `env.events().publish(...)`, but it
@@ -44,6 +81,11 @@ impl PaymentRouter {
         token_address: Address,     // The ID of the asset being sent (e.g., NGNC or USDC)
         amount: i128,
     ) {
+        let is_paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
+        if is_paused {
+            panic!("contract is paused");
+        }
+
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
@@ -72,3 +114,6 @@ impl PaymentRouter {
         log!(&env, "Remaining balance routed to Anchor");
     }
 }
+
+#[cfg(test)]
+mod test;
