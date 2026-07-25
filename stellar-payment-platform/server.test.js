@@ -24,7 +24,7 @@ jest.mock('@prisma/client', () => ({
   Prisma: { PrismaClientKnownRequestError: class extends Error {} },
 }));
 
-// Prisma is mocked so the suite never touches a real database.
+// Prisma is mocked so the suite never touches a real database...
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
