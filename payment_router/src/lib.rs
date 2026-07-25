@@ -18,6 +18,7 @@ impl PaymentRouter {
     const XLM_DECIMALS: i128 = 10_000_000;
     const FEE_CAP_XLM: i128 = 30;
     const FEE_CAP: i128 = Self::FEE_CAP_XLM * Self::XLM_DECIMALS;
+    const VERSION: u32 = 1;
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
@@ -85,5 +86,11 @@ impl PaymentRouter {
         log!(&env, "Remaining balance routed to Anchor");
 
         Ok(())
+    }
+
+    /// Returns the contract version.
+    /// This can be used by frontends to verify compatibility.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
     }
 }
