@@ -29,3 +29,6 @@ data/*.db-shm
 data/*.db-wal
 jest
 stellar-payment-platform@1.0.0
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
