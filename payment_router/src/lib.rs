@@ -1,4 +1,5 @@
 #![no_std]
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol, symbol_short};
 use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol};
 
 #[contracterror]
@@ -16,6 +17,7 @@ pub struct PaymentRouter;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     LimitExceeded = 1,
+    Paused = 2,
 }
 
 #[contractimpl]
@@ -198,6 +200,11 @@ impl PaymentRouter {
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
     ) -> Result<(), Error> {
+        // 0. Check if the contract is paused (config read)
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
