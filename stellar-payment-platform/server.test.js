@@ -24,7 +24,7 @@ jest.mock('@prisma/client', () => ({
   Prisma: { PrismaClientKnownRequestError: class extends Error {} },
 }));
 
-// Prisma is mocked so the suite never touches a real database.
+// Prisma is mocked so the suite never touches a real database...
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
@@ -840,5 +840,59 @@ describe('API v1 routing', () => {
   test('GET /api/v1/federation returns 400 without q param', async () => {
     const res = await request(app).get('/api/v1/federation');
     expect(res.status).toBe(400);
+  });
+});
+
+describe('Idempotency Middleware', () => {
+  let app;
+  let request;
+  let prisma;
+
+  beforeEach(() => {
+    jest.resetModules();
+    ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
+    request = require('supertest');
+    
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.create.mockResolvedValue({
+      id: 1,
+      username: 'idempotent-user',
+      address: 'GABC123',
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('POST /register with new idempotency key succeeds and caches', async () => {
+    const payload = {
+      username: 'idempotent-user',
+      address: 'GDUMMYACCOUNTIDIIIIIIIIIIIIIIIIIIIIIIIIIIIIII',
+      signature: 'GDUMMYACCOUNTIDIIIIIIIIIIIIIIIIIIIIIIIIIIIIII'
+    };
+    
+    // First request
+    const res1 = await request(app)
+      .post('/register')
+      .set('X-Idempotency-Key', 'test-key-123')
+      .send(payload);
+    
+    expect(res1.status).toBe(201);
+    expect(res1.header['x-idempotent-replay']).toBeUndefined();
+
+    // Second request with SAME key
+    const res2 = await request(app)
+      .post('/register')
+      .set('X-Idempotency-Key', 'test-key-123')
+      .send(payload);
+    
+    expect(res2.status).toBe(201);
+    expect(res2.header['x-idempotent-replay']).toBe('true');
+    expect(res2.body).toEqual(res1.body);
+    
+    // Ensure prisma.user.create was only called once
+    expect(prisma.user.create).toHaveBeenCalledTimes(1);
   });
 });
