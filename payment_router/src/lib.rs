@@ -158,8 +158,7 @@ impl PaymentRouter {
     /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
     ///
     /// # Events
-    /// This function does not emit custom contract events natively via `env.events().publish(...)`, but it
-    /// internally logs success messages. The underlying token transfers will emit their respective standard transfer events.
+    /// Emits 'payment_failed' event with reason if validation fails due to bounds or limits.
     pub fn route_payment(
         env: Env,
         sender: Address,
