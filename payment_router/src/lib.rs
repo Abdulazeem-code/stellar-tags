@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol, symbol_short};
 
 #[contract]
 pub struct PaymentRouter;
@@ -8,6 +8,7 @@ pub struct PaymentRouter;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     LimitExceeded = 1,
+    Paused = 2,
 }
 
 #[contractimpl]
@@ -38,13 +39,11 @@ impl PaymentRouter {
     /// Returns `Ok(())` when successful.
     ///
     /// # Errors
+    /// * `Error::Paused` if the contract operations are halted.
     /// * `Error::LimitExceeded` if the amount is out of supported bounds.
     /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
     /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
     ///
-    /// # Events
-    /// This function does not emit custom contract events natively via `env.events().publish(...)`, but it
-    /// internally logs success messages. The underlying token transfers will emit their respective standard transfer events.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -53,6 +52,11 @@ impl PaymentRouter {
         token_address: Address,     // The ID of the asset being sent (e.g., NGNC or USDC)
         amount: i128,
     ) -> Result<(), Error> {
+        // 0. Check if the contract is paused (config read)
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
@@ -71,26 +75,137 @@ impl PaymentRouter {
         }
         let recipient_amount = amount - fee_amount;
 
-        // 3. Initialize the token client for the specific currency
+        // 4. Initialize the token client for the specific currency
         let token_client = token::Client::new(&env, &token_address);
 
-        // 4. Transfer the platform fee to your treasury
+        // 5. Transfer the platform fee to your treasury
         // The client moves funds directly from the sender to the treasury
         token_client.transfer(&sender, &platform_treasury, &fee_amount);
 
-        // 5. Transfer the remaining balance to the recipient (the Anchor)
+        // 6. Transfer the remaining balance to the recipient (the Anchor)
         token_client.transfer(&sender, &recipient, &recipient_amount);
 
-        // 6. Log success for testing
+        // 7. Log success for testing
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to Anchor");
 
         Ok(())
     }
 
+    /// Toggles the paused state of the contract (config write).
+    /// Bumps/extends the instance storage TTL.
+    /// Only the registered admin can perform this operation.
+    pub fn set_pause(env: Env, admin: Address, paused: bool) {
+        admin.require_auth();
+
+        // Extend Instance storage TTL (colloquially known as bumping TTL)
+        env.storage().instance().extend_ttl(100, 200);
+
+        if let Some(stored_admin) = Self::admin(env.clone()) {
+            if admin != stored_admin {
+                panic!("not authorized");
+            }
+        } else {
+            env.storage().instance().set(&symbol_short!("admin"), &admin);
+        }
+
+        env.storage().instance().set(&symbol_short!("paused"), &paused);
+    }
+
+    /// Returns whether the contract operations are halted (config read).
+    /// Bumps/extends the instance storage TTL.
+    pub fn is_paused(env: Env) -> bool {
+        // Extend Instance storage TTL (colloquially known as bumping TTL)
+        env.storage().instance().extend_ttl(100, 200);
+
+        env.storage().instance().get(&symbol_short!("paused")).unwrap_or(false)
+    }
+
+    /// Returns the registered administrator address, if set (config read).
+    /// Bumps/extends the instance storage TTL.
+    pub fn admin(env: Env) -> Option<Address> {
+        // Extend Instance storage TTL (colloquially known as bumping TTL)
+        env.storage().instance().extend_ttl(100, 200);
+
+        env.storage().instance().get(&symbol_short!("admin"))
+    }
+
     /// Returns the contract version.
     /// This can be used by frontends to verify compatibility.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{Env, Address};
+
+    #[test]
+    fn test_set_pause_and_routing_with_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
+        let token_address = Address::generate(&env);
+
+        // Initially contract is not paused and admin is not set
+        assert!(!client.is_paused());
+        assert_eq!(client.admin(), None);
+
+        // Set paused to true using admin
+        client.set_pause(&admin, &true);
+        assert!(client.is_paused());
+        assert_eq!(client.admin(), Some(admin.clone()));
+
+        // Try to route payment, it should fail with Paused error
+        let result = client.try_route_payment(
+            &sender,
+            &recipient,
+            &platform_treasury,
+            &token_address,
+            &1000,
+        );
+        assert_eq!(result, Err(Ok(Error::Paused)));
+
+        // Unpause the contract using the admin
+        client.set_pause(&admin, &false);
+        assert!(!client.is_paused());
+
+        // Now routing should pass the pause check and hit the amount validation
+        let result_invalid_amount = client.try_route_payment(
+            &sender,
+            &recipient,
+            &platform_treasury,
+            &token_address,
+            &0,
+        );
+        assert_eq!(result_invalid_amount, Err(Ok(Error::LimitExceeded)));
+    }
+
+    #[test]
+    #[should_panic(expected = "not authorized")]
+    fn test_set_pause_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // First caller registers as admin
+        client.set_pause(&admin, &true);
+
+        // Non-admin tries to toggle pause, which should panic
+        client.set_pause(&attacker, &false);
     }
 }
