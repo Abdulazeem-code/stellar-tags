@@ -129,6 +129,10 @@ impl PaymentRouter {
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     const VERSION: u32 = 1;
 
+    // Limits
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // Example limit
+    const SECONDS_IN_24H: u64 = 24 * 3600;
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
     /// The fee is calculated as a percentage (`fee_bps` / 10,000) of the `amount`,
@@ -161,6 +165,9 @@ impl PaymentRouter {
         sender: Address,
         recipient: Address, // For fiat withdrawals, this is the Anchor's wallet
         token_address: Address, // The ID of the asset being sent (e.g., NGNC or USDC)
+        recipient: Address,
+        platform_treasury: Address,
+        token_address: Address,
         amount: i128,
     ) -> Result<(), RouterError> {
         // 1. Verify the sender authorized this transaction
@@ -195,6 +202,25 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
+        // 1.5 Check spending limits
+        let current_time = env.ledger().timestamp();
+        let mut spending = env.storage().instance().get(&DataKey::UserSpending(sender.clone()))
+            .unwrap_or(UserSpending { last_reset_time: current_time, accumulated_amount: 0 });
+
+        if current_time - spending.last_reset_time >= Self::SECONDS_IN_24H {
+            spending.last_reset_time = current_time;
+            spending.accumulated_amount = 0;
+        }
+
+        spending.accumulated_amount += amount;
+
+        if spending.accumulated_amount > Self::DAILY_MAX_LIMIT {
+            panic!("Daily spending limit exceeded");
+        }
+
+        env.storage().instance().set(&DataKey::UserSpending(sender.clone()), &spending);
+
+        // 2. Calculate the split
         // 2. Validate the requested payment amount
         if amount <= 0 || amount > Self::MAX_AMOUNT {
             return Err(Error::LimitExceeded);
