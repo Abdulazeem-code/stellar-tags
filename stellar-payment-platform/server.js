@@ -343,6 +343,13 @@ const verifyFreighterRegistrationSignature = ({
 }) => {
   const message = `register:${username}:${address}`;
   const claimedSigner = signerAddress || address;
+
+  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
+    const error = new Error('Invalid signer address format.');
+    error.statusCode = 400;
+    throw error;
+  }
+
   const keypair = Keypair.fromPublicKey(claimedSigner);
 
   let signatureBuffer;
@@ -365,12 +372,6 @@ const verifyFreighterRegistrationSignature = ({
   if (!keypair.verify(messageHash, signatureBuffer)) {
     const error = new Error('Signature verification failed.');
     error.statusCode = 401;
-    throw error;
-  }
-
-  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error('Invalid signer address format.');
-    error.statusCode = 400;
     throw error;
   }
 
