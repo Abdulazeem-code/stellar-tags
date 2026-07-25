@@ -1,41 +1,81 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, log, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, log, token, Address, Env};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Admin,
+    Config,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub fee_bps: i128,
+    pub fee_cap_xlm: i128,
+}
 
 #[contract]
 pub struct PaymentRouter;
 
 #[contractimpl]
 impl PaymentRouter {
-    const FEE_BPS: i128 = 40;
+    const DEFAULT_FEE_BPS: i128 = 40;
     const BPS_DIVISOR: i128 = 10_000;
     const XLM_DECIMALS: i128 = 10_000_000;
-    const FEE_CAP_XLM: i128 = 30;
-    const FEE_CAP: i128 = Self::FEE_CAP_XLM * Self::XLM_DECIMALS;
+    const DEFAULT_FEE_CAP_XLM: i128 = 30;
+
+    /// Initializes the contract admin.
+    /// Requires authorization from `admin`.
+    pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    /// Sets or updates the contract admin.
+    /// Requires authorization from `current_admin`.
+    pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) {
+        current_admin.require_auth();
+        if let Some(stored_admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+            if stored_admin != current_admin {
+                panic!("unauthorized admin change");
+            }
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
+    /// Sets the platform fee configuration (`fee_bps` and `fee_cap_xlm`).
+    /// Requires authorization from `admin`.
+    pub fn set_config(env: Env, admin: Address, fee_bps: i128, fee_cap_xlm: i128) {
+        admin.require_auth();
+        if let Some(stored_admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+            if stored_admin != admin {
+                panic!("unauthorized config change");
+            }
+        }
+        let config = Config { fee_bps, fee_cap_xlm };
+        env.storage().instance().set(&DataKey::Config, &config);
+        log!(&env, "Fee configuration updated by admin");
+    }
+
+    /// Gets the stored admin address, if any.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Gets the current fee configuration (or defaults).
+    pub fn get_config(env: Env) -> Config {
+        env.storage().instance().get(&DataKey::Config).unwrap_or(Config {
+            fee_bps: Self::DEFAULT_FEE_BPS,
+            fee_cap_xlm: Self::DEFAULT_FEE_CAP_XLM,
+        })
+    }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
-    ///
-    /// The fee is calculated as a percentage (`FEE_BPS` / 10,000) of the `amount`,
-    /// capped at `FEE_CAP`. The platform fee is transferred to `platform_treasury`,
-    /// and the remaining balance is transferred to `recipient`.
-    ///
-    /// # Parameters
-    /// * `env` - The Soroban environment interface.
-    /// * `sender` - The address initiating the payment. Must authorize the transaction.
-    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
-    /// * `platform_treasury` - The address where the platform fee will be deposited.
-    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
-    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
-    ///
-    /// # Return Value
-    /// This function does not return a value.
-    ///
-    /// # Errors
-    /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
-    /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
-    ///
-    /// # Events
-    /// This function does not emit custom contract events natively via `env.events().publish(...)`, but it
-    /// internally logs success messages. The underlying token transfers will emit their respective standard transfer events.
+    /// Requires authorization from `sender`.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -47,10 +87,14 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
+        // Fetch stored config or fall back to default constants
+        let config = Self::get_config(env.clone());
+        let fee_cap = config.fee_cap_xlm * Self::XLM_DECIMALS;
+
         // 2. Calculate the split
-        let mut fee_amount = (amount * Self::FEE_BPS) / Self::BPS_DIVISOR;
-        if fee_amount > Self::FEE_CAP {
-            fee_amount = Self::FEE_CAP;
+        let mut fee_amount = (amount * config.fee_bps) / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
         }
         if fee_amount > amount {
             fee_amount = amount;
@@ -72,3 +116,6 @@ impl PaymentRouter {
         log!(&env, "Remaining balance routed to Anchor");
     }
 }
+
+#[cfg(test)]
+mod test;
