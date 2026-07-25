@@ -1,6 +1,19 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, log, token, Address, Env};
 
+#[derive(Clone)]
+#[soroban_sdk::contracttype]
+pub struct UserSpending {
+    pub last_reset_time: u64,
+    pub accumulated_amount: i128,
+}
+
+#[derive(Clone)]
+#[soroban_sdk::contracttype]
+enum DataKey {
+    UserSpending(Address),
+}
+
 #[contract]
 pub struct PaymentRouter;
 
@@ -12,40 +25,39 @@ impl PaymentRouter {
     const FEE_CAP_XLM: i128 = 30;
     const FEE_CAP: i128 = Self::FEE_CAP_XLM * Self::XLM_DECIMALS;
 
+    // Limits
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // Example limit
+    const SECONDS_IN_24H: u64 = 24 * 3600;
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
-    ///
-    /// The fee is calculated as a percentage (`FEE_BPS` / 10,000) of the `amount`,
-    /// capped at `FEE_CAP`. The platform fee is transferred to `platform_treasury`,
-    /// and the remaining balance is transferred to `recipient`.
-    ///
-    /// # Parameters
-    /// * `env` - The Soroban environment interface.
-    /// * `sender` - The address initiating the payment. Must authorize the transaction.
-    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
-    /// * `platform_treasury` - The address where the platform fee will be deposited.
-    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
-    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
-    ///
-    /// # Return Value
-    /// This function does not return a value.
-    ///
-    /// # Errors
-    /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
-    /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
-    ///
-    /// # Events
-    /// This function does not emit custom contract events natively via `env.events().publish(...)`, but it
-    /// internally logs success messages. The underlying token transfers will emit their respective standard transfer events.
     pub fn route_payment(
         env: Env,
         sender: Address,
-        recipient: Address,         // For fiat withdrawals, this is the Anchor's wallet
+        recipient: Address,
         platform_treasury: Address,
-        token_address: Address,     // The ID of the asset being sent (e.g., NGNC or USDC)
+        token_address: Address,
         amount: i128,
     ) {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
+
+        // 1.5 Check spending limits
+        let current_time = env.ledger().timestamp();
+        let mut spending = env.storage().instance().get(&DataKey::UserSpending(sender.clone()))
+            .unwrap_or(UserSpending { last_reset_time: current_time, accumulated_amount: 0 });
+
+        if current_time - spending.last_reset_time >= Self::SECONDS_IN_24H {
+            spending.last_reset_time = current_time;
+            spending.accumulated_amount = 0;
+        }
+
+        spending.accumulated_amount += amount;
+
+        if spending.accumulated_amount > Self::DAILY_MAX_LIMIT {
+            panic!("Daily spending limit exceeded");
+        }
+
+        env.storage().instance().set(&DataKey::UserSpending(sender.clone()), &spending);
 
         // 2. Calculate the split
         let mut fee_amount = (amount * Self::FEE_BPS) / Self::BPS_DIVISOR;
