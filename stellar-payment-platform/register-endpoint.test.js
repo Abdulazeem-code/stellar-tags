@@ -15,6 +15,41 @@ jest.mock("@stellar/stellar-sdk", () => ({
 jest.mock("pdfkit", () => jest.fn());
 jest.mock("./src/cleanup-cron", () => ({ scheduleCleanupJob: jest.fn() }));
 
+jest.mock("sqlite3", () => ({
+  verbose: () => ({
+    Database: jest.fn().mockImplementation((_path, cb) => {
+      const db = {
+        run: jest.fn(function (...args) {
+          const fn = args.find((a) => typeof a === "function");
+          if (fn) fn.call(this, null);
+        }),
+        serialize: jest.fn((fn) => fn && fn()),
+        close: jest.fn((cb) => cb && cb()),
+      };
+      if (cb) cb(null);
+      return db;
+    }),
+  }),
+}));
+
+jest.mock("generic-pool", () => ({
+  createPool: jest.fn(() => ({
+    acquire: jest.fn().mockResolvedValue({
+      run: jest.fn(function (...args) {
+        const fn = args.find((a) => typeof a === "function");
+        if (fn) fn.call(this, null, undefined);
+      }),
+      all: jest.fn(function (...args) {
+        const fn = args.find((a) => typeof a === "function");
+        if (fn) fn.call(this, null, []);
+      }),
+    }),
+    release: jest.fn(),
+    drain: jest.fn().mockResolvedValue(undefined),
+    clear: jest.fn().mockResolvedValue(undefined),
+  })),
+}));
+
 jest.mock("./prismaClient", () => ({
   prisma: {
     user: {
@@ -98,7 +133,11 @@ describe("POST /register - integration test coverage", () => {
       .send({ username: "bob", address: VALID_ADDRESS });
 
     expect(response.status).toBe(409);
-    expect(response.body).toEqual({ error: "Address already registered" });
+    expect(response.body).toMatchObject({
+      success: false,
+      error: "Address already registered",
+      statusCode: 409,
+    });
   });
 
   test("returns 400 when required payload fields are missing", async () => {
