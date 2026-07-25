@@ -17,6 +17,7 @@ const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
 
 dotenv.config();
 
@@ -57,6 +58,10 @@ const corsOptions = {
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+
+// Apply metrics middleware to track all HTTP requests
+app.use(metricsMiddleware);
+
 const redisClient = process.env.REDIS_URL ? createClient({
   url: process.env.REDIS_URL
 }) : null;
@@ -226,6 +231,17 @@ const registerLocalUser = async ({ username, address }) => {
     [username, address, new Date().toISOString()],
   );
 };
+
+// Expose /metrics endpoint for Prometheus to scrape
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', getContentType());
+    const metrics = await getMetrics();
+    res.end(metrics);
+  } catch (err) {
+    res.status(500).end(err.message);
+  }
+});
 
 app.get('/federation', etagCache, async (req, res, next) => {
   const { q, type } = req.query;
