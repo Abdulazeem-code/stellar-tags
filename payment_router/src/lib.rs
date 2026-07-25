@@ -1,23 +1,6 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserSpending {
-    pub last_reset_time: u64,
-    pub accumulated_amount: i128,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    PlatformTreasury,
-    FeeBps,
-    FeeCap,
-    UserVolume(Address),
-    UserSpending(Address),
-}
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol, symbol_short};
+use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -32,6 +15,13 @@ pub enum Error {
 
 #[contract]
 pub struct PaymentRouter;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    LimitExceeded = 1,
+    Paused = 2,
+}
 
 #[contractimpl]
 impl PaymentRouter {
@@ -144,10 +134,18 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Returns the contract version.
-    pub fn version(_env: Env) -> u32 {
-        Self::VERSION
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        current_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
+
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    const VERSION: u32 = 1;
+
+    // Limits
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // Example limit
+    const SECONDS_IN_24H: u64 = 24 * 3600;
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
@@ -212,7 +210,20 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        // 4. Check time-based daily spending limits
+        // 3. Calculate the split
+        let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+    ) -> Result<(), Error> {
+        // 0. Check if the contract is paused (config read)
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        // 1. Verify the sender authorized this transaction
+        sender.require_auth();
+
+        // 1.5 Check spending limits
         let current_time = env.ledger().timestamp();
         let mut spending = env
             .storage()
