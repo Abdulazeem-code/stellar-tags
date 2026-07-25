@@ -156,6 +156,25 @@ impl PaymentRouter {
     /// read from instance storage set via `initialize`.
     /// The platform fee is transferred to the configured treasury, and the
     /// remaining balance is transferred to `recipient`.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the payment. Must authorize the transaction.
+    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
+    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
+    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
+    ///
+    /// # Return Value
+    /// Returns `Ok(())` when successful.
+    ///
+    /// # Errors
+    /// * Fails if the contract has not been initialized.
+    /// * `Error::LimitExceeded` if the amount is out of supported bounds.
+    /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
+    /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
+    ///
+    /// # Events
+    /// Emits 'payment_failed' event with reason if validation fails due to bounds or limits.
     pub fn route_payment(
         env: Env,
         sender: Address,
