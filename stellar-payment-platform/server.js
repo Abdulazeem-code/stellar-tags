@@ -17,8 +17,15 @@ const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const Sentry = require('@sentry/node');
 
 dotenv.config();
+
+// #295 — Only report to Sentry when a DSN is configured, so local/dev/test
+// runs without SENTRY_DSN never try to reach out to Sentry.
+if (process.env.SENTRY_DSN) {
+  Sentry.init({ dsn: process.env.SENTRY_DSN });
+}
 
 const app = express();
 
@@ -735,9 +742,15 @@ app.use((err, _req, _res, next) => {
   next(err);
 });
 
+// #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
+// they reach our own JSON error handler below.
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
+
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
