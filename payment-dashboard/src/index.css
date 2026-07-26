@@ -232,6 +232,13 @@ body::before {
   transform: translateY(-1px);
 }
 
+.nav button[aria-current="page"] {
+  font-weight: 700;
+  border-bottom: 2px solid #30d5c8;
+  background: rgba(48, 213, 200, 0.15);
+  color: #ffffff;
+}
+
 .sidebar-card {
   background: rgba(15, 23, 42, 0.6);
   border: 1px solid rgba(148, 163, 184, 0.2);
@@ -540,6 +547,36 @@ body::before {
   color: var(--muted);
   font-weight: 500;
   margin-left: 6px;
+}
+
+.privacy-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+  margin-left: 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.2s ease;
+}
+
+.privacy-toggle:hover {
+  color: var(--ink);
+}
+
+.privacy-toggle svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .badge {
