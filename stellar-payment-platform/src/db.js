@@ -148,27 +148,7 @@ const normalizeNameTag = (value) => {
   return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
 };
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'registrations.db');
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-const db = attachAsyncDbMethods(new sqlite3.Database(dbPath));
-
-(async () => {
-  try {
-    await db.runAsync(
-      `CREATE TABLE IF NOT EXISTS username_registry (
-        username TEXT PRIMARY KEY,
-        address TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      )`,
-    );
-  } catch (err) {
-    console.error('Failed to initialize direct database schema:', err);
-  }
-})();
-
-// Start the weekly background job that prunes/flags stale registrations.
-scheduleCleanupJob(db);
 
 const etagCache = (req, res, next) => {
   const originalJson = res.json.bind(res);
