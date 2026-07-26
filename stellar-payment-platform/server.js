@@ -19,8 +19,15 @@ const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const swaggerUi = require('swagger-ui-express');
 const { swaggerSpec } = require('./src/swagger');
+const Sentry = require('@sentry/node');
 
 dotenv.config();
+
+// #295 — Only report to Sentry when a DSN is configured, so local/dev/test
+// runs without SENTRY_DSN never try to reach out to Sentry.
+if (process.env.SENTRY_DSN) {
+  Sentry.init({ dsn: process.env.SENTRY_DSN });
+}
 
 const app = express();
 
@@ -431,6 +438,13 @@ const verifyFreighterRegistrationSignature = ({
 }) => {
   const message = `register:${username}:${address}`;
   const claimedSigner = signerAddress || address;
+
+  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
+    const error = new Error('Invalid signer address format.');
+    error.statusCode = 400;
+    throw error;
+  }
+
   const keypair = Keypair.fromPublicKey(claimedSigner);
 
   let signatureBuffer;
@@ -453,12 +467,6 @@ const verifyFreighterRegistrationSignature = ({
   if (!keypair.verify(messageHash, signatureBuffer)) {
     const error = new Error('Signature verification failed.');
     error.statusCode = 401;
-    throw error;
-  }
-
-  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error('Invalid signer address format.');
-    error.statusCode = 400;
     throw error;
   }
 
@@ -1078,6 +1086,12 @@ app.use((err, _req, _res, next) => {
   }
   next(err);
 });
+
+// #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
+// they reach our own JSON error handler below.
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
 
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
