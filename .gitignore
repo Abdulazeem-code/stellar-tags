@@ -29,3 +29,6 @@ data/*.db-shm
 data/*.db-wal
 jest
 stellar-payment-platform@1.0.0
+
+# Soroban test snapshots
+test_snapshots/
