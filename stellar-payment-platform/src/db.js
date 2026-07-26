@@ -23,7 +23,7 @@ const parseDbPath = (raw) => {
   return {
     filePath,
     connectionLimit: parseInt(params.connection_limit, 10) || 10,
-    poolTimeout: parseInt(params.pool_timeout, 10) || 5,
+    poolTimeout: parseInt(params.pool_timeout, 10) || 60,
   };
 };
 
