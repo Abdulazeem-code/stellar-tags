@@ -286,8 +286,9 @@ app.get('/federation', etagCache, async (req, res, next) => {
 });
 
 const { StrKey } = require('@stellar/stellar-sdk');
+const { validateRegister } = require('./src/validation');
 
-app.post('/register', async (req, res, next) => {
+app.post('/register', validateRegister, async (req, res, next) => {
   const username = normalizeNameTag(req.body.username);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
   const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
@@ -529,4 +530,4 @@ if (require.main === module) {
   process.on('SIGINT',  (sig) => gracefulShutdown(server, dbPool, sig));
 }
 
-module.exports = { app, poolGet, poolAll, gracefulShutdown, rejectNestedObjects };
+module.exports = { app, poolGet, poolAll, gracefulShutdown, rejectNestedObjects, validateRegister };

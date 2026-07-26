@@ -208,3 +208,162 @@ describe('rejectNestedObjects middleware', () => {
     expect(res.status).not.toHaveBeenCalled();
   });
 });
+
+describe('validateRegister middleware', () => {
+  let validateRegister;
+  let res;
+  let next;
+
+  beforeAll(() => {
+    ({ validateRegister } = require('./server'));
+  });
+
+  beforeEach(() => {
+    res = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+    next = jest.fn();
+  });
+
+  // ── happy-path ────────────────────────────────────────────────────────────
+
+  test('passes through a valid username and Stellar address', () => {
+    const req = {
+      body: {
+        username: 'alice123',
+        address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  test('passes through a 3-character username (minimum length)', () => {
+    const req = {
+      body: {
+        username: 'abc',
+        address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  test('passes through a 20-character username (maximum length)', () => {
+    const req = {
+      body: {
+        username: 'a'.repeat(20),
+        address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  // ── username failures ─────────────────────────────────────────────────────
+
+  test('rejects 400 when username is missing', () => {
+    const req = {
+      body: { address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ' },
+    };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    const body = res.json.mock.calls[0][0];
+    expect(body.errors.some((e) => e.field === 'username')).toBe(true);
+  });
+
+  test('rejects 400 when username is too short (2 chars)', () => {
+    const req = {
+      body: {
+        username: 'ab',
+        address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('rejects 400 when username is too long (21 chars)', () => {
+    const req = {
+      body: {
+        username: 'a'.repeat(21),
+        address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('rejects 400 when username contains non-alphanumeric characters', () => {
+    const req = {
+      body: {
+        username: 'alice!',
+        address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('rejects 400 when username contains spaces', () => {
+    const req = {
+      body: {
+        username: 'alice bob',
+        address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  // ── address failures ──────────────────────────────────────────────────────
+
+  test('rejects 400 when address is missing', () => {
+    const req = { body: { username: 'alice' } };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    const body = res.json.mock.calls[0][0];
+    expect(body.errors.some((e) => e.field === 'address')).toBe(true);
+  });
+
+  test('rejects 400 when address does not start with G', () => {
+    const req = {
+      body: {
+        username: 'alice',
+        // Same length but starts with S (secret key prefix)
+        address: 'SAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      },
+    };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('rejects 400 when address is too short', () => {
+    const req = {
+      body: { username: 'alice', address: 'GABC123' },
+    };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('rejects 400 when both username and address are invalid (reports both errors)', () => {
+    const req = { body: { username: 'x!', address: 'invalid' } };
+    validateRegister(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    const body = res.json.mock.calls[0][0];
+    const fields = body.errors.map((e) => e.field);
+    expect(fields).toContain('username');
+    expect(fields).toContain('address');
+  });
+});

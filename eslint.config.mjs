@@ -15,5 +15,13 @@ export default [
       "no-unused-vars": "warn",
       "no-undef": "error"
     }
+  },
+  {
+    files: ["**/*.test.js", "**/*.spec.js"],
+    languageOptions: {
+      globals: {
+        ...globals.jest
+      }
+    }
   }
 ];
