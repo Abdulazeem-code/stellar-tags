@@ -7,6 +7,7 @@ const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const { correlationId } = require('./middleware/correlation');
+const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
@@ -16,8 +17,15 @@ const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const Sentry = require('@sentry/node');
 
 dotenv.config();
+
+// #295 — Only report to Sentry when a DSN is configured, so local/dev/test
+// runs without SENTRY_DSN never try to reach out to Sentry.
+if (process.env.SENTRY_DSN) {
+  Sentry.init({ dsn: process.env.SENTRY_DSN });
+}
 
 const app = express();
 
@@ -342,6 +350,13 @@ const verifyFreighterRegistrationSignature = ({
 }) => {
   const message = `register:${username}:${address}`;
   const claimedSigner = signerAddress || address;
+
+  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
+    const error = new Error('Invalid signer address format.');
+    error.statusCode = 400;
+    throw error;
+  }
+
   const keypair = Keypair.fromPublicKey(claimedSigner);
 
   let signatureBuffer;
@@ -367,12 +382,6 @@ const verifyFreighterRegistrationSignature = ({
     throw error;
   }
 
-  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error('Invalid signer address format.');
-    error.statusCode = 400;
-    throw error;
-  }
-
   if (claimedSigner !== address) {
     const error = new Error('Signer address does not match the connected wallet.');
     error.statusCode = 401;
@@ -394,7 +403,7 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', async (req, res, next) => {
+app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
@@ -734,9 +743,15 @@ app.use((err, _req, _res, next) => {
   next(err);
 });
 
+// #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
+// they reach our own JSON error handler below.
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
+
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 

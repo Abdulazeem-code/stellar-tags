@@ -1,18 +1,21 @@
-# Use official Node.js image as base
-FROM node:22-alpine
-
-# Set working directory inside the container
+# ---- Builder: install all dependencies and generate the Prisma client ----
+FROM node:20-alpine AS builder
 WORKDIR /app
 
-# Copy all project files into the container
-COPY . .
+COPY stellar-payment-platform/package*.json ./
+COPY stellar-payment-platform/prisma ./prisma
+RUN npm ci
 
-# Install root dependencies AND backend-specific dependencies
-RUN npm install --legacy-peer-deps
-RUN npm install --prefix stellar-payment-platform --legacy-peer-deps
+COPY stellar-payment-platform/ .
+RUN npx prisma generate
 
-# Expose the backend port (update if your app uses a different port)
+# ---- Runtime: only production dependencies and built app ----
+FROM node:20-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=builder /app /app
+RUN npm prune --omit=dev
+
 EXPOSE 5000
-
-# Start the application from the backend directory
-CMD ["npm", "--prefix", "stellar-payment-platform", "start"]
+CMD ["node", "server.js"]

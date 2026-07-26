@@ -7,6 +7,8 @@ import NetworkBadge from '../NetworkBadge';
 import { useDebounce } from '../useDebounce';
 import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
+import RecentAddresses from '../components/RecentAddresses';
+import { useRecentAddresses } from '../useRecentAddresses';
 import {
   API_BASE,
   CONTRACT_ID,
@@ -52,6 +54,8 @@ function Dashboard({
     action()
   }
   const [nameTag, setNameTag] = useState('')
+  const [showRecent, setShowRecent] = useState(false);
+  const { recentAddresses, saveAddress, clearAddresses } = useRecentAddresses();
   const recipientRef = useRef(null);
   const debouncedNameTag = useDebounce(nameTag, 300)
   const [amount, setAmount] = useState('')
@@ -341,6 +345,7 @@ function Dashboard({
         );
 
         displayMessage("Payment successful!", "#059669", "#D1FAE5");
+        saveAddress(recipientInput);
         setAmount("");
         onRefreshBalance();
         window.dispatchEvent(new Event("stellar:tx-update"));
@@ -566,15 +571,32 @@ function Dashboard({
                   <div className="wallet-status">{walletLabel}</div>
                 )}
                 <label>Recipient username or address</label>
-                <input
-                  ref={recipientRef}
-                  type="text"
-                  value={nameTag}
-                  onChange={(event) => setNameTag(event.target.value)}
-                  placeholder="e.g., walzeem or G..."
-                  autoComplete="off"
-                  disabled={!userPublicKey || isProcessing}
-                />
+                <div style={{ position: 'relative' }}>
+                  <input
+                    ref={recipientRef}
+                    type="text"
+                    value={nameTag}
+                    onChange={(event) => {
+                      setNameTag(event.target.value);
+                      setShowRecent(true);
+                    }}
+                    onFocus={() => setShowRecent(true)}
+                    placeholder="e.g., walzeem or G..."
+                    autoComplete="off"
+                    disabled={!userPublicKey || isProcessing}
+                  />
+                  <RecentAddresses
+                    addresses={recentAddresses}
+                    isVisible={showRecent && recentAddresses.length > 0}
+                    onSelect={(address) => {
+                      setNameTag(address);
+                      setShowRecent(false);
+                      recipientRef.current?.focus();
+                    }}
+                    onClear={clearAddresses}
+                    onClose={() => setShowRecent(false)}
+                  />
+                </div>
                 {nameTag === userPublicKey && (
                   <span className="field-error">Warning: You are sending funds to your own address.</span>
                 )}
