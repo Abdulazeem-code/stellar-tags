@@ -1,6 +1,30 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol, symbol_short};
-use soroban_sdk::{contract, contracterror, contractimpl, log, token, Address, Env, Symbol};
+
+//! # Storage Architecture — Issue #268
+//!
+//! ## Storage Type Guide
+//! - **Instance storage**: Contract-global data (admin, config, counters).
+//!   Shared TTL with the contract instance. Low fee.
+//! - **Persistent storage**: User-specific or per-record data.
+//!   Independent TTL per entry. Higher fee but survives contract upgrades.
+//! - **Temporary storage**: Short-lived data (nonces, session state).
+//!   Cheapest, auto-expires after TTL.
+//!
+//! ## Current Storage Map
+//! | DataKey | Storage Type | Rationale |
+//! |---------|-------------|-----------|
+//! | Admin | Instance | Contract-global admin address |
+//! | PlatformTreasury | Instance | Contract-global config |
+//! | FeeBps | Instance | Contract-global config |
+//! | FeeCap | Instance | Contract-global config |
+//! | UserVolume(Address) | Persistent | Per-user cumulative volume |
+//! | UserSpending(Address) | Persistent | Per-user daily spending tracker |
+//!
+//! ## TTL Policy
+//! - Instance: extend on every admin/config operation
+//! - Persistent: extend on every user interaction with that record
+
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -11,17 +35,29 @@ pub enum Error {
     LimitExceeded = 3,
     AlreadyInitialized = 4,
     NotInitialized = 5,
+    Paused = 6,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    PlatformTreasury,
+    FeeBps,
+    FeeCap,
+    UserVolume(Address),
+    UserSpending(Address),
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserSpending {
+    pub last_reset_time: u64,
+    pub accumulated_amount: i128,
 }
 
 #[contract]
 pub struct PaymentRouter;
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Error {
-    LimitExceeded = 1,
-    Paused = 2,
-}
 
 #[contractimpl]
 impl PaymentRouter {
@@ -35,8 +71,8 @@ impl PaymentRouter {
 
     // Persistent storage entries have independent TTLs, so per-user data is
     // extended on its own schedule instead of riding on the contract's TTL.
-    const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
-    const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+    const PERSISTENT_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
+    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::PERSISTENT_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
 
     const XLM_DECIMALS: i128 = 10_000_000;
     const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
@@ -138,14 +174,11 @@ impl PaymentRouter {
         let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         current_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
     }
-
-    /// Routes a payment from a sender to a recipient, deducting a platform fee.
-    const VERSION: u32 = 1;
-
-    // Limits
-    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // Example limit
-    const SECONDS_IN_24H: u64 = 24 * 3600;
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
@@ -167,12 +200,9 @@ impl PaymentRouter {
     ///
     /// # Errors
     /// * Fails if the contract has not been initialized.
-    /// * `Error::LimitExceeded` if the amount is out of supported bounds.
+    /// * `Error::LimitExceeded` if the amount is out of supported bounds or daily limit exceeded.
     /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
     /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
-    ///
-    /// # Events
-    /// Emits 'payment_failed' event with reason if validation fails due to bounds or limits.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -205,30 +235,19 @@ impl PaymentRouter {
             .get(&DataKey::FeeCap)
             .ok_or(Error::NotInitialized)?;
 
+        // Extend instance storage TTL after reading config
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        // 3. Calculate the split
-        let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
-        if fee_amount > fee_cap {
-            fee_amount = fee_cap;
-    ) -> Result<(), Error> {
-        // 0. Check if the contract is paused (config read)
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
-
-        // 1. Verify the sender authorized this transaction
-        sender.require_auth();
-
-        // 1.5 Check spending limits
+        // 4. Check spending limits — UserSpending is per-user (persistent storage)
         let current_time = env.ledger().timestamp();
+        let spending_key = DataKey::UserSpending(sender.clone());
         let mut spending = env
             .storage()
-            .instance()
-            .get(&DataKey::UserSpending(sender.clone()))
+            .persistent()
+            .get(&spending_key)
             .unwrap_or(UserSpending {
                 last_reset_time: current_time,
                 accumulated_amount: 0,
@@ -245,9 +264,15 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
+        // Store spending back in persistent storage and extend its TTL
         env.storage()
-            .instance()
-            .set(&DataKey::UserSpending(sender.clone()), &spending);
+            .persistent()
+            .set(&spending_key, &spending);
+        env.storage().persistent().extend_ttl(
+            &spending_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
 
         // 5. Initialize the token client
         let token_client = token::Client::new(&env, &token_address);
@@ -283,8 +308,8 @@ impl PaymentRouter {
             .set(&volume_key, &(prev_volume + amount));
         env.storage().persistent().extend_ttl(
             &volume_key,
-            Self::USER_LIFETIME_THRESHOLD,
-            Self::USER_BUMP_AMOUNT,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
         );
 
         // Log success for testing
