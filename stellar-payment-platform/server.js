@@ -17,6 +17,8 @@ const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const swaggerUi = require('swagger-ui-express');
+const { swaggerSpec } = require('./src/swagger');
 
 dotenv.config();
 
@@ -107,6 +109,14 @@ app.use(rejectNestedObjects);
 
 // Enable HTTP response compression for responses exceeding 1KB (1024 bytes)
 app.use(compression({ threshold: 1024 }));
+
+// ---------------------------------------------------------------------------
+// Swagger UI — interactive API documentation available at /api-docs
+// ---------------------------------------------------------------------------
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customSiteTitle: 'Stellar Tags API Docs',
+  swaggerOptions: { persistAuthorization: true },
+}));
 
 scheduleCleanupJob(prisma);
 
@@ -227,6 +237,84 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
+/**
+ * @swagger
+ * /federation:
+ *   get:
+ *     summary: Resolve a username tag or Stellar address via the federation protocol
+ *     description: >
+ *       Implements the Stellar federation protocol. Use `type=name` (default) to
+ *       resolve a username tag (e.g. `alice*localhost`) to a Stellar address, or
+ *       `type=id` to do the reverse lookup by Stellar public key.
+ *     tags:
+ *       - Federation
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: >
+ *           The value to look up. For `type=name` provide a username tag
+ *           (e.g. `alice*localhost`). For `type=id` provide a Stellar public key.
+ *         example: alice*localhost
+ *       - in: query
+ *         name: type
+ *         required: false
+ *         schema:
+ *           type: string
+ *           enum: [name, id]
+ *           default: name
+ *         description: >
+ *           Federation query type. `name` resolves a tag to an address;
+ *           `id` resolves an address to a tag.
+ *     responses:
+ *       200:
+ *         description: Record found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/FederationResponse'
+ *             examples:
+ *               nameResolution:
+ *                 summary: Resolve username tag → address
+ *                 value:
+ *                   stellar_address: alice*localhost
+ *                   account_id: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *               withMemo:
+ *                 summary: Response with optional memo fields
+ *                 value:
+ *                   stellar_address: alice*localhost
+ *                   account_id: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *                   memo_type: text
+ *                   memo: payment-ref-001
+ *       400:
+ *         description: Missing `q` parameter
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *             example:
+ *               success: false
+ *               error: "Missing 'q' parameter"
+ *               statusCode: 400
+ *       404:
+ *         description: Name tag or address not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *             example:
+ *               success: false
+ *               error: Name tag not found
+ *               statusCode: 404
+ *       500:
+ *         description: Database lookup failed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ */
 app.get('/federation', etagCache, async (req, res, next) => {
   const { q, type } = req.query;
   const queryValue = typeof q === 'string' ? q.trim() : '';
@@ -384,16 +472,105 @@ const verifyFreighterRegistrationSignature = ({
 };
 
 /**
- * Registration endpoint with multi-signer threshold verification
- * 
- * For single-signer accounts:
- * - Signature must be the account's public key or a registered signer
- * - Basic validation of address format
- * 
- * For multi-signer accounts (enterprise):
- * - Fetches account signers and thresholds from Horizon
- * - Validates that provided signature(s) meet minimum threshold
- * - Ensures authorization requirements are satisfied
+ * @swagger
+ * /register:
+ *   post:
+ *     summary: Register a new username–address mapping
+ *     description: >
+ *       Associates a human-readable username tag with a Stellar public key.
+ *       Optionally accepts a SEP-0053 signature for multi-signer threshold
+ *       verification. The endpoint is idempotent for the same
+ *       (username, address) pair when an idempotency key header is supplied.
+ *     tags:
+ *       - Registration
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/RegisterRequest'
+ *           examples:
+ *             minimal:
+ *               summary: Minimal registration (no signature)
+ *               value:
+ *                 username: alice
+ *                 address: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *             withMemo:
+ *               summary: Registration with a text memo
+ *               value:
+ *                 username: alice
+ *                 address: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *                 memo_type: text
+ *                 memo: payment-ref-001
+ *             withSignature:
+ *               summary: Registration with Freighter signature (SEP-0053)
+ *               value:
+ *                 username: alice
+ *                 address: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *                 signature: BASE64_ENCODED_SIGNATURE
+ *                 signerAddress: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *     responses:
+ *       201:
+ *         description: Registration successful
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/RegisterResponse'
+ *             example:
+ *               ok: true
+ *               username: alice*localhost
+ *               address: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *               federation_address: alice*localhost
+ *       400:
+ *         description: >
+ *           Missing or invalid fields (username, address, memo validation,
+ *           reserved username, or secret key detected).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *             example:
+ *               success: false
+ *               error: "Missing required fields: username and address are both required."
+ *               statusCode: 400
+ *       401:
+ *         description: Signature verification failed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       403:
+ *         description: Reserved username
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *             example:
+ *               success: false
+ *               error: This username is reserved and cannot be registered.
+ *               statusCode: 403
+ *       409:
+ *         description: Address or username already registered
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *             example:
+ *               success: false
+ *               error: Address already registered
+ *               statusCode: 409
+ *       415:
+ *         description: Content-Type must be application/json
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       500:
+ *         description: Database insertion or verification failed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
  */
 app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
   if (!req.is('application/json')) {
@@ -575,6 +752,101 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
 
 app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
+/**
+ * @swagger
+ * /lookup:
+ *   get:
+ *     summary: Look up a username by Stellar address, or search users
+ *     description: >
+ *       Two modes of operation:
+ *       1. **Exact lookup** — supply `address` to retrieve the username registered
+ *          to that Stellar public key.
+ *       2. **Paginated search** — supply `search` to find users whose username or
+ *          address contains the given string (case-insensitive).
+ *
+ *       Exactly one of `address` or `search` must be provided.
+ *     tags:
+ *       - Lookup
+ *     parameters:
+ *       - in: query
+ *         name: address
+ *         schema:
+ *           type: string
+ *         description: Stellar public key for exact reverse-lookup.
+ *         example: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *         description: Partial username or address string for paginated search.
+ *         example: alice
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *           minimum: 1
+ *         description: Page number (search mode only).
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Results per page (search mode only).
+ *     responses:
+ *       200:
+ *         description: Record(s) found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               oneOf:
+ *                 - $ref: '#/components/schemas/LookupResponse'
+ *                 - $ref: '#/components/schemas/LookupPagedResponse'
+ *             examples:
+ *               exactLookup:
+ *                 summary: Exact address lookup
+ *                 value:
+ *                   username: alice*localhost
+ *                   address: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *               pagedSearch:
+ *                 summary: Paginated search results
+ *                 value:
+ *                   data:
+ *                     - username: alice*localhost
+ *                       address: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *                       created_at: '2024-01-15T10:30:00.000Z'
+ *                   totalCount: 1
+ *                   totalPages: 1
+ *                   currentPage: 1
+ *       400:
+ *         description: Neither `address` nor `search` was provided
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *             example:
+ *               success: false
+ *               error: "Missing required parameter: provide 'address' for exact lookup or 'search' for paginated search"
+ *               statusCode: 400
+ *       404:
+ *         description: No username registered for the given address
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *             example:
+ *               success: false
+ *               error: Username not found for this address
+ *               statusCode: 404
+ *       500:
+ *         description: Database lookup failed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ */
 app.get('/lookup', async (req, res, next) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
   const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
@@ -668,6 +940,60 @@ app.get('/lookup', async (req, res, next) => {
   }
 });
 
+/**
+ * @swagger
+ * /users:
+ *   get:
+ *     summary: List all registered users with optional search and pagination
+ *     description: >
+ *       Returns a paginated list of registered username–address pairs.
+ *       Optionally filter by a partial username or address string.
+ *     tags:
+ *       - Lookup
+ *     parameters:
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *         description: Filter by partial username or address (case-insensitive).
+ *         example: alice
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *           minimum: 1
+ *         description: Page number.
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Results per page.
+ *     responses:
+ *       200:
+ *         description: Paginated list of users
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/LookupPagedResponse'
+ *             example:
+ *               data:
+ *                 - username: alice*localhost
+ *                   address: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *                   created_at: '2024-01-15T10:30:00.000Z'
+ *               totalCount: 1
+ *               totalPages: 1
+ *               currentPage: 1
+ *       500:
+ *         description: Database error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ */
 app.get('/users', async (req, res, next) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
@@ -722,6 +1048,24 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
+/**
+ * @swagger
+ * /health:
+ *   get:
+ *     summary: Server health check
+ *     description: Returns status "ok" when the server is running. Useful for uptime monitoring and load-balancer health probes.
+ *     tags:
+ *       - Health
+ *     responses:
+ *       200:
+ *         description: Server is healthy
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/HealthResponse'
+ *             example:
+ *               status: ok
+ */
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
@@ -737,7 +1081,7 @@ app.use((err, _req, _res, next) => {
 
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
