@@ -12,6 +12,8 @@ const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
+const swaggerUi = require('swagger-ui-express');
+const swaggerJsdoc = require('swagger-jsdoc');
 const v1Router = require('./src/routes/v1');
 const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
@@ -164,6 +166,15 @@ const etagCache = (req, res, next) => {
   next();
 };
 
+/**
+ * Determines whether a Prisma error should trigger a fallback to the local SQLite registry.
+ * Falls back when the error indicates a connection issue, missing table, or database unavailability.
+ *
+ * @param {Object} error - The error object thrown by Prisma
+ * @param {string} [error.code] - The Prisma error code (e.g., 'P2021', 'P2001')
+ * @param {string} [error.message] - The error message string
+ * @returns {boolean} True if the operation should fall back to the local SQLite registry
+ */
 const shouldFallbackToLocalRegistry = (error) => {
   const code = typeof error?.code === 'string' ? error.code : '';
   const message = typeof error?.message === 'string' ? error.message : '';
@@ -175,18 +186,40 @@ const shouldFallbackToLocalRegistry = (error) => {
   );
 };
 
+/**
+ * Retrieves a user from the local SQLite registry by their Stellar public address.
+ *
+ * @param {string} address - The Stellar public key to look up
+ * @returns {Promise<Object|null>} The user record containing username and address, or null if not found
+ */
 const getLocalUserByAddress = async (address) =>
   poolGet(
     'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
     [address],
   );
 
+/**
+ * Retrieves a user from the local SQLite registry by their username.
+ *
+ * @param {string} username - The username to look up
+ * @returns {Promise<Object|null>} The user record containing username and address, or null if not found
+ */
 const getLocalUserByUsername = async (username) =>
   poolGet(
     'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
     [username],
   );
 
+/**
+ * Paginated search of the local SQLite registry by username or address.
+ * Supports case-insensitive partial matching on both fields.
+ *
+ * @param {string} search - The search string to match against username or address
+ * @param {number} page - The page number (1-indexed)
+ * @param {number} limit - The maximum number of results per page
+ * @returns {Promise<{data: Array, totalCount: number, totalPages: number, currentPage: number}>}
+ *   An object containing the paginated results and metadata
+ */
 const listLocalUsers = async (search, page, limit) => {
   const searchPattern = `%${search}%`;
   const skip = (page - 1) * limit;
@@ -220,6 +253,16 @@ const listLocalUsers = async (search, page, limit) => {
   };
 };
 
+/**
+ * Registers a new user in the local SQLite registry.
+ * Checks for existing entries by both address and username to avoid conflicts.
+ *
+ * @param {Object} params - Registration parameters
+ * @param {string} params.username - The username to register
+ * @param {string} params.address - The Stellar public key to register
+ * @returns {Promise<void>} Resolves when the user is successfully registered
+ * @throws {Error} Throws with statusCode 409 if the address or username is already registered
+ */
 const registerLocalUser = async ({ username, address }) => {
   const existingByAddress = await getLocalUserByAddress(address);
   if (existingByAddress) {
@@ -242,6 +285,52 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     summary: Stellar federation lookup
+ *     description: Resolve a stellar address or public key to its federation details.
+ *     tags: [Federation]
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: The stellar address (name*domain) or public key to look up
+ *         example: alice*localhost
+ *       - in: query
+ *         name: type
+ *         required: false
+ *         schema:
+ *           type: string
+ *           enum: [name, id]
+ *         description: Type of lookup - 'name' for username resolution, 'id' for address resolution
+ *         example: name
+ *     responses:
+ *       200:
+ *         description: Federation record found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 stellar_address:
+ *                   type: string
+ *                 account_id:
+ *                   type: string
+ *                 memo_type:
+ *                   type: string
+ *                   nullable: true
+ *                 memo:
+ *                   type: string
+ *                   nullable: true
+ *       400:
+ *         description: Missing or invalid query parameter
+ *       404:
+ *         description: Address or name tag not found
+ */
 // Expose /metrics endpoint for Prometheus to scrape
 app.get('/metrics', async (req, res) => {
   try {
@@ -421,6 +510,78 @@ const verifyFreighterRegistrationSignature = ({
  * - Fetches account signers and thresholds from Horizon
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
+ */
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     summary: Register a new Stellar username
+ *     description: Register a new username with a Stellar public key. Supports single-signer and multi-signer accounts.
+ *     tags: [Registration]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - username
+ *               - address
+ *             properties:
+ *               username:
+ *                 type: string
+ *                 description: Desired username (will be normalized to username*domain)
+ *                 example: alice
+ *               address:
+ *                 type: string
+ *                 description: Stellar public key (G...)
+ *                 example: GA3DUQ...
+ *               signature:
+ *                 type: string
+ *                 description: Signed message for verification (optional for legacy flow)
+ *               signerAddress:
+ *                 type: string
+ *                 description: Signer address (optional, defaults to address)
+ *               memo_type:
+ *                 type: string
+ *                 enum: [text, id, hash]
+ *                 description: Optional memo type
+ *               memo:
+ *                 type: string
+ *                 description: Optional memo value
+ *     responses:
+ *       201:
+ *         description: Registration successful
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 username:
+ *                   type: string
+ *                 address:
+ *                   type: string
+ *                 federation_address:
+ *                   type: string
+ *                 verification:
+ *                   type: object
+ *                   properties:
+ *                     accountId:
+ *                       type: string
+ *                     signerCount:
+ *                       type: integer
+ *                     thresholdMet:
+ *                       type: boolean
+ *       400:
+ *         description: Invalid input (bad username, address format, etc.)
+ *       401:
+ *         description: Signature verification failed
+ *       409:
+ *         description: Username or address already registered
+ *       415:
+ *         description: Unsupported media type (must be application/json)
  */
 app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
   if (!req.is('application/json')) {
@@ -620,6 +781,78 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
 
 app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
+/**
+ * @openapi
+ * /lookup:
+ *   get:
+ *     summary: Lookup username by Stellar address
+ *     description: Resolve a Stellar public key to its registered username, or search users by username/address.
+ *     tags: [Lookup]
+ *     parameters:
+ *       - in: query
+ *         name: address
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Stellar public key for exact lookup
+ *         example: GA3DUQ...
+ *       - in: query
+ *         name: search
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Search string for paginated username/address search
+ *       - in: query
+ *         name: page
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *         description: Page number for paginated search
+ *       - in: query
+ *         name: limit
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *         description: Results per page (max 100)
+ *     responses:
+ *       200:
+ *         description: Lookup result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               oneOf:
+ *                 - type: object
+ *                   properties:
+ *                     username:
+ *                       type: string
+ *                     address:
+ *                       type: string
+ *                 - type: object
+ *                   properties:
+ *                     data:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           username:
+ *                             type: string
+ *                           address:
+ *                             type: string
+ *                           created_at:
+ *                             type: string
+ *                     totalCount:
+ *                       type: integer
+ *                     totalPages:
+ *                       type: integer
+ *                     currentPage:
+ *                       type: integer
+ *       400:
+ *         description: Missing required parameter
+ *       404:
+ *         description: Username not found
+ */
 app.get('/lookup', async (req, res, next) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
   const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
@@ -767,6 +1000,29 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
+// ---------------------------------------------------------------------------
+// Swagger UI - Interactive API documentation
+// ---------------------------------------------------------------------------
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     summary: Health check endpoint
+ *     tags: [Health]
+ *     responses:
+ *       200:
+ *         description: Service is healthy
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   example: ok
+ */
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
