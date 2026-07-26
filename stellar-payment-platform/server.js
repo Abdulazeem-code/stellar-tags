@@ -19,34 +19,19 @@ const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
+const { registerValidator } = require('./src/validators/registerValidator');
+const { validate } = require('./src/middleware/validate');
+const { validationResult } = require('express-validator');
+const Sentry = require('@sentry/node');
 
 dotenv.config();
 
-// ---------------------------------------------------------------------------
-// Swagger / OpenAPI configuration
-// ---------------------------------------------------------------------------
-const swaggerDefinition = {
-  openapi: '3.0.0',
-  info: {
-    title: 'Stellar Tags API',
-    version: '1.0.0',
-    description:
-      'Stellar Tags provides federation, registration, and lookup services for the Stellar network.',
-  },
-  servers: [
-    {
-      url: process.env.STELLAR_TAG_DOMAIN || 'http://localhost:5000',
-      description: 'Server',
-    },
-  ],
-};
-
-const swaggerOptions = {
-  swaggerDefinition,
-  apis: [__filename],
-};
-
-const swaggerSpec = swaggerJsdoc(swaggerOptions);
+// #295 — Only report to Sentry when a DSN is configured, so local/dev/test
+// runs without SENTRY_DSN never try to reach out to Sentry.
+if (process.env.SENTRY_DSN) {
+  Sentry.init({ dsn: process.env.SENTRY_DSN });
+}
 
 const app = express();
 
@@ -85,6 +70,10 @@ const corsOptions = {
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+
+// Apply metrics middleware to track all HTTP requests
+app.use(metricsMiddleware);
+
 const redisClient = process.env.REDIS_URL ? createClient({
   url: process.env.REDIS_URL
 }) : null;
@@ -296,52 +285,17 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
-/**
- * @openapi
- * /federation:
- *   get:
- *     summary: Stellar federation lookup
- *     description: Resolve a stellar address or public key to its federation details.
- *     tags: [Federation]
- *     parameters:
- *       - in: query
- *         name: q
- *         required: true
- *         schema:
- *           type: string
- *         description: The stellar address (name*domain) or public key to look up
- *         example: alice*localhost
- *       - in: query
- *         name: type
- *         required: false
- *         schema:
- *           type: string
- *           enum: [name, id]
- *         description: Type of lookup - 'name' for username resolution, 'id' for address resolution
- *         example: name
- *     responses:
- *       200:
- *         description: Federation record found
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 stellar_address:
- *                   type: string
- *                 account_id:
- *                   type: string
- *                 memo_type:
- *                   type: string
- *                   nullable: true
- *                 memo:
- *                   type: string
- *                   nullable: true
- *       400:
- *         description: Missing or invalid query parameter
- *       404:
- *         description: Address or name tag not found
- */
+// Expose /metrics endpoint for Prometheus to scrape
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', getContentType());
+    const metrics = await getMetrics();
+    res.end(metrics);
+  } catch (err) {
+    res.status(500).end(err.message);
+  }
+});
+
 app.get('/federation', etagCache, async (req, res, next) => {
   const { q, type } = req.query;
   const queryValue = typeof q === 'string' ? q.trim() : '';
@@ -458,6 +412,13 @@ const verifyFreighterRegistrationSignature = ({
 }) => {
   const message = `register:${username}:${address}`;
   const claimedSigner = signerAddress || address;
+
+  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
+    const error = new Error('Invalid signer address format.');
+    error.statusCode = 400;
+    throw error;
+  }
+
   const keypair = Keypair.fromPublicKey(claimedSigner);
 
   let signatureBuffer;
@@ -480,12 +441,6 @@ const verifyFreighterRegistrationSignature = ({
   if (!keypair.verify(messageHash, signatureBuffer)) {
     const error = new Error('Signature verification failed.');
     error.statusCode = 401;
-    throw error;
-  }
-
-  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error('Invalid signer address format.');
-    error.statusCode = 400;
     throw error;
   }
 
@@ -586,6 +541,24 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
+
+  // Run express-validator chains manually
+  for (const validator of registerValidator) {
+    await validator.run(req);
+  }
+  
+  // Check for validation errors
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(422).json({
+      success: false,
+      errors: errors.array().map(err => ({
+        field: err.path,
+        message: err.msg,
+      })),
+    });
+  }
+
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
@@ -1017,9 +990,15 @@ app.use((err, _req, _res, next) => {
   next(err);
 });
 
+// #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
+// they reach our own JSON error handler below.
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
+
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 

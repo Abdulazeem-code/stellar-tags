@@ -140,14 +140,13 @@ describe("POST /register - integration test coverage", () => {
     });
   });
 
-  test("returns 400 when required payload fields are missing", async () => {
+  test("returns 422 when required payload fields are missing", async () => {
     const response = await request(app)
       .post("/register")
       .send({ username: "charlie" });
 
-    expect(response.status).toBe(400);
-    expect(response.body).toEqual({
-      error: "Missing required fields: username and address are both required.",
-    });
+    expect(response.status).toBe(422);
+    expect(response.body).toHaveProperty('errors');
+    expect(response.body.errors.some(e => e.field === 'address')).toBe(true);
   });
 });
