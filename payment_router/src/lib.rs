@@ -1,30 +1,26 @@
 #![no_std]
-
-//! # Storage Architecture — Issue #268
-//!
-//! ## Storage Type Guide
-//! - **Instance storage**: Contract-global data (admin, config, counters).
-//!   Shared TTL with the contract instance. Low fee.
-//! - **Persistent storage**: User-specific or per-record data.
-//!   Independent TTL per entry. Higher fee but survives contract upgrades.
-//! - **Temporary storage**: Short-lived data (nonces, session state).
-//!   Cheapest, auto-expires after TTL.
-//!
-//! ## Current Storage Map
-//! | DataKey | Storage Type | Rationale |
-//! |---------|-------------|-----------|
-//! | Admin | Instance | Contract-global admin address |
-//! | PlatformTreasury | Instance | Contract-global config |
-//! | FeeBps | Instance | Contract-global config |
-//! | FeeCap | Instance | Contract-global config |
-//! | UserVolume(Address) | Persistent | Per-user cumulative volume |
-//! | UserSpending(Address) | Persistent | Per-user daily spending tracker |
-//!
-//! ## TTL Policy
-//! - Instance: extend on every admin/config operation
-//! - Persistent: extend on every user interaction with that record
-
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSpending {
+    pub last_reset_time: u64,
+    pub accumulated_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    PlatformTreasury,
+    FeeBps,
+    FeeCap,
+    UserVolume(Address),
+    UserSpending(Address),
+}
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, log, token, Address, Env, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -48,12 +44,22 @@ pub enum DataKey {
     FeeCap,
     UserVolume(Address),
     UserSpending(Address),
-    Treasury,          // Address that receives protocol fees
-    FeeRateBps,        // Fee rate in basis points (e.g. 10 = 0.1%)
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Admin,
+    PlatformTreasury,
+    FeeBps,
+    FeeCap,
+    UserVolume(Address),
+    UserSpending(Address),
+    Paused,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserSpending {
     pub last_reset_time: u64,
     pub accumulated_amount: i128,
@@ -65,17 +71,18 @@ pub struct PaymentRouter;
 #[contractimpl]
 impl PaymentRouter {
     const BPS_DIVISOR: i128 = 10_000;
+    const XLM_DECIMALS: i128 = 10_000_000;
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100k tokens with 7 decimals
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS;
+    const SECONDS_IN_24H: u64 = 24 * 3600;
+    const VERSION: u32 = 1;
 
-    // Instance storage backs the contract's own lifetime, so admin/config data
-    // (small, read on every call) is bumped alongside it.
     const DAY_IN_LEDGERS: u32 = 17280;
     const INSTANCE_BUMP_AMOUNT: u32 = 7 * Self::DAY_IN_LEDGERS;
     const INSTANCE_LIFETIME_THRESHOLD: u32 = Self::INSTANCE_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
 
-    // Persistent storage entries have independent TTLs, so per-user data is
-    // extended on its own schedule instead of riding on the contract's TTL.
-    const PERSISTENT_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
-    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::PERSISTENT_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+    const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
+    const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
 
     const XLM_DECIMALS: i128 = 10_000_000;
     const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
@@ -141,6 +148,27 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Pauses or unpauses the payment router. Admin-only.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Returns whether the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Returns the cumulative amount a given sender has routed through the contract.
     pub fn get_user_volume(env: Env, user: Address) -> i128 {
         env.storage()
@@ -182,6 +210,9 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+    /// Returns the contract version.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -191,22 +222,6 @@ impl PaymentRouter {
     /// read from instance storage set via `initialize`.
     /// The platform fee is transferred to the configured treasury, and the
     /// remaining balance is transferred to `recipient`.
-    ///
-    /// # Parameters
-    /// * `env` - The Soroban environment interface.
-    /// * `sender` - The address initiating the payment. Must authorize the transaction.
-    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
-    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
-    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
-    ///
-    /// # Return Value
-    /// Returns `Ok(())` when successful.
-    ///
-    /// # Errors
-    /// * Fails if the contract has not been initialized.
-    /// * `Error::LimitExceeded` if the amount is out of supported bounds or daily limit exceeded.
-    /// * Fails if `sender.require_auth()` fails (i.e., the sender has not authorized the transaction).
-    /// * Fails if the `token_client.transfer` calls fail (e.g., insufficient balance, or invalid token).
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -245,7 +260,20 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        // 4. Check spending limits — UserSpending is per-user (persistent storage)
+        // 4. Check time-based daily spending limits
+        let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+    ) -> Result<(), Error> {
+        // 0. Check if the contract is paused (config read)
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        // 1. Verify the sender authorized this transaction
+        sender.require_auth();
+
+        // 1.5 Check spending limits
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
         let mut spending = env
@@ -286,13 +314,15 @@ impl PaymentRouter {
             return Err(Error::InsufficientBalance);
         }
 
-        // 7. Calculate the fee split correctly
-        let fee_rate_bps: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRateBps)
-            .unwrap_or(0);
-        let (fee_amount, remainder) = Self::calculate_fee(amount, fee_rate_bps);
+        // 7. Calculate the fee split
+        let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        let recipient_amount = amount - fee_amount;
 
         // 8. Execute token transfers
         // Transfer fee to treasury (only if fee > 0 and treasury is configured)
@@ -324,6 +354,7 @@ impl PaymentRouter {
 
         Ok(())
     }
+}
 
     fn require_admin(env: &Env) -> Result<Address, Error> {
         env.storage()
@@ -404,6 +435,7 @@ mod test {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _, LedgerInfo},
+        token::StellarAssetClient,
         Address, Env,
     };
 
@@ -424,7 +456,7 @@ mod test {
         let new_admin = Address::generate(&env);
 
         // Initialize contract
-        client.initialize(&admin, &treasury, &100, &1000).unwrap();
+        client.initialize(&admin, &treasury, &100, &1000);
 
         // Trying to initialize again should fail
         let res = client.try_initialize(&admin, &treasury, &100, &1000);
@@ -433,12 +465,12 @@ mod test {
         // Set admin can be called (by current admin)
         client.set_admin(&new_admin);
 
-        // Modify config by new admin (using legacy function)
-        client.set_fee_config_legacy(&200, &2000).unwrap();
+        // Modify config by new admin
+        client.set_fee_config(&200, &2000);
 
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
-        client.set_platform_treasury(&new_treasury).unwrap();
+        client.set_platform_treasury(&new_treasury);
     }
 
     #[test]
@@ -456,15 +488,16 @@ mod test {
         let token_client = token::Client::new(&env, &token_address);
 
         // Mint tokens to sender
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         let initial_balance = 10_000;
-        token_client.mint(&sender, &initial_balance);
+        sac.mint(&sender, &initial_balance);
 
         // Initialize router with 1% fee (100 bps) and cap of 50
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
+        client.initialize(&admin, &treasury, &100, &50);
 
         // Test normal fee calculation
         let amount_1 = 2000; // 1% of 2000 is 20, which is below cap (50)
-        client.route_payment(&sender, &recipient, &token_address, &amount_1).unwrap();
+        client.route_payment(&sender, &recipient, &token_address, &amount_1);
 
         assert_eq!(token_client.balance(&treasury), 20);
         assert_eq!(token_client.balance(&recipient), 1980);
@@ -473,7 +506,7 @@ mod test {
 
         // Test fee capped at 50
         let amount_2 = 8000; // 1% of 8000 is 80, which is capped at 50
-        client.route_payment(&sender, &recipient, &token_address, &amount_2).unwrap();
+        client.route_payment(&sender, &recipient, &token_address, &amount_2);
 
         // Total fee should be 20 + 50 = 70
         assert_eq!(token_client.balance(&treasury), 70);
@@ -494,11 +527,11 @@ mod test {
 
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let token_client = token::Client::new(&env, &token_address);
 
-        token_client.mint(&sender, &100);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &100);
 
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
+        client.initialize(&admin, &treasury, &100, &50);
 
         // Route payment of 500 when balance is only 100
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
@@ -520,12 +553,13 @@ mod test {
 
         // Daily limit is 1,000,000 * 10,000,000 = 10,000,000,000,000
         let limit = 10_000_000_000_000;
-        token_client.mint(&sender, &(limit + 2000));
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &(limit + 2000));
 
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
+        client.initialize(&admin, &treasury, &100, &50);
 
         // Route amount within limit
-        client.route_payment(&sender, &recipient, &token_address, &limit).unwrap();
+        client.route_payment(&sender, &recipient, &token_address, &limit);
 
         // Exceed daily limit
         let res = client.try_route_payment(&sender, &recipient, &token_address, &2000);
@@ -536,192 +570,54 @@ mod test {
         env.ledger().set(LedgerInfo {
             timestamp: current_time + 86400,
             sequence_number: 1,
-            network_id: env.ledger().network_id(),
+            network_id: env.ledger().network_id().into(),
             base_reserve: 100,
             min_temp_entry_ttl: 16,
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6312000,
+            protocol_version: 20,
         });
 
         // Now routing should be successful again
-        client.route_payment(&sender, &recipient, &token_address, &2000).unwrap();
+        client.route_payment(&sender, &recipient, &token_address, &2000);
         assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 20));
     }
 
-    // Issue #267 test cases for fee extraction logic
     #[test]
-    fn test_calculate_fee_returns_correct_amounts_at_10_bps() {
-        // calculate_fee(1_000_000, 10)
-        // Expected: fee == 1_000, remainder == 999_000
-        let (fee, remainder) = PaymentRouter::calculate_fee(1_000_000, 10);
-        assert_eq!(fee, 1_000);
-        assert_eq!(remainder, 999_000);
-    }
-
-    #[test]
-    fn test_calculate_fee_returns_correct_amounts_at_0_bps() {
-        // calculate_fee(1_000_000, 0)
-        // Expected: fee == 0, remainder == 1_000_000
-        let (fee, remainder) = PaymentRouter::calculate_fee(1_000_000, 0);
-        assert_eq!(fee, 0);
-        assert_eq!(remainder, 1_000_000);
-    }
-
-    #[test]
-    fn test_calculate_fee_handles_small_amounts() {
-        // calculate_fee(5, 10) — amount too small for 0.1% fee
-        // Expected: fee == 0, remainder == 5 (no dust fee)
-        let (fee, remainder) = PaymentRouter::calculate_fee(5, 10);
-        assert_eq!(fee, 0);
-        assert_eq!(remainder, 5);
-    }
-
-    #[test]
-    fn test_set_fee_config_requires_admin_auth() {
-        let (env, client) = setup_env();
+    fn test_successful_xlm_routing() {
+        let env = Env::default();
+        env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let not_admin = Address::generate(&env);
-
-        // Initialize contract
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
-
-        // Mock auth for not_admin to fail
-        env.set_auths(&[]);
-
-        // Call set_fee_config without admin auth
-        // This should fail because we explicitly set auth to empty
-        let new_treasury = Address::generate(&env);
-        let res = client.try_set_fee_config(&new_treasury, &10);
-        // The result will be an auth error from Soroban SDK
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn test_set_fee_config_rejects_fee_rate_above_1000_bps() {
-        let (env, client) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
-
-        // Call set_fee_config with fee_rate_bps = 1001
-        let new_treasury = Address::generate(&env);
-        let res = client.try_set_fee_config(&new_treasury, &1001);
-        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidFeeRate);
-    }
-
-    #[test]
-    fn test_transfer_sends_fee_to_treasury_and_remainder_to_destination() {
-        let (env, client) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
 
-        // Deploy mock token
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        client.initialize(&admin, &platform_treasury, &40, &i128::MAX);
+
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = StellarAssetClient::new(&env, &token_address);
         let token_client = token::Client::new(&env, &token_address);
 
-        // Mint tokens to sender
-        let initial_balance = 1_000_000;
-        token_client.mint(&sender, &initial_balance);
+        let initial_balance = 1_000_000_000;
+        sac.mint(&sender, &initial_balance);
 
-        // Initialize router
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
+        assert_eq!(token_client.balance(&sender), initial_balance);
+        assert_eq!(token_client.balance(&recipient), 0);
+        assert_eq!(token_client.balance(&platform_treasury), 0);
 
-        // Set fee config: treasury address and 10 bps (0.1%)
-        client.set_fee_config(&treasury, &10).unwrap();
+        let amount = 100_000_000;
+        client.route_payment(&sender, &recipient, &token_address, &amount);
 
-        // Call route_payment with 1_000_000
-        let amount = 1_000_000;
-        client.route_payment(&sender, &recipient, &token_address, &amount).unwrap();
+        let expected_fee = 400_000;
+        let expected_recipient_amount = amount - expected_fee;
 
-        // Expected fee: 1_000_000 * 10 / 10_000 = 1_000
-        // Expected remainder: 1_000_000 - 1_000 = 999_000
-        assert_eq!(token_client.balance(&treasury), 1_000);
-        assert_eq!(token_client.balance(&recipient), 999_000);
         assert_eq!(token_client.balance(&sender), initial_balance - amount);
-    }
-
-    #[test]
-    fn test_transfer_skips_fee_when_rate_is_zero() {
-        let (env, client) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        // Deploy mock token
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let token_client = token::Client::new(&env, &token_address);
-
-        // Mint tokens to sender
-        let initial_balance = 1_000_000;
-        token_client.mint(&sender, &initial_balance);
-
-        // Initialize router
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
-
-        // Set fee config: fee_rate_bps = 0 (no fee)
-        client.set_fee_config(&treasury, &0).unwrap();
-
-        // Call route_payment with 1_000_000
-        let amount = 1_000_000;
-        client.route_payment(&sender, &recipient, &token_address, &amount).unwrap();
-
-        // With 0 fee rate, destination should get full amount
-        assert_eq!(token_client.balance(&recipient), amount);
-        assert_eq!(token_client.balance(&treasury), 0);
-        assert_eq!(token_client.balance(&sender), initial_balance - amount);
-    }
-
-    #[test]
-    fn test_get_treasury_returns_configured_address() {
-        let (env, client) = setup_env();
-
-        let admin = Address::generate(&env);
-        let initial_treasury = Address::generate(&env);
-        let new_treasury = Address::generate(&env);
-
-        // Initialize router (doesn't set Treasury key)
-        client.initialize(&admin, &initial_treasury, &100, &50).unwrap();
-
-        // Before set_fee_config, get_treasury should return None
-        let treasury_opt = client.get_treasury();
-        assert_eq!(treasury_opt, None);
-
-        // Set fee config with new treasury
-        client.set_fee_config(&new_treasury, &10).unwrap();
-
-        // Now get_treasury should return that address
-        let treasury_opt = client.get_treasury();
-        assert_eq!(treasury_opt, Some(new_treasury));
-    }
-
-    #[test]
-    fn test_get_fee_rate_returns_configured_rate() {
-        let (env, client) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        // Initialize router
-        client.initialize(&admin, &treasury, &100, &50).unwrap();
-
-        // Before set_fee_config, get_fee_rate_bps should return 0
-        assert_eq!(client.get_fee_rate_bps(), 0);
-
-        // Set fee config with fee_rate_bps = 10
-        client.set_fee_config(&treasury, &10).unwrap();
-
-        // Now get_fee_rate_bps should return 10
-        assert_eq!(client.get_fee_rate_bps(), 10);
+        assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
+        assert_eq!(token_client.balance(&platform_treasury), expected_fee);
     }
 }
