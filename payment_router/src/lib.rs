@@ -31,6 +31,8 @@ pub enum Error {
     LimitExceeded = 3,
     AlreadyInitialized = 4,
     NotInitialized = 5,
+    Paused = 6,
+    InvalidFeeRate = 7,
 }
 
 #[contracttype]
@@ -132,7 +134,8 @@ impl PaymentRouter {
     }
 
     /// Updates the fee basis points and fee cap. Admin-only.
-    pub fn set_fee_config(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+    /// (Legacy function — use set_fee_config_v2 for new code)
+    pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
@@ -199,6 +202,14 @@ impl PaymentRouter {
         Ok(())
     }
 
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        current_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
@@ -243,6 +254,7 @@ impl PaymentRouter {
             .get(&DataKey::FeeCap)
             .ok_or(Error::NotInitialized)?;
 
+        // Extend instance storage TTL after reading config
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -263,10 +275,11 @@ impl PaymentRouter {
 
         // 1.5 Check spending limits
         let current_time = env.ledger().timestamp();
+        let spending_key = DataKey::UserSpending(sender.clone());
         let mut spending = env
             .storage()
-            .instance()
-            .get(&DataKey::UserSpending(sender.clone()))
+            .persistent()
+            .get(&spending_key)
             .unwrap_or(UserSpending {
                 last_reset_time: current_time,
                 accumulated_amount: 0,
@@ -283,9 +296,15 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
+        // Store spending back in persistent storage and extend its TTL
         env.storage()
-            .instance()
-            .set(&DataKey::UserSpending(sender.clone()), &spending);
+            .persistent()
+            .set(&spending_key, &spending);
+        env.storage().persistent().extend_ttl(
+            &spending_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
 
         // 5. Initialize the token client
         let token_client = token::Client::new(&env, &token_address);
@@ -306,11 +325,15 @@ impl PaymentRouter {
         let recipient_amount = amount - fee_amount;
 
         // 8. Execute token transfers
+        // Transfer fee to treasury (only if fee > 0 and treasury is configured)
         if fee_amount > 0 {
-            token_client.transfer(&sender, &platform_treasury, &fee_amount);
+            if let Some(treasury) = env.storage().instance().get::<DataKey, Address>(&DataKey::Treasury) {
+                token_client.transfer(&sender, &treasury, &fee_amount);
+            }
         }
-        if recipient_amount > 0 {
-            token_client.transfer(&sender, &recipient, &recipient_amount);
+        // Transfer remainder to destination
+        if remainder > 0 {
+            token_client.transfer(&sender, &recipient, &remainder);
         }
 
         // 9. Record the sender's cumulative routed volume in persistent storage
@@ -321,8 +344,8 @@ impl PaymentRouter {
             .set(&volume_key, &(prev_volume + amount));
         env.storage().persistent().extend_ttl(
             &volume_key,
-            Self::USER_LIFETIME_THRESHOLD,
-            Self::USER_BUMP_AMOUNT,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
         );
 
         // Log success for testing
@@ -338,6 +361,72 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Calculates the protocol fee and remainder for a given amount.
+    /// Uses basis points: fee = amount * fee_rate_bps / 10_000
+    ///
+    /// # Returns
+    /// (fee_amount, remainder_amount)
+    /// Both are guaranteed non-negative and sum to <= amount.
+    ///
+    /// # Errors
+    /// Returns (0, amount) if fee_rate_bps is 0 or amount <= 0.
+    fn calculate_fee(amount: i128, fee_rate_bps: u32) -> (i128, i128) {
+        if fee_rate_bps == 0 || amount <= 0 {
+            return (0, amount);
+        }
+        // Use i128 arithmetic to avoid overflow
+        // fee = amount * fee_rate_bps / 10_000
+        let fee = amount
+            .checked_mul(fee_rate_bps as i128)
+            .unwrap_or(0)
+            .checked_div(10_000)
+            .unwrap_or(0);
+        let remainder = amount.checked_sub(fee).unwrap_or(amount);
+        (fee, remainder)
+    }
+
+    /// Sets the treasury address and fee rate.
+    /// Only callable by admin. Must be called before fee extraction is active.
+    ///
+    /// # Arguments
+    /// * `treasury` - Address that receives protocol fees
+    /// * `fee_rate_bps` - Fee rate in basis points (1 bps = 0.01%, max 1000 = 10%)
+    pub fn set_fee_config(env: Env, treasury: Address, fee_rate_bps: u32) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        // Validate fee rate — cap at 1000 bps (10%) to prevent abuse
+        if fee_rate_bps > 1_000 {
+            return Err(Error::InvalidFeeRate);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Treasury, &treasury);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRateBps, &fee_rate_bps);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Returns the current treasury address, or None if not configured.
+    pub fn get_treasury(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Treasury)
+    }
+
+    /// Returns the current fee rate in basis points.
+    pub fn get_fee_rate_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeRateBps)
+            .unwrap_or(0)
     }
 }
 
