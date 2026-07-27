@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, log, token, Address, Env,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9,7 +11,7 @@ pub struct UserSpending {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
     PlatformTreasury,
@@ -17,10 +19,10 @@ pub enum DataKey {
     FeeCap,
     UserVolume(Address),
     UserSpending(Address),
+    Paused,
+    Treasury,
+    FeeRateBps,
 }
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, token, Address, Env, Vec,
-};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -35,36 +37,6 @@ pub enum Error {
     InvalidFeeRate = 7,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    PlatformTreasury,
-    FeeBps,
-    FeeCap,
-    UserVolume(Address),
-    UserSpending(Address),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Admin,
-    PlatformTreasury,
-    FeeBps,
-    FeeCap,
-    UserVolume(Address),
-    UserSpending(Address),
-    Paused,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserSpending {
-    pub last_reset_time: u64,
-    pub accumulated_amount: i128,
-}
-
 #[contract]
 pub struct PaymentRouter;
 
@@ -72,8 +44,8 @@ pub struct PaymentRouter;
 impl PaymentRouter {
     const BPS_DIVISOR: i128 = 10_000;
     const XLM_DECIMALS: i128 = 10_000_000;
-    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100k tokens with 7 decimals
-    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS;
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
     const SECONDS_IN_24H: u64 = 24 * 3600;
     const VERSION: u32 = 1;
 
@@ -83,12 +55,15 @@ impl PaymentRouter {
 
     const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
     const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+    const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
+    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
 
-    const XLM_DECIMALS: i128 = 10_000_000;
-    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
-    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
-    const SECONDS_IN_24H: u64 = 24 * 3600;
-    const VERSION: u32 = 1;
+    fn require_admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
 
     /// One-time setup: records the admin and the initial fee configuration
     /// in instance storage. Must be called before `route_payment`.
@@ -110,6 +85,7 @@ impl PaymentRouter {
             .set(&DataKey::PlatformTreasury, &platform_treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+        env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -134,7 +110,6 @@ impl PaymentRouter {
     }
 
     /// Updates the fee basis points and fee cap. Admin-only.
-    /// (Legacy function — use set_fee_config_v2 for new code)
     pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -149,7 +124,7 @@ impl PaymentRouter {
     }
 
     /// Pauses or unpauses the payment router. Admin-only.
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+    pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
@@ -159,6 +134,11 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
         Ok(())
+    }
+
+    /// Pauses or unpauses the payment router. Admin-only. Alias for set_pause.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+        Self::set_pause(env, paused)
     }
 
     /// Returns whether the contract is currently paused.
@@ -210,18 +190,14 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+    }
+
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
-    ///
-    /// The fee is calculated as a percentage (`fee_bps` / 10,000) of the `amount`,
-    /// capped at `fee_cap`. Both values, along with the treasury address, are
-    /// read from instance storage set via `initialize`.
-    /// The platform fee is transferred to the configured treasury, and the
-    /// remaining balance is transferred to `recipient`.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -229,6 +205,11 @@ impl PaymentRouter {
         token_address: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        // 0. Check if the contract is paused
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
@@ -261,19 +242,6 @@ impl PaymentRouter {
         );
 
         // 4. Check time-based daily spending limits
-        let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
-        if fee_amount > fee_cap {
-            fee_amount = fee_cap;
-    ) -> Result<(), Error> {
-        // 0. Check if the contract is paused (config read)
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
-
-        // 1. Verify the sender authorized this transaction
-        sender.require_auth();
-
-        // 1.5 Check spending limits
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
         let mut spending = env
@@ -325,15 +293,11 @@ impl PaymentRouter {
         let recipient_amount = amount - fee_amount;
 
         // 8. Execute token transfers
-        // Transfer fee to treasury (only if fee > 0 and treasury is configured)
         if fee_amount > 0 {
-            if let Some(treasury) = env.storage().instance().get::<DataKey, Address>(&DataKey::Treasury) {
-                token_client.transfer(&sender, &treasury, &fee_amount);
-            }
+            token_client.transfer(&sender, &platform_treasury, &fee_amount);
         }
-        // Transfer remainder to destination
-        if remainder > 0 {
-            token_client.transfer(&sender, &recipient, &remainder);
+        if recipient_amount > 0 {
+            token_client.transfer(&sender, &recipient, &recipient_amount);
         }
 
         // 9. Record the sender's cumulative routed volume in persistent storage
@@ -348,36 +312,18 @@ impl PaymentRouter {
             Self::PERSISTENT_BUMP_AMOUNT,
         );
 
-        // Log success for testing
+        // Log success
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to recipient");
 
         Ok(())
     }
-}
 
-    fn require_admin(env: &Env) -> Result<Address, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
-    }
-
-    /// Calculates the protocol fee and remainder for a given amount.
-    /// Uses basis points: fee = amount * fee_rate_bps / 10_000
-    ///
-    /// # Returns
-    /// (fee_amount, remainder_amount)
-    /// Both are guaranteed non-negative and sum to <= amount.
-    ///
-    /// # Errors
-    /// Returns (0, amount) if fee_rate_bps is 0 or amount <= 0.
+    /// Calculates protocol fee and remainder
     fn calculate_fee(amount: i128, fee_rate_bps: u32) -> (i128, i128) {
         if fee_rate_bps == 0 || amount <= 0 {
             return (0, amount);
         }
-        // Use i128 arithmetic to avoid overflow
-        // fee = amount * fee_rate_bps / 10_000
         let fee = amount
             .checked_mul(fee_rate_bps as i128)
             .unwrap_or(0)
@@ -387,17 +333,11 @@ impl PaymentRouter {
         (fee, remainder)
     }
 
-    /// Sets the treasury address and fee rate.
-    /// Only callable by admin. Must be called before fee extraction is active.
-    ///
-    /// # Arguments
-    /// * `treasury` - Address that receives protocol fees
-    /// * `fee_rate_bps` - Fee rate in basis points (1 bps = 0.01%, max 1000 = 10%)
+    /// Sets treasury and fee rate
     pub fn set_fee_config(env: Env, treasury: Address, fee_rate_bps: u32) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        // Validate fee rate — cap at 1000 bps (10%) to prevent abuse
         if fee_rate_bps > 1_000 {
             return Err(Error::InvalidFeeRate);
         }
@@ -416,12 +356,12 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Returns the current treasury address, or None if not configured.
+    /// Returns current treasury address
     pub fn get_treasury(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Treasury)
     }
 
-    /// Returns the current fee rate in basis points.
+    /// Returns current fee rate in basis points
     pub fn get_fee_rate_bps(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -471,6 +411,41 @@ mod test {
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
         client.set_platform_treasury(&new_treasury);
+    }
+
+    #[test]
+    fn test_admin_pause_functionality() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Initially not paused
+        assert_eq!(client.is_paused(), false);
+
+        // Pause the contract using set_pause
+        client.set_pause(&true);
+        assert_eq!(client.is_paused(), true);
+
+        // Route payment should fail when paused
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
+
+        // Unpause the contract using set_paused alias
+        client.set_paused(&false);
+        assert_eq!(client.is_paused(), false);
+
+        // Route payment should succeed now
+        client.route_payment(&sender, &recipient, &token_address, &1000);
     }
 
     #[test]
