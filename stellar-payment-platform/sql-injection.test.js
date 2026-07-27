@@ -43,10 +43,9 @@ jest.mock('./prismaClient', () => ({
     },
     $transaction: jest.fn((ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
 }));
-
-const { prisma } = require('./prismaClient');
 
 // Load a fresh `app` instance inside isolated module context per test to avoid
 // cross-file mock leakage that causes inconsistent behavior when tests run

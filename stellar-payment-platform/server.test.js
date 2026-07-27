@@ -35,10 +35,10 @@ jest.mock('./prismaClient', () => ({
       findFirst: jest.fn(),
     },
     $transaction: jest.fn(),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
 }));
 
-// Default multi-signer verifier mock for server tests
 jest.mock('./src/multisigner-verifier', () => ({
   verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
     success: true,

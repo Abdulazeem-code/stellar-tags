@@ -54,6 +54,7 @@ jest.mock('./prismaClient', () => ({
     },
     $transaction: jest.fn((ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
 }));
 
