@@ -47,6 +47,8 @@ jest.mock('./prismaClient', () => ({
   },
 }));
 
+const { prisma } = require('./prismaClient');
+
 // Load a fresh `app` instance inside isolated module context per test to avoid
 // cross-file mock leakage that causes inconsistent behavior when tests run
 // together in the full suite.
