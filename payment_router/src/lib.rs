@@ -206,6 +206,7 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+        Ok(())
     }
 
     /// Returns the contract version.
@@ -435,7 +436,7 @@ mod test {
         client.set_admin(&new_admin);
 
         // Modify config by new admin
-        client.set_fee_config(&200, &2000);
+        client.set_fee_config(&new_admin, &200);
 
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
@@ -576,7 +577,6 @@ mod test {
             min_temp_entry_ttl: 16,
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6312000,
-            protocol_version: 20,
         });
 
         // Now routing should be successful again
