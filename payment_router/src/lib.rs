@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
 };
 
 #[contracttype]
@@ -206,6 +206,7 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+        Ok(())
     }
 
     /// Returns the contract version.
@@ -371,6 +372,11 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
+        env.events().publish(
+            (symbol_short!("fee_cfg"),),
+            (treasury, fee_rate_bps),
+        );
+
         Ok(())
     }
 
@@ -392,9 +398,9 @@ impl PaymentRouter {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, LedgerInfo},
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
-        Address, Env,
+        Address, Env, Symbol, TryIntoVal,
     };
 
     fn setup_env() -> (Env, PaymentRouterClient<'static>) {
@@ -435,11 +441,31 @@ mod test {
         client.set_admin(&new_admin);
 
         // Modify config by new admin
-        client.set_fee_config(&200, &2000);
+        client.set_fee_config_legacy(&200, &2000);
 
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
         client.set_platform_treasury(&new_treasury);
+    }
+
+    #[test]
+    fn test_set_fee_config_emits_event() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000);
+
+        client.set_fee_config(&new_treasury, &250u32);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, _) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 1);
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("fee_cfg"));
     }
 
     #[test]
@@ -576,7 +602,6 @@ mod test {
             min_temp_entry_ttl: 16,
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6312000,
-            protocol_version: 20,
         });
 
         // Now routing should be successful again
