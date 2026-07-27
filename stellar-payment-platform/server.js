@@ -56,7 +56,7 @@ const allowedOrigins = [
   'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
-];
+].filter(Boolean);
 
 const corsOptions = {
   origin: (origin, callback) => {
