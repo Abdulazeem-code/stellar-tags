@@ -42,6 +42,8 @@ pub enum Error {
     NotInitialized = 5,
     Paused = 6,
     InvalidFeeRate = 7,
+    /// Sender and recipient addresses are the same (self-routing not allowed).
+    InvalidRecipient = 8,
 }
 
 #[contract]
@@ -231,6 +233,11 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         // 2. Verify the sender authorized this transaction
         sender.require_auth();
+
+        // 2.5. Prevent self-routing (sender == recipient)
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
 
         // 3. Validate the requested payment amount bounds
         if amount <= 0 || amount > Self::MAX_AMOUNT {
@@ -607,6 +614,28 @@ mod test {
         // Now routing should be successful again
         client.route_payment(&sender, &recipient, &token_address, &2000);
         assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 20));
+    }
+
+    #[test]
+    fn test_prevent_self_routing() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+
+        // Mint tokens to sender
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        // Initialize router
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Attempt to route payment to self should fail
+        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
     }
 
     #[test]
