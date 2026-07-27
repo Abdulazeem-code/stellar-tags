@@ -56,6 +56,7 @@ pub enum DataKey {
     UserVolume(Address),
     UserSpending(Address),
     Paused,
+    MaxAmount,
 }
 
 #[contracttype]
@@ -98,6 +99,7 @@ impl PaymentRouter {
         platform_treasury: Address,
         fee_bps: i128,
         fee_cap: i128,
+        max_amount: i128,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -110,6 +112,7 @@ impl PaymentRouter {
             .set(&DataKey::PlatformTreasury, &platform_treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+        env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -232,12 +235,7 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         sender.require_auth();
 
-        // 2. Validate the requested payment amount bounds
-        if amount <= 0 || amount > Self::MAX_AMOUNT {
-            return Err(Error::LimitExceeded);
-        }
-
-        // 3. Load fee configuration from instance storage
+        // 3. Load fee and limit configuration from instance storage
         let platform_treasury: Address = env
             .storage()
             .instance()
@@ -253,6 +251,16 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::FeeCap)
             .ok_or(Error::NotInitialized)?;
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+
+        // 2. Validate the requested payment amount bounds
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
 
         // Extend instance storage TTL after reading config
         env.storage().instance().extend_ttl(
@@ -456,10 +464,10 @@ mod test {
         let new_admin = Address::generate(&env);
 
         // Initialize contract
-        client.initialize(&admin, &treasury, &100, &1000);
+        client.initialize(&admin, &treasury, &100, &1000, &Self::MAX_AMOUNT);
 
         // Trying to initialize again should fail
-        let res = client.try_initialize(&admin, &treasury, &100, &1000);
+        let res = client.try_initialize(&admin, &treasury, &100, &1000, &Self::MAX_AMOUNT);
         assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyInitialized);
 
         // Set admin can be called (by current admin)
@@ -493,7 +501,7 @@ mod test {
         sac.mint(&sender, &initial_balance);
 
         // Initialize router with 1% fee (100 bps) and cap of 50
-        client.initialize(&admin, &treasury, &100, &50);
+        client.initialize(&admin, &treasury, &100, &50, &Self::MAX_AMOUNT);
 
         // Test normal fee calculation
         let amount_1 = 2000; // 1% of 2000 is 20, which is below cap (50)
@@ -531,7 +539,7 @@ mod test {
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &100);
 
-        client.initialize(&admin, &treasury, &100, &50);
+        client.initialize(&admin, &treasury, &100, &50, &Self::MAX_AMOUNT);
 
         // Route payment of 500 when balance is only 100
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
@@ -556,7 +564,7 @@ mod test {
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &(limit + 2000));
 
-        client.initialize(&admin, &treasury, &100, &50);
+        client.initialize(&admin, &treasury, &100, &50, &Self::MAX_AMOUNT);
 
         // Route amount within limit
         client.route_payment(&sender, &recipient, &token_address, &limit);
@@ -596,7 +604,7 @@ mod test {
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &platform_treasury, &40, &i128::MAX);
+        client.initialize(&admin, &platform_treasury, &40, &i128::MAX, &Self::MAX_AMOUNT);
 
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
