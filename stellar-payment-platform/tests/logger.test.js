@@ -24,9 +24,12 @@ describe('Rotating file logger (#294)', () => {
   afterAll(async () => {
     loaded.forEach((logger) => logger.close());
     // Give winston-daily-rotate-file time to close its file streams
-    // before we yank the directory out from under it.
     await new Promise(resolve => setTimeout(resolve, 500));
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    // Intentionally NOT deleting tmpDir here. 
+    // fs.rmSync(tmpDir, { recursive: true, force: true });
+    // winston-daily-rotate-file closes streams asynchronously and trying to 
+    // delete the folder while a background flush is happening causes unhandled ENOENT crashes in Jest.
+    // The OS will automatically clean up os.tmpdir() later.
   });
 
   describe('in test mode', () => {
