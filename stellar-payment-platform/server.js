@@ -794,10 +794,11 @@ app.get('/api/v1/time', (_req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', database: 'connected' });
   } catch (err) {
     logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
-    res.status(503).json({ status: 'error', message: 'Database unavailable', correlation_id: req.correlationId });
+    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
+
   }
 });
 
