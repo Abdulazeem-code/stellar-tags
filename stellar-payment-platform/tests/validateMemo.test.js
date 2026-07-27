@@ -1,4 +1,4 @@
-const { validateMemo } = require('../../server');
+const { validateMemo } = require('../server');
 
 describe('validateMemo', () => {
   it('returns null if both memoType and memo are absent', () => {
