@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, log, token, Address, Env, Vec,
 };
 
 #[contracttype]
@@ -8,6 +8,15 @@ use soroban_sdk::{
 pub struct UserSpending {
     pub last_reset_time: u64,
     pub accumulated_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payment {
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -213,53 +222,22 @@ impl PaymentRouter {
         Self::VERSION
     }
 
-    /// Routes a payment from a sender to a recipient, deducting a platform fee.
-    pub fn route_payment(
-        env: Env,
-        sender: Address,
-        recipient: Address,
-        token_address: Address,
+    fn process_single_payment(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token_address: &Address,
         amount: i128,
+        platform_treasury: &Address,
+        fee_bps: i128,
+        fee_cap: i128,
     ) -> Result<(), Error> {
-        // 0. Check if the contract is paused
-        // 1. Reject if the contract is paused
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
-
-        // 1. Verify the sender authorized this transaction
-        // 2. Verify the sender authorized this transaction
         sender.require_auth();
 
-        // 3. Validate the requested payment amount bounds
         if amount <= 0 || amount > Self::MAX_AMOUNT {
             return Err(Error::LimitExceeded);
         }
 
-        // 4. Load fee configuration from instance storage
-        let platform_treasury: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PlatformTreasury)
-            .ok_or(Error::NotInitialized)?;
-        let fee_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .ok_or(Error::NotInitialized)?;
-        let fee_cap: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeCap)
-            .ok_or(Error::NotInitialized)?;
-
-        // Extend instance storage TTL after reading config
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        // 4. Check time-based daily spending limits
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
         let mut spending = env
@@ -282,7 +260,6 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
-        // Store spending back in persistent storage and extend its TTL
         env.storage()
             .persistent()
             .set(&spending_key, &spending);
@@ -292,15 +269,12 @@ impl PaymentRouter {
             Self::PERSISTENT_BUMP_AMOUNT,
         );
 
-        // 6. Initialize the token client
-        let token_client = token::Client::new(&env, &token_address);
+        let token_client = token::Client::new(env, token_address);
 
-        // 7. Verify sender has sufficient balance
-        if token_client.balance(&sender) < amount {
+        if token_client.balance(sender) < amount {
             return Err(Error::InsufficientBalance);
         }
 
-        // 7. Calculate the fee split
         let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
@@ -310,15 +284,13 @@ impl PaymentRouter {
         }
         let recipient_amount = amount - fee_amount;
 
-        // 8. Execute token transfers
         if fee_amount > 0 {
-            token_client.transfer(&sender, &platform_treasury, &fee_amount);
+            token_client.transfer(sender, platform_treasury, &fee_amount);
         }
         if recipient_amount > 0 {
-            token_client.transfer(&sender, &recipient, &recipient_amount);
+            token_client.transfer(sender, recipient, &recipient_amount);
         }
 
-        // 10. Record the sender's cumulative routed volume in persistent storage
         let volume_key = DataKey::UserVolume(sender.clone());
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
         env.storage()
@@ -330,9 +302,84 @@ impl PaymentRouter {
             Self::PERSISTENT_BUMP_AMOUNT,
         );
 
-        // Log success
-        log!(&env, "Platform fee routed to treasury");
-        log!(&env, "Remaining balance routed to recipient");
+        log!(env, "Platform fee routed to treasury");
+        log!(env, "Remaining balance routed to recipient");
+
+        Ok(())
+    }
+
+    fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
+        let platform_treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .ok_or(Error::NotInitialized)?;
+        let fee_cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeCap)
+            .ok_or(Error::NotInitialized)?;
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        Ok((platform_treasury, fee_bps, fee_cap))
+    }
+
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    pub fn route_payment(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
+    }
+
+    /// Routes multiple payments to multiple recipients in a single transaction.
+    /// If any individual payment fails, the entire batch is reverted atomically.
+    pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        for payment in payments.iter() {
+            Self::process_single_payment(
+                &env,
+                &payment.sender,
+                &payment.recipient,
+                &payment.token_address,
+                payment.amount,
+                &platform_treasury,
+                fee_bps,
+                fee_cap,
+            )?;
+        }
 
         Ok(())
     }
