@@ -6,6 +6,8 @@ const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { scheduleWebhookRetryJob } = require('./src/webhookWorker');
+const { poolAll, poolRun } = require('./src/db');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
@@ -126,6 +128,12 @@ app.use(rejectNestedObjects);
 app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
+
+try {
+  scheduleWebhookRetryJob({ prisma, poolAllFn: poolAll, poolRunFn: poolRun });
+} catch (err) {
+  logger.error('Failed to schedule webhook retry job:', err.message);
+}
 
 const USER_DATABASE = {
   'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',

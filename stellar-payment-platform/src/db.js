@@ -127,6 +127,24 @@ const poolAll = (sql, params) =>
       )`,
       [],
     );
+    await poolRun(
+      `CREATE TABLE IF NOT EXISTS webhooks (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        url TEXT NOT NULL,
+        secret TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_sent_at TEXT,
+        failing_since TEXT,
+        UNIQUE(username, url),
+        FOREIGN KEY (username) REFERENCES username_registry(username) ON DELETE CASCADE
+      )`,
+      [],
+    );
+    try {
+      await poolRun(`CREATE INDEX IF NOT EXISTS webhooks_username_idx ON webhooks(username)`, []);
+      await poolRun(`CREATE INDEX IF NOT EXISTS webhooks_last_sent_at_idx ON webhooks(last_sent_at)`, []);
+    } catch (_) { /* index already exists, safe to ignore */ }
     logger.info(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
   } catch (err) {
     logger.error('Failed to initialise database schema:', err);
