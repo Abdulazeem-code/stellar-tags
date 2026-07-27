@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 
-import { Toaster } from 'react-hot-toast';
+import { toast, Toaster } from "react-hot-toast";
+import logger from "./logger";
 import LoadingSpinner from './components/LoadingSpinner';
 import { HORIZON_BASE, API_BASE, walletKit } from './views/shared';
 
@@ -67,14 +68,16 @@ const [activeView, setActiveView] = useState('dashboard')
             setUserPublicKey(publicKey);
             
           } catch (err) {
-            console.error("Wallet connection failed:", err);
+            logger.error("Wallet connection failed:", err);
+            toast.error("Failed to connect wallet.");
           }
         },
       });
 
       return { ok: true };
     } catch (error) {
-      console.error("User closed modal or an error occurred:", error);
+      toast.error("Connection cancelled.");
+      logger.error("User closed modal or an error occurred:", error);
       return { ok: false, error: "Wallet connection process cancelled." };
     }
   };
