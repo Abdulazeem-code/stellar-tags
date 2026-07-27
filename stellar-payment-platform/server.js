@@ -792,9 +792,9 @@ app.get('/api/v1/time', (_req, res) => {
 app.get('/health', async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', database: 'connected' });
   } catch {
-    res.status(503).json({ status: 'error', message: 'Database unavailable' });
+    res.status(503).json({ status: 'error', database: 'disconnected' });
   }
 });
 
