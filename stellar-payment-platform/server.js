@@ -215,6 +215,14 @@ const listLocalUsers = async (search, page, limit) => {
       address: user.address,
       created_at: user.created_at,
     })),
+    meta: {
+      total: totalCount,
+      totalCount,
+      page,
+      currentPage: page,
+      limit,
+      totalPages: Math.ceil(totalCount / limit),
+    },
     totalCount,
     totalPages: Math.ceil(totalCount / limit),
     currentPage: page,
@@ -744,10 +752,23 @@ app.get('/users', async (req, res, next) => {
     const data = rows.map((user) => ({
       username: user.username,
       address: user.address,
-      created_at: user.createdAt.toISOString(),
+      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
     }));
 
-    res.json({ data, totalCount, totalPages, currentPage: page });
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
   } catch {
     const dbError = new Error('Database error');
     dbError.statusCode = 500;

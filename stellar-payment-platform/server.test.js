@@ -447,18 +447,29 @@ describe('GET /users — pagination and search', () => {
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ totalCount: 25, currentPage: 1 });
     expect(Array.isArray(res.body.data)).toBe(true);
+    expect(res.body).toHaveProperty('meta');
+    expect(res.body.meta).toMatchObject({
+      total: 25,
+      page: 1,
+      limit: 10,
+    });
   });
 
   test('respects explicit page and limit query params', async () => {
     const res = await request(app).get('/users?page=3&limit=5');
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ currentPage: 3 });
+    expect(res.body.meta).toMatchObject({
+      page: 3,
+      limit: 5,
+    });
   });
 
   test('accepts search query param without error', async () => {
     const res = await request(app).get('/users?search=alice');
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('data');
+    expect(res.body).toHaveProperty('meta');
   });
 });
 
