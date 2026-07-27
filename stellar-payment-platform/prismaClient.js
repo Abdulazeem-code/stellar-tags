@@ -1,4 +1,5 @@
-console.log('--- PRISMA CLIENT INITIALIZED ---');
+const { logger } = require('./src/logger');
+logger.info('--- PRISMA CLIENT INITIALIZED ---');
 // ---------------------------------------------------------------------------
 // Shared Prisma Client
 // ---------------------------------------------------------------------------
