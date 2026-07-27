@@ -91,7 +91,6 @@ const limiter = rateLimit({
 });
 
 app.use(cors(corsOptions));
-app.use(limiter);
 app.use(express.json({ limit: '10kb' }));
 app.use((err, _req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
@@ -253,7 +252,7 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
-app.get('/federation', etagCache, async (req, res, next) => {
+app.get('/federation', limiter, etagCache, async (req, res, next) => {
   const { q, type } = req.query;
   const queryValue = typeof q === 'string' ? q.trim() : '';
 
@@ -422,7 +421,7 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
+app.post('/register', limiter, idempotencyMiddleware(redisClient), async (req, res, next) => {
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
