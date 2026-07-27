@@ -15,8 +15,13 @@ const compression = require('compression');
 const v1Router = require('./src/routes/v1');
 const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
+const { logger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
+const { registerValidator } = require('./src/validators/registerValidator');
+const { validate } = require('./src/middleware/validate');
+const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
 
 dotenv.config();
@@ -72,7 +77,7 @@ const redisClient = process.env.REDIS_URL ? createClient({
   url: process.env.REDIS_URL
 }) : null;
 if (redisClient) {
-  redisClient.connect().catch(console.error);
+  redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
 const limiter = rateLimit({
@@ -210,6 +215,14 @@ const listLocalUsers = async (search, page, limit) => {
       address: user.address,
       created_at: user.created_at,
     })),
+    meta: {
+      total: totalCount,
+      totalCount,
+      page,
+      currentPage: page,
+      limit,
+      totalPages: Math.ceil(totalCount / limit),
+    },
     totalCount,
     totalPages: Math.ceil(totalCount / limit),
     currentPage: page,
@@ -422,6 +435,24 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
+
+  // Run express-validator chains manually
+  for (const validator of registerValidator) {
+    await validator.run(req);
+  }
+  
+  // Check for validation errors
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(422).json({
+      success: false,
+      errors: errors.array().map(err => ({
+        field: err.path,
+        message: err.msg,
+      })),
+    });
+  }
+
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
@@ -589,7 +620,7 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
     }
 
     // Handle other errors
-    console.error('Registration error:', error.message);
+    logger.error('Registration error:', error.message);
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
@@ -633,7 +664,7 @@ app.get('/lookup', async (req, res, next) => {
       return res.json({ username: row.username, address });
     } catch (err) {  // <-- 1. Add (err) here
       // 2. Add this console.log to print the exact reason Prisma is failing
-      console.error("🚨 ACTUAL PRISMA ERROR:", err); 
+      logger.error("🚨 ACTUAL PRISMA ERROR:", err); 
       
       const dbError = new Error('Database lookup failed');
       dbError.statusCode = 500;
@@ -721,10 +752,23 @@ app.get('/users', async (req, res, next) => {
     const data = rows.map((user) => ({
       username: user.username,
       address: user.address,
-      created_at: user.createdAt.toISOString(),
+      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
     }));
 
-    res.json({ data, totalCount, totalPages, currentPage: page });
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
   } catch {
     const dbError = new Error('Database error');
     dbError.statusCode = 500;
@@ -745,8 +789,13 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
+app.get('/health', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ok' });
+  } catch {
+    res.status(503).json({ status: 'error', message: 'Database unavailable' });
+  }
 });
 
 app.use((err, _req, _res, next) => {
@@ -774,7 +823,7 @@ app.use((err, req, res, _next) => {
     const errorId = crypto.randomUUID();
     // #31 — Prefix error logs with the correlation ID so a single API call can
     // be traced across every log line it produced.
-    console.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
+    logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
     return res.status(500).json({
       success: false,
       error: 'Internal Server Error',
@@ -793,24 +842,24 @@ app.use((err, req, res, _next) => {
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
-const gracefulShutdown = (server, pool, signal) => {
+const gracefulShutdown = (server, prismaClient, signal) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+  logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
 
   const timer = setTimeout(() => {
-    console.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
+    logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
   server.close(async () => {
     clearTimeout(timer);
     try {
-      await pool.drain();
-      await pool.clear();
+      await prismaClient.$disconnect();
     } catch (err) {
-      console.error('Error draining DB pool during shutdown:', err);
+      console.error('Error disconnecting Prisma during shutdown:', err);
+      logger.error('Error draining DB pool during shutdown:', err);
     }
     process.exit(0);
   });
@@ -819,23 +868,18 @@ const gracefulShutdown = (server, pool, signal) => {
 
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server successfully initialized on port ${PORT}`);
+    logger.info(`Server successfully initialized on port ${PORT}`);
   });
 
   server.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+      logger.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
       process.exit(1);
     }
   });
 
-  const prismaPool = {
-    drain: () => Promise.resolve(),
-    clear: () => prisma.$disconnect(),
-  };
-
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prismaPool, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prismaPool, sig));
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
+  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects };
