@@ -24,6 +24,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
   StrKey: { isValidEd25519PublicKey: jest.fn(() => true) },
 }));
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock to avoid transform errors.
 jest.mock('bad-words', () => {

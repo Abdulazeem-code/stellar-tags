@@ -2,6 +2,7 @@
 
 // Mock cleanup-cron so background cron doesn't interfere during tests
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 // Mock @stellar/stellar-sdk to prevent Jest from trying to parse ESM dependencies
 jest.mock('@stellar/stellar-sdk', () => ({

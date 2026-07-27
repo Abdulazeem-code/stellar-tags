@@ -12,6 +12,7 @@ jest.mock('pdfkit', () => jest.fn());
 // The cleanup cron schedules a recurring job at module load — stub it so the
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock the module so the
 // test suite can require server.js without a transform error.
@@ -74,6 +75,7 @@ jest.mock('sqlite3', () => ({
 }));
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock('generic-pool', () => ({
   createPool: jest.fn(() => ({
@@ -260,6 +262,7 @@ describe('GET /lookup — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     jest.mock('sqlite3', () => ({
       verbose: () => ({
@@ -376,6 +379,7 @@ describe('GET /users — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     jest.mock('sqlite3', () => ({
       verbose: () => ({
@@ -488,6 +492,7 @@ describe('POST /register — block secret keys', () => {
     }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     ({ app } = require('./server'));
     request = require('supertest');
@@ -768,6 +773,7 @@ describe('API v1 routing', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     jest.mock('sqlite3', () => ({
       verbose: () => ({
