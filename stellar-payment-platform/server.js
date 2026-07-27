@@ -448,7 +448,19 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
   const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
   const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
-  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
+  // #memo-sanitization — strip ALL HTML/script tags from user-provided memos
+  // before they reach the database. We must explicitly enable
+  // `stripIgnoreTag: true` because the default `xss()` behaviour is to
+  // *escape* tags as `&lt;`/`&gt;` rather than strip them, which would inflate
+  // the string past the 28-byte Stellar text-memo limit and reject legitimate
+  // input. `stripIgnoreTagBody: ['script']` also removes the body inside
+  // `<script>` tags (otherwise `alert(1)` would leak through). Empty output
+  // then trips the existing validateMemo's `memoType && !memo` check and is
+  // rejected with 400. For `id` (digits) and `hash` (hex) inputs there are no
+  // tags to strip, so the call is effectively a no-op.
+  const memo = typeof req.body.memo === 'string'
+    ? xss(req.body.memo.trim(), { whiteList: {}, stripIgnoreTag: true, stripIgnoreTagBody: ['script'] })
+    : undefined;
   const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
   const signerAddress = typeof req.body.signerAddress === 'string' ? req.body.signerAddress.trim() : '';
 

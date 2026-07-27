@@ -220,4 +220,63 @@ describe('API Integration Lifecycle Suite', () => {
     expect(duplicateRes.status).toBe(409);
     expect(duplicateRes.body).toHaveProperty("error");
   });
+
+  test('v1 /register sanitizes memo of type text — strips HTML/script tags before save', async () => {
+    const address = 'GBDQD3WTQ6W2VQ2W4V74UZ5WYF6B72GZ6EHD7I3L3WYH357Y4K5H3E4W';
+
+    // Mixed payload: inner safe text + dangerous tag — inner text must remain
+    // in the saved row, dangerous tags must be removed.
+    const malicious = '<b>payment</b><script>alert("xss")</script><a href="javascript:alert(1)">x</a>';
+
+    const res = await request(app)
+      .post('/api/v1/register')
+      .send({
+        username: 'memo_xss',
+        address,
+        memo_type: 'text',
+        memo: malicious,
+      });
+
+    expect(res.status).toBe(201);
+
+    // Saved/returned memo must not contain any angle brackets, script tags,
+    // javascript: scheme, etc. Inner text 'payment' is preserved.
+    expect(res.body.memo).not.toMatch(/[<>]/);
+    expect(res.body.memo).not.toMatch(/script/i);
+    expect(res.body.memo).not.toMatch(/javascript:/i);
+    expect(res.body.memo).toContain('payment');
+
+    // Lookup confirms the sanitized value is what is actually stored.
+    const lookup = await request(app).get(`/api/v1/lookup?address=${address}`);
+    expect(lookup.status).toBe(200);
+    expect(lookup.body).toHaveProperty('username', 'memo_xss*localhost');
+
+    // Federation response echoes the sanitized memo.
+    const fed = await request(app).get(`/api/v1/federation?q=GBDQD3WTQ6W2VQ2W4V74UZ5WYF6B72GZ6EHD7I3L3WYH357Y4K5H3E4W&type=id`);
+    expect(fed.status).toBe(200);
+    expect(fed.body.memo_type).toBe('text');
+    expect(fed.body.memo).not.toMatch(/[<>]/);
+    expect(fed.body.memo).not.toMatch(/script/i);
+  });
+
+  test('v1 /register rejects memo whose sanitization removes all content', async () => {
+    const address = 'GFFZF43FJB7Q5K6SWFKJQTNAXYVF7KAVN4GYJ3ZU3VZMYR5SX5QGYBS3';
+
+    const malicious = '<script>alert("xss")</script>';
+
+    const res = await request(app)
+      .post('/api/v1/register')
+      .send({
+        username: 'memo_xss_empty',
+        address,
+        memo_type: 'text',
+        memo: malicious,
+      });
+
+    // Sanitization emptied the memo, validateMemo rejects; no row is created.
+    expect(res.status).toBe(400);
+
+    const lookup = await request(app).get(`/api/v1/lookup?address=${address}`);
+    expect(lookup.status).toBe(404);
+  });
 });
