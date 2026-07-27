@@ -763,12 +763,18 @@ app.get('/.well-known/stellar.toml', (_req, res) => {
   res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
 });
 
+<<<<<<< Updated upstream
 app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
+app.get('/health', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ok' });
+  } catch {
+    res.status(503).json({ status: 'error', message: 'Database unavailable' });
+  }
 });
 
 app.use((err, _req, _res, next) => {
