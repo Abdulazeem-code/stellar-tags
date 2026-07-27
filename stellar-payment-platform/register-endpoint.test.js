@@ -56,6 +56,7 @@ jest.mock("./prismaClient", () => ({
       findUnique: jest.fn(),
       create: jest.fn(),
     },
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
 }));
 
