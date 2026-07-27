@@ -821,7 +821,7 @@ app.use((err, req, res, _next) => {
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
-const gracefulShutdown = (server, pool, signal) => {
+const gracefulShutdown = (server, prismaClient, signal) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
@@ -835,9 +835,9 @@ const gracefulShutdown = (server, pool, signal) => {
   server.close(async () => {
     clearTimeout(timer);
     try {
-      await pool.drain();
-      await pool.clear();
+      await prismaClient.$disconnect();
     } catch (err) {
+      console.error('Error disconnecting Prisma during shutdown:', err);
       logger.error('Error draining DB pool during shutdown:', err);
     }
     process.exit(0);
@@ -857,13 +857,8 @@ if (require.main === module) {
     }
   });
 
-  const prismaPool = {
-    drain: () => Promise.resolve(),
-    clear: () => prisma.$disconnect(),
-  };
-
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prismaPool, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prismaPool, sig));
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
+  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects };
