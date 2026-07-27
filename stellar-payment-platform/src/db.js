@@ -5,6 +5,7 @@ const { promisify } = require('util');
 const sqlite3 = require('sqlite3').verbose();
 const genericPool = require('generic-pool');
 const { scheduleCleanupJob } = require('./cleanup-cron');
+const { logger } = require('./logger');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -126,9 +127,9 @@ const poolAll = (sql, params) =>
       )`,
       [],
     );
-    console.log(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
+    logger.info(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
   } catch (err) {
-    console.error('Failed to initialise database schema:', err);
+    logger.error('Failed to initialise database schema:', err);
     process.exit(1);
   }
 })();

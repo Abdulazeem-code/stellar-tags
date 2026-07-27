@@ -15,6 +15,7 @@ const compression = require('compression');
 const v1Router = require('./src/routes/v1');
 const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
+const { logger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
@@ -76,7 +77,7 @@ const redisClient = process.env.REDIS_URL ? createClient({
   url: process.env.REDIS_URL
 }) : null;
 if (redisClient) {
-  redisClient.connect().catch(console.error);
+  redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
 const limiter = rateLimit({
@@ -611,7 +612,7 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
     }
 
     // Handle other errors
-    console.error('Registration error:', error.message);
+    logger.error('Registration error:', error.message);
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
@@ -655,7 +656,7 @@ app.get('/lookup', async (req, res, next) => {
       return res.json({ username: row.username, address });
     } catch (err) {  // <-- 1. Add (err) here
       // 2. Add this console.log to print the exact reason Prisma is failing
-      console.error("🚨 ACTUAL PRISMA ERROR:", err); 
+      logger.error("🚨 ACTUAL PRISMA ERROR:", err); 
       
       const dbError = new Error('Database lookup failed');
       dbError.statusCode = 500;
@@ -801,7 +802,7 @@ app.use((err, req, res, _next) => {
     const errorId = crypto.randomUUID();
     // #31 — Prefix error logs with the correlation ID so a single API call can
     // be traced across every log line it produced.
-    console.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
+    logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
     return res.status(500).json({
       success: false,
       error: 'Internal Server Error',
@@ -824,10 +825,10 @@ const gracefulShutdown = (server, pool, signal) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+  logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
 
   const timer = setTimeout(() => {
-    console.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
+    logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
@@ -837,7 +838,7 @@ const gracefulShutdown = (server, pool, signal) => {
       await pool.drain();
       await pool.clear();
     } catch (err) {
-      console.error('Error draining DB pool during shutdown:', err);
+      logger.error('Error draining DB pool during shutdown:', err);
     }
     process.exit(0);
   });
@@ -846,12 +847,12 @@ const gracefulShutdown = (server, pool, signal) => {
 
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server successfully initialized on port ${PORT}`);
+    logger.info(`Server successfully initialized on port ${PORT}`);
   });
 
   server.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+      logger.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
       process.exit(1);
     }
   });
