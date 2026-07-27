@@ -24,14 +24,21 @@ pub enum DataKey {
     FeeRateBps,
 }
 
+/// Contract-level errors returned instead of panicking, so callers get a
+/// specific, stable error code to branch on rather than an opaque trap.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Caller is not authorized to perform this action (e.g. not the admin).
     Unauthorized = 1,
+    /// Sender's token balance is lower than the requested payment amount.
     InsufficientBalance = 2,
+    /// Requested amount is outside allowed bounds, or a spending limit was exceeded.
     LimitExceeded = 3,
+    /// `initialize` was called on a contract that already has an admin set.
     AlreadyInitialized = 4,
+    /// An admin-configured value (treasury, fee, admin) was read before `initialize`.
     NotInitialized = 5,
     Paused = 6,
     InvalidFeeRate = 7,
@@ -157,9 +164,14 @@ impl PaymentRouter {
             .unwrap_or(0)
     }
 
-    /// Set a new admin. Gated by the current admin if one exists.
-    pub fn set_admin(env: Env, new_admin: Address) {
-        if let Some(admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+    /// Set a new admin. Gated by the current admin if one exists (first call
+    /// bootstraps the admin with no auth check required).
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        if let Some(admin) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+        {
             admin.require_auth();
         }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -167,13 +179,14 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+        Ok(())
     }
 
     /// Updates the fee basis points. Admin-only. (Provided for backward compatibility).
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-        
+
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -182,8 +195,11 @@ impl PaymentRouter {
         Ok(())
     }
 
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    /// Transfers admin rights to a new address. Requires the current admin's
+    /// authorization. Returns `Error::NotInitialized` instead of panicking
+    /// if no admin has been set yet.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let current_admin = Self::require_admin(&env)?;
         current_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().extend_ttl(
@@ -206,19 +222,21 @@ impl PaymentRouter {
         amount: i128,
     ) -> Result<(), Error> {
         // 0. Check if the contract is paused
+        // 1. Reject if the contract is paused
         if Self::is_paused(env.clone()) {
             return Err(Error::Paused);
         }
 
         // 1. Verify the sender authorized this transaction
+        // 2. Verify the sender authorized this transaction
         sender.require_auth();
 
-        // 2. Validate the requested payment amount bounds
+        // 3. Validate the requested payment amount bounds
         if amount <= 0 || amount > Self::MAX_AMOUNT {
             return Err(Error::LimitExceeded);
         }
 
-        // 3. Load fee configuration from instance storage
+        // 4. Load fee configuration from instance storage
         let platform_treasury: Address = env
             .storage()
             .instance()
@@ -274,10 +292,10 @@ impl PaymentRouter {
             Self::PERSISTENT_BUMP_AMOUNT,
         );
 
-        // 5. Initialize the token client
+        // 6. Initialize the token client
         let token_client = token::Client::new(&env, &token_address);
 
-        // 6. Verify sender has sufficient balance
+        // 7. Verify sender has sufficient balance
         if token_client.balance(&sender) < amount {
             return Err(Error::InsufficientBalance);
         }
@@ -300,7 +318,7 @@ impl PaymentRouter {
             token_client.transfer(&sender, &recipient, &recipient_amount);
         }
 
-        // 9. Record the sender's cumulative routed volume in persistent storage
+        // 10. Record the sender's cumulative routed volume in persistent storage
         let volume_key = DataKey::UserVolume(sender.clone());
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
         env.storage()
@@ -387,6 +405,17 @@ mod test {
         (env, client)
     }
 
+    /// Deploys a Stellar Asset Contract test token and returns both the
+    /// standard token client (balance/transfer) and the asset admin client
+    /// (mint), since `token::Client` alone has no `mint`.
+    fn setup_token(env: &Env) -> (Address, token::Client<'static>, token::StellarAssetClient<'static>) {
+        let token_admin = Address::generate(env);
+        let token_address = env.register_stellar_asset_contract(token_admin);
+        let token_client = token::Client::new(env, &token_address);
+        let token_admin_client = token::StellarAssetClient::new(env, &token_address);
+        (token_address, token_client, token_admin_client)
+    }
+
     #[test]
     fn test_initialize_and_admin_restrictions() {
         let (env, client) = setup_env();
@@ -457,10 +486,7 @@ mod test {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        // Deploy mock token
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let token_client = token::Client::new(&env, &token_address);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
 
         // Mint tokens to sender
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
@@ -522,9 +548,7 @@ mod test {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let token_client = token::Client::new(&env, &token_address);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
 
         // Daily limit is 1,000,000 * 10,000,000 = 10,000,000,000,000
         let limit = 10_000_000_000_000;
@@ -542,8 +566,10 @@ mod test {
 
         // Warp time by 24 hours (86,400 seconds)
         let current_time = env.ledger().timestamp();
+        let current_protocol_version = env.ledger().protocol_version();
         env.ledger().set(LedgerInfo {
             timestamp: current_time + 86400,
+            protocol_version: current_protocol_version,
             sequence_number: 1,
             network_id: env.ledger().network_id().into(),
             base_reserve: 100,
