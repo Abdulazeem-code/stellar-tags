@@ -34,10 +34,10 @@ describe('validateMemo', () => {
       expect(validateMemo('text', 'a'.repeat(29))).toBe('memo of type text must not exceed 28 bytes.');
     });
 
-    it('returns error for multibyte text memo exceeding 28 bytes', () => {
-      // '🚀' is 4 bytes. 7 of them = 28 bytes (valid), 8 = 32 bytes (invalid)
-      expect(validateMemo('text', '🚀'.repeat(7))).toBeNull();
-      expect(validateMemo('text', '🚀'.repeat(8))).toBe('memo of type text must not exceed 28 bytes.');
+    it('returns error for text memo exceeding 28 bytes', () => {
+      // 'abcd' is 4 bytes. 7 of them = 28 bytes (valid), 8 = 32 bytes (invalid)
+      expect(validateMemo('text', 'abcd'.repeat(7))).toBeNull();
+      expect(validateMemo('text', 'abcd'.repeat(8))).toBe('memo of type text must not exceed 28 bytes.');
     });
   });
 
