@@ -21,8 +21,11 @@ describe('Rotating file logger (#294)', () => {
   const tmpDir = path.join(os.tmpdir(), `stellar-tags-logs-${process.pid}`);
   const loaded = [];
 
-  afterAll(() => {
+  afterAll(async () => {
     loaded.forEach((logger) => logger.close());
+    // Give winston-daily-rotate-file time to close its file streams
+    // before we yank the directory out from under it.
+    await new Promise(resolve => setTimeout(resolve, 500));
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
