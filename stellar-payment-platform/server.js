@@ -790,11 +790,36 @@ app.get('/api/v1/time', (_req, res) => {
 });
 
 app.get('/health', async (_req, res) => {
+  const checks = { database: null, redis: null };
+  let allOk = true;
+  const errors = [];
+
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok' });
+    checks.database = 'ok';
   } catch {
-    res.status(503).json({ status: 'error', message: 'Database unavailable' });
+    checks.database = 'error';
+    allOk = false;
+    errors.push('Database unavailable');
+  }
+
+  if (redisClient) {
+    try {
+      await redisClient.ping();
+      checks.redis = 'ok';
+    } catch {
+      checks.redis = 'error';
+      allOk = false;
+      errors.push('Redis unavailable');
+    }
+  } else {
+    checks.redis = 'not configured';
+  }
+
+  if (allOk) {
+    res.json({ status: 'ok', ...checks });
+  } else {
+    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
   }
 });
 
