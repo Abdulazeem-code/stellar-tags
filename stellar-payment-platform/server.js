@@ -66,6 +66,10 @@ const corsOptions = {
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+
+// Apply metrics middleware to track all HTTP requests
+app.use(metricsMiddleware);
+
 const redisClient = process.env.REDIS_URL ? createClient({
   url: process.env.REDIS_URL
 }) : null;
@@ -322,6 +326,17 @@ const registerLocalUser = async ({ username, address }) => {
  *             schema:
  *               $ref: '#/components/schemas/ErrorResponse'
  */
+// Expose /metrics endpoint for Prometheus to scrape
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', getContentType());
+    const metrics = await getMetrics();
+    res.end(metrics);
+  } catch (err) {
+    res.status(500).end(err.message);
+  }
+});
+
 app.get('/federation', etagCache, async (req, res, next) => {
   const { q, type } = req.query;
   const queryValue = typeof q === 'string' ? q.trim() : '';
@@ -584,6 +599,24 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
   }
+
+  // Run express-validator chains manually
+  for (const validator of registerValidator) {
+    await validator.run(req);
+  }
+  
+  // Check for validation errors
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(422).json({
+      success: false,
+      errors: errors.array().map(err => ({
+        field: err.path,
+        message: err.msg,
+      })),
+    });
+  }
+
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
   const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
