@@ -73,10 +73,25 @@ app.use(correlationId);
 // Apply metrics middleware to track all HTTP requests
 app.use(metricsMiddleware);
 
+const REDIS_RETRY_MAX = 5;
+const REDIS_RETRY_BASE_DELAY_MS = 500;
+
 const redisClient = process.env.REDIS_URL ? createClient({
-  url: process.env.REDIS_URL
+  url: process.env.REDIS_URL,
+  socket: {
+    reconnectStrategy(retries, cause) {
+      if (retries >= REDIS_RETRY_MAX) {
+        logger.error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`, { cause });
+        return new Error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`);
+      }
+      const delay = Math.min(2 ** retries * REDIS_RETRY_BASE_DELAY_MS, 10000);
+      logger.warn(`Redis connection attempt ${retries + 1} failed, retrying in ${delay}ms...`, { cause });
+      return delay;
+    }
+  }
 }) : null;
 if (redisClient) {
+  redisClient.on('error', (err) => logger.error('Redis client error:', err));
   redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
