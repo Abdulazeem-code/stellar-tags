@@ -4,6 +4,7 @@ const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
+const { logger } = require('../../logger');
 
 const router = express.Router();
 
@@ -145,7 +146,7 @@ router.post('/register', async (req, res, next) => {
       return next(error);
     }
 
-    console.error('Registration error:', error.message);
+    logger.error('Registration error:', error.message);
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);

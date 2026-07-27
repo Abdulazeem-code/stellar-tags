@@ -18,6 +18,7 @@ jest.mock('../prismaClient', () => ({
       }),
     },
     $transaction: jest.fn().mockResolvedValue([0, []]),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
 }));
 

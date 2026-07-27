@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "tsx watch server.js",
-    "test": "jest --forceExit",
+    "test": "jest --forceExit --maxWorkers=2",
     "test:integration": "TEST_API_URL=http://localhost:5001 jest --forceExit --testPathPattern=integration",
     "listener": "node horizonListener.js",
     "db:seed": "node scripts/seed.js",

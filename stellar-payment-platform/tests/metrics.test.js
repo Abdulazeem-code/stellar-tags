@@ -22,7 +22,8 @@ jest.mock('../prismaClient', () => ({
       create: jest.fn().mockResolvedValue({})
     },
     $transaction: jest.fn().mockResolvedValue([0, []]),
-    $disconnect: jest.fn().mockResolvedValue(undefined)
+    $disconnect: jest.fn().mockResolvedValue(undefined),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }])
   }
 }));
 
