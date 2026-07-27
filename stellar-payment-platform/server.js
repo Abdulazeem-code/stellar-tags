@@ -763,7 +763,6 @@ app.get('/.well-known/stellar.toml', (_req, res) => {
   res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
 });
 
-<<<<<<< Updated upstream
 app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
