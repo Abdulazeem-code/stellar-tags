@@ -1,4 +1,8 @@
 #![no_std]
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
+
+#[contracttype]
+#[derive(Clone)]
 use soroban_sdk::{contract, contractimpl, log, symbol_short, token, Address, Env};
 
 const ADMIN: soroban_sdk::Symbol = symbol_short!("admin");
@@ -22,6 +26,13 @@ pub enum DataKey {
     FeeCap,
     UserVolume(Address),
     UserSpending(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSpending {
+    pub last_reset_time: u64,
+    pub accumulated_amount: i128,
     Paused,
     Treasury,
     FeeRateBps,
@@ -160,6 +171,12 @@ impl PaymentRouter {
         admin.require_auth();
 
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+    /// Returns the current protocol fee percentage in basis points (read-only).
+    pub fn get_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0)
     /// Pauses or unpauses the payment router. Admin-only.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
@@ -170,6 +187,12 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+
+        env.events().publish(
+            (symbol_short!("pause"),),
+            (paused,),
+        );
+
         Ok(())
     }
 
@@ -276,6 +299,13 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// The fee is calculated as a percentage (`fee_bps` / 10,000) of the `amount`,
+    /// capped at `fee_cap`. Both values, along with the treasury address, are
+    /// read from instance storage set via `initialize`.
+    /// The platform fee is transferred to the configured treasury, and the
+    /// remaining balance is transferred to `recipient`.
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
@@ -341,6 +371,7 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
+        // 4. Check spending limits
         // 4. Check time-based daily spending limits
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
@@ -364,15 +395,16 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
-        // Store spending back in persistent storage and extend its TTL
         env.storage()
             .persistent()
             .set(&spending_key, &spending);
-        env.storage().persistent().extend_ttl(
-            &spending_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &spending_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
 
         let platform_treasury: Address = env
             .storage()
@@ -405,7 +437,7 @@ impl PaymentRouter {
             return Err(Error::InsufficientBalance);
         }
 
-        // 7. Calculate the fee split
+        // 8. Calculate the fee split
         let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
@@ -415,9 +447,12 @@ impl PaymentRouter {
         }
         let recipient_amount = amount - fee_amount;
 
+        // 8. Execute token transfers
+        // Transfer fee to treasury (only if fee > 0)
         if fee_amount > 0 {
             token_client.transfer(&sender, &platform_treasury, &fee_amount);
         }
+        // Transfer remainder to destination
         if recipient_amount > 0 {
             token_client.transfer(&sender, &recipient, &recipient_amount);
         }
@@ -428,11 +463,13 @@ impl PaymentRouter {
         env.storage()
             .persistent()
             .set(&volume_key, &(prev_volume + amount));
-        env.storage().persistent().extend_ttl(
-            &volume_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &volume_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
 
         // Log success
         log!(&env, "Platform fee routed to treasury");
@@ -601,6 +638,25 @@ mod test {
 
         assert_eq!(token_client.balance(&admin), recover_amount);
         assert_eq!(token_client.balance(&contract_id), accidental_amount - recover_amount);
+    fn test_get_fee() {
+        let (env, client) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        // Before initialization, get_fee returns 0
+        assert_eq!(client.get_fee(), 0);
+
+        // Initialize with 250 bps (2.5%)
+        client.initialize(&admin, &treasury, &250, &1000).unwrap();
+        assert_eq!(client.get_fee(), 250);
+
+        // Update fee via set_fee_bps
+        client.set_fee_bps(&300).unwrap();
+        assert_eq!(client.get_fee(), 300);
+
+        // Update fee via set_fee_config
+        client.set_fee_config(&150, &500).unwrap();
+        assert_eq!(client.get_fee(), 150);
     }
 
     #[test]
@@ -691,6 +747,9 @@ mod test {
         // Initialize router with 1% fee (100 bps) and cap of 50
         client.initialize(&admin, &treasury, &100, &50);
 
+        // Add the token to the supported whitelist
+        client.add_supported_token(&token_address);
+
         // Test normal fee calculation
         let amount_1 = 2000; // 1% of 2000 is 20, which is below cap (50)
         client.route_payment(&sender, &recipient, &token_address, &amount_1);
@@ -707,7 +766,10 @@ mod test {
 
         assert_eq!(token_client.balance(&treasury), 70);
         assert_eq!(token_client.balance(&recipient), 9930);
-        assert_eq!(token_client.balance(&sender), initial_balance - amount_1 - amount_2);
+        assert_eq!(
+            token_client.balance(&sender),
+            initial_balance - amount_1 - amount_2
+        );
         assert_eq!(client.get_user_volume(&sender), amount_1 + amount_2);
     }
 
@@ -730,6 +792,7 @@ mod test {
         sac.mint(&sender, &100);
 
         client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
 
         client.initialize(&admin, &treasury, &100, &50);
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
@@ -760,6 +823,7 @@ mod test {
         sac.mint(&sender, &(limit + 2000));
 
         client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
 
         // Route amount within limit
         client.route_payment(&sender, &recipient, &token_address, &limit);
@@ -783,7 +847,10 @@ mod test {
 
         // Now routing should be successful again
         client.route_payment(&sender, &recipient, &token_address, &2000);
-        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 20));
+        assert_eq!(
+            token_client.balance(&recipient),
+            (limit - 50) + (2000 - 20)
+        );
     }
 
     #[test]
@@ -831,6 +898,9 @@ mod test {
         let initial_balance = 1_000_000_000;
         sac.mint(&sender, &initial_balance);
 
+        // Add token to the whitelist
+        client.add_supported_token(&token_address);
+
         assert_eq!(token_client.balance(&sender), initial_balance);
         assert_eq!(token_client.balance(&recipient), 0);
         assert_eq!(token_client.balance(&platform_treasury), 0);
@@ -842,7 +912,10 @@ mod test {
         let expected_recipient_amount = amount - expected_fee;
 
         assert_eq!(token_client.balance(&sender), initial_balance - amount);
-        assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
+        assert_eq!(
+            token_client.balance(&recipient),
+            expected_recipient_amount
+        );
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
     }
 
