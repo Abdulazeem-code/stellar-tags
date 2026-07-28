@@ -18,7 +18,8 @@ jest.mock('../prismaClient', () => ({
       findFirst: jest.fn().mockResolvedValue(null)
     },
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
-  }
+  },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 process.env.NODE_ENV = 'test';

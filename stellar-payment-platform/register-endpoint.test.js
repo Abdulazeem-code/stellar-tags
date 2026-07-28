@@ -58,6 +58,7 @@ jest.mock("./prismaClient", () => ({
     },
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock("./src/multisigner-verifier", () => ({

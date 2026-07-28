@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
-const { prisma } = require('./prismaClient');
+const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
@@ -367,8 +367,8 @@ app.get('/federation', etagCache, async (req, res, next) => {
         error: "Unsupported query type. Supported types: 'id', 'name'",
       });
     }
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -693,11 +693,10 @@ app.get('/lookup', async (req, res, next) => {
       }
 
       return res.json({ username: row.username, address });
-    } catch (err) {  // <-- 1. Add (err) here
-      // 2. Add this console.log to print the exact reason Prisma is failing
-      logger.error("🚨 ACTUAL PRISMA ERROR:", err); 
-      
-      const dbError = new Error('Database lookup failed');
+    } catch (err) {
+      logger.error("🚨 ACTUAL PRISMA ERROR:", err);
+
+      const dbError = new Error('Database lookup failed', { cause: err });
       dbError.statusCode = 500;
       return next(dbError);
     }
@@ -746,8 +745,8 @@ app.get('/lookup', async (req, res, next) => {
     }
 
     return res.json(response);
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -800,8 +799,8 @@ app.get('/users', async (req, res, next) => {
       totalPages,
       currentPage: page,
     });
-  } catch {
-    const dbError = new Error('Database error');
+  } catch (error) {
+    const dbError = new Error('Database error', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -883,6 +882,11 @@ if (process.env.SENTRY_DSN) {
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
+  if (isPrismaConnectionError(err)) {
+    err.statusCode = 503;
+    err.message = 'Service Unavailable';
+  }
+
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
