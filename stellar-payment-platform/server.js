@@ -34,10 +34,15 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
+// #31 — Attach a correlation ID to every request before anything else runs so
+// all downstream middleware, handlers and logs can reference the same trace.
+app.use(correlationId);
+
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
   if (req.timedout) {
-    return res.status(503).json({ error: 'Service Unavailable' });
+    logger.error(`[Correlation ID: ${req.correlationId}] Request Timeout`, err);
+    return res.status(503).json({ error: 'Service Unavailable', correlation_id: req.correlationId });
   }
   next(err);
 });
@@ -51,7 +56,7 @@ const allowedOrigins = [
   'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
-];
+].filter(Boolean);
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -66,17 +71,28 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-// #31 — Attach a correlation ID to every request before anything else runs so
-// all downstream middleware, handlers and logs can reference the same trace.
-app.use(correlationId);
-
 // Apply metrics middleware to track all HTTP requests
 app.use(metricsMiddleware);
 
+const REDIS_RETRY_MAX = 5;
+const REDIS_RETRY_BASE_DELAY_MS = 500;
+
 const redisClient = process.env.REDIS_URL ? createClient({
-  url: process.env.REDIS_URL
+  url: process.env.REDIS_URL,
+  socket: {
+    reconnectStrategy(retries, cause) {
+      if (retries >= REDIS_RETRY_MAX) {
+        logger.error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`, { cause });
+        return new Error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`);
+      }
+      const delay = Math.min(2 ** retries * REDIS_RETRY_BASE_DELAY_MS, 10000);
+      logger.warn(`Redis connection attempt ${retries + 1} failed, retrying in ${delay}ms...`, { cause });
+      return delay;
+    }
+  }
 }) : null;
 if (redisClient) {
+  redisClient.on('error', (err) => logger.error('Redis client error:', err));
   redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
@@ -258,6 +274,7 @@ app.get('/metrics', async (req, res) => {
     const metrics = await getMetrics();
     res.end(metrics);
   } catch (err) {
+    logger.error(`[Correlation ID: ${req.correlationId}] Metrics error`, err);
     res.status(500).end(err.message);
   }
 });
@@ -789,12 +806,14 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', async (_req, res) => {
+app.get('/health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok' });
-  } catch {
-    res.status(503).json({ status: 'error', message: 'Database unavailable' });
+    res.json({ status: 'ok', database: 'connected' });
+  } catch (err) {
+    logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
+    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
+
   }
 });
 
@@ -819,16 +838,17 @@ app.use((err, req, res, _next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
-  if (statusCode === 500) {
+  if (statusCode >= 500) {
     const errorId = crypto.randomUUID();
     // #31 — Prefix error logs with the correlation ID so a single API call can
     // be traced across every log line it produced.
     logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
-    return res.status(500).json({
+    return res.status(statusCode).json({
       success: false,
-      error: 'Internal Server Error',
+      error: statusCode === 500 ? 'Internal Server Error' : errorMessage,
       reference_id: errorId,
-      correlation_id: req.correlationId
+      correlation_id: req.correlationId,
+      ...(statusCode !== 500 ? { statusCode } : {})
     });
   }
 

@@ -2,7 +2,8 @@
   "version": "0.2",
   "language": "en",
   "ignorePaths": [
-    "**/node_modules/**"
+    "**/node_modules/**",
+    "payment_router/ethnum-patch/**"
   ],
   "ignoreRegExpList": [
     "\\b[A-Z0-9]{6,}\\b"

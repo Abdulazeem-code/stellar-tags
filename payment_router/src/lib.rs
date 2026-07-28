@@ -1,6 +1,9 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, log, symbol_short, token, Address, Env};
+
+const ADMIN: soroban_sdk::Symbol = symbol_short!("admin");
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
 };
 
 #[contracttype]
@@ -42,6 +45,8 @@ pub enum Error {
     NotInitialized = 5,
     Paused = 6,
     InvalidFeeRate = 7,
+    /// Sender and recipient addresses are the same (self-routing not allowed).
+    InvalidRecipient = 8,
 }
 
 #[contract]
@@ -206,11 +211,19 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+        Ok(())
     }
 
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&ADMIN, &admin);
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -230,6 +243,11 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         // 2. Verify the sender authorized this transaction
         sender.require_auth();
+
+        // 2.5. Prevent self-routing (sender == recipient)
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
 
         // 3. Validate the requested payment amount bounds
         if amount <= 0 || amount > Self::MAX_AMOUNT {
@@ -371,6 +389,11 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
+        env.events().publish(
+            (symbol_short!("fee_cfg"),),
+            (treasury, fee_rate_bps),
+        );
+
         Ok(())
     }
 
@@ -392,9 +415,9 @@ impl PaymentRouter {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, LedgerInfo},
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
-        Address, Env,
+        Address, Env, Symbol, TryIntoVal,
     };
 
     fn setup_env() -> (Env, PaymentRouterClient<'static>) {
@@ -435,11 +458,31 @@ mod test {
         client.set_admin(&new_admin);
 
         // Modify config by new admin
-        client.set_fee_config(&200, &2000);
+        client.set_fee_config_legacy(&200, &2000);
 
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
         client.set_platform_treasury(&new_treasury);
+    }
+
+    #[test]
+    fn test_set_fee_config_emits_event() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000);
+
+        client.set_fee_config(&new_treasury, &250u32);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, _) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 1);
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("fee_cfg"));
     }
 
     #[test]
@@ -576,12 +619,33 @@ mod test {
             min_temp_entry_ttl: 16,
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6312000,
-            protocol_version: 20,
         });
 
         // Now routing should be successful again
         client.route_payment(&sender, &recipient, &token_address, &2000);
         assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 20));
+    }
+
+    #[test]
+    fn test_prevent_self_routing() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+
+        // Mint tokens to sender
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        // Initialize router
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Attempt to route payment to self should fail
+        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
     }
 
     #[test]
@@ -620,5 +684,50 @@ mod test {
         assert_eq!(token_client.balance(&sender), initial_balance - amount);
         assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
+    }
+
+    pub fn emergency_withdraw(env: Env, token: Address, amount: i128) {
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        admin.require_auth();
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+
+        log!(&env, "Emergency withdraw executed by admin");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn test_initialize_sets_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
+
+        client.initialize(&admin);
+
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin));
+    }
+
+    #[test]
+    fn test_emergency_withdraw_stores_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
+
+        client.initialize(&admin);
+
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin.clone()));
+        assert_eq!(stored_admin.unwrap(), admin);
     }
 }

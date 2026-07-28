@@ -13,7 +13,17 @@ const loadLogger = (env) => {
     mod = require('../src/logger');
   });
 
-  process.env = previous;
+  // Object.keys(process.env) is safer than process.env = previous
+  // because process.env in Node 20+ is a Proxy and assignment can leak.
+  const added = Object.keys(env);
+  for (const key of added) {
+    if (key in previous) {
+      process.env[key] = previous[key];
+    } else {
+      delete process.env[key];
+    }
+  }
+
   return mod;
 };
 
