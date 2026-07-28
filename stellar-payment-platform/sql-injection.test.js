@@ -49,6 +49,7 @@ jest.mock('./prismaClient', () => ({
     $disconnect: jest.fn().mockResolvedValue(undefined),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 const { prisma } = require('./prismaClient');

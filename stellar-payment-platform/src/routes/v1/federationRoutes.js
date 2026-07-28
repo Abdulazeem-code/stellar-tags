@@ -67,8 +67,8 @@ router.get('/federation', etagCache, async (req, res, next) => {
         error: "Unsupported query type. Supported types: 'id', 'name'",
       });
     }
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }

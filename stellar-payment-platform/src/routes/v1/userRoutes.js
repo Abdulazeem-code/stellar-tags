@@ -148,7 +148,7 @@ router.post('/register', async (req, res, next) => {
     }
 
     logger.error('Registration error:', error.message);
-    const registrationError = new Error(`Registration verification failed: ${error.message}`);
+    const registrationError = new Error(`Registration verification failed: ${error.message}`, { cause: error });
     registrationError.statusCode = 500;
     return next(registrationError);
   }
@@ -183,8 +183,8 @@ router.get('/lookup', async (req, res, next) => {
       }
 
       return res.json(result);
-    } catch {
-      const dbError = new Error('Database lookup failed');
+    } catch (error) {
+      const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
     }
@@ -220,8 +220,8 @@ router.get('/lookup', async (req, res, next) => {
     }));
 
     return res.json({ data, totalCount, totalPages, currentPage: page });
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -274,8 +274,8 @@ router.get('/users', async (req, res, next) => {
       totalPages,
       currentPage: page,
     });
-  } catch {
-    const dbError = new Error('Database error');
+  } catch (error) {
+    const dbError = new Error('Database error', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
