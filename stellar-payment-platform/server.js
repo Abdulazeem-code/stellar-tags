@@ -757,6 +757,8 @@ app.get('/users', async (req, res, next) => {
 // Mount v1 router for both legacy paths and explicit API versioning
 app.use('/', v1Router);
 app.use('/api/v1', v1Router);
+// Auth endpoints (email OTP verification) - uses Redis when available
+app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
 
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
