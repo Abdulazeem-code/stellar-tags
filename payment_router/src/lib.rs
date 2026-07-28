@@ -17,10 +17,9 @@ pub enum DataKey {
     FeeCap,
     UserVolume(Address),
     UserSpending(Address),
+    Paused,
+    SupportedToken(Address),
 }
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, token, Address, Env, Vec,
-};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -33,36 +32,7 @@ pub enum Error {
     NotInitialized = 5,
     Paused = 6,
     InvalidFeeRate = 7,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    PlatformTreasury,
-    FeeBps,
-    FeeCap,
-    UserVolume(Address),
-    UserSpending(Address),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Admin,
-    PlatformTreasury,
-    FeeBps,
-    FeeCap,
-    UserVolume(Address),
-    UserSpending(Address),
-    Paused,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserSpending {
-    pub last_reset_time: u64,
-    pub accumulated_amount: i128,
+    UnsupportedToken = 8,
 }
 
 #[contract]
@@ -73,7 +43,7 @@ impl PaymentRouter {
     const BPS_DIVISOR: i128 = 10_000;
     const XLM_DECIMALS: i128 = 10_000_000;
     const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100k tokens with 7 decimals
-    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS;
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
     const SECONDS_IN_24H: u64 = 24 * 3600;
     const VERSION: u32 = 1;
 
@@ -81,14 +51,8 @@ impl PaymentRouter {
     const INSTANCE_BUMP_AMOUNT: u32 = 7 * Self::DAY_IN_LEDGERS;
     const INSTANCE_LIFETIME_THRESHOLD: u32 = Self::INSTANCE_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
 
-    const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
-    const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
-
-    const XLM_DECIMALS: i128 = 10_000_000;
-    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
-    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
-    const SECONDS_IN_24H: u64 = 24 * 3600;
-    const VERSION: u32 = 1;
+    const PERSISTENT_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
+    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::PERSISTENT_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
 
     /// One-time setup: records the admin and the initial fee configuration
     /// in instance storage. Must be called before `route_payment`.
@@ -134,8 +98,7 @@ impl PaymentRouter {
     }
 
     /// Updates the fee basis points and fee cap. Admin-only.
-    /// (Legacy function — use set_fee_config_v2 for new code)
-    pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+    pub fn set_fee_config(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
@@ -193,7 +156,6 @@ impl PaymentRouter {
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-        
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -202,6 +164,7 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Transfers admin rights to a new address. Current admin must authorize.
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         current_admin.require_auth();
@@ -210,9 +173,54 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+    }
+
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+
+    /// Adds a token address to the supported whitelist. Admin-only.
+    /// Once added, the token can be used in `route_payment`.
+    pub fn add_supported_token(env: Env, token_address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SupportedToken(token_address.clone()), &true);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        log!(&env, "Token added to whitelist: {}", token_address);
+        Ok(())
+    }
+
+    /// Removes a token address from the supported whitelist. Admin-only.
+    /// Once removed, the token can no longer be used in `route_payment`.
+    pub fn remove_supported_token(env: Env, token_address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::SupportedToken(token_address.clone()));
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        log!(&env, "Token removed from whitelist: {}", token_address);
+        Ok(())
+    }
+
+    /// Checks whether a given token address is on the supported whitelist.
+    pub fn is_supported_token(env: Env, token_address: Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::SupportedToken(token_address))
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -220,8 +228,14 @@ impl PaymentRouter {
     /// The fee is calculated as a percentage (`fee_bps` / 10,000) of the `amount`,
     /// capped at `fee_cap`. Both values, along with the treasury address, are
     /// read from instance storage set via `initialize`.
+    ///
     /// The platform fee is transferred to the configured treasury, and the
     /// remaining balance is transferred to `recipient`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::UnsupportedToken` if `token_address` is not on the
+    /// supported whitelist (see `add_supported_token`).
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -229,15 +243,29 @@ impl PaymentRouter {
         token_address: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        // 1. Verify the sender authorized this transaction
+        // 0. Check if the contract is paused
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        // 1. Verify the token is on the supported whitelist
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::SupportedToken(token_address.clone()))
+        {
+            return Err(Error::UnsupportedToken);
+        }
+
+        // 2. Verify the sender authorized this transaction
         sender.require_auth();
 
-        // 2. Validate the requested payment amount bounds
+        // 3. Validate the requested payment amount bounds
         if amount <= 0 || amount > Self::MAX_AMOUNT {
             return Err(Error::LimitExceeded);
         }
 
-        // 3. Load fee configuration from instance storage
+        // 4. Load fee configuration from instance storage
         let platform_treasury: Address = env
             .storage()
             .instance()
@@ -260,20 +288,7 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        // 4. Check time-based daily spending limits
-        let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
-        if fee_amount > fee_cap {
-            fee_amount = fee_cap;
-    ) -> Result<(), Error> {
-        // 0. Check if the contract is paused (config read)
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
-
-        // 1. Verify the sender authorized this transaction
-        sender.require_auth();
-
-        // 1.5 Check spending limits
+        // 5. Check time-based daily spending limits
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
         let mut spending = env
@@ -296,25 +311,26 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
-        // Store spending back in persistent storage and extend its TTL
         env.storage()
             .persistent()
             .set(&spending_key, &spending);
-        env.storage().persistent().extend_ttl(
-            &spending_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &spending_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
 
-        // 5. Initialize the token client
+        // 6. Initialize the token client
         let token_client = token::Client::new(&env, &token_address);
 
-        // 6. Verify sender has sufficient balance
+        // 7. Verify sender has sufficient balance
         if token_client.balance(&sender) < amount {
             return Err(Error::InsufficientBalance);
         }
 
-        // 7. Calculate the fee split
+        // 8. Calculate the fee split
         let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
@@ -324,109 +340,35 @@ impl PaymentRouter {
         }
         let recipient_amount = amount - fee_amount;
 
-        // 8. Execute token transfers
-        // Transfer fee to treasury (only if fee > 0 and treasury is configured)
-        if fee_amount > 0 {
-            if let Some(treasury) = env.storage().instance().get::<DataKey, Address>(&DataKey::Treasury) {
-                token_client.transfer(&sender, &treasury, &fee_amount);
-            }
-        }
-        // Transfer remainder to destination
-        if remainder > 0 {
-            token_client.transfer(&sender, &recipient, &remainder);
-        }
+        // 9. Execute token transfers
+        token_client.transfer(&sender, &platform_treasury, &fee_amount);
+        token_client.transfer(&sender, &recipient, &recipient_amount);
 
-        // 9. Record the sender's cumulative routed volume in persistent storage
+        // 10. Record the sender's cumulative routed volume in persistent storage
         let volume_key = DataKey::UserVolume(sender.clone());
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
         env.storage()
             .persistent()
             .set(&volume_key, &(prev_volume + amount));
-        env.storage().persistent().extend_ttl(
-            &volume_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &volume_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
 
-        // Log success for testing
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to recipient");
 
         Ok(())
     }
-}
 
     fn require_admin(env: &Env) -> Result<Address, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
-    }
-
-    /// Calculates the protocol fee and remainder for a given amount.
-    /// Uses basis points: fee = amount * fee_rate_bps / 10_000
-    ///
-    /// # Returns
-    /// (fee_amount, remainder_amount)
-    /// Both are guaranteed non-negative and sum to <= amount.
-    ///
-    /// # Errors
-    /// Returns (0, amount) if fee_rate_bps is 0 or amount <= 0.
-    fn calculate_fee(amount: i128, fee_rate_bps: u32) -> (i128, i128) {
-        if fee_rate_bps == 0 || amount <= 0 {
-            return (0, amount);
-        }
-        // Use i128 arithmetic to avoid overflow
-        // fee = amount * fee_rate_bps / 10_000
-        let fee = amount
-            .checked_mul(fee_rate_bps as i128)
-            .unwrap_or(0)
-            .checked_div(10_000)
-            .unwrap_or(0);
-        let remainder = amount.checked_sub(fee).unwrap_or(amount);
-        (fee, remainder)
-    }
-
-    /// Sets the treasury address and fee rate.
-    /// Only callable by admin. Must be called before fee extraction is active.
-    ///
-    /// # Arguments
-    /// * `treasury` - Address that receives protocol fees
-    /// * `fee_rate_bps` - Fee rate in basis points (1 bps = 0.01%, max 1000 = 10%)
-    pub fn set_fee_config(env: Env, treasury: Address, fee_rate_bps: u32) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        // Validate fee rate — cap at 1000 bps (10%) to prevent abuse
-        if fee_rate_bps > 1_000 {
-            return Err(Error::InvalidFeeRate);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Treasury, &treasury);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeRateBps, &fee_rate_bps);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        Ok(())
-    }
-
-    /// Returns the current treasury address, or None if not configured.
-    pub fn get_treasury(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Treasury)
-    }
-
-    /// Returns the current fee rate in basis points.
-    pub fn get_fee_rate_bps(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::FeeRateBps)
-            .unwrap_or(0)
     }
 }
 
@@ -495,6 +437,9 @@ mod test {
         // Initialize router with 1% fee (100 bps) and cap of 50
         client.initialize(&admin, &treasury, &100, &50);
 
+        // Add the token to the supported whitelist
+        client.add_supported_token(&token_address);
+
         // Test normal fee calculation
         let amount_1 = 2000; // 1% of 2000 is 20, which is below cap (50)
         client.route_payment(&sender, &recipient, &token_address, &amount_1);
@@ -512,7 +457,10 @@ mod test {
         assert_eq!(token_client.balance(&treasury), 70);
         // Total recipient amount should be 1980 + 7950 = 9930
         assert_eq!(token_client.balance(&recipient), 9930);
-        assert_eq!(token_client.balance(&sender), initial_balance - amount_1 - amount_2);
+        assert_eq!(
+            token_client.balance(&sender),
+            initial_balance - amount_1 - amount_2
+        );
         assert_eq!(client.get_user_volume(&sender), amount_1 + amount_2);
     }
 
@@ -532,6 +480,7 @@ mod test {
         sac.mint(&sender, &100);
 
         client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
 
         // Route payment of 500 when balance is only 100
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
@@ -557,6 +506,7 @@ mod test {
         sac.mint(&sender, &(limit + 2000));
 
         client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
 
         // Route amount within limit
         client.route_payment(&sender, &recipient, &token_address, &limit);
@@ -580,7 +530,10 @@ mod test {
 
         // Now routing should be successful again
         client.route_payment(&sender, &recipient, &token_address, &2000);
-        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 20));
+        assert_eq!(
+            token_client.balance(&recipient),
+            (limit - 50) + (2000 - 20)
+        );
     }
 
     #[test]
@@ -606,6 +559,9 @@ mod test {
         let initial_balance = 1_000_000_000;
         sac.mint(&sender, &initial_balance);
 
+        // Add token to the whitelist
+        client.add_supported_token(&token_address);
+
         assert_eq!(token_client.balance(&sender), initial_balance);
         assert_eq!(token_client.balance(&recipient), 0);
         assert_eq!(token_client.balance(&platform_treasury), 0);
@@ -617,7 +573,121 @@ mod test {
         let expected_recipient_amount = amount - expected_fee;
 
         assert_eq!(token_client.balance(&sender), initial_balance - amount);
-        assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
+        assert_eq!(
+            token_client.balance(&recipient),
+            expected_recipient_amount
+        );
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
+    }
+
+    // --- Token Whitelist Tests ---
+
+    #[test]
+    fn test_add_supported_token_by_admin() {
+        let (env, client) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Token should not be supported initially
+        assert!(!client.is_supported_token(&token));
+
+        // Admin adds the token
+        client.add_supported_token(&token);
+
+        // Token should now be supported
+        assert!(client.is_supported_token(&token));
+    }
+
+    #[test]
+    fn test_remove_supported_token_by_admin() {
+        let (env, client) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token);
+        assert!(client.is_supported_token(&token));
+
+        // Admin removes the token
+        client.remove_supported_token(&token);
+
+        // Token should no longer be supported
+        assert!(!client.is_supported_token(&token));
+    }
+
+    #[test]
+    fn test_route_payment_fails_for_unsupported_token() {
+        let (env, client) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Token is NOT added to whitelist — route_payment should fail
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::UnsupportedToken);
+    }
+
+    #[test]
+    fn test_route_payment_succeeds_after_token_added_and_fails_after_removed() {
+        let (env, client) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // First, add the token — routing should succeed
+        client.add_supported_token(&token_address);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert!(res.is_ok());
+
+        // Now remove the token — routing should fail
+        client.remove_supported_token(&token_address);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
+        assert_eq!(res.unwrap_err().unwrap(), Error::UnsupportedToken);
+    }
+
+    #[test]
+    fn test_multiple_supported_tokens() {
+        let (env, client) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let token_c = Address::generate(&env);
+
+        // Add token_a and token_b
+        client.add_supported_token(&token_a);
+        client.add_supported_token(&token_b);
+
+        assert!(client.is_supported_token(&token_a));
+        assert!(client.is_supported_token(&token_b));
+        assert!(!client.is_supported_token(&token_c));
+
+        // Remove token_a
+        client.remove_supported_token(&token_a);
+        assert!(!client.is_supported_token(&token_a));
+        assert!(client.is_supported_token(&token_b));
     }
 }
