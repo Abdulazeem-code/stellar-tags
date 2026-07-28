@@ -799,7 +799,7 @@ app.use('/api/v1', v1Router);
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
-  res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
+  res.send(`FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`);
 });
 
 app.get('/api/v1/time', (_req, res) => {
