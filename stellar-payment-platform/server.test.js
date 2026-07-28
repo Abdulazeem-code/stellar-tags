@@ -38,6 +38,12 @@ jest.mock('./prismaClient', () => ({
     $transaction: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: (error) => {
+    const code = typeof error?.code === 'string' ? error.code : '';
+    if (code.startsWith('P10')) return true;
+    const causeCode = typeof error?.cause?.code === 'string' ? error.cause.code : '';
+    return causeCode.startsWith('P10');
+  },
 }));
 
 jest.mock('./src/multisigner-verifier', () => ({
@@ -901,5 +907,143 @@ describe('Idempotency Middleware', () => {
     
     // Ensure prisma.user.create was only called once
     expect(prisma.user.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Database disconnection — 503 handling', () => {
+  let request;
+  let app;
+  let prisma;
+
+  const makePrismaError = (code) => {
+    const err = new Error(`Prisma ${code}: simulated database connection error`);
+    err.code = code;
+    return err;
+  };
+
+  beforeEach(() => {
+    jest.resetModules();
+
+    jest.mock('dotenv', () => ({ config: jest.fn() }));
+    jest.mock('fs', () => ({ ...jest.requireActual('fs'), mkdirSync: jest.fn() }));
+    jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
+    jest.mock('pdfkit', () => jest.fn());
+    jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+    jest.mock('./src/multisigner-verifier', () => ({
+      verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
+        success: true, accountId: 'GDUMMY', operationType: 'management',
+        requiredThreshold: 1, totalWeight: 1, signatureCount: 1, uniqueSignerCount: 1,
+        signatures: [{ publicKey: 'GDUMMY', weight: 1, isValid: true }],
+        thresholds: { low_threshold: 1, med_threshold: 2, high_threshold: 3 },
+        signerCount: 1, errorMessage: null,
+      }),
+      isSingleSignerAccount: jest.fn().mockReturnValue(true),
+    }));
+
+    jest.mock('sqlite3', () => ({
+      verbose: () => ({
+        Database: jest.fn().mockImplementation((_path, cb) => {
+          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
+          if (cb) cb(null);
+          return db;
+        }),
+      }),
+    }));
+
+    const mockConn = {
+      run: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null); }),
+      get: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null, null); }),
+      all: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null, []); }),
+    };
+
+    jest.mock('generic-pool', () => ({
+      createPool: jest.fn(() => ({
+        acquire: jest.fn().mockResolvedValue(mockConn),
+        release: jest.fn(),
+        drain: jest.fn().mockResolvedValue(undefined),
+        clear: jest.fn().mockResolvedValue(undefined),
+      })),
+    }));
+
+    ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
+    request = require('supertest');
+
+    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
+    prisma.user.findMany.mockReset();
+    prisma.user.count.mockReset();
+    prisma.user.create.mockReset();
+    prisma.$transaction.mockReset();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test.each([
+    ['P1001', 'Connection refused'],
+    ['P1008', 'Connection timeout'],
+    ['P1017', 'Pool timeout'],
+  ])('GET /api/v1/federation returns 503 when Prisma throws %s', async (code) => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get('/api/v1/federation?q=alice*localhost&type=name');
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+    ['P1017'],
+  ])('GET /api/v1/lookup returns 503 on address lookup when Prisma throws %s', async (code) => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get(`/api/v1/lookup?address=GABC123`);
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+  ])('GET /api/v1/lookup returns 503 on search when Prisma throws %s', async (code) => {
+    prisma.$transaction.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get('/api/v1/lookup?search=alice');
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+  ])('GET /api/v1/users returns 503 when Prisma throws %s', async (code) => {
+    prisma.$transaction.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get('/api/v1/users');
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+  ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app)
+      .post('/api/v1/register')
+      .send({ username: 'newuser', address: 'GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN' });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('Service Unavailable');
+  });
+
+  test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError('P1001'));
+
+    const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');
+    expect(res.status).toBe(404);
   });
 });

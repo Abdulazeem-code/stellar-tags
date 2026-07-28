@@ -54,7 +54,7 @@ router.get('/stats', async (req, res, next) => {
     });
   } catch (error) {
     logger.error(`[Correlation ID: ${req.correlationId}] Stats endpoint error`, error);
-    const statsError = new Error('Failed to retrieve platform statistics');
+    const statsError = new Error('Failed to retrieve platform statistics', { cause: error });
     statsError.statusCode = 500;
     return next(statsError);
   }
