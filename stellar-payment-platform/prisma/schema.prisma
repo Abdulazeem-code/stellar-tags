@@ -10,7 +10,8 @@ datasource db {
 }
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["metrics"]
 }
 
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
@@ -28,6 +29,7 @@ model User {
   memo      String?
   createdAt DateTime  @default(now()) @map("created_at")
   flaggedAt DateTime? @map("flagged_at")
+  deletedAt DateTime? @map("deleted_at")
 
   @@index([username])
   @@map("username_registry")

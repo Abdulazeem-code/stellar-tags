@@ -50,6 +50,7 @@ jest.mock('../prismaClient', () => ({
 }));
 
 jest.mock('../src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock('../src/multisigner-verifier', () => ({
   verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
