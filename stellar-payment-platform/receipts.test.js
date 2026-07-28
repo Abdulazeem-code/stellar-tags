@@ -33,6 +33,7 @@ jest.mock('pdfkit', () => {
 jest.mock('dotenv', () => ({ config: jest.fn() }));
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock it to avoid transform errors.
 jest.mock('bad-words', () => {

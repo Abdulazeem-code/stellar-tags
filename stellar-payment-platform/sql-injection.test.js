@@ -24,6 +24,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
   StrKey: { isValidEd25519PublicKey: jest.fn(() => true) },
 }));
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock('redis', () => ({
   createClient: jest.fn(() => null),

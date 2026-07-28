@@ -6,6 +6,7 @@ const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { scheduleSoftDeletePurgeJob } = require('./src/soft-delete-purge-cron');
 const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
@@ -151,6 +152,7 @@ app.use(rejectNestedObjects);
 app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
+scheduleSoftDeletePurgeJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
 // ---------------------------------------------------------------------------
