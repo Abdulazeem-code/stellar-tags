@@ -19,6 +19,11 @@ soroban-sdk = { version = "20.0.0", features = ["testutils"] }
 [patch.crates-io]
 ethnum = { path = "ethnum-patch" }
 
+[dev-dependencies]
+soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+arbitrary = { version = "=1.3.2", optional = false }
+derive_arbitrary = { version = "=1.3.2", optional = false }
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true

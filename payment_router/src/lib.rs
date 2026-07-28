@@ -1,4 +1,7 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, log, symbol_short, token, Address, Env};
+
+const ADMIN: soroban_sdk::Symbol = symbol_short!("admin");
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
 };
@@ -214,6 +217,13 @@ impl PaymentRouter {
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&ADMIN, &admin);
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -674,5 +684,50 @@ mod test {
         assert_eq!(token_client.balance(&sender), initial_balance - amount);
         assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
+    }
+
+    pub fn emergency_withdraw(env: Env, token: Address, amount: i128) {
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        admin.require_auth();
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+
+        log!(&env, "Emergency withdraw executed by admin");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn test_initialize_sets_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
+
+        client.initialize(&admin);
+
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin));
+    }
+
+    #[test]
+    fn test_emergency_withdraw_stores_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
+
+        client.initialize(&admin);
+
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin.clone()));
+        assert_eq!(stored_admin.unwrap(), admin);
     }
 }
