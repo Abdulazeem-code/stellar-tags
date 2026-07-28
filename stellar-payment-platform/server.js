@@ -15,6 +15,7 @@ const compression = require('compression');
 const v1Router = require('./src/routes/v1');
 const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
+const { logger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
@@ -33,10 +34,15 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
+// #31 — Attach a correlation ID to every request before anything else runs so
+// all downstream middleware, handlers and logs can reference the same trace.
+app.use(correlationId);
+
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
   if (req.timedout) {
-    return res.status(503).json({ error: 'Service Unavailable' });
+    logger.error(`[Correlation ID: ${req.correlationId}] Request Timeout`, err);
+    return res.status(503).json({ error: 'Service Unavailable', correlation_id: req.correlationId });
   }
   next(err);
 });
@@ -50,7 +56,7 @@ const allowedOrigins = [
   'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
-];
+].filter(Boolean);
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -65,18 +71,29 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-// #31 — Attach a correlation ID to every request before anything else runs so
-// all downstream middleware, handlers and logs can reference the same trace.
-app.use(correlationId);
-
 // Apply metrics middleware to track all HTTP requests
 app.use(metricsMiddleware);
 
+const REDIS_RETRY_MAX = 5;
+const REDIS_RETRY_BASE_DELAY_MS = 500;
+
 const redisClient = process.env.REDIS_URL ? createClient({
-  url: process.env.REDIS_URL
+  url: process.env.REDIS_URL,
+  socket: {
+    reconnectStrategy(retries, cause) {
+      if (retries >= REDIS_RETRY_MAX) {
+        logger.error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`, { cause });
+        return new Error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`);
+      }
+      const delay = Math.min(2 ** retries * REDIS_RETRY_BASE_DELAY_MS, 10000);
+      logger.warn(`Redis connection attempt ${retries + 1} failed, retrying in ${delay}ms...`, { cause });
+      return delay;
+    }
+  }
 }) : null;
 if (redisClient) {
-  redisClient.connect().catch(console.error);
+  redisClient.on('error', (err) => logger.error('Redis client error:', err));
+  redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
 const limiter = rateLimit({
@@ -214,6 +231,14 @@ const listLocalUsers = async (search, page, limit) => {
       address: user.address,
       created_at: user.created_at,
     })),
+    meta: {
+      total: totalCount,
+      totalCount,
+      page,
+      currentPage: page,
+      limit,
+      totalPages: Math.ceil(totalCount / limit),
+    },
     totalCount,
     totalPages: Math.ceil(totalCount / limit),
     currentPage: page,
@@ -249,6 +274,7 @@ app.get('/metrics', async (req, res) => {
     const metrics = await getMetrics();
     res.end(metrics);
   } catch (err) {
+    logger.error(`[Correlation ID: ${req.correlationId}] Metrics error`, err);
     res.status(500).end(err.message);
   }
 });
@@ -611,7 +637,7 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
     }
 
     // Handle other errors
-    console.error('Registration error:', error.message);
+    logger.error('Registration error:', error.message);
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
@@ -655,7 +681,7 @@ app.get('/lookup', async (req, res, next) => {
       return res.json({ username: row.username, address });
     } catch (err) {  // <-- 1. Add (err) here
       // 2. Add this console.log to print the exact reason Prisma is failing
-      console.error("🚨 ACTUAL PRISMA ERROR:", err); 
+      logger.error("🚨 ACTUAL PRISMA ERROR:", err); 
       
       const dbError = new Error('Database lookup failed');
       dbError.statusCode = 500;
@@ -743,10 +769,23 @@ app.get('/users', async (req, res, next) => {
     const data = rows.map((user) => ({
       username: user.username,
       address: user.address,
-      created_at: user.createdAt.toISOString(),
+      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
     }));
 
-    res.json({ data, totalCount, totalPages, currentPage: page });
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
   } catch {
     const dbError = new Error('Database error');
     dbError.statusCode = 500;
@@ -767,8 +806,15 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
+app.get('/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ok', database: 'connected' });
+  } catch (err) {
+    logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
+    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
+
+  }
 });
 
 app.use((err, _req, _res, next) => {
@@ -792,16 +838,17 @@ app.use((err, req, res, _next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
-  if (statusCode === 500) {
+  if (statusCode >= 500) {
     const errorId = crypto.randomUUID();
     // #31 — Prefix error logs with the correlation ID so a single API call can
     // be traced across every log line it produced.
-    console.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
-    return res.status(500).json({
+    logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
+    return res.status(statusCode).json({
       success: false,
-      error: 'Internal Server Error',
+      error: statusCode === 500 ? 'Internal Server Error' : errorMessage,
       reference_id: errorId,
-      correlation_id: req.correlationId
+      correlation_id: req.correlationId,
+      ...(statusCode !== 500 ? { statusCode } : {})
     });
   }
 
@@ -815,24 +862,24 @@ app.use((err, req, res, _next) => {
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
-const gracefulShutdown = (server, pool, signal) => {
+const gracefulShutdown = (server, prismaClient, signal) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+  logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
 
   const timer = setTimeout(() => {
-    console.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
+    logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
   server.close(async () => {
     clearTimeout(timer);
     try {
-      await pool.drain();
-      await pool.clear();
+      await prismaClient.$disconnect();
     } catch (err) {
-      console.error('Error draining DB pool during shutdown:', err);
+      console.error('Error disconnecting Prisma during shutdown:', err);
+      logger.error('Error draining DB pool during shutdown:', err);
     }
     process.exit(0);
   });
@@ -841,23 +888,18 @@ const gracefulShutdown = (server, pool, signal) => {
 
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server successfully initialized on port ${PORT}`);
+    logger.info(`Server successfully initialized on port ${PORT}`);
   });
 
   server.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+      logger.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
       process.exit(1);
     }
   });
 
-  const prismaPool = {
-    drain: () => Promise.resolve(),
-    clear: () => prisma.$disconnect(),
-  };
-
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prismaPool, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prismaPool, sig));
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
+  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };

@@ -1,5 +1,10 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, log, symbol_short, token, Address, Env};
+
+const ADMIN: soroban_sdk::Symbol = symbol_short!("admin");
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9,7 +14,7 @@ pub struct UserSpending {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
     PlatformTreasury,
@@ -18,21 +23,30 @@ pub enum DataKey {
     UserVolume(Address),
     UserSpending(Address),
     Paused,
-    SupportedToken(Address),
+    Treasury,
+    FeeRateBps,
 }
 
+/// Contract-level errors returned instead of panicking, so callers get a
+/// specific, stable error code to branch on rather than an opaque trap.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Caller is not authorized to perform this action (e.g. not the admin).
     Unauthorized = 1,
+    /// Sender's token balance is lower than the requested payment amount.
     InsufficientBalance = 2,
+    /// Requested amount is outside allowed bounds, or a spending limit was exceeded.
     LimitExceeded = 3,
+    /// `initialize` was called on a contract that already has an admin set.
     AlreadyInitialized = 4,
+    /// An admin-configured value (treasury, fee, admin) was read before `initialize`.
     NotInitialized = 5,
     Paused = 6,
     InvalidFeeRate = 7,
-    UnsupportedToken = 8,
+    /// Sender and recipient addresses are the same (self-routing not allowed).
+    InvalidRecipient = 8,
 }
 
 #[contract]
@@ -42,7 +56,7 @@ pub struct PaymentRouter;
 impl PaymentRouter {
     const BPS_DIVISOR: i128 = 10_000;
     const XLM_DECIMALS: i128 = 10_000_000;
-    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100k tokens with 7 decimals
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
     const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
     const SECONDS_IN_24H: u64 = 24 * 3600;
     const VERSION: u32 = 1;
@@ -51,8 +65,17 @@ impl PaymentRouter {
     const INSTANCE_BUMP_AMOUNT: u32 = 7 * Self::DAY_IN_LEDGERS;
     const INSTANCE_LIFETIME_THRESHOLD: u32 = Self::INSTANCE_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
 
-    const PERSISTENT_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
-    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::PERSISTENT_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+    const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
+    const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+    const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
+    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
+
+    fn require_admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
 
     /// One-time setup: records the admin and the initial fee configuration
     /// in instance storage. Must be called before `route_payment`.
@@ -74,6 +97,7 @@ impl PaymentRouter {
             .set(&DataKey::PlatformTreasury, &platform_treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+        env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -98,7 +122,7 @@ impl PaymentRouter {
     }
 
     /// Updates the fee basis points and fee cap. Admin-only.
-    pub fn set_fee_config(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+    pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
@@ -112,7 +136,7 @@ impl PaymentRouter {
     }
 
     /// Pauses or unpauses the payment router. Admin-only.
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+    pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
@@ -122,6 +146,11 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
         Ok(())
+    }
+
+    /// Pauses or unpauses the payment router. Admin-only. Alias for set_pause.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+        Self::set_pause(env, paused)
     }
 
     /// Returns whether the contract is currently paused.
@@ -140,9 +169,14 @@ impl PaymentRouter {
             .unwrap_or(0)
     }
 
-    /// Set a new admin. Gated by the current admin if one exists.
-    pub fn set_admin(env: Env, new_admin: Address) {
-        if let Some(admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+    /// Set a new admin. Gated by the current admin if one exists (first call
+    /// bootstraps the admin with no auth check required).
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        if let Some(admin) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+        {
             admin.require_auth();
         }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -150,12 +184,14 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+        Ok(())
     }
 
     /// Updates the fee basis points. Admin-only. (Provided for backward compatibility).
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
+
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -164,15 +200,18 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Transfers admin rights to a new address. Current admin must authorize.
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    /// Transfers admin rights to a new address. Requires the current admin's
+    /// authorization. Returns `Error::NotInitialized` instead of panicking
+    /// if no admin has been set yet.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let current_admin = Self::require_admin(&env)?;
         current_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+        Ok(())
     }
 
     /// Returns the contract version.
@@ -180,62 +219,14 @@ impl PaymentRouter {
         Self::VERSION
     }
 
-    /// Adds a token address to the supported whitelist. Admin-only.
-    /// Once added, the token can be used in `route_payment`.
-    pub fn add_supported_token(env: Env, token_address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::SupportedToken(token_address.clone()), &true);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        log!(&env, "Token added to whitelist: {}", token_address);
-        Ok(())
-    }
-
-    /// Removes a token address from the supported whitelist. Admin-only.
-    /// Once removed, the token can no longer be used in `route_payment`.
-    pub fn remove_supported_token(env: Env, token_address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        env.storage()
-            .instance()
-            .remove(&DataKey::SupportedToken(token_address.clone()));
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        log!(&env, "Token removed from whitelist: {}", token_address);
-        Ok(())
-    }
-
-    /// Checks whether a given token address is on the supported whitelist.
-    pub fn is_supported_token(env: Env, token_address: Address) -> bool {
-        env.storage()
-            .instance()
-            .has(&DataKey::SupportedToken(token_address))
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&ADMIN, &admin);
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
-    ///
-    /// The fee is calculated as a percentage (`fee_bps` / 10,000) of the `amount`,
-    /// capped at `fee_cap`. Both values, along with the treasury address, are
-    /// read from instance storage set via `initialize`.
-    ///
-    /// The platform fee is transferred to the configured treasury, and the
-    /// remaining balance is transferred to `recipient`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::UnsupportedToken` if `token_address` is not on the
-    /// supported whitelist (see `add_supported_token`).
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -244,21 +235,19 @@ impl PaymentRouter {
         amount: i128,
     ) -> Result<(), Error> {
         // 0. Check if the contract is paused
+        // 1. Reject if the contract is paused
         if Self::is_paused(env.clone()) {
             return Err(Error::Paused);
         }
 
-        // 1. Verify the token is on the supported whitelist
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::SupportedToken(token_address.clone()))
-        {
-            return Err(Error::UnsupportedToken);
-        }
-
+        // 1. Verify the sender authorized this transaction
         // 2. Verify the sender authorized this transaction
         sender.require_auth();
+
+        // 2.5. Prevent self-routing (sender == recipient)
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
 
         // 3. Validate the requested payment amount bounds
         if amount <= 0 || amount > Self::MAX_AMOUNT {
@@ -288,7 +277,7 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        // 5. Check time-based daily spending limits
+        // 4. Check time-based daily spending limits
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
         let mut spending = env
@@ -340,9 +329,13 @@ impl PaymentRouter {
         }
         let recipient_amount = amount - fee_amount;
 
-        // 9. Execute token transfers
-        token_client.transfer(&sender, &platform_treasury, &fee_amount);
-        token_client.transfer(&sender, &recipient, &recipient_amount);
+        // 8. Execute token transfers
+        if fee_amount > 0 {
+            token_client.transfer(&sender, &platform_treasury, &fee_amount);
+        }
+        if recipient_amount > 0 {
+            token_client.transfer(&sender, &recipient, &recipient_amount);
+        }
 
         // 10. Record the sender's cumulative routed volume in persistent storage
         let volume_key = DataKey::UserVolume(sender.clone());
@@ -358,17 +351,66 @@ impl PaymentRouter {
                 Self::PERSISTENT_BUMP_AMOUNT,
             );
 
+        // Log success
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to recipient");
 
         Ok(())
     }
 
-    fn require_admin(env: &Env) -> Result<Address, Error> {
+    /// Calculates protocol fee and remainder
+    fn calculate_fee(amount: i128, fee_rate_bps: u32) -> (i128, i128) {
+        if fee_rate_bps == 0 || amount <= 0 {
+            return (0, amount);
+        }
+        let fee = amount
+            .checked_mul(fee_rate_bps as i128)
+            .unwrap_or(0)
+            .checked_div(10_000)
+            .unwrap_or(0);
+        let remainder = amount.checked_sub(fee).unwrap_or(amount);
+        (fee, remainder)
+    }
+
+    /// Sets treasury and fee rate
+    pub fn set_fee_config(env: Env, treasury: Address, fee_rate_bps: u32) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        if fee_rate_bps > 1_000 {
+            return Err(Error::InvalidFeeRate);
+        }
+
         env.storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
+            .set(&DataKey::Treasury, &treasury);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRateBps, &fee_rate_bps);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("fee_cfg"),),
+            (treasury, fee_rate_bps),
+        );
+
+        Ok(())
+    }
+
+    /// Returns current treasury address
+    pub fn get_treasury(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Treasury)
+    }
+
+    /// Returns current fee rate in basis points
+    pub fn get_fee_rate_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeRateBps)
+            .unwrap_or(0)
     }
 }
 
@@ -376,9 +418,9 @@ impl PaymentRouter {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, LedgerInfo},
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
-        Address, Env,
+        Address, Env, Symbol, TryIntoVal,
     };
 
     fn setup_env() -> (Env, PaymentRouterClient<'static>) {
@@ -387,6 +429,17 @@ mod test {
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
         (env, client)
+    }
+
+    /// Deploys a Stellar Asset Contract test token and returns both the
+    /// standard token client (balance/transfer) and the asset admin client
+    /// (mint), since `token::Client` alone has no `mint`.
+    fn setup_token(env: &Env) -> (Address, token::Client<'static>, token::StellarAssetClient<'static>) {
+        let token_admin = Address::generate(env);
+        let token_address = env.register_stellar_asset_contract(token_admin);
+        let token_client = token::Client::new(env, &token_address);
+        let token_admin_client = token::StellarAssetClient::new(env, &token_address);
+        (token_address, token_client, token_admin_client)
     }
 
     #[test]
@@ -408,11 +461,66 @@ mod test {
         client.set_admin(&new_admin);
 
         // Modify config by new admin
-        client.set_fee_config(&200, &2000);
+        client.set_fee_config_legacy(&200, &2000);
 
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
         client.set_platform_treasury(&new_treasury);
+    }
+
+    #[test]
+    fn test_set_fee_config_emits_event() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000);
+
+        client.set_fee_config(&new_treasury, &250u32);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, _) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 1);
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("fee_cfg"));
+    }
+
+    #[test]
+    fn test_admin_pause_functionality() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Initially not paused
+        assert_eq!(client.is_paused(), false);
+
+        // Pause the contract using set_pause
+        client.set_pause(&true);
+        assert_eq!(client.is_paused(), true);
+
+        // Route payment should fail when paused
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
+
+        // Unpause the contract using set_paused alias
+        client.set_paused(&false);
+        assert_eq!(client.is_paused(), false);
+
+        // Route payment should succeed now
+        client.route_payment(&sender, &recipient, &token_address, &1000);
     }
 
     #[test]
@@ -424,10 +532,7 @@ mod test {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        // Deploy mock token
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let token_client = token::Client::new(&env, &token_address);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
 
         // Mint tokens to sender
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
@@ -496,9 +601,7 @@ mod test {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let token_client = token::Client::new(&env, &token_address);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
 
         // Daily limit is 1,000,000 * 10,000,000 = 10,000,000,000,000
         let limit = 10_000_000_000_000;
@@ -517,15 +620,16 @@ mod test {
 
         // Warp time by 24 hours (86,400 seconds)
         let current_time = env.ledger().timestamp();
+        let current_protocol_version = env.ledger().protocol_version();
         env.ledger().set(LedgerInfo {
             timestamp: current_time + 86400,
+            protocol_version: current_protocol_version,
             sequence_number: 1,
             network_id: env.ledger().network_id().into(),
             base_reserve: 100,
             min_temp_entry_ttl: 16,
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6312000,
-            protocol_version: 20,
         });
 
         // Now routing should be successful again
@@ -534,6 +638,28 @@ mod test {
             token_client.balance(&recipient),
             (limit - 50) + (2000 - 20)
         );
+    }
+
+    #[test]
+    fn test_prevent_self_routing() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+
+        // Mint tokens to sender
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        // Initialize router
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Attempt to route payment to self should fail
+        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
     }
 
     #[test]
@@ -580,114 +706,48 @@ mod test {
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
     }
 
-    // --- Token Whitelist Tests ---
+    pub fn emergency_withdraw(env: Env, token: Address, amount: i128) {
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        admin.require_auth();
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+
+        log!(&env, "Emergency withdraw executed by admin");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
 
     #[test]
-    fn test_add_supported_token_by_admin() {
-        let (env, client) = setup_env();
+    fn test_initialize_sets_admin() {
+        let env = Env::default();
         let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let token = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
 
-        client.initialize(&admin, &treasury, &100, &50);
+        client.initialize(&admin);
 
-        // Token should not be supported initially
-        assert!(!client.is_supported_token(&token));
-
-        // Admin adds the token
-        client.add_supported_token(&token);
-
-        // Token should now be supported
-        assert!(client.is_supported_token(&token));
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin));
     }
 
     #[test]
-    fn test_remove_supported_token_by_admin() {
-        let (env, client) = setup_env();
+    fn test_emergency_withdraw_stores_admin() {
+        let env = Env::default();
         let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let token = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
 
-        client.initialize(&admin, &treasury, &100, &50);
-        client.add_supported_token(&token);
-        assert!(client.is_supported_token(&token));
+        client.initialize(&admin);
 
-        // Admin removes the token
-        client.remove_supported_token(&token);
-
-        // Token should no longer be supported
-        assert!(!client.is_supported_token(&token));
-    }
-
-    #[test]
-    fn test_route_payment_fails_for_unsupported_token() {
-        let (env, client) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let sac = StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50);
-
-        // Token is NOT added to whitelist — route_payment should fail
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
-        assert_eq!(res.unwrap_err().unwrap(), Error::UnsupportedToken);
-    }
-
-    #[test]
-    fn test_route_payment_succeeds_after_token_added_and_fails_after_removed() {
-        let (env, client) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let token_admin = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract(token_admin.clone());
-        let sac = StellarAssetClient::new(&env, &token_address);
-        sac.mint(&sender, &10_000);
-
-        client.initialize(&admin, &treasury, &100, &50);
-
-        // First, add the token — routing should succeed
-        client.add_supported_token(&token_address);
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
-        assert!(res.is_ok());
-
-        // Now remove the token — routing should fail
-        client.remove_supported_token(&token_address);
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
-        assert_eq!(res.unwrap_err().unwrap(), Error::UnsupportedToken);
-    }
-
-    #[test]
-    fn test_multiple_supported_tokens() {
-        let (env, client) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &50);
-
-        let token_a = Address::generate(&env);
-        let token_b = Address::generate(&env);
-        let token_c = Address::generate(&env);
-
-        // Add token_a and token_b
-        client.add_supported_token(&token_a);
-        client.add_supported_token(&token_b);
-
-        assert!(client.is_supported_token(&token_a));
-        assert!(client.is_supported_token(&token_b));
-        assert!(!client.is_supported_token(&token_c));
-
-        // Remove token_a
-        client.remove_supported_token(&token_a);
-        assert!(!client.is_supported_token(&token_a));
-        assert!(client.is_supported_token(&token_b));
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin.clone()));
+        assert_eq!(stored_admin.unwrap(), admin);
     }
 }
