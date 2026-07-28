@@ -134,22 +134,7 @@ const poolAll = (sql, params) =>
   }
 })();
 
-const USER_DATABASE = {
-  'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-  'lekan*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-};
-
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const normalizeNameTag = (value) => {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (!trimmed) {
-    return '';
-  }
-  return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
-};
-
-
+const { USER_DATABASE, normalizeNameTag } = require('./utils');
 
 const etagCache = (req, res, next) => {
   const originalJson = res.json.bind(res);
