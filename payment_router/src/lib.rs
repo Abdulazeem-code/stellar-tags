@@ -331,15 +331,16 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
-        // Store spending back in persistent storage and extend its TTL
         env.storage()
             .persistent()
             .set(&spending_key, &spending);
-        env.storage().persistent().extend_ttl(
-            &spending_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &spending_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
 
         // 6. Initialize the token client
         let token_client = token::Client::new(&env, &token_address);
@@ -349,7 +350,7 @@ impl PaymentRouter {
             return Err(Error::InsufficientBalance);
         }
 
-        // 7. Calculate the fee split
+        // 8. Calculate the fee split
         let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
@@ -375,11 +376,13 @@ impl PaymentRouter {
         env.storage()
             .persistent()
             .set(&volume_key, &(prev_volume + amount));
-        env.storage().persistent().extend_ttl(
-            &volume_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &volume_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
 
         // Log success
         log!(&env, "Platform fee routed to treasury");
@@ -595,6 +598,9 @@ mod test {
         // Initialize router with 1% fee (100 bps) and cap of 50
         client.initialize(&admin, &treasury, &100, &50);
 
+        // Add the token to the supported whitelist
+        client.add_supported_token(&token_address);
+
         // Test normal fee calculation
         let amount_1 = 2000; // 1% of 2000 is 20, which is below cap (50)
         client.route_payment(&sender, &recipient, &token_address, &amount_1);
@@ -612,7 +618,10 @@ mod test {
         assert_eq!(token_client.balance(&treasury), 70);
         // Total recipient amount should be 1980 + 7950 = 9930
         assert_eq!(token_client.balance(&recipient), 9930);
-        assert_eq!(token_client.balance(&sender), initial_balance - amount_1 - amount_2);
+        assert_eq!(
+            token_client.balance(&sender),
+            initial_balance - amount_1 - amount_2
+        );
         assert_eq!(client.get_user_volume(&sender), amount_1 + amount_2);
     }
 
@@ -632,6 +641,7 @@ mod test {
         sac.mint(&sender, &100);
 
         client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
 
         // Route payment of 500 when balance is only 100
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
@@ -655,6 +665,7 @@ mod test {
         sac.mint(&sender, &(limit + 2000));
 
         client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
 
         // Route amount within limit
         client.route_payment(&sender, &recipient, &token_address, &limit);
@@ -679,7 +690,10 @@ mod test {
 
         // Now routing should be successful again
         client.route_payment(&sender, &recipient, &token_address, &2000);
-        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 20));
+        assert_eq!(
+            token_client.balance(&recipient),
+            (limit - 50) + (2000 - 20)
+        );
     }
 
     #[test]
@@ -727,6 +741,9 @@ mod test {
         let initial_balance = 1_000_000_000;
         sac.mint(&sender, &initial_balance);
 
+        // Add token to the whitelist
+        client.add_supported_token(&token_address);
+
         assert_eq!(token_client.balance(&sender), initial_balance);
         assert_eq!(token_client.balance(&recipient), 0);
         assert_eq!(token_client.balance(&platform_treasury), 0);
@@ -738,7 +755,10 @@ mod test {
         let expected_recipient_amount = amount - expected_fee;
 
         assert_eq!(token_client.balance(&sender), initial_balance - amount);
-        assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
+        assert_eq!(
+            token_client.balance(&recipient),
+            expected_recipient_amount
+        );
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
     }
 
