@@ -902,4 +902,4 @@ if (require.main === module) {
   process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
