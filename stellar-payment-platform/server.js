@@ -6,6 +6,7 @@ const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
@@ -141,6 +142,7 @@ app.use(rejectNestedObjects);
 app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
+const poolMonitor = schedulePoolMonitoring(prisma);
 
 const USER_DATABASE = {
   'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
@@ -867,6 +869,10 @@ const gracefulShutdown = (server, prismaClient, signal) => {
   isShuttingDown = true;
 
   logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
+
+  // Stop the pool monitor so it doesn't produce misleading warnings during
+  // the shutdown window.
+  poolMonitor.stop();
 
   const timer = setTimeout(() => {
     logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
