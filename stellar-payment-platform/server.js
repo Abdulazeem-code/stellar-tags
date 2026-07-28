@@ -369,11 +369,15 @@ app.use((err, req, res, next) => {
 
   if (statusCode === 500) {
     const errorId = crypto.randomUUID();
-    console.error(`[Error ID: ${errorId}]`, err);
+    // Safely fall back to 'unknown' if correlation middleware has not yet assigned
+    // req.correlationId (e.g. an error thrown before the middleware chain runs).
+    const traceId = req.correlationId || 'unknown';
+    console.error(`[Error ID: ${errorId}] [Trace ID: ${traceId}]`, err);
     return res.status(500).json({
       success: false,
       error: 'Internal Server Error',
-      reference_id: errorId
+      reference_id: errorId,
+      trace_id: traceId
     });
   }
 
