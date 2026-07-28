@@ -851,6 +851,9 @@ app.get('/health', async (_req, res) => {
     res.json({ status: 'ok', ...checks });
   } else {
     res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
+  }
+});
+
 app.get('/health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
