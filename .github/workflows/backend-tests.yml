@@ -1,0 +1,30 @@
+name: Backend Unit Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install backend dependencies
+        working-directory: stellar-payment-platform
+        run: npm install --legacy-peer-deps
+
+      - name: Run backend unit tests
+        run: npm test --prefix stellar-payment-platform

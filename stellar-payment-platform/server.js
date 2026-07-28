@@ -7,6 +7,7 @@ const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const { scheduleSoftDeletePurgeJob } = require('./src/soft-delete-purge-cron');
+const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
@@ -57,7 +58,7 @@ const allowedOrigins = [
   'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
-];
+].filter(Boolean);
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -75,10 +76,25 @@ const corsOptions = {
 // Apply metrics middleware to track all HTTP requests
 app.use(metricsMiddleware);
 
+const REDIS_RETRY_MAX = 5;
+const REDIS_RETRY_BASE_DELAY_MS = 500;
+
 const redisClient = process.env.REDIS_URL ? createClient({
-  url: process.env.REDIS_URL
+  url: process.env.REDIS_URL,
+  socket: {
+    reconnectStrategy(retries, cause) {
+      if (retries >= REDIS_RETRY_MAX) {
+        logger.error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`, { cause });
+        return new Error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`);
+      }
+      const delay = Math.min(2 ** retries * REDIS_RETRY_BASE_DELAY_MS, 10000);
+      logger.warn(`Redis connection attempt ${retries + 1} failed, retrying in ${delay}ms...`, { cause });
+      return delay;
+    }
+  }
 }) : null;
 if (redisClient) {
+  redisClient.on('error', (err) => logger.error('Redis client error:', err));
   redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
@@ -128,6 +144,7 @@ app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
+const poolMonitor = schedulePoolMonitoring(prisma);
 
 const USER_DATABASE = {
   'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
@@ -280,13 +297,19 @@ app.get('/federation', etagCache, async (req, res, next) => {
     if (type === 'id') {
       const row = await prisma.user.findFirst({
         where: { address: { equals: queryValue, mode: 'insensitive' } },
-        select: { username: true, address: true, memoType: true, memo: true },
+        select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
       });
 
       if (!row) {
         const notFoundError = new Error('Address not found');
         notFoundError.statusCode = 404;
         return next(notFoundError);
+      }
+      
+      if (row.flaggedAt) {
+        const forbiddenError = new Error('Address is blocked');
+        forbiddenError.statusCode = 403;
+        return next(forbiddenError);
       }
       const response = {
         stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
@@ -305,8 +328,14 @@ app.get('/federation', etagCache, async (req, res, next) => {
       try {
         row = await prisma.user.findUnique({
           where: { username: queryName },
-          select: { address: true, memoType: true, memo: true },
+          select: { address: true, memoType: true, memo: true, flaggedAt: true },
         });
+        
+        if (row && row.flaggedAt) {
+          const forbiddenError = new Error('Address is blocked');
+          forbiddenError.statusCode = 403;
+          return next(forbiddenError);
+        }
       } catch (error) {
         if (!shouldFallbackToLocalRegistry(error)) {
           throw error;
@@ -786,7 +815,7 @@ app.use('/api/v1', v1Router);
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
-  res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
+  res.send(`FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`);
 });
 
 app.get('/api/v1/time', (_req, res) => {
@@ -796,10 +825,11 @@ app.get('/api/v1/time', (_req, res) => {
 app.get('/health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', database: 'connected' });
   } catch (err) {
     logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
-    res.status(503).json({ status: 'error', message: 'Database unavailable', correlation_id: req.correlationId });
+    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
+
   }
 });
 
@@ -854,6 +884,10 @@ const gracefulShutdown = (server, prismaClient, signal) => {
 
   logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
 
+  // Stop the pool monitor so it doesn't produce misleading warnings during
+  // the shutdown window.
+  poolMonitor.stop();
+
   const timer = setTimeout(() => {
     logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
     process.exit(1);
@@ -888,4 +922,4 @@ if (require.main === module) {
   process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
