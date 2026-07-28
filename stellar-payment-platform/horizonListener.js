@@ -32,6 +32,20 @@ const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000; //
 // ---------------------------------------------------------------------------
 const horizon = new Horizon.Server(HORIZON_URL);
 
+// Attempt to connect to the API server's Socket.IO endpoint so detected
+// payments can be forwarded to connected clients in real-time. The listener
+// runs as a separate process; it connects as a Socket.IO client and emits
+// 'payment' events which the server will route to the appropriate room.
+try {
+  const ioClient = require('socket.io-client');
+  const SOCKET_SERVER = process.env.SOCKET_SERVER_URL || `http://localhost:${process.env.PORT || 5000}`;
+  global.__socketClient = ioClient(SOCKET_SERVER, { reconnection: true });
+  global.__socketClient.on('connect', () => logger.info('[SocketClient] connected to server'));
+  global.__socketClient.on('connect_error', (err) => logger.error('[SocketClient] connect_error', err));
+} catch (err) {
+  logger.warn('Socket.IO client not available; real-time notifications disabled', err?.message || err);
+}
+
 // Track active streams so we can clean up on shutdown
 const activeStreams = new Map();
 
@@ -83,7 +97,19 @@ const watchAccount = (accountId) => {
         // Only log payment operations (ignore account_merge, etc.)
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
-        }
+
+            // If a Socket.IO server is available, emit the payment event so
+            // connected clients listening for this account receive a real-time
+            // notification. The horizon listener connects as a client to the
+            // API server and emits a 'payment' event with the address and payload.
+            try {
+              if (typeof global.__socketClient !== 'undefined' && global.__socketClient && global.__socketClient.connected) {
+                global.__socketClient.emit('payment', { address: accountId, payment });
+              }
+            } catch (err) {
+              logger.error('Failed to emit payment over socket client', err);
+            }
+          }
       },
       onerror: (error) => {
         logger.error(
