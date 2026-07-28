@@ -3,18 +3,26 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "start": "npm --prefix stellar-payment-platform start",
     "lint": "eslint .",
-    "prepare": "husky"
+    "prepare": "husky",
+    "load:test": "artillery run artillery.yml"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "artillery": "^2.0.33",
     "eslint": "^10.5.0",
     "globals": "^17.6.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.7"
   },
   "lint-staged": {
-    "*.js": "npm run lint",
+    "stellar-payment-platform/**/*.js": "eslint",
     "payment-dashboard/**/*.{js,jsx}": "npm --prefix payment-dashboard run lint"
+  },
+  "dependencies": {
+    "@creit.tech/stellar-wallets-kit": "^2.5.0",
+    "bad-words": "^3.0.4",
+    "xss": "^1.0.15"
   }
 }
