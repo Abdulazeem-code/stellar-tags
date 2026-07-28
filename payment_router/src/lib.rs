@@ -145,6 +145,12 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+
+        env.events().publish(
+            (symbol_short!("pause"),),
+            (paused,),
+        );
+
         Ok(())
     }
 
