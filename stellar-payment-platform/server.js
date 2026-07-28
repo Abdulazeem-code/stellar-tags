@@ -100,12 +100,50 @@ if (redisClient) {
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
+  // Use Redis-backed store when available
   store: redisClient ? new RedisStore({
     sendCommand: (...args) => redisClient.sendCommand(args),
   }) : undefined,
+  // Return the standard RateLimit-* headers only
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
+  // Key by authenticated user identifier when present (address/username),
+  // otherwise fall back to client IP. This lets registered/identified users
+  // get a per-account quota rather than being grouped by IP.
+  keyGenerator: (req /*, res */) => {
+    try {
+      // 1) x-api-key (admin or API key users)
+      const apiKey = req.headers['x-api-key'] || req.query.api_key;
+      if (apiKey) return String(apiKey);
+
+      // 2) JSON body address (e.g., /register)
+      if (req.body && typeof req.body.address === 'string' && req.body.address.trim()) {
+        return req.body.address.trim();
+      }
+
+      // 3) Query params: federation (q with type=id) or address param
+      if (req.query) {
+        if (req.query.type === 'id' && typeof req.query.q === 'string' && req.query.q.trim()) {
+          return req.query.q.trim();
+        }
+        if (typeof req.query.address === 'string' && req.query.address.trim()) {
+          return req.query.address.trim();
+        }
+        // Some endpoints use q for lookup by name; not an account id — skip.
+      }
+
+      // 4) URL path pattern: /v1/accounts/:account
+      const m = req.originalUrl && req.originalUrl.match(/\/v1\/accounts\/([^\/]+)/i);
+      if (m && m[1]) return decodeURIComponent(m[1]);
+
+      // Default to IP
+      return req.ip || (req.connection && req.connection.remoteAddress) || '';
+    } catch (err) {
+      // On error, fall back to IP so rate limiting still works
+      return req.ip || '';
+    }
+  },
 });
 
 app.use(cors(corsOptions));
