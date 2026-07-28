@@ -1,4 +1,8 @@
 #![no_std]
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
+
+#[contracttype]
+#[derive(Clone)]
 use soroban_sdk::{contract, contractimpl, log, symbol_short, token, Address, Env};
 
 const ADMIN: soroban_sdk::Symbol = symbol_short!("admin");
@@ -22,6 +26,13 @@ pub enum DataKey {
     FeeCap,
     UserVolume(Address),
     UserSpending(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSpending {
+    pub last_reset_time: u64,
+    pub accumulated_amount: i128,
     Paused,
     Treasury,
     FeeRateBps,
@@ -135,6 +146,12 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Returns the current protocol fee percentage in basis points (read-only).
+    pub fn get_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0)
     /// Pauses or unpauses the payment router. Admin-only.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
@@ -220,6 +237,13 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// The fee is calculated as a percentage (`fee_bps` / 10,000) of the `amount`,
+    /// capped at `fee_cap`. Both values, along with the treasury address, are
+    /// read from instance storage set via `initialize`.
+    /// The platform fee is transferred to the configured treasury, and the
+    /// remaining balance is transferred to `recipient`.
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
@@ -283,6 +307,7 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
+        // 4. Check spending limits
         // 4. Check time-based daily spending limits
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
@@ -472,6 +497,29 @@ mod test {
     }
 
     #[test]
+    fn test_get_fee() {
+        let (env, client) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        // Before initialization, get_fee returns 0
+        assert_eq!(client.get_fee(), 0);
+
+        // Initialize with 250 bps (2.5%)
+        client.initialize(&admin, &treasury, &250, &1000).unwrap();
+        assert_eq!(client.get_fee(), 250);
+
+        // Update fee via set_fee_bps
+        client.set_fee_bps(&300).unwrap();
+        assert_eq!(client.get_fee(), 300);
+
+        // Update fee via set_fee_config
+        client.set_fee_config(&150, &500).unwrap();
+        assert_eq!(client.get_fee(), 150);
+    }
+
+    #[test]
+    fn test_route_payment_calculates_and_sends_fee() {
     fn test_set_fee_config_emits_event() {
         let (env, client) = setup_env();
 
