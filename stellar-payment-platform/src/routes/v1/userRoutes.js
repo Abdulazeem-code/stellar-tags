@@ -3,34 +3,97 @@ const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
+const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
+const { parsePagination, paginatedResponse } = require('../../pagination');
+const {
+  normalizeNameTag,
+  validateMemo,
+  RESERVED_NAMES,
+  shouldFallbackToLocalRegistry,
+} = require('../../utils');
 
 const router = express.Router();
 
-const VALID_MEMO_TYPES = ['text', 'id', 'hash'];
-const MEMO_ID_RE = /^\d+$/;
-const MEMO_HASH_RE = /^[0-9a-fA-F]{64}$/;
+const buildUserSearchWhere = (search) => {
+  if (!search) return {};
+  return {
+    OR: [
+      { username: { contains: search, mode: 'insensitive' } },
+      { address: { contains: search, mode: 'insensitive' } },
+    ],
+  };
+};
 
-const validateMemo = (memoType, memo) => {
-  if (!memoType && !memo) return null;
-  if (memoType && !memo) return 'memo is required when memo_type is provided.';
-  if (!memoType && memo) return 'memo_type is required when memo is provided.';
-  if (!VALID_MEMO_TYPES.includes(memoType)) {
-    return `memo_type must be one of: ${VALID_MEMO_TYPES.join(', ')}.`;
+const serializeUser = (user) => ({
+  username: user.username,
+  address: user.address,
+  created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+});
+
+const getLocalUserByAddress = async (address) =>
+  poolGet(
+    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
+    [address],
+  );
+
+const getLocalUserByUsername = async (username) =>
+  poolGet(
+    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+    [username],
+  );
+
+const listLocalUsers = async (search, page, limit) => {
+  const searchPattern = `%${search}%`;
+  const skip = (page - 1) * limit;
+  const rows = await poolAll(
+    `SELECT username, address, created_at
+     FROM username_registry
+     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`,
+    [searchPattern, searchPattern, limit, skip],
+  );
+
+  const countRow = await poolGet(
+    `SELECT COUNT(*) AS totalCount
+     FROM username_registry
+     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE`,
+    [searchPattern, searchPattern],
+  );
+
+  const totalCount = Number(countRow?.totalCount || 0);
+  return paginatedResponse(
+    rows.map((user) => ({
+      username: user.username,
+      address: user.address,
+      created_at: user.created_at,
+    })),
+    totalCount,
+    { page, limit },
+  );
+};
+
+const registerLocalUser = async ({ username, address }) => {
+  const existingByAddress = await getLocalUserByAddress(address);
+  if (existingByAddress) {
+    const conflictError = new Error('Address already registered');
+    conflictError.statusCode = 409;
+    throw conflictError;
   }
-  if (memoType === 'text' && Buffer.byteLength(memo, 'utf8') > 28) {
-    return 'memo of type text must not exceed 28 bytes.';
+
+  const existingByUsername = await getLocalUserByUsername(username);
+  if (existingByUsername) {
+    const conflictError = new Error('Username is already taken. Please choose another.');
+    conflictError.statusCode = 409;
+    throw conflictError;
   }
-  if (memoType === 'id') {
-    if (!MEMO_ID_RE.test(memo) || BigInt(memo) > 18446744073709551615n) {
-      return 'memo of type id must be a valid 64-bit unsigned integer.';
-    }
-  }
-  if (memoType === 'hash' && !MEMO_HASH_RE.test(memo)) {
-    return 'memo of type hash must be a 64-character hex string (32 bytes).';
-  }
-  return null;
+
+  await poolRun(
+    `INSERT INTO username_registry (username, address, created_at)
+     VALUES (?, ?, ?)`,
+    [username, address, new Date().toISOString()],
+  );
 };
 
 router.post('/register', async (req, res, next) => {
@@ -76,7 +139,6 @@ router.post('/register', async (req, res, next) => {
 
   const normalizedUsername = username.toLowerCase();
 
-  const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
   if (RESERVED_NAMES.includes(normalizedUsername)) {
     return res.status(403).json({ error: "This username is reserved and cannot be registered." });
   }
@@ -186,16 +248,8 @@ router.get('/lookup', async (req, res, next) => {
     }
   }
 
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const skip = (page - 1) * limit;
-
-  const where = {
-    OR: [
-      { username: { contains: search, mode: 'insensitive' } },
-      { address: { contains: search, mode: 'insensitive' } },
-    ],
-  };
+  const { page, limit, skip } = parsePagination(req.query);
+  const where = buildUserSearchWhere(search);
 
   try {
     const [totalCount, rows] = await prisma.$transaction([
@@ -208,14 +262,9 @@ router.get('/lookup', async (req, res, next) => {
       }),
     ]);
 
-    const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
-    }));
-
-    return res.json({ data, totalCount, totalPages, currentPage: page });
+    return res.json(
+      paginatedResponse(rows.map(serializeUser), totalCount, { page, limit }),
+    );
   } catch {
     const dbError = new Error('Database lookup failed');
     dbError.statusCode = 500;
@@ -224,19 +273,9 @@ router.get('/lookup', async (req, res, next) => {
 });
 
 router.get('/users', async (req, res, next) => {
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+  const { page, limit, skip } = parsePagination(req.query);
   const search = typeof req.query.search === 'string' ? req.query.search : null;
-  const skip = (page - 1) * limit;
-
-  const where = search
-    ? {
-        OR: [
-          { username: { contains: search, mode: 'insensitive' } },
-          { address: { contains: search, mode: 'insensitive' } },
-        ],
-      }
-    : {};
+  const where = buildUserSearchWhere(search);
 
   try {
     const [totalCount, rows] = await prisma.$transaction([
@@ -249,27 +288,7 @@ router.get('/users', async (req, res, next) => {
       }),
     ]);
 
-    const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-    }));
-
-    res.json({
-      data,
-      meta: {
-        total: totalCount,
-        totalCount,
-        page,
-        currentPage: page,
-        limit,
-        totalPages,
-      },
-      totalCount,
-      totalPages,
-      currentPage: page,
-    });
+    res.json(paginatedResponse(rows.map(serializeUser), totalCount, { page, limit }));
   } catch {
     const dbError = new Error('Database error');
     dbError.statusCode = 500;

@@ -14,7 +14,7 @@ const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
 const v1Router = require('./src/routes/v1');
-const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
+const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
 const xss = require('xss');
@@ -24,6 +24,14 @@ const { registerValidator } = require('./src/validators/registerValidator');
 const { validate } = require('./src/middleware/validate');
 const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
+const { parsePagination, paginatedResponse } = require('./src/pagination');
+const {
+  normalizeNameTag,
+  validateMemo,
+  RESERVED_NAMES,
+  USER_DATABASE,
+  shouldFallbackToLocalRegistry,
+} = require('./src/utils');
 
 dotenv.config();
 
@@ -144,21 +152,6 @@ app.use(compression({ threshold: 1024 }));
 scheduleCleanupJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
-const USER_DATABASE = {
-  'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-  'lekan*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-};
-
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const normalizeNameTag = (value) => {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (!trimmed) {
-    return '';
-  }
-  return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
-};
-
 // ---------------------------------------------------------------------------
 // #51 — ETag Caching Middleware for Federation Endpoint
 // ---------------------------------------------------------------------------
@@ -181,17 +174,6 @@ const etagCache = (req, res, next) => {
   };
 
   next();
-};
-
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
 };
 
 const getLocalUserByAddress = async (address) =>
@@ -226,25 +208,15 @@ const listLocalUsers = async (search, page, limit) => {
   );
 
   const totalCount = Number(countRow?.totalCount || 0);
-
-  return {
-    data: rows.map((user) => ({
+  return paginatedResponse(
+    rows.map((user) => ({
       username: user.username,
       address: user.address,
       created_at: user.created_at,
     })),
-    meta: {
-      total: totalCount,
-      totalCount,
-      page,
-      currentPage: page,
-      limit,
-      totalPages: Math.ceil(totalCount / limit),
-    },
     totalCount,
-    totalPages: Math.ceil(totalCount / limit),
-    currentPage: page,
-  };
+    { page, limit },
+  );
 };
 
 const registerLocalUser = async ({ username, address }) => {
@@ -376,31 +348,6 @@ app.get('/federation', etagCache, async (req, res, next) => {
 
 // Initialise profanity filter once at module load (reused across requests).
 const profanityFilter = new Filter();
-const VALID_MEMO_TYPES = ['text', 'id', 'hash'];
-const MEMO_ID_RE = /^\d+$/;
-const MEMO_HASH_RE = /^[0-9a-fA-F]{64}$/;
-
-const validateMemo = (memoType, memo) => {
-  if (!memoType && !memo) return null;
-  if (memoType && !memo) return 'memo is required when memo_type is provided.';
-  if (!memoType && memo) return 'memo_type is required when memo is provided.';
-  if (!VALID_MEMO_TYPES.includes(memoType)) {
-    return `memo_type must be one of: ${VALID_MEMO_TYPES.join(', ')}.`;
-  }
-  if (memoType === 'text' && Buffer.byteLength(memo, 'utf8') > 28) {
-    return 'memo of type text must not exceed 28 bytes.';
-  }
-  if (memoType === 'id') {
-    if (!MEMO_ID_RE.test(memo) || BigInt(memo) > 18446744073709551615n) {
-      return 'memo of type id must be a valid 64-bit unsigned integer.';
-    }
-  }
-  if (memoType === 'hash' && !MEMO_HASH_RE.test(memo)) {
-    return 'memo of type hash must be a 64-character hex string (32 bytes).';
-  }
-  return null;
-};
-
 const verifyFreighterRegistrationSignature = ({
   username,
   address,
@@ -703,9 +650,7 @@ app.get('/lookup', async (req, res, next) => {
     }
   }
 
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const skip = (page - 1) * limit;
+  const { page, limit, skip } = parsePagination(req.query);
 
   const where = {
     OR: [
@@ -727,16 +672,15 @@ app.get('/lookup', async (req, res, next) => {
         }),
       ]);
 
-      response = {
-        data: rows.map((user) => ({
+      response = paginatedResponse(
+        rows.map((user) => ({
           username: user.username,
           address: user.address,
           created_at: user.createdAt.toISOString(),
         })),
         totalCount,
-        totalPages: Math.ceil(totalCount / limit),
-        currentPage: page,
-      };
+        { page, limit },
+      );
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) {
         throw error;
@@ -753,59 +697,6 @@ app.get('/lookup', async (req, res, next) => {
   }
 });
 
-app.get('/users', async (req, res, next) => {
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const search = typeof req.query.search === 'string' ? req.query.search : null;
-  const skip = (page - 1) * limit;
-
-  const where = search
-    ? {
-        OR: [
-          { username: { contains: search, mode: 'insensitive' } },
-          { address: { contains: search, mode: 'insensitive' } },
-        ],
-      }
-    : {};
-
-  try {
-    const [totalCount, rows] = await prisma.$transaction([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-      }),
-    ]);
-
-    const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-    }));
-
-    res.json({
-      data,
-      meta: {
-        total: totalCount,
-        totalCount,
-        page,
-        currentPage: page,
-        limit,
-        totalPages,
-      },
-      totalCount,
-      totalPages,
-      currentPage: page,
-    });
-  } catch {
-    const dbError = new Error('Database error');
-    dbError.statusCode = 500;
-    return next(dbError);
-  }
-});
 // Mount v1 router for both legacy paths and explicit API versioning
 app.use('/', v1Router);
 app.use('/api/v1', v1Router);
