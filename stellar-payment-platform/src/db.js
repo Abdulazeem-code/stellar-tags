@@ -5,6 +5,7 @@ const { promisify } = require('util');
 const sqlite3 = require('sqlite3').verbose();
 const genericPool = require('generic-pool');
 const { scheduleCleanupJob } = require('./cleanup-cron');
+const { logger } = require('./logger');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -23,7 +24,7 @@ const parseDbPath = (raw) => {
   return {
     filePath,
     connectionLimit: parseInt(params.connection_limit, 10) || 10,
-    poolTimeout: parseInt(params.pool_timeout, 10) || 5,
+    poolTimeout: parseInt(params.pool_timeout, 10) || 60,
   };
 };
 
@@ -126,9 +127,9 @@ const poolAll = (sql, params) =>
       )`,
       [],
     );
-    console.log(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
+    logger.info(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
   } catch (err) {
-    console.error('Failed to initialise database schema:', err);
+    logger.error('Failed to initialise database schema:', err);
     process.exit(1);
   }
 })();
@@ -148,27 +149,7 @@ const normalizeNameTag = (value) => {
   return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
 };
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'registrations.db');
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-const db = attachAsyncDbMethods(new sqlite3.Database(dbPath));
-
-(async () => {
-  try {
-    await db.runAsync(
-      `CREATE TABLE IF NOT EXISTS username_registry (
-        username TEXT PRIMARY KEY,
-        address TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      )`,
-    );
-  } catch (err) {
-    console.error('Failed to initialize direct database schema:', err);
-  }
-})();
-
-// Start the weekly background job that prunes/flags stale registrations.
-scheduleCleanupJob(db);
 
 const etagCache = (req, res, next) => {
   const originalJson = res.json.bind(res);

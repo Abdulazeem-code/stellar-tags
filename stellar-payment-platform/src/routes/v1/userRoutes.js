@@ -4,6 +4,7 @@ const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
+const { logger } = require('../../logger');
 
 const router = express.Router();
 
@@ -145,7 +146,7 @@ router.post('/register', async (req, res, next) => {
       return next(error);
     }
 
-    console.error('Registration error:', error.message);
+    logger.error('Registration error:', error.message);
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
@@ -252,10 +253,23 @@ router.get('/users', async (req, res, next) => {
     const data = rows.map((user) => ({
       username: user.username,
       address: user.address,
-      created_at: user.createdAt.toISOString(),
+      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
     }));
 
-    res.json({ data, totalCount, totalPages, currentPage: page });
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
   } catch {
     const dbError = new Error('Database error');
     dbError.statusCode = 500;
