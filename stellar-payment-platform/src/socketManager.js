@@ -1,5 +1,5 @@
 const { Server } = require('socket.io');
-const { logger } = require('./src/logger');
+const { logger } = require('./logger');
 
 let io = null;
 
