@@ -9,10 +9,14 @@ require('winston-daily-rotate-file');
 
 // Logs live in <stellar-payment-platform>/logs by default. LOG_DIR can point the
 // transports somewhere else (e.g. a mounted volume in Docker).
+const fs = require('fs');
 const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, '..', 'logs');
 const LOG_LEVEL = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
 const MAX_SIZE = process.env.LOG_MAX_SIZE || '20m';
 const MAX_FILES = process.env.LOG_MAX_FILES || '14d';
+
+// Ensure the directory exists to prevent ENOENT crashes when transports are initialized
+fs.mkdirSync(LOG_DIR, { recursive: true });
 
 // Test runs should not litter the working tree with log files or console noise.
 const IS_TEST = process.env.NODE_ENV === 'test';

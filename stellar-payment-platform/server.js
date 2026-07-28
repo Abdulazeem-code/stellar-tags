@@ -6,6 +6,7 @@ const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
@@ -141,6 +142,7 @@ app.use(rejectNestedObjects);
 app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
+const poolMonitor = schedulePoolMonitoring(prisma);
 
 const USER_DATABASE = {
   'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
@@ -293,13 +295,19 @@ app.get('/federation', etagCache, async (req, res, next) => {
     if (type === 'id') {
       const row = await prisma.user.findFirst({
         where: { address: { equals: queryValue, mode: 'insensitive' } },
-        select: { username: true, address: true, memoType: true, memo: true },
+        select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
       });
 
       if (!row) {
         const notFoundError = new Error('Address not found');
         notFoundError.statusCode = 404;
         return next(notFoundError);
+      }
+      
+      if (row.flaggedAt) {
+        const forbiddenError = new Error('Address is blocked');
+        forbiddenError.statusCode = 403;
+        return next(forbiddenError);
       }
       const response = {
         stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
@@ -318,8 +326,14 @@ app.get('/federation', etagCache, async (req, res, next) => {
       try {
         row = await prisma.user.findUnique({
           where: { username: queryName },
-          select: { address: true, memoType: true, memo: true },
+          select: { address: true, memoType: true, memo: true, flaggedAt: true },
         });
+        
+        if (row && row.flaggedAt) {
+          const forbiddenError = new Error('Address is blocked');
+          forbiddenError.statusCode = 403;
+          return next(forbiddenError);
+        }
       } catch (error) {
         if (!shouldFallbackToLocalRegistry(error)) {
           throw error;
@@ -799,7 +813,7 @@ app.use('/api/v1', v1Router);
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
-  res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
+  res.send(`FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`);
 });
 
 app.get('/api/v1/time', (_req, res) => {
@@ -898,6 +912,10 @@ const gracefulShutdown = (server, prismaClient, signal) => {
   isShuttingDown = true;
 
   logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
+
+  // Stop the pool monitor so it doesn't produce misleading warnings during
+  // the shutdown window.
+  poolMonitor.stop();
 
   const timer = setTimeout(() => {
     logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
