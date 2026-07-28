@@ -2,16 +2,21 @@
 // Tests for DB Pool Monitor
 // ---------------------------------------------------------------------------
 
+const mockLogger = {
+  warn: jest.fn(),
+  info: jest.fn(),
+  error: jest.fn(),
+};
+
+// Mock the logger before the module is loaded
+jest.mock('../src/logger', () => ({
+  logger: mockLogger,
+}));
+
 describe('DB Pool Monitor', () => {
   let getPoolMetrics;
   let checkPool;
   let schedulePoolMonitoring;
-
-  const mockLogger = {
-    warn: jest.fn(),
-    info: jest.fn(),
-    error: jest.fn(),
-  };
 
   const mockPrisma = {
     $metrics: {
@@ -20,11 +25,6 @@ describe('DB Pool Monitor', () => {
   };
 
   beforeAll(() => {
-    // Mock the logger before loading the module
-    jest.mock('../src/logger', () => ({
-      logger: mockLogger,
-    }));
-
     const mod = require('../src/db-pool-monitor');
     getPoolMetrics = mod.getPoolMetrics;
     checkPool = mod.checkPool;
@@ -33,7 +33,7 @@ describe('DB Pool Monitor', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    jest.useFakeTimers();
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
   });
 
   afterEach(() => {
@@ -230,14 +230,14 @@ describe('DB Pool Monitor', () => {
           setImmediate(() => {
             // warn should be called again after the interval check
             expect(mockLogger.warn).toHaveBeenCalled();
-            clearInterval(handle);
+            handle.stop();
             resolve();
           });
         });
       });
     });
 
-    it('returns a handle that can be cleared', () => {
+    it('returns a handle that can be stopped', () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
         gauges: [],
@@ -249,9 +249,10 @@ describe('DB Pool Monitor', () => {
 
       const handle = schedulePoolMonitoring(mockPrisma);
       expect(handle).toBeDefined();
+      expect(handle.stop).toEqual(expect.any(Function));
 
-      // Clear it and verify no more calls after interval
-      clearInterval(handle);
+      // Stop it and verify no more checks run after interval
+      handle.stop();
 
       jest.advanceTimersByTime(60_000);
 

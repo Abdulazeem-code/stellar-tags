@@ -13,7 +13,14 @@ const loadLogger = (env) => {
     mod = require('../src/logger');
   });
 
-  process.env = previous;
+  // Restore process.env properly (assignment to process.env is a no-op in Node)
+  for (const key of Object.keys(process.env)) {
+    if (!(key in previous)) {
+      delete process.env[key];
+    }
+  }
+  Object.assign(process.env, previous);
+
   return mod;
 };
 
