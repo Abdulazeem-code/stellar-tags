@@ -5,6 +5,7 @@ const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
+const { lookupCached } = require('../../cache');
 const { parsePagination, paginatedResponse } = require('../../pagination');
 const {
   normalizeNameTag,
@@ -209,7 +210,7 @@ router.post('/register', async (req, res, next) => {
     }
 
     logger.error('Registration error:', error.message);
-    const registrationError = new Error(`Registration verification failed: ${error.message}`);
+    const registrationError = new Error(`Registration verification failed: ${error.message}`, { cause: error });
     registrationError.statusCode = 500;
     return next(registrationError);
   }
@@ -229,20 +230,23 @@ router.get('/lookup', async (req, res, next) => {
 
   if (address) {
     try {
-      const row = await prisma.user.findUnique({
-        where: { address },
-        select: { username: true },
+      const result = await lookupCached(address, async () => {
+        const row = await prisma.user.findUnique({
+          where: { address },
+          select: { username: true },
+        });
+        return row ? { username: row.username, address } : null;
       });
 
-      if (!row) {
+      if (!result) {
         const notFoundError = new Error('Username not found for this address');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      return res.json({ username: row.username, address });
-    } catch {
-      const dbError = new Error('Database lookup failed');
+      return res.json(result);
+    } catch (error) {
+      const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
     }
@@ -262,11 +266,16 @@ router.get('/lookup', async (req, res, next) => {
       }),
     ]);
 
-    return res.json(
-      paginatedResponse(rows.map(serializeUser), totalCount, { page, limit }),
-    );
-  } catch {
-    const dbError = new Error('Database lookup failed');
+const totalPages = Math.ceil(totalCount / limit);
+    const data = rows.map((user) => ({
+      username: user.username,
+      address: user.address,
+      created_at: user.createdAt.toISOString(),
+    }));
+
+    return res.json({ data, totalCount, totalPages, currentPage: page });
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -288,9 +297,29 @@ router.get('/users', async (req, res, next) => {
       }),
     ]);
 
-    res.json(paginatedResponse(rows.map(serializeUser), totalCount, { page, limit }));
-  } catch {
-    const dbError = new Error('Database error');
+const totalPages = Math.ceil(totalCount / limit);
+    const data = rows.map((user) => ({
+      username: user.username,
+      address: user.address,
+      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+    }));
+
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
+  } catch (error) {
+    const dbError = new Error('Database error', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }

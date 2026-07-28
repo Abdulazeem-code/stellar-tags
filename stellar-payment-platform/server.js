@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
-const { prisma } = require('./prismaClient');
+const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
@@ -24,6 +24,7 @@ const { registerValidator } = require('./src/validators/registerValidator');
 const { validate } = require('./src/middleware/validate');
 const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
+const { lookupCached } = require('./src/cache');
 const { parsePagination, paginatedResponse } = require('./src/pagination');
 const {
   normalizeNameTag,
@@ -339,8 +340,8 @@ app.get('/federation', etagCache, async (req, res, next) => {
         error: "Unsupported query type. Supported types: 'id', 'name'",
       });
     }
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -619,32 +620,33 @@ app.get('/lookup', async (req, res, next) => {
 
   if (address) {
     try {
-      let row = null;
-      try {
-        row = await prisma.user.findUnique({
-          where: { address },
-          select: { username: true },
-        });
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
+      const result = await lookupCached(address, async () => {
+        let row = null;
+        try {
+          row = await prisma.user.findUnique({
+            where: { address },
+            select: { username: true },
+          });
+        } catch (error) {
+          if (!shouldFallbackToLocalRegistry(error)) {
+            throw error;
+          }
+          row = await getLocalUserByAddress(address);
         }
+        return row ? { username: row.username, address } : null;
+      });
 
-        row = await getLocalUserByAddress(address);
-      }
-
-      if (!row) {
+      if (!result) {
         const notFoundError = new Error('Username not found for this address');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      return res.json({ username: row.username, address });
-    } catch (err) {  // <-- 1. Add (err) here
-      // 2. Add this console.log to print the exact reason Prisma is failing
-      logger.error("🚨 ACTUAL PRISMA ERROR:", err); 
-      
-      const dbError = new Error('Database lookup failed');
+      return res.json(result);
+    } catch (err) {
+      logger.error("🚨 ACTUAL PRISMA ERROR:", err);
+
+      const dbError = new Error('Database lookup failed', { cause: err });
       dbError.statusCode = 500;
       return next(dbError);
     }
@@ -690,13 +692,66 @@ app.get('/lookup', async (req, res, next) => {
     }
 
     return res.json(response);
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
 });
 
+app.get('/users', async (req, res, next) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+  const search = typeof req.query.search === 'string' ? req.query.search : null;
+  const skip = (page - 1) * limit;
+
+  const where = search
+    ? {
+        OR: [
+          { username: { contains: search, mode: 'insensitive' } },
+          { address: { contains: search, mode: 'insensitive' } },
+        ],
+      }
+    : {};
+
+  try {
+    const [totalCount, rows] = await prisma.$transaction([
+      prisma.user.count({ where }),
+      prisma.user.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    const totalPages = Math.ceil(totalCount / limit);
+    const data = rows.map((user) => ({
+      username: user.username,
+      address: user.address,
+      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+    }));
+
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
+  } catch (error) {
+    const dbError = new Error('Database error', { cause: error });
+    dbError.statusCode = 500;
+    return next(dbError);
+  }
+});
 // Mount v1 router for both legacy paths and explicit API versioning
 app.use('/', v1Router);
 app.use('/api/v1', v1Router);
@@ -774,6 +829,11 @@ if (process.env.SENTRY_DSN) {
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
+  if (isPrismaConnectionError(err)) {
+    err.statusCode = 503;
+    err.message = 'Service Unavailable';
+  }
+
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 

@@ -39,6 +39,7 @@ jest.mock('./prismaClient', () => ({
     $transaction: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock('generic-pool', () => ({
