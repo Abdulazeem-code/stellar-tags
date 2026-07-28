@@ -69,6 +69,7 @@ impl PaymentRouter {
     const XLM_DECIMALS: i128 = 10_000_000;
     const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
     const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
+    const VOLUME_THRESHOLD: i128 = 10_000 * Self::XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
     const SECONDS_IN_24H: u64 = 24 * 3600;
     const VERSION: u32 = 1;
 
@@ -307,6 +308,17 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
+        // 5. Apply tiered fee discount for high-volume users
+        // Read the sender's cumulative volume *before* this payment to determine
+        // whether they qualify for a volume-based fee discount.
+        let user_volume = Self::get_user_volume(env.clone(), sender.clone());
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2 // 50% discount
+        } else {
+            fee_bps
+        };
+
+        // 6. Check time-based daily spending limits
         // 4. Check spending limits
         // 4. Check time-based daily spending limits
         let current_time = env.ledger().timestamp();
@@ -350,8 +362,8 @@ impl PaymentRouter {
             return Err(Error::InsufficientBalance);
         }
 
-        // 8. Calculate the fee split
-        let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
+        // 9. Calculate the fee split using the (potentially discounted) fee rate
+        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
         }
@@ -370,7 +382,7 @@ impl PaymentRouter {
             token_client.transfer(&sender, &recipient, &recipient_amount);
         }
 
-        // 10. Record the sender's cumulative routed volume in persistent storage
+        // 11. Record the sender's cumulative routed volume in persistent storage
         let volume_key = DataKey::UserVolume(sender.clone());
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
         env.storage()
@@ -389,6 +401,22 @@ impl PaymentRouter {
         log!(&env, "Remaining balance routed to recipient");
 
         Ok(())
+    }
+
+    /// Returns the effective fee_bps for a sender after applying any
+    /// volume-based tiered discount.
+    pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
+        let fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0);
+        let user_volume = Self::get_user_volume(env.clone(), sender);
+        if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2 // 50% discount
+        } else {
+            fee_bps
+        }
     }
 
     /// Calculates protocol fee and remainder
@@ -716,6 +744,78 @@ mod test {
         // Attempt to route payment to self should fail
         let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
         assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
+    }
+
+    #[test]
+    fn test_tiered_fee_discount_applied_after_volume_threshold() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, _token_admin_client) = setup_token(&env);
+
+        // Threshold is 10,000 XLM = 10,000 * 10,000,000 (7 decimals)
+        let threshold = 100_000_000_000i128;
+        // Mint enough for two payments: one just above threshold, then a small one
+        let first_amount = threshold + 1; // 10,000 XLM + 1 (just above threshold)
+        let second_amount = 1000;
+        let total_mint = first_amount + second_amount + 10_000_000; // extra for fees
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &total_mint);
+
+        // Initialize router with 1% fee (100 bps) and no cap
+        client.initialize(&admin, &treasury, &100, &i128::MAX);
+
+        // First payment: volume is 0 (< threshold), so full fee applies
+        client.route_payment(&sender, &recipient, &token_address, &first_amount);
+
+        let full_fee_first = (first_amount * 100) / 10_000;
+        assert_eq!(token_client.balance(&treasury), full_fee_first);
+        assert_eq!(token_client.balance(&recipient), first_amount - full_fee_first);
+        assert_eq!(client.get_user_volume(&sender), first_amount);
+        // Effective fee should still be full rate (volume not yet above threshold when fee was calc'd)
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
+
+        // Second payment: existing volume (first_amount) > threshold, so 50% discount applies
+        client.route_payment(&sender, &recipient, &token_address, &second_amount);
+
+        // Effective fee_bps should be 100 / 2 = 50
+        let discounted_fee = (second_amount * 50) / 10_000; // 1000 * 50 / 10000 = 5
+        assert_eq!(token_client.balance(&treasury), full_fee_first + discounted_fee);
+        assert_eq!(
+            token_client.balance(&recipient),
+            (first_amount - full_fee_first) + (second_amount - discounted_fee)
+        );
+    }
+
+    #[test]
+    fn test_get_effective_fee_bps_no_discount_below_threshold() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &1_000_000);
+
+        // Initialize router with 1% fee (100 bps)
+        client.initialize(&admin, &treasury, &100, &i128::MAX);
+
+        // No volume yet, so effective fee should equal the full fee_bps
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
+
+        // Route a small payment (below threshold)
+        client.route_payment(&sender, &recipient, &token_address, &1000);
+
+        // Volume is 1000, far below 10,000 XLM threshold
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
     }
 
     #[test]
