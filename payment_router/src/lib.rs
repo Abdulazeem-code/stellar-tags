@@ -229,6 +229,12 @@ impl PaymentRouter {
     /// configured treasury. Config is read from instance storage set via
     /// `initialize`.
     ///
+    /// `token_address` is the contract ID of any Stellar asset implementing
+    /// the standard token interface — this is not limited to native XLM.
+    /// Passing the contract ID of a Stellar Asset Contract (e.g. a USDC
+    /// issuer's SAC) routes that asset instead; the same fee and spending
+    /// logic applies uniformly regardless of which asset is passed.
+    ///
     /// # Errors
     /// `Error::Paused` if paused. `Error::NotInitialized` if not yet
     /// initialized. `Error::LimitExceeded` if `amount` is out of bounds or
@@ -545,4 +551,46 @@ mod test {
         let res = client.try_transfer_admin(&placeholder_new_admin);
         assert_eq!(res.unwrap_err().unwrap(), Error::NotInitialized);
     }
+
+    /// Proves route_payment is asset-agnostic: two independently deployed
+    /// Stellar Asset Contracts (standing in for e.g. USDC and EURC) are
+    /// each routed correctly through the same initialized router, with
+    /// balances and fees tracked separately per asset.
+    #[test]
+    fn test_routes_multiple_distinct_assets() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000_000);
+
+        // Two separately deployed assets -- distinct contract IDs, distinct balances.
+        let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
+        let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
+        assert_ne!(usdc_like_address, eurc_like_address);
+
+        usdc_like_admin_client.mint(&sender, &10_000);
+        eurc_like_admin_client.mint(&sender, &5_000);
+
+        // Route asset #1
+        client.route_payment(&sender, &recipient, &usdc_like_address, &2_000);
+        // Route asset #2
+        client.route_payment(&sender, &recipient, &eurc_like_address, &1_000);
+
+        // Each asset's balances moved independently -- asset #2 was untouched
+        // by asset #1's transfer, and vice versa.
+        assert_eq!(usdc_like_client.balance(&sender), 8_000);
+        assert_eq!(usdc_like_client.balance(&recipient), 1_980); // 2000 - 1% fee (20)
+        assert_eq!(eurc_like_client.balance(&sender), 4_000);
+        assert_eq!(eurc_like_client.balance(&recipient), 990); // 1000 - 1% fee (10)
+
+        // Cumulative volume is asset-agnostic -- it's a total across whatever
+        // was routed, matching the sum of both payments.
+        assert_eq!(client.get_user_volume(&sender), 3_000);
+    }
 }
+
+
