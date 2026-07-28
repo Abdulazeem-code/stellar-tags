@@ -1,7 +1,11 @@
 const express = require('express');
-const { prisma } = require('../../prismaClient');
 
 const router = express.Router();
+
+const getPrisma = () => {
+  // require at runtime so tests that import routes but stub prisma won't fail at import time
+  return require('../../../prismaClient').prisma;
+};
 
 const adminAuth = (req, res, next) => {
   const apiKey = req.headers['x-api-key'] || req.query.api_key;
@@ -12,6 +16,7 @@ const adminAuth = (req, res, next) => {
 };
 
 router.post('/admin/block', adminAuth, async (req, res, next) => {
+  const prisma = getPrisma();
   const { address } = req.body;
   
   if (!address || typeof address !== 'string') {
