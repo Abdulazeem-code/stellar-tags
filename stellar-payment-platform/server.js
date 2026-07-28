@@ -24,6 +24,7 @@ const { registerValidator } = require('./src/validators/registerValidator');
 const { validate } = require('./src/middleware/validate');
 const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
+const { lookupCached } = require('./src/cache');
 
 dotenv.config();
 
@@ -672,29 +673,30 @@ app.get('/lookup', async (req, res, next) => {
 
   if (address) {
     try {
-      let row = null;
-      try {
-        row = await prisma.user.findUnique({
-          where: { address },
-          select: { username: true },
-        });
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
+      const result = await lookupCached(address, async () => {
+        let row = null;
+        try {
+          row = await prisma.user.findUnique({
+            where: { address },
+            select: { username: true },
+          });
+        } catch (error) {
+          if (!shouldFallbackToLocalRegistry(error)) {
+            throw error;
+          }
+          row = await getLocalUserByAddress(address);
         }
+        return row ? { username: row.username, address } : null;
+      });
 
-        row = await getLocalUserByAddress(address);
-      }
-
-      if (!row) {
+      if (!result) {
         const notFoundError = new Error('Username not found for this address');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      return res.json({ username: row.username, address });
-    } catch (err) {  // <-- 1. Add (err) here
-      // 2. Add this console.log to print the exact reason Prisma is failing
+      return res.json(result);
+    } catch (err) {
       logger.error("🚨 ACTUAL PRISMA ERROR:", err); 
       
       const dbError = new Error('Database lookup failed');

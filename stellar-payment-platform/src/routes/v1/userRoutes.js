@@ -5,6 +5,7 @@ const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
+const { lookupCached } = require('../../cache');
 
 const router = express.Router();
 
@@ -167,18 +168,21 @@ router.get('/lookup', async (req, res, next) => {
 
   if (address) {
     try {
-      const row = await prisma.user.findUnique({
-        where: { address },
-        select: { username: true },
+      const result = await lookupCached(address, async () => {
+        const row = await prisma.user.findUnique({
+          where: { address },
+          select: { username: true },
+        });
+        return row ? { username: row.username, address } : null;
       });
 
-      if (!row) {
+      if (!result) {
         const notFoundError = new Error('Username not found for this address');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      return res.json({ username: row.username, address });
+      return res.json(result);
     } catch {
       const dbError = new Error('Database lookup failed');
       dbError.statusCode = 500;
