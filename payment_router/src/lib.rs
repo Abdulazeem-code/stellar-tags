@@ -360,9 +360,11 @@ impl PaymentRouter {
         let recipient_amount = amount - fee_amount;
 
         // 8. Execute token transfers
+        // Transfer fee to treasury (only if fee > 0)
         if fee_amount > 0 {
             token_client.transfer(&sender, &platform_treasury, &fee_amount);
         }
+        // Transfer remainder to destination
         if recipient_amount > 0 {
             token_client.transfer(&sender, &recipient, &recipient_amount);
         }
