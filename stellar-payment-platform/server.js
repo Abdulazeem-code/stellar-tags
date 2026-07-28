@@ -820,6 +820,40 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
+app.get('/health', async (_req, res) => {
+  const checks = { database: null, redis: null };
+  let allOk = true;
+  const errors = [];
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    checks.database = 'ok';
+  } catch {
+    checks.database = 'error';
+    allOk = false;
+    errors.push('Database unavailable');
+  }
+
+  if (redisClient) {
+    try {
+      await redisClient.ping();
+      checks.redis = 'ok';
+    } catch {
+      checks.redis = 'error';
+      allOk = false;
+      errors.push('Redis unavailable');
+    }
+  } else {
+    checks.redis = 'not configured';
+  }
+
+  if (allOk) {
+    res.json({ status: 'ok', ...checks });
+  } else {
+    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
+  }
+});
+
 app.get('/health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
