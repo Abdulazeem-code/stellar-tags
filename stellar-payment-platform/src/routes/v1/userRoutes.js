@@ -5,7 +5,7 @@ const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
-const { lookupCached } = require('../../cache');
+const { lookupCached, invalidateFederationCache } = require('../../cache');
 const { parsePagination, paginatedResponse } = require('../../pagination');
 const {
   normalizeNameTag,
@@ -177,6 +177,8 @@ router.post('/register', async (req, res, next) => {
         ...(memoType && { memoType, memo }),
       },
     });
+    // Invalidate any stale federation cache entries for this username/address
+    invalidateFederationCache(normalizedUsername, address);
 
     return res.status(201).json({
       ok: true,

@@ -7,6 +7,8 @@ const getPrisma = () => {
   return require('../../../prismaClient').prisma;
 };
 
+const { invalidateFederationCache } = require('../../cache');
+
 const adminAuth = (req, res, next) => {
   const apiKey = req.headers['x-api-key'] || req.query.api_key;
   if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
@@ -28,6 +30,9 @@ router.post('/admin/block', adminAuth, async (req, res, next) => {
       where: { address },
       data: { flaggedAt: new Date() },
     });
+
+    // Evict federation cache so blocked users are not served from cache
+    invalidateFederationCache(updatedUser.username, updatedUser.address);
     
     return res.status(200).json({
       message: 'Address successfully blocked',
