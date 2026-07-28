@@ -10,7 +10,8 @@ datasource db {
 }
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["metrics"]
 }
 
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
