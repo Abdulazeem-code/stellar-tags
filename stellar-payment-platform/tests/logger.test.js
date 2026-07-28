@@ -13,7 +13,7 @@ const loadLogger = (env) => {
     mod = require('../src/logger');
   });
 
-  process.env = previous;
+  Object.keys(env).forEach(key => delete process.env[key]);
   return mod;
 };
 

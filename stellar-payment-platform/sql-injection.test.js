@@ -25,6 +25,10 @@ jest.mock('@stellar/stellar-sdk', () => ({
 }));
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
+jest.mock('redis', () => ({
+  createClient: jest.fn(() => null),
+}));
+
 // bad-words ships as ESM; Jest runs in CJS mode — mock to avoid transform errors.
 jest.mock('bad-words', () => {
   return jest.fn().mockImplementation(() => ({
@@ -54,6 +58,7 @@ const { prisma } = require('./prismaClient');
 // together in the full suite.
 const getApp = () => {
   let app;
+  process.env.NODE_ENV = 'test';
   jest.isolateModules(() => {
     app = require('./server').app;
   });
