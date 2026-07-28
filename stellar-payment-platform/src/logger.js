@@ -27,13 +27,26 @@ const rotateOptions = (filename, level) => ({
   ...(level ? { level } : {}),
 });
 
+const redactKeys = winston.format((info) => {
+  const S_KEY_REGEX = /S[A-Z2-7]{55}/g;
+  if (typeof info.message === 'string') {
+    info.message = info.message.replace(S_KEY_REGEX, '[REDACTED_SECRET_KEY]');
+  }
+  if (info.stack && typeof info.stack === 'string') {
+    info.stack = info.stack.replace(S_KEY_REGEX, '[REDACTED_SECRET_KEY]');
+  }
+  return info;
+});
+
 const fileFormat = winston.format.combine(
+  redactKeys(),
   winston.format.timestamp(),
   winston.format.errors({ stack: true }),
   winston.format.json()
 );
 
 const consoleFormat = winston.format.combine(
+  redactKeys(),
   winston.format.colorize(),
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.errors({ stack: true }),
