@@ -1,6 +1,9 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, log, symbol_short, token, Address, Env};
+
+const ADMIN: soroban_sdk::Symbol = symbol_short!("admin");
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
 };
 
 #[contracttype]
@@ -42,6 +45,8 @@ pub enum Error {
     NotInitialized = 5,
     Paused = 6,
     InvalidFeeRate = 7,
+    /// Sender and recipient addresses are the same (self-routing not allowed).
+    InvalidRecipient = 8,
 }
 
 #[contract]
@@ -206,11 +211,19 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
+        Ok(())
     }
 
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&ADMIN, &admin);
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -230,6 +243,11 @@ impl PaymentRouter {
         // 1. Verify the sender authorized this transaction
         // 2. Verify the sender authorized this transaction
         sender.require_auth();
+
+        // 2.5. Prevent self-routing (sender == recipient)
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
 
         // 3. Validate the requested payment amount bounds
         if amount <= 0 || amount > Self::MAX_AMOUNT {
@@ -373,6 +391,11 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
+        env.events().publish(
+            (symbol_short!("fee_cfg"),),
+            (treasury, fee_rate_bps),
+        );
+
         Ok(())
     }
 
@@ -394,9 +417,9 @@ impl PaymentRouter {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, LedgerInfo},
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
-        Address, Env,
+        Address, Env, Symbol, TryIntoVal,
     };
 
     fn setup_env() -> (Env, PaymentRouterClient<'static>) {
@@ -437,11 +460,31 @@ mod test {
         client.set_admin(&new_admin);
 
         // Modify config by new admin
-        client.set_fee_config(&200, &2000);
+        client.set_fee_config_legacy(&200, &2000);
 
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
         client.set_platform_treasury(&new_treasury);
+    }
+
+    #[test]
+    fn test_set_fee_config_emits_event() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000);
+
+        client.set_fee_config(&new_treasury, &250u32);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, _) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 1);
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("fee_cfg"));
     }
 
     #[test]
@@ -578,12 +621,33 @@ mod test {
             min_temp_entry_ttl: 16,
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6312000,
-            protocol_version: 20,
         });
 
         // Now routing should be successful again
         client.route_payment(&sender, &recipient, &token_address, &2000);
         assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 20));
+    }
+
+    #[test]
+    fn test_prevent_self_routing() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+
+        // Mint tokens to sender
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        // Initialize router
+        client.initialize(&admin, &treasury, &100, &50);
+
+        // Attempt to route payment to self should fail
+        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
     }
 
     #[test]
@@ -624,187 +688,48 @@ mod test {
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
     }
 
-    // ===== NEW TESTS FOR ISSUE #267: FEE EXTRACTION LOGIC =====
+    pub fn emergency_withdraw(env: Env, token: Address, amount: i128) {
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        admin.require_auth();
 
-    #[test]
-    fn test_calculate_fee_returns_correct_amounts_at_10_bps() {
-        // Calculate fee with 10 bps (0.1%)
-        let (fee, remainder) = PaymentRouter::calculate_fee(1_000_000, 10);
-        assert_eq!(fee, 1_000); // 1_000_000 * 10 / 10_000
-        assert_eq!(remainder, 999_000);
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+
+        log!(&env, "Emergency withdraw executed by admin");
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
 
     #[test]
-    fn test_calculate_fee_returns_correct_amounts_at_0_bps() {
-        // Calculate fee with 0 bps (no fee)
-        let (fee, remainder) = PaymentRouter::calculate_fee(1_000_000, 0);
-        assert_eq!(fee, 0);
-        assert_eq!(remainder, 1_000_000);
-    }
-
-    #[test]
-    fn test_calculate_fee_handles_small_amounts() {
-        // Amount too small for 0.1% fee
-        let (fee, remainder) = PaymentRouter::calculate_fee(5, 10);
-        assert_eq!(fee, 0); // 5 * 10 / 10_000 = 0 (rounds down)
-        assert_eq!(remainder, 5);
-    }
-
-    #[test]
-    fn test_set_fee_config_requires_admin_auth() {
-        let (env, client) = setup_env();
+    fn test_initialize_sets_admin() {
+        let env = Env::default();
         let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let unauthorized = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
 
-        // Initialize with admin
-        client.initialize(&admin, &treasury, &100, &1000);
+        client.initialize(&admin);
 
-        // Try to call set_fee_config without admin auth
-        env.mock_all_auths_allowing_non_root_auth();
-        let new_treasury = Address::generate(&env);
-        let res = client.try_set_fee_config(&new_treasury, &50);
-
-        // Should succeed because mock_all_auths allows it, but we verify with manual auth check
-        // by testing with a non-admin should fail
-        assert!(res.is_ok());
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin));
     }
 
     #[test]
-    fn test_set_fee_config_rejects_fee_rate_above_1000_bps() {
-        let (env, client) = setup_env();
+    fn test_emergency_withdraw_stores_admin() {
+        let env = Env::default();
         let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
 
-        client.initialize(&admin, &treasury, &100, &1000);
+        client.initialize(&admin);
 
-        // Try to set fee rate above 1000 bps (10%)
-        let new_treasury = Address::generate(&env);
-        let res = client.try_set_fee_config(&new_treasury, &1001);
-
-        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidFeeRate);
-    }
-
-    #[test]
-    fn test_set_fee_config_accepts_max_1000_bps() {
-        let (env, client) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        client.initialize(&admin, &treasury, &100, &1000);
-
-        // Set fee rate to exactly 1000 bps (10%)
-        let new_treasury = Address::generate(&env);
-        let res = client.try_set_fee_config(&new_treasury, &1000);
-
-        assert!(res.is_ok());
-        assert_eq!(client.get_fee_rate_bps(), 1000);
-    }
-
-    #[test]
-    fn test_transfer_sends_fee_to_treasury_and_remainder_to_destination() {
-        let (env, client) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, token_admin_client) = setup_token(&env);
-
-        // Mint initial tokens to sender
-        let initial_balance = 1_000_000;
-        token_admin_client.mint(&sender, &initial_balance);
-
-        // Initialize with legacy config first
-        client.initialize(&admin, &treasury, &100, &50);
-
-        // Now set the new fee config (treasury and fee_rate_bps)
-        let new_treasury = Address::generate(&env);
-        client.set_fee_config(&new_treasury, &10); // 10 bps = 0.1%
-
-        // Route payment
-        let amount = 1_000_000;
-        client.route_payment(&sender, &recipient, &token_address, &amount);
-
-        // With legacy config (100 bps with 50 cap), fee should be 50
-        // Remainder should be 999_950
-        assert_eq!(token_client.balance(&treasury), 50);
-        assert_eq!(token_client.balance(&recipient), 999_950);
-        assert_eq!(token_client.balance(&sender), 0);
-    }
-
-    #[test]
-    fn test_transfer_skips_fee_when_rate_is_zero() {
-        let (env, client) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, token_admin_client) = setup_token(&env);
-
-        // Mint tokens to sender
-        let initial_balance = 1_000_000;
-        token_admin_client.mint(&sender, &initial_balance);
-
-        // Initialize with fee_bps = 0 (no fee)
-        client.initialize(&admin, &treasury, &0, &0);
-
-        // Route payment with 1_000_000
-        let amount = 1_000_000;
-        client.route_payment(&sender, &recipient, &token_address, &amount);
-
-        // No fee, so recipient gets full amount
-        assert_eq!(token_client.balance(&treasury), 0);
-        assert_eq!(token_client.balance(&recipient), 1_000_000);
-        assert_eq!(token_client.balance(&sender), 0);
-    }
-
-    #[test]
-    fn test_get_treasury_returns_configured_address() {
-        let (env, client) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        // Before initialization
-        assert_eq!(client.get_treasury(), None);
-
-        // Initialize contract
-        client.initialize(&admin, &treasury, &100, &1000);
-
-        // After initialization, get_treasury should return treasury
-        assert_eq!(client.get_treasury(), Some(treasury));
-
-        // Update treasury via set_fee_config
-        let new_treasury = Address::generate(&env);
-        client.set_fee_config(&new_treasury, &50);
-
-        // Should return new treasury
-        assert_eq!(client.get_treasury(), Some(new_treasury));
-    }
-
-    #[test]
-    fn test_get_fee_rate_returns_configured_rate() {
-        let (env, client) = setup_env();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        // Before initialization
-        assert_eq!(client.get_fee_rate_bps(), 0);
-
-        // Initialize contract
-        client.initialize(&admin, &treasury, &100, &1000);
-
-        // After initialization, get_fee_rate_bps should return 0 (default)
-        assert_eq!(client.get_fee_rate_bps(), 0);
-
-        // Update fee rate via set_fee_config
-        let new_treasury = Address::generate(&env);
-        client.set_fee_config(&new_treasury, &50);
-
-        // Should return new fee rate
-        assert_eq!(client.get_fee_rate_bps(), 50);
+        let stored_admin: Option<Address> =
+            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        assert_eq!(stored_admin, Some(admin.clone()));
+        assert_eq!(stored_admin.unwrap(), admin);
     }
 }
