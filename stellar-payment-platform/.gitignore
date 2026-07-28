@@ -1,0 +1,14 @@
+node_modules/
+
+# Local environment — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Legacy SQLite database (replaced by PostgreSQL/Prisma)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Rotating log files (#294)
+logs/
