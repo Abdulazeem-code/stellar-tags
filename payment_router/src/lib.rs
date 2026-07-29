@@ -519,7 +519,7 @@ mod test {
         client.set_admin(&new_admin);
 
         // Modify config by new admin
-        client.set_fee_config_legacy(&200, &2000);
+        client.set_fee_config(&new_admin, &200);
 
         // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
