@@ -5,6 +5,7 @@ const { promisify } = require('util');
 const sqlite3 = require('sqlite3').verbose();
 const genericPool = require('generic-pool');
 const { scheduleCleanupJob } = require('./cleanup-cron');
+const { logger } = require('./logger');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -126,29 +127,14 @@ const poolAll = (sql, params) =>
       )`,
       [],
     );
-    console.log(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
+    logger.info(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
   } catch (err) {
-    console.error('Failed to initialise database schema:', err);
+    logger.error('Failed to initialise database schema:', err);
     process.exit(1);
   }
 })();
 
-const USER_DATABASE = {
-  'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-  'lekan*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-};
-
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const normalizeNameTag = (value) => {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (!trimmed) {
-    return '';
-  }
-  return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
-};
-
-
+const { USER_DATABASE, normalizeNameTag } = require('./utils');
 
 const etagCache = (req, res, next) => {
   const originalJson = res.json.bind(res);

@@ -11,6 +11,10 @@ jest.mock('@stellar/stellar-sdk', () => ({
   }
 }));
 
+jest.mock('redis', () => ({
+  createClient: jest.fn(() => null),
+}));
+
 // Mock Prisma so it doesn't try to connect to a real database and crash
 jest.mock('../prismaClient', () => ({
   prisma: {
@@ -22,10 +26,12 @@ jest.mock('../prismaClient', () => ({
       create: jest.fn().mockResolvedValue({})
     },
     $transaction: jest.fn().mockResolvedValue([0, []]),
-    $disconnect: jest.fn().mockResolvedValue(undefined)
+    $disconnect: jest.fn().mockResolvedValue(undefined),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }])
   }
 }));
 
+process.env.NODE_ENV = 'test';
 const { app } = require('../server');
 
 describe('Prometheus Metrics Endpoint', () => {

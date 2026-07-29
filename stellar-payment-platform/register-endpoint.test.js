@@ -14,6 +14,7 @@ jest.mock("@stellar/stellar-sdk", () => ({
 
 jest.mock("pdfkit", () => jest.fn());
 jest.mock("./src/cleanup-cron", () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock("./src/soft-delete-purge-cron", () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock("sqlite3", () => ({
   verbose: () => ({
@@ -56,7 +57,9 @@ jest.mock("./prismaClient", () => ({
       findUnique: jest.fn(),
       create: jest.fn(),
     },
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock("./src/multisigner-verifier", () => ({
