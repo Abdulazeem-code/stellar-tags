@@ -82,6 +82,7 @@ impl PaymentRouter {
         platform_treasury: Address,
         fee_bps: i128,
         fee_cap: i128,
+        max_amount: i128,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -94,6 +95,7 @@ impl PaymentRouter {
             .set(&DataKey::PlatformTreasury, &platform_treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+        env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -222,7 +224,12 @@ impl PaymentRouter {
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
-        Ok(())
+               Ok(())
+    }
+
+    /// Returns the contract version.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
     }
 
     /// Replaces this contract's WASM with a previously uploaded version.
@@ -234,6 +241,7 @@ impl PaymentRouter {
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
+
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -313,8 +321,16 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::FeeCap)
             .ok_or(Error::NotInitialized)?;
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
 
-        // Extend instance storage TTL after reading config
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -382,18 +398,17 @@ impl PaymentRouter {
         if fee_amount > amount {
             fee_amount = amount;
         }
-        let recipient_amount = amount - fee_amount;
+        let remainder = amount - fee_amount;
 
-        // 8. Execute token transfers
+       // 8. Execute token transfers
         // Transfer fee to treasury (only if fee > 0)
         if fee_amount > 0 {
             token_client.transfer(&sender, &platform_treasury, &fee_amount);
         }
         // Transfer remainder to destination
-        if recipient_amount > 0 {
-            token_client.transfer(&sender, &recipient, &recipient_amount);
+        if remainder > 0 {
+            token_client.transfer(&sender, &recipient, &remainder);
         }
-
         // 11. Record the sender's cumulative routed volume in persistent storage
         let volume_key = DataKey::UserVolume(sender.clone());
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
@@ -494,10 +509,10 @@ mod test {
         let new_admin = Address::generate(&env);
 
         // Initialize contract
-        client.initialize(&admin, &treasury, &100, &1000);
+        client.initialize(&admin, &treasury, &100, &1000, &1_000_000_000_000_000i128);
 
         // Trying to initialize again should fail
-        let res = client.try_initialize(&admin, &treasury, &100, &1000);
+        let res = client.try_initialize(&admin, &treasury, &100, &1000, &1_000_000_000_000_000i128);
         assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyInitialized);
 
         // Set admin can be called (by current admin)
@@ -657,7 +672,7 @@ mod test {
         sac.mint(&sender, &initial_balance);
 
         // Initialize router with 1% fee (100 bps) and cap of 50
-        client.initialize(&admin, &treasury, &100, &50);
+        client.initialize(&admin, &treasury, &100, &50, &1_000_000_000_000_000i128);
 
         // Add the token to the supported whitelist
         client.add_supported_token(&token_address);
@@ -701,8 +716,9 @@ mod test {
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &100);
 
-        client.initialize(&admin, &treasury, &100, &50);
+        client.initialize(&admin, &treasury, &100, &50, &1_000_000_000_000_000i128);
         client.add_supported_token(&token_address);
+
 
         // Route payment of 500 when balance is only 100
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
@@ -725,8 +741,9 @@ mod test {
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &(limit + 2000));
 
-        client.initialize(&admin, &treasury, &100, &50);
+        client.initialize(&admin, &treasury, &100, &50, &1_000_000_000_000_000i128);
         client.add_supported_token(&token_address);
+
 
         // Route amount within limit
         client.route_payment(&sender, &recipient, &token_address, &limit);
@@ -864,7 +881,7 @@ mod test {
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &platform_treasury, &40, &i128::MAX);
+        client.initialize(&admin, &platform_treasury, &40, &i128::MAX, &1_000_000_000_000_000i128);
 
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
