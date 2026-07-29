@@ -4,10 +4,9 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const RedisStore = require('rate-limit-redis');
 const { createClient } = require('redis');
-const { prisma } = require('./prismaClient');
+const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
-const { scheduleWebhookRetryJob } = require('./src/webhookWorker');
-const { poolAll, poolRun } = require('./src/db');
+const { scheduleSoftDeletePurgeJob } = require('./src/soft-delete-purge-cron');
 const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
@@ -16,7 +15,7 @@ const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
 const v1Router = require('./src/routes/v1');
-const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
+const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
 const xss = require('xss');
@@ -26,6 +25,15 @@ const { registerValidator } = require('./src/validators/registerValidator');
 const { validate } = require('./src/middleware/validate');
 const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
+const { lookupCached } = require('./src/cache');
+const { parsePagination, paginatedResponse } = require('./src/pagination');
+const {
+  normalizeNameTag,
+  validateMemo,
+  RESERVED_NAMES,
+  USER_DATABASE,
+  shouldFallbackToLocalRegistry,
+} = require('./src/utils');
 
 dotenv.config();
 
@@ -102,12 +110,50 @@ if (redisClient) {
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
+  // Use Redis-backed store when available
   store: redisClient ? new RedisStore({
     sendCommand: (...args) => redisClient.sendCommand(args),
   }) : undefined,
+  // Return the standard RateLimit-* headers only
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
+  // Key by authenticated user identifier when present (address/username),
+  // otherwise fall back to client IP. This lets registered/identified users
+  // get a per-account quota rather than being grouped by IP.
+  keyGenerator: (req /*, res */) => {
+    try {
+      // 1) x-api-key (admin or API key users)
+      const apiKey = req.headers['x-api-key'] || req.query.api_key;
+      if (apiKey) return String(apiKey);
+
+      // 2) JSON body address (e.g., /register)
+      if (req.body && typeof req.body.address === 'string' && req.body.address.trim()) {
+        return req.body.address.trim();
+      }
+
+      // 3) Query params: federation (q with type=id) or address param
+      if (req.query) {
+        if (req.query.type === 'id' && typeof req.query.q === 'string' && req.query.q.trim()) {
+          return req.query.q.trim();
+        }
+        if (typeof req.query.address === 'string' && req.query.address.trim()) {
+          return req.query.address.trim();
+        }
+        // Some endpoints use q for lookup by name; not an account id — skip.
+      }
+
+      // 4) URL path pattern: /v1/accounts/:account
+      const m = req.originalUrl && req.originalUrl.match(/\/v1\/accounts\/([^\/]+)/i);
+      if (m && m[1]) return decodeURIComponent(m[1]);
+
+      // Default to IP
+      return req.ip || (req.connection && req.connection.remoteAddress) || '';
+    } catch (err) {
+      // On error, fall back to IP so rate limiting still works
+      return req.ip || '';
+    }
+  },
 });
 
 app.use(cors(corsOptions));
@@ -144,28 +190,8 @@ app.use(rejectNestedObjects);
 app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
+scheduleSoftDeletePurgeJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
-
-try {
-  scheduleWebhookRetryJob({ prisma, poolAllFn: poolAll, poolRunFn: poolRun });
-} catch (err) {
-  logger.error('Failed to schedule webhook retry job:', err.message);
-}
-
-const USER_DATABASE = {
-  'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-  'lekan*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-};
-
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const normalizeNameTag = (value) => {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (!trimmed) {
-    return '';
-  }
-  return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
-};
 
 // ---------------------------------------------------------------------------
 // #51 — ETag Caching Middleware for Federation Endpoint
@@ -189,17 +215,6 @@ const etagCache = (req, res, next) => {
   };
 
   next();
-};
-
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
 };
 
 const getLocalUserByAddress = async (address) =>
@@ -234,25 +249,15 @@ const listLocalUsers = async (search, page, limit) => {
   );
 
   const totalCount = Number(countRow?.totalCount || 0);
-
-  return {
-    data: rows.map((user) => ({
+  return paginatedResponse(
+    rows.map((user) => ({
       username: user.username,
       address: user.address,
       created_at: user.created_at,
     })),
-    meta: {
-      total: totalCount,
-      totalCount,
-      page,
-      currentPage: page,
-      limit,
-      totalPages: Math.ceil(totalCount / limit),
-    },
     totalCount,
-    totalPages: Math.ceil(totalCount / limit),
-    currentPage: page,
-  };
+    { page, limit },
+  );
 };
 
 const registerLocalUser = async ({ username, address }) => {
@@ -303,13 +308,19 @@ app.get('/federation', etagCache, async (req, res, next) => {
     if (type === 'id') {
       const row = await prisma.user.findFirst({
         where: { address: { equals: queryValue, mode: 'insensitive' } },
-        select: { username: true, address: true, memoType: true, memo: true },
+        select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
       });
 
       if (!row) {
         const notFoundError = new Error('Address not found');
         notFoundError.statusCode = 404;
         return next(notFoundError);
+      }
+      
+      if (row.flaggedAt) {
+        const forbiddenError = new Error('Address is blocked');
+        forbiddenError.statusCode = 403;
+        return next(forbiddenError);
       }
       const response = {
         stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
@@ -328,8 +339,14 @@ app.get('/federation', etagCache, async (req, res, next) => {
       try {
         row = await prisma.user.findUnique({
           where: { username: queryName },
-          select: { address: true, memoType: true, memo: true },
+          select: { address: true, memoType: true, memo: true, flaggedAt: true },
         });
+        
+        if (row && row.flaggedAt) {
+          const forbiddenError = new Error('Address is blocked');
+          forbiddenError.statusCode = 403;
+          return next(forbiddenError);
+        }
       } catch (error) {
         if (!shouldFallbackToLocalRegistry(error)) {
           throw error;
@@ -363,8 +380,8 @@ app.get('/federation', etagCache, async (req, res, next) => {
         error: "Unsupported query type. Supported types: 'id', 'name'",
       });
     }
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -372,31 +389,6 @@ app.get('/federation', etagCache, async (req, res, next) => {
 
 // Initialise profanity filter once at module load (reused across requests).
 const profanityFilter = new Filter();
-const VALID_MEMO_TYPES = ['text', 'id', 'hash'];
-const MEMO_ID_RE = /^\d+$/;
-const MEMO_HASH_RE = /^[0-9a-fA-F]{64}$/;
-
-const validateMemo = (memoType, memo) => {
-  if (!memoType && !memo) return null;
-  if (memoType && !memo) return 'memo is required when memo_type is provided.';
-  if (!memoType && memo) return 'memo_type is required when memo is provided.';
-  if (!VALID_MEMO_TYPES.includes(memoType)) {
-    return `memo_type must be one of: ${VALID_MEMO_TYPES.join(', ')}.`;
-  }
-  if (memoType === 'text' && Buffer.byteLength(memo, 'utf8') > 28) {
-    return 'memo of type text must not exceed 28 bytes.';
-  }
-  if (memoType === 'id') {
-    if (!MEMO_ID_RE.test(memo) || BigInt(memo) > 18446744073709551615n) {
-      return 'memo of type id must be a valid 64-bit unsigned integer.';
-    }
-  }
-  if (memoType === 'hash' && !MEMO_HASH_RE.test(memo)) {
-    return 'memo of type hash must be a 64-character hex string (32 bytes).';
-  }
-  return null;
-};
-
 const verifyFreighterRegistrationSignature = ({
   username,
   address,
@@ -668,40 +660,39 @@ app.get('/lookup', async (req, res, next) => {
 
   if (address) {
     try {
-      let row = null;
-      try {
-        row = await prisma.user.findUnique({
-          where: { address },
-          select: { username: true },
-        });
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
+      const result = await lookupCached(address, async () => {
+        let row = null;
+        try {
+          row = await prisma.user.findUnique({
+            where: { address },
+            select: { username: true },
+          });
+        } catch (error) {
+          if (!shouldFallbackToLocalRegistry(error)) {
+            throw error;
+          }
+          row = await getLocalUserByAddress(address);
         }
+        return row ? { username: row.username, address } : null;
+      });
 
-        row = await getLocalUserByAddress(address);
-      }
-
-      if (!row) {
+      if (!result) {
         const notFoundError = new Error('Username not found for this address');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      return res.json({ username: row.username, address });
-    } catch (err) {  // <-- 1. Add (err) here
-      // 2. Add this console.log to print the exact reason Prisma is failing
-      logger.error("🚨 ACTUAL PRISMA ERROR:", err); 
-      
-      const dbError = new Error('Database lookup failed');
+      return res.json(result);
+    } catch (err) {
+      logger.error("🚨 ACTUAL PRISMA ERROR:", err);
+
+      const dbError = new Error('Database lookup failed', { cause: err });
       dbError.statusCode = 500;
       return next(dbError);
     }
   }
 
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const skip = (page - 1) * limit;
+  const { page, limit, skip } = parsePagination(req.query);
 
   const where = {
     OR: [
@@ -723,16 +714,15 @@ app.get('/lookup', async (req, res, next) => {
         }),
       ]);
 
-      response = {
-        data: rows.map((user) => ({
+      response = paginatedResponse(
+        rows.map((user) => ({
           username: user.username,
           address: user.address,
           created_at: user.createdAt.toISOString(),
         })),
         totalCount,
-        totalPages: Math.ceil(totalCount / limit),
-        currentPage: page,
-      };
+        { page, limit },
+      );
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) {
         throw error;
@@ -742,8 +732,8 @@ app.get('/lookup', async (req, res, next) => {
     }
 
     return res.json(response);
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -796,8 +786,8 @@ app.get('/users', async (req, res, next) => {
       totalPages,
       currentPage: page,
     });
-  } catch {
-    const dbError = new Error('Database error');
+  } catch (error) {
+    const dbError = new Error('Database error', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -805,6 +795,8 @@ app.get('/users', async (req, res, next) => {
 // Mount v1 router for both legacy paths and explicit API versioning
 app.use('/', v1Router);
 app.use('/api/v1', v1Router);
+// Auth endpoints (email OTP verification) - uses Redis when available
+app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
 
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -814,6 +806,40 @@ app.get('/.well-known/stellar.toml', (_req, res) => {
 
 app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
+});
+
+app.get('/health', async (_req, res) => {
+  const checks = { database: null, redis: null };
+  let allOk = true;
+  const errors = [];
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    checks.database = 'ok';
+  } catch {
+    checks.database = 'error';
+    allOk = false;
+    errors.push('Database unavailable');
+  }
+
+  if (redisClient) {
+    try {
+      await redisClient.ping();
+      checks.redis = 'ok';
+    } catch {
+      checks.redis = 'error';
+      allOk = false;
+      errors.push('Redis unavailable');
+    }
+  } else {
+    checks.redis = 'not configured';
+  }
+
+  if (allOk) {
+    res.json({ status: 'ok', ...checks });
+  } else {
+    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
+  }
 });
 
 app.get('/health', async (req, res) => {
@@ -845,6 +871,11 @@ if (process.env.SENTRY_DSN) {
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
+  if (isPrismaConnectionError(err)) {
+    err.statusCode = 503;
+    err.message = 'Service Unavailable';
+  }
+
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 

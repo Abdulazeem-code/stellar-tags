@@ -29,7 +29,7 @@ model User {
   memo      String?
   createdAt DateTime  @default(now()) @map("created_at")
   flaggedAt DateTime? @map("flagged_at")
-  webhooks  Webhook[]
+  deletedAt DateTime? @map("deleted_at")
 
   @@index([username])
   @@map("username_registry")
