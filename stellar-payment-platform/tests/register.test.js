@@ -29,9 +29,9 @@ jest.mock('../src/db', () => ({
   poolAll: jest.fn().mockResolvedValue([]),
 }));
 
-// Mock the v1 routes
+// Mock the v1 routes (factory function since v1/index.js now exports a function)
 jest.mock('../src/routes/v1', () => {
-  return require('express').Router();
+  return () => require('express').Router();
 });
 
 const { app } = require('../server');

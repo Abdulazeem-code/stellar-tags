@@ -14,7 +14,6 @@ const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
-const v1Router = require('./src/routes/v1');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
@@ -112,6 +111,8 @@ if (redisClient) {
   redisClient.on('error', (err) => logger.error('Redis client error:', err));
   redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
+
+const v1Router = require('./src/routes/v1')(redisClient);
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
