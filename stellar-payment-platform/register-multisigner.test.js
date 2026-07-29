@@ -27,6 +27,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
 jest.mock('pdfkit', () => jest.fn());
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
@@ -37,7 +38,9 @@ jest.mock('./prismaClient', () => ({
       count: jest.fn(),
     },
     $transaction: jest.fn(),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock('generic-pool', () => ({
@@ -164,12 +167,14 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
     it('should reject request with missing username', async () => {
       const response = await request(app)
         .post('/register')
+        .set('Content-Type', 'application/json')
         .send({
           address: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
           signature: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
         });
 
-      expect(response.status).toBe(400);
+      expect(response.status).toBe(422);
+      expect(response.body).toHaveProperty('errors');
     });
   });
 

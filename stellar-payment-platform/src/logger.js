@@ -9,10 +9,14 @@ require('winston-daily-rotate-file');
 
 // Logs live in <stellar-payment-platform>/logs by default. LOG_DIR can point the
 // transports somewhere else (e.g. a mounted volume in Docker).
+const fs = require('fs');
 const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, '..', 'logs');
 const LOG_LEVEL = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
 const MAX_SIZE = process.env.LOG_MAX_SIZE || '20m';
 const MAX_FILES = process.env.LOG_MAX_FILES || '14d';
+
+// Ensure the directory exists to prevent ENOENT crashes when transports are initialized
+fs.mkdirSync(LOG_DIR, { recursive: true });
 
 // Test runs should not litter the working tree with log files or console noise.
 const IS_TEST = process.env.NODE_ENV === 'test';
@@ -27,13 +31,26 @@ const rotateOptions = (filename, level) => ({
   ...(level ? { level } : {}),
 });
 
+const redactKeys = winston.format((info) => {
+  const S_KEY_REGEX = /S[A-Z2-7]{55}/g;
+  if (typeof info.message === 'string') {
+    info.message = info.message.replace(S_KEY_REGEX, '[REDACTED_SECRET_KEY]');
+  }
+  if (info.stack && typeof info.stack === 'string') {
+    info.stack = info.stack.replace(S_KEY_REGEX, '[REDACTED_SECRET_KEY]');
+  }
+  return info;
+});
+
 const fileFormat = winston.format.combine(
+  redactKeys(),
   winston.format.timestamp(),
   winston.format.errors({ stack: true }),
   winston.format.json()
 );
 
 const consoleFormat = winston.format.combine(
+  redactKeys(),
   winston.format.colorize(),
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.errors({ stack: true }),
