@@ -144,7 +144,7 @@ const limiter = rateLimit({
       }
 
       // 4) URL path pattern: /v1/accounts/:account
-      const m = req.originalUrl && req.originalUrl.match(/\/v1\/accounts\/([^\/]+)/i);
+      const m = req.originalUrl && req.originalUrl.match(/\/v1\/accounts\/([^/]+)/i);
       if (m && m[1]) return decodeURIComponent(m[1]);
 
       // Default to IP
@@ -661,7 +661,7 @@ app.get('/lookup', async (req, res, next) => {
   if (address) {
     try {
       const result = await lookupCached(address, async () => {
-        let row = null;
+        let row;
         try {
           row = await prisma.user.findUnique({
             where: { address },
@@ -923,8 +923,7 @@ const gracefulShutdown = (server, prismaClient, signal) => {
     try {
       await prismaClient.$disconnect();
     } catch (err) {
-      console.error('Error disconnecting Prisma during shutdown:', err);
-      logger.error('Error draining DB pool during shutdown:', err);
+      logger.error('Error disconnecting Prisma during shutdown:', err);
     }
     process.exit(0);
   });
