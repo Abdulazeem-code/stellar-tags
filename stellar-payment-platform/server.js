@@ -25,7 +25,13 @@ const { registerValidator } = require('./src/validators/registerValidator');
 const { validate } = require('./src/middleware/validate');
 const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
-const { lookupCached } = require('./src/cache');
+const {
+  lookupCached,
+  federationNameKey,
+  federationIdKey,
+  federationLookupCached,
+  invalidateFederationCache,
+} = require('./src/cache');
 const { parsePagination, paginatedResponse } = require('./src/pagination');
 const {
   normalizeNameTag,
@@ -306,75 +312,89 @@ app.get('/federation', etagCache, async (req, res, next) => {
 
   try {
     if (type === 'id') {
-      const row = await prisma.user.findFirst({
-        where: { address: { equals: queryValue, mode: 'insensitive' } },
-        select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
+      const cacheKey = federationIdKey(queryValue);
+      const cached = await federationLookupCached(cacheKey, async () => {
+        const row = await prisma.user.findFirst({
+          where: { address: { equals: queryValue, mode: 'insensitive' } },
+          select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
+        });
+
+        if (!row) return null;
+        if (row.flaggedAt) {
+          const forbiddenError = new Error('Address is blocked');
+          forbiddenError.statusCode = 403;
+          throw forbiddenError;
+        }
+
+        const response = {
+          stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
+          account_id: row.address,
+        };
+        if (row.memoType) {
+          response.memo_type = row.memoType;
+          response.memo = row.memo;
+        }
+        return response;
       });
 
-      if (!row) {
+      if (!cached) {
         const notFoundError = new Error('Address not found');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
-      
-      if (row.flaggedAt) {
-        const forbiddenError = new Error('Address is blocked');
-        forbiddenError.statusCode = 403;
-        return next(forbiddenError);
-      }
-      const response = {
-        stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
-        account_id: row.address,
-      };
-      if (row.memoType) {
-        response.memo_type = row.memoType;
-        response.memo = row.memo;
-      }
-      return res.json(response);
+
+      return res.json(cached);
     } else if (type === 'name' || !type) {
       const nameTag = normalizeNameTag(queryValue);
       const queryName = nameTag.toLowerCase();
+      const cacheKey = federationNameKey(queryName);
 
-      let row = null;
-      try {
-        row = await prisma.user.findUnique({
-          where: { username: queryName },
-          select: { address: true, memoType: true, memo: true, flaggedAt: true },
-        });
-        
-        if (row && row.flaggedAt) {
-          const forbiddenError = new Error('Address is blocked');
-          forbiddenError.statusCode = 403;
-          return next(forbiddenError);
+      const cached = await federationLookupCached(cacheKey, async () => {
+        let row;
+        try {
+          row = await prisma.user.findUnique({
+            where: { username: queryName },
+            select: { address: true, memoType: true, memo: true, flaggedAt: true },
+          });
+
+          if (row && row.flaggedAt) {
+            const forbiddenError = new Error('Address is blocked');
+            forbiddenError.statusCode = 403;
+            throw forbiddenError;
+          }
+        } catch (error) {
+          if (error.statusCode === 403) throw error;
+          if (!shouldFallbackToLocalRegistry(error)) {
+            throw error;
+          }
+
+          const localRow = await getLocalUserByUsername(queryName);
+          row = localRow
+            ? { address: localRow.address, memoType: null, memo: null }
+            : null;
         }
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
+
+        const address = row?.address || USER_DATABASE[queryName];
+        if (!address) return null;
+
+        const response = {
+          stellar_address: address,
+          account_id: address,
+        };
+        if (row?.memoType) {
+          response.memo_type = row.memoType;
+          response.memo = row.memo;
         }
+        return response;
+      });
 
-        const localRow = await getLocalUserByUsername(queryName);
-        row = localRow
-          ? { address: localRow.address, memoType: null, memo: null }
-          : null;
-      }
-
-      const address = row?.address || USER_DATABASE[queryName];
-
-      if (!address) {
+      if (!cached) {
         const notFoundError = new Error('Name tag not found');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      const response = {
-        stellar_address: address,
-        account_id: address,
-      };
-      if (row?.memoType) {
-        response.memo_type = row.memoType;
-        response.memo = row.memo;
-      }
-      return res.json(response);
+      return res.json(cached);
     } else {
       return res.status(400).json({
         error: "Unsupported query type. Supported types: 'id', 'name'",
@@ -597,6 +617,8 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
           ...(memoType && { memoType, memo }),
         },
       });
+      // Invalidate any stale federation cache entries for this username/address
+      invalidateFederationCache(normalizedUsername, address);
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) {
         throw error;
