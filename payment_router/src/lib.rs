@@ -253,6 +253,11 @@ impl PaymentRouter {
     /// the sender's rolling 24h limit is exceeded. `Error::InsufficientBalance`
     /// if the sender's balance is too low. Also fails if `sender` did not
     /// authorize the call, or the token transfer fails.
+    ///
+    /// # Events
+    /// On success, publishes a `("routed", sender, recipient)` topic event
+    /// with `amount` as data, so indexers can track routed payments and
+    /// filter/query by sender or recipient address.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -391,6 +396,14 @@ impl PaymentRouter {
                 Self::PERSISTENT_BUMP_AMOUNT,
             );
 
+        // Emit an event so indexers can track routed payments. Sender and
+        // recipient are topics (queryable/filterable by indexers), amount is
+        // the event data.
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            amount,
+        );
+
         // Log success
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to recipient");
@@ -524,6 +537,60 @@ mod test {
         assert_eq!(topics.len(), 1);
         let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
         assert_eq!(topic, symbol_short!("pause"));
+    }
+
+    #[test]
+    fn test_route_payment_emits_routed_event() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
+
+        let amount = 2_000i128;
+        client.route_payment(&sender, &recipient, &token_address, &amount);
+
+        let events = env.events().all();
+        assert!(!events.is_empty());
+
+        // The routed event is the one published by route_payment itself —
+        // find it by topic rather than assuming position, since the token
+        // transfers above also publish their own events.
+        let mut found = None;
+        for evt in events.iter() {
+            let (_contract_id, topics, _data) = evt.clone();
+            if topics.len() != 3 {
+                continue;
+            }
+            let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            if topic0 == symbol_short!("routed") {
+                found = Some(evt.clone());
+                break;
+            }
+        }
+        let routed = found.expect("route_payment should publish a \"routed\" event");
+
+        let (_contract_id, topics, data) = routed;
+        assert_eq!(topics.len(), 3);
+
+        // Sender and recipient are topics, so indexers can filter/query
+        // routed-payment events by either address.
+        let topic_sender: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        let topic_recipient: Address = topics.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_sender, sender);
+        assert_eq!(topic_recipient, recipient);
+
+        // Amount is the event data.
+        let event_amount: i128 = data.try_into_val(&env).unwrap();
+        assert_eq!(event_amount, amount);
     }
 
     #[test]
