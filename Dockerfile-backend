@@ -18,4 +18,4 @@ COPY --from=builder /app /app
 RUN npm prune --omit=dev
 
 EXPOSE 5000
-CMD ["node", "server.js"]
+CMD ["sh", "startup.sh"]

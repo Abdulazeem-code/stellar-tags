@@ -9,7 +9,7 @@ RUN npm ci
 COPY stellar-payment-platform/ .
 RUN npx prisma generate
 EXPOSE 5000
-CMD ["node", "server.js"]
+CMD ["sh", "startup.sh"]
 
 # --- Frontend build ---
 FROM base AS frontend-build
