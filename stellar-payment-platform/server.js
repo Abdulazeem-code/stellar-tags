@@ -14,7 +14,6 @@ const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
-const v1Router = require('./src/routes/v1');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
@@ -26,6 +25,7 @@ const { validate } = require('./src/middleware/validate');
 const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
 const { lookupCached } = require('./src/cache');
+const { getCachedFederationResult, buildFederationCacheKey, invalidateFederationCache } = require('./src/federationCache');
 const { parsePagination, paginatedResponse } = require('./src/pagination');
 const {
   normalizeNameTag,
@@ -106,6 +106,8 @@ if (redisClient) {
   redisClient.on('error', (err) => logger.error('Redis client error:', err));
   redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
+
+const v1Router = require('./src/routes/v1')(redisClient);
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -306,9 +308,13 @@ app.get('/federation', etagCache, async (req, res, next) => {
 
   try {
     if (type === 'id') {
-      const row = await prisma.user.findFirst({
-        where: { address: { equals: queryValue, mode: 'insensitive' } },
-        select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
+      const cacheKey = buildFederationCacheKey('id', queryValue);
+
+      const row = await getCachedFederationResult(redisClient, cacheKey, async () => {
+        return prisma.user.findFirst({
+          where: { address: { equals: queryValue, mode: 'insensitive' } },
+          select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
+        });
       });
 
       if (!row) {
@@ -334,12 +340,15 @@ app.get('/federation', etagCache, async (req, res, next) => {
     } else if (type === 'name' || !type) {
       const nameTag = normalizeNameTag(queryValue);
       const queryName = nameTag.toLowerCase();
+      const cacheKey = buildFederationCacheKey('name', queryName);
 
       let row = null;
       try {
-        row = await prisma.user.findUnique({
-          where: { username: queryName },
-          select: { address: true, memoType: true, memo: true, flaggedAt: true },
+        row = await getCachedFederationResult(redisClient, cacheKey, async () => {
+          return prisma.user.findUnique({
+            where: { username: queryName },
+            select: { address: true, memoType: true, memo: true, flaggedAt: true },
+          });
         });
         
         if (row && row.flaggedAt) {
