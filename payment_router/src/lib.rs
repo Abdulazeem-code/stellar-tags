@@ -1,11 +1,4 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, token, Address, Env};
-
-#[contracttype]
-#[derive(Clone)]
-use soroban_sdk::{contract, contractimpl, log, symbol_short, token, Address, Env};
-
-const ADMIN: soroban_sdk::Symbol = symbol_short!("admin");
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Env,
 };
@@ -24,18 +17,9 @@ pub enum DataKey {
     PlatformTreasury,
     FeeBps,
     FeeCap,
+    Paused,
     UserVolume(Address),
     UserSpending(Address),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserSpending {
-    pub last_reset_time: u64,
-    pub accumulated_amount: i128,
-    Paused,
-    Treasury,
-    FeeRateBps,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -178,6 +162,8 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::FeeBps)
             .unwrap_or(0)
+    }
+
     /// Pauses or unpauses the payment router. Admin-only.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
@@ -329,14 +315,11 @@ impl PaymentRouter {
     /// the sender's rolling 24h limit is exceeded. `Error::InsufficientBalance`
     /// if the sender's balance is too low. Also fails if `sender` did not
     /// authorize the call, or the token transfer fails.
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&ADMIN) {
-            panic!("already initialized");
-        }
-        env.storage().instance().set(&ADMIN, &admin);
-    }
-
-    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// # Events
+    /// On success, publishes a `("routed", sender, recipient)` topic event
+    /// with `amount` as data, so indexers can track routed payments and
+    /// filter/query by sender or recipient address.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -500,6 +483,14 @@ impl PaymentRouter {
                 Self::PERSISTENT_BUMP_AMOUNT,
             );
 
+        // Emit an event so indexers can track routed payments. Sender and
+        // recipient are topics (queryable/filterable by indexers), amount is
+        // the event data.
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            amount,
+        );
+
         // Log success
         log!(&env, "Platform fee routed to treasury");
         log!(&env, "Remaining balance routed to recipient");
@@ -529,59 +520,21 @@ impl PaymentRouter {
         }
     }
 
-    /// Calculates protocol fee and remainder
-    fn calculate_fee(amount: i128, fee_rate_bps: u32) -> (i128, i128) {
-        if fee_rate_bps == 0 || amount <= 0 {
-            return (0, amount);
-        }
-        let fee = amount
-            .checked_mul(fee_rate_bps as i128)
-            .unwrap_or(0)
-            .checked_div(10_000)
-            .unwrap_or(0);
-        let remainder = amount.checked_sub(fee).unwrap_or(amount);
-        (fee, remainder)
-    }
-
-    /// Sets treasury and fee rate
-    pub fn set_fee_config(env: Env, treasury: Address, fee_rate_bps: u32) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        if fee_rate_bps > 1_000 {
-            return Err(Error::InvalidFeeRate);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Treasury, &treasury);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeRateBps, &fee_rate_bps);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        env.events().publish(
-            (symbol_short!("fee_cfg"),),
-            (treasury, fee_rate_bps),
-        );
-
+    /// Records a token as supported (no-op; routing accepts any token contract ID).
+    pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
         Ok(())
     }
 
-    /// Returns current treasury address
-    pub fn get_treasury(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Treasury)
-    }
+    /// Admin-only emergency withdrawal of tokens held by this contract.
+    pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
 
-    /// Returns current fee rate in basis points
-    pub fn get_fee_rate_bps(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::FeeRateBps)
-            .unwrap_or(0)
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+
+        log!(&env, "Emergency withdraw executed by admin");
+        Ok(())
     }
 }
 
@@ -699,8 +652,7 @@ mod test {
         client.set_fee_bps(&300).unwrap();
         assert_eq!(client.get_fee(), 300);
 
-        // Update fee via set_fee_config
-        client.set_fee_config(&150, &500).unwrap();
+        client.set_fee_config_legacy(&150, &500).unwrap();
         assert_eq!(client.get_fee(), 150);
     }
 
@@ -711,22 +663,76 @@ mod test {
 
     #[test]
     fn test_set_fee_config_emits_event() {
+    fn test_set_pause_emits_event() {
         let (env, client) = setup_env();
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let new_treasury = Address::generate(&env);
 
         client.initialize(&admin, &treasury, &100, &1000);
 
-        client.set_fee_config(&new_treasury, &250u32);
+        client.set_pause(&true);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 1);
+        assert!(!events.is_empty());
         let (_, topics, _) = events.get(0).unwrap();
         assert_eq!(topics.len(), 1);
         let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(topic, symbol_short!("fee_cfg"));
+        assert_eq!(topic, symbol_short!("pause"));
+    }
+
+    #[test]
+    fn test_route_payment_emits_routed_event() {
+        let (env, client) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50);
+        client.add_supported_token(&token_address);
+
+        let amount = 2_000i128;
+        client.route_payment(&sender, &recipient, &token_address, &amount);
+
+        let events = env.events().all();
+        assert!(!events.is_empty());
+
+        // The routed event is the one published by route_payment itself —
+        // find it by topic rather than assuming position, since the token
+        // transfers above also publish their own events.
+        let mut found = None;
+        for evt in events.iter() {
+            let (_contract_id, topics, _data) = evt.clone();
+            if topics.len() != 3 {
+                continue;
+            }
+            let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            if topic0 == symbol_short!("routed") {
+                found = Some(evt.clone());
+                break;
+            }
+        }
+        let routed = found.expect("route_payment should publish a \"routed\" event");
+
+        let (_contract_id, topics, data) = routed;
+        assert_eq!(topics.len(), 3);
+
+        // Sender and recipient are topics, so indexers can filter/query
+        // routed-payment events by either address.
+        let topic_sender: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        let topic_recipient: Address = topics.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_sender, sender);
+        assert_eq!(topic_recipient, recipient);
+
+        // Amount is the event data.
+        let event_amount: i128 = data.try_into_val(&env).unwrap();
+        assert_eq!(event_amount, amount);
     }
 
     #[test]
@@ -1036,55 +1042,41 @@ mod test {
         assert_eq!(token_client.balance(&platform_treasury), expected_fee);
     }
 
-    pub fn emergency_withdraw(env: Env, token: Address, amount: i128) {
-        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
-        admin.require_auth();
-
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &admin, &amount);
-
-        log!(&env, "Emergency withdraw executed by admin");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
-
     #[test]
     fn test_initialize_sets_admin() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
         let contract_addr = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_addr);
 
-        client.initialize(&admin);
+        client.initialize(&admin, &treasury, &100, &1000);
 
-        let stored_admin: Option<Address> =
-            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        let stored_admin: Option<Address> = env.as_contract(&contract_addr, || {
+            env.storage().instance().get(&DataKey::Admin)
+        });
         assert_eq!(stored_admin, Some(admin));
     }
 
     #[test]
     fn test_emergency_withdraw_stores_admin() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
         let contract_addr = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_addr);
 
-        client.initialize(&admin);
+        client.initialize(&admin, &treasury, &100, &1000);
 
-        let stored_admin: Option<Address> =
-            env.as_contract(&contract_addr, || env.storage().instance().get(&ADMIN));
+        let stored_admin: Option<Address> = env.as_contract(&contract_addr, || {
+            env.storage().instance().get(&DataKey::Admin)
+        });
         assert_eq!(stored_admin, Some(admin.clone()));
         assert_eq!(stored_admin.unwrap(), admin);
     }
 
-    /// Proves route_payment is asset-agnostic: two independently deployed
-    /// Stellar Asset Contracts (standing in for e.g. USDC and EURC) are
-    /// each routed correctly through the same initialized router, with
-    /// balances and fees tracked separately per asset.
     #[test]
     fn test_routes_multiple_distinct_assets() {
         let (env, client) = setup_env();
@@ -1096,7 +1088,6 @@ mod tests {
 
         client.initialize(&admin, &treasury, &100, &1_000_000);
 
-        // Two separately deployed assets -- distinct contract IDs, distinct balances.
         let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
         let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
         assert_ne!(usdc_like_address, eurc_like_address);
@@ -1104,22 +1095,13 @@ mod tests {
         usdc_like_admin_client.mint(&sender, &10_000);
         eurc_like_admin_client.mint(&sender, &5_000);
 
-        // Route asset #1
         client.route_payment(&sender, &recipient, &usdc_like_address, &2_000);
-        // Route asset #2
         client.route_payment(&sender, &recipient, &eurc_like_address, &1_000);
 
-        // Each asset's balances moved independently -- asset #2 was untouched
-        // by asset #1's transfer, and vice versa.
         assert_eq!(usdc_like_client.balance(&sender), 8_000);
-        assert_eq!(usdc_like_client.balance(&recipient), 1_980); // 2000 - 1% fee (20)
+        assert_eq!(usdc_like_client.balance(&recipient), 1_980);
         assert_eq!(eurc_like_client.balance(&sender), 4_000);
-        assert_eq!(eurc_like_client.balance(&recipient), 990); // 1000 - 1% fee (10)
-
-        // Cumulative volume is asset-agnostic -- it's a total across whatever
-        // was routed, matching the sum of both payments.
+        assert_eq!(eurc_like_client.balance(&recipient), 990);
         assert_eq!(client.get_user_volume(&sender), 3_000);
     }
 }
-
-
