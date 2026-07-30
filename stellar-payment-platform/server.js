@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const RedisStore = require('rate-limit-redis');
@@ -53,6 +54,7 @@ const app = express();
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+app.use(helmet());
 
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
