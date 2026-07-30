@@ -31,6 +31,18 @@ function initSocketServer(httpServer, corsOptions = {}) {
       }
     });
 
+    socket.on('payment', (payload) => {
+      try {
+        const { address, payment } = payload || {};
+        if (address && payment) {
+          emitToAddress(address, 'payment', payment);
+          logger.info(`Forwarded payment event to room for address ${address}`);
+        }
+      } catch (err) {
+        logger.error('Socket payment forwarding error', err);
+      }
+    });
+
     socket.on('disconnect', () => {
       logger.info(`Socket disconnected: ${socket.id}`);
     });
@@ -44,4 +56,11 @@ function emitToAddress(address, event, data) {
   io.to(address).emit(event, data);
 }
 
-module.exports = { initSocketServer, emitToAddress };
+function closeSocketServer() {
+  if (io) {
+    io.close();
+    io = null;
+  }
+}
+
+module.exports = { initSocketServer, emitToAddress, closeSocketServer };
