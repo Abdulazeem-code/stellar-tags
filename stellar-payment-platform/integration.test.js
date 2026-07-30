@@ -139,13 +139,17 @@ const request = require('supertest');
 const { app } = require('./server');
 
 describe('API Integration Lifecycle Suite', () => {
+  // Clients submit a bare username; the server appends the federation suffix,
+  // so `federationTag` is what gets stored and returned.
   const user1 = {
-    username: 'integration_user*localhost',
+    username: 'integrationuser',
+    federationTag: 'integrationuser*localhost',
     address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
   };
 
   const user2 = {
-    username: 'integration_user*localhost',
+    username: 'integrationuser',
+    federationTag: 'integrationuser*localhost',
     address: 'GBDQD3WTQ6W2VQ2W4V74UZ5WYF6B72GZ6EHD7I3L3WYH357Y4K5H3E4W',
   };
 
@@ -171,7 +175,7 @@ describe('API Integration Lifecycle Suite', () => {
     expect(registerRes.status).toBe(201);
     expect(registerRes.body).toMatchObject({
       ok: true,
-      username: user1.username.toLowerCase(),
+      username: user1.federationTag,
       address: user1.address,
     });
 
@@ -181,19 +185,19 @@ describe('API Integration Lifecycle Suite', () => {
 
     expect(queryRes.status).toBe(200);
     expect(queryRes.body).toMatchObject({
-      username: user1.username.toLowerCase(),
+      username: user1.federationTag,
       address: user1.address,
     });
 
     // Also query the user via search parameter on /api/v1/lookup
     const searchRes = await request(app)
-      .get('/api/v1/lookup?search=integration_user');
+      .get('/api/v1/lookup?search=integrationuser');
 
     expect(searchRes.status).toBe(200);
     expect(searchRes.body.data).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          username: user1.username.toLowerCase(),
+          username: user1.federationTag,
           address: user1.address,
         }),
       ]),
@@ -201,7 +205,7 @@ describe('API Integration Lifecycle Suite', () => {
 
     // Also query the user via /api/v1/federation
     const fedRes = await request(app)
-      .get(`/api/v1/federation?q=${user1.username}&type=name`);
+      .get(`/api/v1/federation?q=${user1.federationTag}&type=name`);
 
     expect(fedRes.status).toBe(200);
     expect(fedRes.body).toMatchObject({

@@ -45,13 +45,12 @@ describe('DB Pool Monitor', () => {
     it('returns parsed pool metrics from Prisma', async () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [
-          { key: 'prisma_client_pool_connections_active', value: 3, labels: {} },
-          { key: 'prisma_client_pool_connections_idle', value: 7, labels: {} },
-          { key: 'prisma_client_pool_connections_size', value: 10, labels: {} },
-          { key: 'prisma_client_pool_waiters', value: 0, labels: {} },
+        gauges: [
+          { key: 'prisma_pool_connections_busy', value: 3, labels: {} },
+          { key: 'prisma_pool_connections_idle', value: 7, labels: {} },
+          { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+          { key: 'prisma_client_queries_wait', value: 0, labels: {} },
         ],
       });
 
@@ -62,9 +61,8 @@ describe('DB Pool Monitor', () => {
     it('defaults to 0 for missing metrics keys', async () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [],
+        gauges: [],
       });
 
       const metrics = await getPoolMetrics(mockPrisma);
@@ -89,13 +87,12 @@ describe('DB Pool Monitor', () => {
     it('logs warning when pool usage exceeds 80%', async () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [
-          { key: 'prisma_client_pool_connections_active', value: 9, labels: {} },
-          { key: 'prisma_client_pool_connections_idle', value: 1, labels: {} },
-          { key: 'prisma_client_pool_connections_size', value: 10, labels: {} },
-          { key: 'prisma_client_pool_waiters', value: 0, labels: {} },
+        gauges: [
+          { key: 'prisma_pool_connections_busy', value: 9, labels: {} },
+          { key: 'prisma_pool_connections_idle', value: 1, labels: {} },
+          { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+          { key: 'prisma_client_queries_wait', value: 0, labels: {} },
         ],
       });
 
@@ -110,13 +107,12 @@ describe('DB Pool Monitor', () => {
     it('does not log when pool usage is below threshold', async () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [
-          { key: 'prisma_client_pool_connections_active', value: 5, labels: {} },
-          { key: 'prisma_client_pool_connections_idle', value: 5, labels: {} },
-          { key: 'prisma_client_pool_connections_size', value: 10, labels: {} },
-          { key: 'prisma_client_pool_waiters', value: 0, labels: {} },
+        gauges: [
+          { key: 'prisma_pool_connections_busy', value: 5, labels: {} },
+          { key: 'prisma_pool_connections_idle', value: 5, labels: {} },
+          { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+          { key: 'prisma_client_queries_wait', value: 0, labels: {} },
         ],
       });
 
@@ -128,13 +124,12 @@ describe('DB Pool Monitor', () => {
     it('logs warning when there are waiters regardless of pool usage', async () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [
-          { key: 'prisma_client_pool_connections_active', value: 3, labels: {} },
-          { key: 'prisma_client_pool_connections_idle', value: 7, labels: {} },
-          { key: 'prisma_client_pool_connections_size', value: 10, labels: {} },
-          { key: 'prisma_client_pool_waiters', value: 2, labels: {} },
+        gauges: [
+          { key: 'prisma_pool_connections_busy', value: 3, labels: {} },
+          { key: 'prisma_pool_connections_idle', value: 7, labels: {} },
+          { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+          { key: 'prisma_client_queries_wait', value: 2, labels: {} },
         ],
       });
 
@@ -156,13 +151,12 @@ describe('DB Pool Monitor', () => {
     it('does not warn when pool size is zero', async () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [
-          { key: 'prisma_client_pool_connections_active', value: 0, labels: {} },
-          { key: 'prisma_client_pool_connections_idle', value: 0, labels: {} },
-          { key: 'prisma_client_pool_connections_size', value: 0, labels: {} },
-          { key: 'prisma_client_pool_waiters', value: 0, labels: {} },
+        gauges: [
+          { key: 'prisma_pool_connections_busy', value: 0, labels: {} },
+          { key: 'prisma_pool_connections_idle', value: 0, labels: {} },
+          { key: 'prisma_pool_connections_open', value: 0, labels: {} },
+          { key: 'prisma_client_queries_wait', value: 0, labels: {} },
         ],
       });
 
@@ -174,13 +168,12 @@ describe('DB Pool Monitor', () => {
     it('logs both warnings when usage is high and waiters exist', async () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [
-          { key: 'prisma_client_pool_connections_active', value: 10, labels: {} },
-          { key: 'prisma_client_pool_connections_idle', value: 0, labels: {} },
-          { key: 'prisma_client_pool_connections_size', value: 10, labels: {} },
-          { key: 'prisma_client_pool_waiters', value: 3, labels: {} },
+        gauges: [
+          { key: 'prisma_pool_connections_busy', value: 10, labels: {} },
+          { key: 'prisma_pool_connections_idle', value: 0, labels: {} },
+          { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+          { key: 'prisma_client_queries_wait', value: 3, labels: {} },
         ],
       });
 
@@ -196,13 +189,12 @@ describe('DB Pool Monitor', () => {
     it('runs an immediate check and schedules periodic checks', () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [
-          { key: 'prisma_client_pool_connections_active', value: 9, labels: {} },
-          { key: 'prisma_client_pool_connections_idle', value: 1, labels: {} },
-          { key: 'prisma_client_pool_connections_size', value: 10, labels: {} },
-          { key: 'prisma_client_pool_waiters', value: 0, labels: {} },
+        gauges: [
+          { key: 'prisma_pool_connections_busy', value: 9, labels: {} },
+          { key: 'prisma_pool_connections_idle', value: 1, labels: {} },
+          { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+          { key: 'prisma_client_queries_wait', value: 0, labels: {} },
         ],
       });
 
@@ -240,9 +232,8 @@ describe('DB Pool Monitor', () => {
     it('returns a handle that can be stopped', () => {
       mockPrisma.$metrics.json.mockResolvedValue({
         counters: [],
-        gauges: [],
         histograms: [],
-        ecollections: [],
+        gauges: [],
       });
 
       mockLogger.info.mockClear();

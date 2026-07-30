@@ -1,11 +1,14 @@
 const express = require('express');
+const { invalidateFederationCache } = require('../../federationCache');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
 
-const getPrisma = () => {
-  // require at runtime so tests that import routes but stub prisma won't fail at import time
-  return require('../../../prismaClient').prisma;
-};
+  const getPrisma = () => {
+    return require('../../../prismaClient').prisma;
+  };
+
+const { invalidateFederationCache } = require('../../cache');
 
 const adminAuth = (req, res, next) => {
   const apiKey = req.headers['x-api-key'] || req.query.api_key;
@@ -28,6 +31,9 @@ router.post('/admin/block', adminAuth, async (req, res, next) => {
       where: { address },
       data: { flaggedAt: new Date() },
     });
+
+    // Evict federation cache so blocked users are not served from cache
+    invalidateFederationCache(updatedUser.username, updatedUser.address);
     
     return res.status(200).json({
       message: 'Address successfully blocked',
@@ -39,8 +45,28 @@ router.post('/admin/block', adminAuth, async (req, res, next) => {
     if (error.code === 'P2025') {
       return res.status(404).json({ error: 'Address not found' });
     }
-    return next(error);
-  }
-});
 
-module.exports = router;
+    try {
+      const updatedUser = await prisma.user.update({
+        where: { address },
+        data: { flaggedAt: new Date() },
+      });
+
+      await invalidateFederationCache(redisClient, updatedUser.address, updatedUser.username);
+
+      return res.status(200).json({
+        message: 'Address successfully blocked',
+        username: updatedUser.username,
+        address: updatedUser.address,
+        flaggedAt: updatedUser.flaggedAt,
+      });
+    } catch (error) {
+      if (error.code === 'P2025') {
+        return res.status(404).json({ error: 'Address not found' });
+      }
+      return next(error);
+    }
+  });
+
+  return router;
+};

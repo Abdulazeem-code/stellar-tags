@@ -5,14 +5,22 @@ const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
-const { lookupCached } = require('../../cache');
-const { parsePagination, paginatedResponse } = require('../../pagination');
+const { lookupCached, invalidateFederationCache } = require('../../cache');
+const { paginatedResponse } = require('../../pagination');
 const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
   shouldFallbackToLocalRegistry,
 } = require('../../utils');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { ApiError } = require('../../errors');
+const { requireJson } = require('../../middleware/requireJson');
+const {
+  registerBodySchema,
+  lookupQuerySchema,
+  usersQuerySchema,
+} = require('../../schemas');
 
 const router = express.Router();
 
@@ -97,28 +105,18 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
-router.post('/register', async (req, res, next) => {
-  if (!req.is('application/json')) {
-    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
-  }
+router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
-  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
-  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
-  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
-  const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
+  const { address, memo_type: memoType, memo, signature = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
-    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
-  }
-
-  if (!username || !address) {
-    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
-  }
-
-  const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-  if (usernameLocalPart.length < 3) {
-    return res.status(400).json({ error: "Username must be at least 3 characters long." });
+    return next(
+      new ApiError(
+        'INVALID_INPUT',
+        'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      ),
+    );
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -129,7 +127,7 @@ router.post('/register', async (req, res, next) => {
 
   const memoError = validateMemo(memoType, memo);
   if (memoError) {
-    return res.status(400).json({ error: memoError });
+    return next(new ApiError('INVALID_INPUT', memoError));
   }
 
   if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
@@ -141,7 +139,7 @@ router.post('/register', async (req, res, next) => {
   const normalizedUsername = username.toLowerCase();
 
   if (RESERVED_NAMES.includes(normalizedUsername)) {
-    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+    return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
   }
 
   try {
@@ -177,6 +175,8 @@ router.post('/register', async (req, res, next) => {
         ...(memoType && { memoType, memo }),
       },
     });
+    // Invalidate any stale federation cache entries for this username/address
+    invalidateFederationCache(normalizedUsername, address);
 
     return res.status(201).json({
       ok: true,
@@ -196,7 +196,7 @@ router.post('/register', async (req, res, next) => {
     });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
-      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
     if (error.message && error.message.includes('Account not found')) {
@@ -216,17 +216,10 @@ router.post('/register', async (req, res, next) => {
   }
 });
 
-router.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
+router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
-router.get('/lookup', async (req, res, next) => {
-  const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
-  const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
-
-  if (!address && !search) {
-    const error = new Error("Missing required parameter: provide 'address' for exact lookup or 'search' for paginated search");
-    error.statusCode = 400;
-    return next(error);
-  }
+router.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
+  const { address = '', search = '' } = req.query;
 
   if (address) {
     try {
@@ -252,7 +245,8 @@ router.get('/lookup', async (req, res, next) => {
     }
   }
 
-  const { page, limit, skip } = parsePagination(req.query);
+  const { page, limit } = req.query;
+  const skip = (page - 1) * limit;
   const where = buildUserSearchWhere(search);
 
   try {
@@ -281,9 +275,10 @@ const totalPages = Math.ceil(totalCount / limit);
   }
 });
 
-router.get('/users', async (req, res, next) => {
-  const { page, limit, skip } = parsePagination(req.query);
-  const search = typeof req.query.search === 'string' ? req.query.search : null;
+router.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
+  const { page, limit } = req.query;
+  const skip = (page - 1) * limit;
+  const search = req.query.search ?? null;
   const where = buildUserSearchWhere(search);
 
   try {
