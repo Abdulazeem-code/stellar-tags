@@ -218,6 +218,16 @@ scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
+const RESERVED_USERNAMES = [
+  'admin',
+  'root',
+  'stellar',
+  'system',
+  'superuser',
+  'administrator',
+  'support',
+];
+
 // ---------------------------------------------------------------------------
 // #51 — ETag Caching Middleware for Federation Endpoint
 // ---------------------------------------------------------------------------
@@ -519,6 +529,11 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   }
 
   const normalizedUsername = username.toLowerCase();
+  
+  const normalizedLocalPart = normalizedUsername.includes('*') ? normalizedUsername.split('*')[0] : normalizedUsername;
+  if (RESERVED_USERNAMES.includes(normalizedLocalPart)) {
+    return res.status(403).json({ error: "Username is reserved." });
+  }
 
   const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
   if (RESERVED_NAMES.includes(normalizedUsername)) {

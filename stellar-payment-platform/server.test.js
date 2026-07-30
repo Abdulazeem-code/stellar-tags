@@ -616,7 +616,17 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ'
     });
   });
-});
+
+  test('rejects reserved usernames', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'admin', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({
+      error: "Username is reserved."
+    });
+  });
 
 describe('POST /register — memo validation', () => {
   let request;
@@ -1058,4 +1068,5 @@ describe('Database disconnection — 503 handling', () => {
     const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');
     expect(res.status).toBe(404);
   });
+
 });
