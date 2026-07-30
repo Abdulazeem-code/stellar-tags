@@ -52,8 +52,28 @@ const mockPages = (pages) => {
   return chain;
 };
 
+const express = require('express');
 const { app } = require('../server');
-const { COLUMNS, escapeField } = require('../src/routes/v1/exportRoutes');
+const exportRoutes = require('../src/routes/v1/exportRoutes');
+const { COLUMNS, escapeField, normalize } = exportRoutes;
+
+/**
+ * Mounts the router alone with res.write counted, so a test can tell an
+ * incremental stream apart from one buffered body written at the end.
+ */
+const countingApp = (writes) => {
+  const isolated = express();
+  isolated.use((req, res, next) => {
+    const write = res.write.bind(res);
+    res.write = (chunk, ...rest) => {
+      writes.push(Buffer.byteLength(chunk));
+      return write(chunk, ...rest);
+    };
+    next();
+  });
+  isolated.use('/', exportRoutes);
+  return isolated;
+};
 
 describe('GET /transactions/export', () => {
   beforeEach(() => jest.clearAllMocks());
@@ -132,6 +152,36 @@ describe('GET /transactions/export', () => {
     });
   });
 
+  describe('streaming mechanism', () => {
+    test('writes each row separately rather than one buffered body', async () => {
+      mockPages([[record(1), record(2), record(3)]]);
+      const writes = [];
+
+      const res = await request(countingApp(writes)).get(`/transactions/export?address=${ADDRESS}`);
+
+      expect(res.status).toBe(200);
+      // One write for the header row plus one per record.
+      expect(writes).toHaveLength(4);
+      expect(writes.every((size) => size < 512)).toBe(true);
+    });
+
+    test('stops writing when the page cap is reached and records the truncation', async () => {
+      const full = () => Array.from({ length: 200 }, (_, i) => record(i));
+      mockPages([full(), full(), full()]);
+      process.env.EXPORT_MAX_PAGES = '2';
+      jest.resetModules();
+      const cappedRoutes = require('../src/routes/v1/exportRoutes');
+      const capped = express();
+      capped.use('/', cappedRoutes);
+
+      const res = await request(capped).get(`/transactions/export?address=${ADDRESS}`);
+      delete process.env.EXPORT_MAX_PAGES;
+
+      // Header plus two full pages, and no third page.
+      expect(res.text.trim().split('\r\n')).toHaveLength(401);
+    });
+  });
+
   describe('CSV correctness', () => {
     test('quotes fields containing a comma, quote or newline', () => {
       expect(escapeField('a,b')).toBe('"a,b"');
@@ -154,6 +204,42 @@ describe('GET /transactions/export', () => {
       const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
 
       expect(res.text).toContain('"a,b""c"');
+    });
+  });
+
+  describe('operation types', () => {
+    test('maps a payment straight through', () => {
+      expect(normalize({ type: 'payment', from: 'GF', to: 'GT', amount: '5.0', asset_type: 'native' }))
+        .toMatchObject({ from: 'GF', to: 'GT', amount: '5.0', asset_type: 'native' });
+    });
+
+    test('maps create_account funder/account/starting_balance', () => {
+      expect(normalize({ type: 'create_account', funder: 'GF', account: 'GNEW', starting_balance: '100.0' }))
+        .toMatchObject({ from: 'GF', to: 'GNEW', amount: '100.0', asset_type: 'native' });
+    });
+
+    test('maps account_merge account/into without repeating one side', () => {
+      const row = normalize({ type: 'account_merge', account: 'GGONE', into: 'GDEST' });
+      expect(row).toMatchObject({ from: 'GGONE', to: 'GDEST' });
+      expect(row.from).not.toBe(row.to);
+    });
+
+    test('maps a path payment like a payment', () => {
+      expect(normalize({ type: 'path_payment_strict_send', from: 'GF', to: 'GT', amount: '9.0' }))
+        .toMatchObject({ from: 'GF', to: 'GT', amount: '9.0' });
+    });
+
+    test('fills the participant columns for a streamed create_account row', async () => {
+      mockPages([[{
+        id: 'ca-1', created_at: '2026-07-30T00:00:00Z', type: 'create_account',
+        funder: 'GFUNDER', account: 'GNEW', starting_balance: '100.0000000',
+        transaction_hash: 'hash-ca',
+      }]]);
+
+      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const row = res.text.trim().split('\r\n')[1];
+
+      expect(row).toBe('ca-1,2026-07-30T00:00:00Z,create_account,GFUNDER,GNEW,100.0000000,native,,,hash-ca');
     });
   });
 

@@ -51,7 +51,42 @@ const escapeField = (value) => {
   return field;
 };
 
-const toRow = (record) => `${COLUMNS.map((column) => escapeField(record[column])).join(',')}\r\n`;
+/**
+ * Per-type field names for the two operations in the /payments collection that
+ * do not use from/to. A generic fallback chain cannot express these: an
+ * account_merge names its source `account` and its destination `into`, while a
+ * create_account names its source `funder` and its destination `account`.
+ */
+const PARTICIPANTS = {
+  create_account: (record) => ({ from: record.funder, to: record.account }),
+  account_merge: (record) => ({ from: record.account, to: record.into }),
+};
+
+/**
+ * Normalises a Horizon payment record onto the CSV columns. Reading only the
+ * `payment` field names would leave other operation types blank.
+ */
+const normalize = (record) => {
+  const { from, to } = (PARTICIPANTS[record.type] || ((r) => ({ from: r.from, to: r.to })))(record);
+
+  return {
+    id: record.id,
+    created_at: record.created_at,
+    type: record.type,
+    from,
+    to,
+    amount: record.type === 'create_account' ? record.starting_balance : record.amount,
+    asset_type: record.type === 'create_account' ? 'native' : record.asset_type,
+    asset_code: record.asset_code,
+    asset_issuer: record.asset_issuer,
+    transaction_hash: record.transaction_hash,
+  };
+};
+
+const toRow = (record) => {
+  const row = normalize(record);
+  return `${COLUMNS.map((column) => escapeField(row[column])).join(',')}\r\n`;
+};
 
 /** Writes a chunk, waiting for drain when the socket applies backpressure. */
 const writeChunk = async (res, chunk) => {
@@ -103,7 +138,10 @@ router.get(
     try {
       await writeChunk(res, `${COLUMNS.join(',')}\r\n`);
 
-      for (let pageCount = 0; pageCount < MAX_PAGES; pageCount += 1) {
+      let truncated = false;
+      let pageCount = 0;
+
+      for (; pageCount < MAX_PAGES; pageCount += 1) {
         const records = page.records || [];
         if (records.length === 0) break;
 
@@ -113,8 +151,21 @@ router.get(
           rows += 1;
         }
 
-        if (records.length < PAGE_SIZE || typeof page.next !== 'function') break;
+        const exhausted = records.length < PAGE_SIZE || typeof page.next !== 'function';
+        if (exhausted) break;
+
+        if (pageCount === MAX_PAGES - 1) {
+          truncated = true;
+          break;
+        }
         page = await page.next();
+      }
+
+      if (truncated) {
+        logger.warn(
+          `[Correlation ID: ${req.correlationId}] Export for ${address} hit the ` +
+            `${MAX_PAGES}-page cap after ${rows} rows and was truncated`,
+        );
       }
 
       logger.info(
@@ -134,3 +185,4 @@ router.get(
 module.exports = router;
 module.exports.COLUMNS = COLUMNS;
 module.exports.escapeField = escapeField;
+module.exports.normalize = normalize;
