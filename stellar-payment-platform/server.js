@@ -26,6 +26,8 @@ const {
   setMetricsSources,
 } = require('./src/metrics');
 const { validateSchema } = require('./src/middleware/validateSchema');
+const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
+const { ApiError, errorBody } = require('./src/errors');
 const { requireJson } = require('./src/middleware/requireJson');
 const {
   registerBodySchema,
@@ -68,7 +70,7 @@ app.use(timeout('10s'));
 app.use((err, req, res, next) => {
   if (req.timedout) {
     logger.error(`[Correlation ID: ${req.correlationId}] Request Timeout`, err);
-    return res.status(503).json({ error: 'Service Unavailable', correlation_id: req.correlationId });
+    return next(new ApiError('SERVICE_UNAVAILABLE', undefined, { cause: err }));
   }
   next(err);
 });
@@ -136,7 +138,7 @@ const limiter = rateLimit({
   // Return the standard RateLimit-* headers only
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
   // Prometheus scrapes /metrics on a fixed interval from a single address, so
   // counting those scrapes against the shared quota would 429 the scraper.
   skip: (req) => req.path === '/metrics',
@@ -181,13 +183,6 @@ const limiter = rateLimit({
 app.use(cors(corsOptions));
 app.use(limiter);
 app.use(express.json({ limit: '10kb' }));
-app.use((err, _req, res, next) => {
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    return res.status(400).json({ error: 'Malformed JSON payload' });
-  }
-  next(err);
-});
-
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
@@ -196,9 +191,15 @@ const rejectNestedObjects = (req, res, next) => {
     if (source && typeof source === 'object') {
       for (const val of Object.values(source)) {
         if (!isPrimitive(val)) {
-          return res
-            .status(400)
-            .json({ detail: 'Invalid parameter type: nested objects and arrays are not allowed.' });
+          // Responds directly rather than delegating, so the middleware stays
+          // usable on its own — the same way validateSchema behaves.
+          return res.status(400).json(
+            errorBody(
+              'INVALID_INPUT',
+              'Invalid parameter type: nested objects and arrays are not allowed.',
+              { correlationId: req.correlationId },
+            ),
+          );
         }
       }
     }
@@ -405,9 +406,9 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
 
       return res.json(cached);
     } else {
-      return res.status(400).json({
-        error: "Unsupported query type. Supported types: 'id', 'name'",
-      });
+      return next(
+        new ApiError('INVALID_INPUT', "Unsupported query type. Supported types: 'id', 'name'"),
+      );
     }
   } catch (error) {
     const dbError = new Error('Database lookup failed', { cause: error });
@@ -488,7 +489,12 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   const { address, memo_type: memoType, memo, signature = '', signerAddress = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
-    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
+    return next(
+      new ApiError(
+        'INVALID_INPUT',
+        'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      ),
+    );
   }
 
   // Extract the username part before the * for the profanity check
@@ -496,7 +502,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
 
   // Reject usernames containing profanity or offensive words.
   if (profanityFilter.isProfane(usernameLocalPart)) {
-    return res.status(400).json({ error: 'Username contains restricted words' });
+    return next(new ApiError('INVALID_INPUT', 'Username contains restricted words'));
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -507,14 +513,14 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
 
   const memoError = validateMemo(memoType, memo);
   if (memoError) {
-    return res.status(400).json({ error: memoError });
+    return next(new ApiError('INVALID_INPUT', memoError));
   }
 
   const normalizedUsername = username.toLowerCase();
 
   const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
   if (RESERVED_NAMES.includes(normalizedUsername)) {
-    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+    return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
   }
 
   try {
@@ -624,7 +630,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
     });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
-      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
     // Handle verification errors
@@ -647,7 +653,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   }
 });
 
-app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
+app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
 app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
   const { address = '', search = '' } = req.query;
@@ -846,52 +852,15 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.use((err, _req, _res, next) => {
-  if (err.type === 'entity.too.large') {
-    const error = new Error('Payload too large. Maximum allowed size is 10kb.');
-    error.statusCode = 413;
-    return next(error);
-  }
-  next(err);
-});
-
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
 // they reach our own JSON error handler below.
 if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
 
-// Global error handling middleware
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, _next) => {
-  if (isPrismaConnectionError(err)) {
-    err.statusCode = 503;
-    err.message = 'Service Unavailable';
-  }
-
-  const statusCode = err.statusCode || 500;
-  const errorMessage = err.message || 'Internal server error';
-
-  if (statusCode >= 500) {
-    const errorId = crypto.randomUUID();
-    // #31 — Prefix error logs with the correlation ID so a single API call can
-    // be traced across every log line it produced.
-    logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
-    return res.status(statusCode).json({
-      success: false,
-      error: statusCode === 500 ? 'Internal Server Error' : errorMessage,
-      reference_id: errorId,
-      correlation_id: req.correlationId,
-      ...(statusCode !== 500 ? { statusCode } : {})
-    });
-  }
-
-  return res.status(statusCode).json({
-    success: false,
-    error: errorMessage,
-    statusCode: statusCode,
-  });
-});
+// Unmatched routes and every error share the standard envelope.
+app.use(notFoundHandler);
+app.use(buildErrorHandler(isPrismaConnectionError));
 
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;

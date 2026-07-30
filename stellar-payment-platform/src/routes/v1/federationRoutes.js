@@ -7,6 +7,7 @@ const {
   federationLookupCached,
 } = require('../../cache');
 const { validateSchema } = require('../../middleware/validateSchema');
+const { ApiError } = require('../../errors');
 const { federationQuerySchema } = require('../../schemas');
 
 module.exports = (redisClient) => {
@@ -77,9 +78,9 @@ module.exports = (redisClient) => {
 
         return res.json(cached);
       } else {
-        return res.status(400).json({
-          error: "Unsupported query type. Supported types: 'id', 'name'",
-        });
+        return next(
+          new ApiError('INVALID_INPUT', "Unsupported query type. Supported types: 'id', 'name'"),
+        );
       }
     } catch (error) {
       const dbError = new Error('Database lookup failed', { cause: error });

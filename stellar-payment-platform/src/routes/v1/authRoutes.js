@@ -1,6 +1,7 @@
 const express = require('express');
 const xss = require('xss');
 const { validateSchema } = require('../../middleware/validateSchema');
+const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
 const { verifyEmailBodySchema, verifyEmailConfirmBodySchema } = require('../../schemas');
 
@@ -14,9 +15,7 @@ module.exports = (redisClient) => {
   // payload is inspected.
   const requireRedis = (req, res, next) => {
     if (!redisClient) {
-      const err = new Error('Redis is not configured');
-      err.statusCode = 503;
-      return next(err);
+      return next(new ApiError('SERVICE_UNAVAILABLE', 'Redis is not configured'));
     }
     return next();
   };
@@ -55,11 +54,11 @@ module.exports = (redisClient) => {
       const stored = await redisClient.get(key);
 
       if (!stored) {
-        return res.status(404).json({ error: 'Verification code not found or expired' });
+        return next(new ApiError('NOT_FOUND', 'Verification code not found or expired'));
       }
 
       if (stored !== code) {
-        return res.status(400).json({ error: 'Invalid verification code' });
+        return next(new ApiError('INVALID_INPUT', 'Invalid verification code'));
       }
 
       // On success, remove key

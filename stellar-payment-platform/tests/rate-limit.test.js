@@ -184,7 +184,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 
@@ -203,7 +207,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 

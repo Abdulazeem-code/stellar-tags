@@ -189,6 +189,61 @@ anything beyond the retention window is deleted, so logs cannot exhaust the disk
 human-readable copy is also printed to the console (silenced when `NODE_ENV=test`, which
 also disables file output so test runs leave no logs behind).
 
+## Error responses
+
+Every API error leaves the server in one shape, produced by a single terminal
+handler (`stellar-payment-platform/src/middleware/errorHandler.js`):
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "Invalid request body",
+    "details": [{ "field": "username", "message": "username is required" }]
+  },
+  "correlation_id": "3f2a…",
+  "reference_id": "9b41…"
+}
+```
+
+`error.code` is the stable part of the contract — branch on it rather than on
+the status or the message text, which may be reworded. `details` appears only
+when the failure is field-level. `correlation_id` is on every error;
+`reference_id` is added on `5xx` and matches the logged stack.
+
+| Code | Status | Raised when |
+| --- | --- | --- |
+| `INVALID_INPUT` | 400 | Malformed query, JSON, or a rejected value |
+| `UNAUTHENTICATED` | 401 | Missing or failed signature verification |
+| `FORBIDDEN` | 403 | Reserved name, blocked address |
+| `NOT_FOUND` | 404 | No such tag, address, or route |
+| `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
+| `CONFLICT` | 409 | Username or address already registered |
+| `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
+| `VALIDATION_FAILED` | 422 | Body failed its schema |
+| `RATE_LIMITED` | 429 | Rate limit exhausted |
+| `INTERNAL_ERROR` | 500 | Unhandled failure |
+| `UPSTREAM_ERROR` | 502 | Horizon or another upstream failed |
+| `SERVICE_UNAVAILABLE` | 503 | Database or Redis unreachable, request timeout |
+
+To raise one, throw or pass an `ApiError` — the handler is the only place that
+turns an error into a response:
+
+```js
+const { ApiError } = require('./src/errors');
+
+return next(new ApiError('CONFLICT', 'Address already registered'));
+```
+
+A `5xx` from an unexpected throw always reports the generic message so
+internals are never leaked; the real error goes to the log under
+`reference_id`. A message passed deliberately to `ApiError` is sent as written.
+
+`GET /health` is exempt: it reports component status (`{ status, database,
+redis }`) rather than an API error.
+
 ## Request validation
 
 Incoming request bodies and query strings are validated by

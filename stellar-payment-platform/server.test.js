@@ -224,7 +224,11 @@ describe('rejectNestedObjects middleware', () => {
     expect(next).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({
-      detail: 'Invalid parameter type: nested objects and arrays are not allowed.',
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+      },
     });
   });
 
@@ -514,8 +518,12 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       .send({ username: 'alice', address: 'SBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      },
     });
   });
 
@@ -525,8 +533,12 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       .send({ username: 'alice', address: 'sBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      },
     });
   });
 
@@ -560,7 +572,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       .send({ username: 'a', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('rejects 1-character local username payload', async () => {
@@ -570,7 +582,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       .send({ username: 'a', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('rejects 2-character local username payload', async () => {
@@ -580,7 +592,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       .send({ username: 'ab', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('rejects 2-character local username payload with domain suffix', async () => {
@@ -590,7 +602,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       .send({ username: 'ab*domain.com', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('allows 3-character username payload', async () => {
@@ -654,7 +666,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'text', memo: 'a'.repeat(29) });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/28 bytes/);
+    expect(res.body.error.message).toMatch(/28 bytes/);
   });
 
   test('accepts valid id memo (64-bit uint)', async () => {
@@ -671,7 +683,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'id', memo: 'notanumber' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/64-bit unsigned integer/);
+    expect(res.body.error.message).toMatch(/64-bit unsigned integer/);
   });
 
   test('accepts valid hash memo (64 hex chars)', async () => {
@@ -689,7 +701,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'hash', memo: 'tooshort' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/64-character hex/);
+    expect(res.body.error.message).toMatch(/64-character hex/);
   });
 
   test('rejects unknown memo_type', async () => {
@@ -697,7 +709,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'return', memo: 'something' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/memo_type must be one of/);
+    expect(res.body.error.message).toMatch(/memo_type must be one of/);
   });
 
   test('rejects memo without memo_type', async () => {
@@ -705,7 +717,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo: 'orphan' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/memo_type is required/);
+    expect(res.body.error.message).toMatch(/memo_type is required/);
   });
 
   test('rejects memo_type without memo', async () => {
@@ -713,7 +725,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'text' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/memo is required/);
+    expect(res.body.error.message).toMatch(/memo is required/);
   });
 });
 
@@ -990,7 +1002,7 @@ describe('Database disconnection — 503 handling', () => {
 
     const res = await request(app).get('/api/v1/federation?q=alice*localhost&type=name');
     expect(res.status).toBe(503);
-    expect(res.body.error).toBe('Service Unavailable');
+    expect(res.body.error.message).toBe('Service Unavailable');
   });
 
   test.each([
@@ -1002,7 +1014,7 @@ describe('Database disconnection — 503 handling', () => {
 
     const res = await request(app).get(`/api/v1/lookup?address=GABC123`);
     expect(res.status).toBe(503);
-    expect(res.body.error).toBe('Service Unavailable');
+    expect(res.body.error.message).toBe('Service Unavailable');
   });
 
   test.each([
@@ -1013,7 +1025,7 @@ describe('Database disconnection — 503 handling', () => {
 
     const res = await request(app).get('/api/v1/lookup?search=alice');
     expect(res.status).toBe(503);
-    expect(res.body.error).toBe('Service Unavailable');
+    expect(res.body.error.message).toBe('Service Unavailable');
   });
 
   test.each([
@@ -1024,7 +1036,7 @@ describe('Database disconnection — 503 handling', () => {
 
     const res = await request(app).get('/api/v1/users');
     expect(res.status).toBe(503);
-    expect(res.body.error).toBe('Service Unavailable');
+    expect(res.body.error.message).toBe('Service Unavailable');
   });
 
   test.each([
@@ -1037,7 +1049,7 @@ describe('Database disconnection — 503 handling', () => {
       .post('/api/v1/register')
       .send({ username: 'newuser', address: 'GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN' });
     expect(res.status).toBe(503);
-    expect(res.body.error).toBe('Service Unavailable');
+    expect(res.body.error.message).toBe('Service Unavailable');
   });
 
   test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {

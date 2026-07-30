@@ -14,6 +14,7 @@ const {
   shouldFallbackToLocalRegistry,
 } = require('../../utils');
 const { validateSchema } = require('../../middleware/validateSchema');
+const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
 const {
   registerBodySchema,
@@ -110,7 +111,12 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   const { address, memo_type: memoType, memo, signature = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
-    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
+    return next(
+      new ApiError(
+        'INVALID_INPUT',
+        'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      ),
+    );
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -121,7 +127,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
 
   const memoError = validateMemo(memoType, memo);
   if (memoError) {
-    return res.status(400).json({ error: memoError });
+    return next(new ApiError('INVALID_INPUT', memoError));
   }
 
   if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
@@ -133,7 +139,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   const normalizedUsername = username.toLowerCase();
 
   if (RESERVED_NAMES.includes(normalizedUsername)) {
-    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+    return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
   }
 
   try {
@@ -190,7 +196,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
-      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
     if (error.message && error.message.includes('Account not found')) {
@@ -210,7 +216,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   }
 });
 
-router.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
+router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
 router.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
   const { address = '', search = '' } = req.query;

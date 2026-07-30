@@ -4,7 +4,13 @@ const express = require('express');
 const request = require('supertest');
 const { z } = require('zod');
 
-const { validateSchema, BODY_STATUS, REQUEST_STATUS } = require('../../src/middleware/validateSchema');
+const {
+  validateSchema,
+  BODY_STATUS,
+  REQUEST_STATUS,
+  BODY_CODE,
+  REQUEST_CODE,
+} = require('../../src/middleware/validateSchema');
 
 const buildApp = (schemas, handler) => {
   const app = express();
@@ -37,9 +43,14 @@ describe('validateSchema middleware', () => {
 
       expect(res.status).toBe(BODY_STATUS);
       expect(res.status).toBe(422);
+      expect(res.body.error.code).toBe(BODY_CODE);
       expect(res.body).toEqual({
         success: false,
-        errors: [{ field: 'name', message: 'name must be at least 2 characters' }],
+        error: {
+          code: 'VALIDATION_FAILED',
+          message: 'Invalid request body',
+          details: [{ field: 'name', message: 'name must be at least 2 characters' }],
+        },
       });
     });
 
@@ -47,7 +58,7 @@ describe('validateSchema middleware', () => {
       const res = await request(buildApp(schemas)).post('/t').send({});
 
       expect(res.status).toBe(422);
-      expect(res.body.errors).toEqual([{ field: 'name', message: 'name is required' }]);
+      expect(res.body.error.details).toEqual([{ field: 'name', message: 'name is required' }]);
     });
 
     test('reports every invalid field at once', async () => {
@@ -60,7 +71,7 @@ describe('validateSchema middleware', () => {
       const res = await request(buildApp(multi)).post('/t').send({});
 
       expect(res.status).toBe(422);
-      expect(res.body.errors.map((e) => e.field).sort()).toEqual(['a', 'b']);
+      expect(res.body.error.details.map((e) => e.field).sort()).toEqual(['a', 'b']);
     });
 
     test('replaces the body with parsed values so handlers skip re-checking types', async () => {
@@ -81,7 +92,7 @@ describe('validateSchema middleware', () => {
       const res = await request(buildApp(schemas)).post('/t');
 
       expect(res.status).toBe(422);
-      expect(res.body.errors[0].field).toBe('name');
+      expect(res.body.error.details[0].field).toBe('name');
     });
 
     test('labels a whole-object failure with _root', async () => {
@@ -92,7 +103,7 @@ describe('validateSchema middleware', () => {
       };
       const res = await request(buildApp(rootRefine)).post('/t').send({});
 
-      expect(res.body.errors).toEqual([{ field: '_root', message: 'a or b is required' }]);
+      expect(res.body.error.details).toEqual([{ field: '_root', message: 'a or b is required' }]);
     });
   });
 
@@ -116,9 +127,14 @@ describe('validateSchema middleware', () => {
 
       expect(res.status).toBe(REQUEST_STATUS);
       expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe(REQUEST_CODE);
       expect(res.body).toEqual({
         success: false,
-        errors: [{ field: 'q', message: "Missing 'q' parameter" }],
+        error: {
+          code: 'INVALID_INPUT',
+          message: 'Invalid request query',
+          details: [{ field: 'q', message: "Missing 'q' parameter" }],
+        },
       });
     });
 
@@ -139,14 +155,14 @@ describe('validateSchema middleware', () => {
       const res = await request(buildApp(schemas)).post('/t').send({});
 
       expect(res.status).toBe(422);
-      expect(res.body.errors[0].field).toBe('name');
+      expect(res.body.error.details[0].field).toBe('name');
     });
 
     test('reports the query once the body is valid', async () => {
       const res = await request(buildApp(schemas)).post('/t').send({ name: 'ada' });
 
       expect(res.status).toBe(400);
-      expect(res.body.errors[0].field).toBe('q');
+      expect(res.body.error.details[0].field).toBe('q');
     });
   });
 

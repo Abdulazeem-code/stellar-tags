@@ -1,10 +1,14 @@
 'use strict';
 
+const { errorBody } = require('../errors');
+
 // An invalid body is a well-formed request carrying unprocessable content, so
-// it answers 422. A malformed query string or path parameter is a bad request
-// and answers 400. Both use the same error shape.
+// it answers 422 with VALIDATION_FAILED. A malformed query string is a bad
+// request and answers 400 with INVALID_INPUT.
 const BODY_STATUS = 422;
 const REQUEST_STATUS = 400;
+const BODY_CODE = 'VALIDATION_FAILED';
+const REQUEST_CODE = 'INVALID_INPUT';
 
 const formatIssues = (issues) =>
   issues.map((issue) => ({
@@ -24,19 +28,21 @@ const formatIssues = (issues) =>
  */
 function validateSchema({ body, query } = {}) {
   const targets = [
-    { key: 'body', schema: body, status: BODY_STATUS },
-    { key: 'query', schema: query, status: REQUEST_STATUS },
+    { key: 'body', schema: body, status: BODY_STATUS, code: BODY_CODE },
+    { key: 'query', schema: query, status: REQUEST_STATUS, code: REQUEST_CODE },
   ].filter((target) => target.schema);
 
   return (req, res, next) => {
-    for (const { key, schema, status } of targets) {
+    for (const { key, schema, status, code } of targets) {
       const result = schema.safeParse(req[key] ?? {});
 
       if (!result.success) {
-        return res.status(status).json({
-          success: false,
-          errors: formatIssues(result.error.issues),
-        });
+        return res.status(status).json(
+          errorBody(code, `Invalid request ${key}`, {
+            details: formatIssues(result.error.issues),
+            correlationId: req.correlationId,
+          }),
+        );
       }
 
       req[key] = result.data;
@@ -46,4 +52,4 @@ function validateSchema({ body, query } = {}) {
   };
 }
 
-module.exports = { validateSchema, BODY_STATUS, REQUEST_STATUS };
+module.exports = { validateSchema, BODY_STATUS, REQUEST_STATUS, BODY_CODE, REQUEST_CODE };
