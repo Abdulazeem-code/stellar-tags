@@ -68,21 +68,6 @@ jest.mock('../src/multisigner-verifier', () => ({
   }),
 }));
 
-jest.mock('../src/validators/registerValidator', () => ({
-  registerValidator: [
-    {
-      run: jest.fn().mockResolvedValue(undefined),
-    },
-  ],
-}));
-
-jest.mock('express-validator', () => ({
-  validationResult: jest.fn(() => ({
-    isEmpty: () => true,
-    array: () => [],
-  })),
-}));
-
 jest.mock('sqlite3', () => ({
   verbose: () => ({
     Database: jest.fn().mockImplementation((_path, cb) => {
@@ -199,7 +184,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 
@@ -218,7 +207,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 
