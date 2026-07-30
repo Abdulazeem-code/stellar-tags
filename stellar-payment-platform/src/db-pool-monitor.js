@@ -32,25 +32,27 @@ let metricsUnavailableLogged = false;
 /**
  * Queries Prisma metrics and returns an object with the current pool snapshot.
  *
+ * `$metrics.json()` returns `{ counters, gauges, histograms }`; the pool
+ * counters are all gauges.
+ *
  * @param {import('@prisma/client').PrismaClient} prisma
  * @returns {Promise<{active: number, idle: number, size: number, waiters: number} | null>}
  *   Returns null when metrics are unavailable (e.g. preview feature not enabled).
  */
 async function getPoolMetrics(prisma) {
   try {
-    const raw = await prisma.$metrics.json();
-    const collections = raw.ecollections || [];
+    const { gauges = [] } = await prisma.$metrics.json();
 
     const find = (key) => {
-      const entry = collections.find((m) => m.key === key);
+      const entry = gauges.find((m) => m.key === key);
       return typeof entry?.value === 'number' ? entry.value : 0;
     };
 
     return {
-      active: find('prisma_client_pool_connections_active'),
-      idle: find('prisma_client_pool_connections_idle'),
-      size: find('prisma_client_pool_connections_size'),
-      waiters: find('prisma_client_pool_waiters'),
+      active: find('prisma_pool_connections_busy'),
+      idle: find('prisma_pool_connections_idle'),
+      size: find('prisma_pool_connections_open'),
+      waiters: find('prisma_client_queries_wait'),
     };
   } catch {
     // $metrics is unavailable (preview feature not enabled, or older Prisma).

@@ -138,8 +138,7 @@ describe("POST /register - integration test coverage", () => {
     expect(response.status).toBe(409);
     expect(response.body).toMatchObject({
       success: false,
-      error: "Address already registered",
-      statusCode: 409,
+      error: { code: 'CONFLICT', message: 'Address already registered' },
     });
   });
 
@@ -149,7 +148,7 @@ describe("POST /register - integration test coverage", () => {
       .send({ username: "charlie" });
 
     expect(response.status).toBe(422);
-    expect(response.body).toHaveProperty('errors');
-    expect(response.body.errors.some(e => e.field === 'address')).toBe(true);
+    expect(response.body).toHaveProperty('error.details');
+    expect(response.body.error.details.some(e => e.field === 'address')).toBe(true);
   });
 });

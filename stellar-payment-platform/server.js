@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
+const { RedisStore } = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
@@ -14,16 +14,27 @@ const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
-const v1Router = require('./src/routes/v1');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
-const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
-const { registerValidator } = require('./src/validators/registerValidator');
-const { validate } = require('./src/middleware/validate');
-const { validationResult } = require('express-validator');
+const {
+  metricsMiddleware,
+  getMetrics,
+  getContentType,
+  setMetricsSources,
+} = require('./src/metrics');
+const { validateSchema } = require('./src/middleware/validateSchema');
+const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
+const { ApiError, errorBody } = require('./src/errors');
+const { requireJson } = require('./src/middleware/requireJson');
+const {
+  registerBodySchema,
+  federationQuerySchema,
+  lookupQuerySchema,
+  usersQuerySchema,
+} = require('./src/schemas');
 const Sentry = require('@sentry/node');
 const {
   lookupCached,
@@ -32,7 +43,7 @@ const {
   federationLookupCached,
   invalidateFederationCache,
 } = require('./src/cache');
-const { parsePagination, paginatedResponse } = require('./src/pagination');
+const { paginatedResponse } = require('./src/pagination');
 const {
   normalizeNameTag,
   validateMemo,
@@ -59,7 +70,7 @@ app.use(timeout('10s'));
 app.use((err, req, res, next) => {
   if (req.timedout) {
     logger.error(`[Correlation ID: ${req.correlationId}] Request Timeout`, err);
-    return res.status(503).json({ error: 'Service Unavailable', correlation_id: req.correlationId });
+    return next(new ApiError('SERVICE_UNAVAILABLE', undefined, { cause: err }));
   }
   next(err);
 });
@@ -113,6 +124,10 @@ if (redisClient) {
   redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
+setMetricsSources({ prisma, redisClient });
+
+const v1Router = require('./src/routes/v1')(redisClient);
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -123,7 +138,10 @@ const limiter = rateLimit({
   // Return the standard RateLimit-* headers only
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  // Prometheus scrapes /metrics on a fixed interval from a single address, so
+  // counting those scrapes against the shared quota would 429 the scraper.
+  skip: (req) => req.path === '/metrics',
   // Key by authenticated user identifier when present (address/username),
   // otherwise fall back to client IP. This lets registered/identified users
   // get a per-account quota rather than being grouped by IP.
@@ -165,13 +183,6 @@ const limiter = rateLimit({
 app.use(cors(corsOptions));
 app.use(limiter);
 app.use(express.json({ limit: '10kb' }));
-app.use((err, _req, res, next) => {
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    return res.status(400).json({ error: 'Malformed JSON payload' });
-  }
-  next(err);
-});
-
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
@@ -180,9 +191,15 @@ const rejectNestedObjects = (req, res, next) => {
     if (source && typeof source === 'object') {
       for (const val of Object.values(source)) {
         if (!isPrimitive(val)) {
-          return res
-            .status(400)
-            .json({ detail: 'Invalid parameter type: nested objects and arrays are not allowed.' });
+          // Responds directly rather than delegating, so the middleware stays
+          // usable on its own — the same way validateSchema behaves.
+          return res.status(400).json(
+            errorBody(
+              'INVALID_INPUT',
+              'Invalid parameter type: nested objects and arrays are not allowed.',
+              { correlationId: req.correlationId },
+            ),
+          );
         }
       }
     }
@@ -300,15 +317,8 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
-app.get('/federation', etagCache, async (req, res, next) => {
-  const { q, type } = req.query;
-  const queryValue = typeof q === 'string' ? q.trim() : '';
-
-  if (!queryValue) {
-    const error = new Error("Missing 'q' parameter");
-    error.statusCode = 400;
-    return next(error);
-  }
+app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+  const { q: queryValue, type } = req.query;
 
   try {
     if (type === 'id') {
@@ -396,9 +406,9 @@ app.get('/federation', etagCache, async (req, res, next) => {
 
       return res.json(cached);
     } else {
-      return res.status(400).json({
-        error: "Unsupported query type. Supported types: 'id', 'name'",
-      });
+      return next(
+        new ApiError('INVALID_INPUT', "Unsupported query type. Supported types: 'id', 'name'"),
+      );
     }
   } catch (error) {
     const dbError = new Error('Database lookup failed', { cause: error });
@@ -470,54 +480,29 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
-  if (!req.is('application/json')) {
-    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
-  }
-
-  // Run express-validator chains manually
-  for (const validator of registerValidator) {
-    await validator.run(req);
-  }
-  
-  // Check for validation errors
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(422).json({
-      success: false,
-      errors: errors.array().map(err => ({
-        field: err.path,
-        message: err.msg,
-      })),
-    });
-  }
-
+app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+  // registerBodySchema has already guaranteed that username is a trimmed
+  // 3-20 character alphanumeric string and address is a non-empty trimmed
+  // string, so those shape checks are not repeated here.
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
-  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
-  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
-  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
-  const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
-  const signerAddress = typeof req.body.signerAddress === 'string' ? req.body.signerAddress.trim() : '';
+  const { address, memo_type: memoType, memo, signature = '', signerAddress = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
-    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
+    return next(
+      new ApiError(
+        'INVALID_INPUT',
+        'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      ),
+    );
   }
 
-  if (!username || !address) {
-    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
-  }
-
-  // Extract the username part before the * for profanity check and length validation
+  // Extract the username part before the * for the profanity check
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-
-  if (usernameLocalPart.length < 3) {
-    return res.status(400).json({ error: "Username must be at least 3 characters long." });
-  }
 
   // Reject usernames containing profanity or offensive words.
   if (profanityFilter.isProfane(usernameLocalPart)) {
-    return res.status(400).json({ error: 'Username contains restricted words' });
+    return next(new ApiError('INVALID_INPUT', 'Username contains restricted words'));
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -528,14 +513,14 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
 
   const memoError = validateMemo(memoType, memo);
   if (memoError) {
-    return res.status(400).json({ error: memoError });
+    return next(new ApiError('INVALID_INPUT', memoError));
   }
 
   const normalizedUsername = username.toLowerCase();
 
   const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
   if (RESERVED_NAMES.includes(normalizedUsername)) {
-    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+    return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
   }
 
   try {
@@ -645,7 +630,7 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
     });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
-      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
     // Handle verification errors
@@ -668,17 +653,10 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
   }
 });
 
-app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
+app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
-app.get('/lookup', async (req, res, next) => {
-  const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
-  const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
-
-  if (!address && !search) {
-    const error = new Error("Missing required parameter: provide 'address' for exact lookup or 'search' for paginated search");
-    error.statusCode = 400;
-    return next(error);
-  }
+app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
+  const { address = '', search = '' } = req.query;
 
   if (address) {
     try {
@@ -714,7 +692,8 @@ app.get('/lookup', async (req, res, next) => {
     }
   }
 
-  const { page, limit, skip } = parsePagination(req.query);
+  const { page, limit } = req.query;
+  const skip = (page - 1) * limit;
 
   const where = {
     OR: [
@@ -761,10 +740,8 @@ app.get('/lookup', async (req, res, next) => {
   }
 });
 
-app.get('/users', async (req, res, next) => {
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const search = typeof req.query.search === 'string' ? req.query.search : null;
+app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
+  const { page, limit, search = null } = req.query;
   const skip = (page - 1) * limit;
 
   const where = search
@@ -875,52 +852,15 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.use((err, _req, _res, next) => {
-  if (err.type === 'entity.too.large') {
-    const error = new Error('Payload too large. Maximum allowed size is 10kb.');
-    error.statusCode = 413;
-    return next(error);
-  }
-  next(err);
-});
-
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
 // they reach our own JSON error handler below.
 if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
 
-// Global error handling middleware
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, _next) => {
-  if (isPrismaConnectionError(err)) {
-    err.statusCode = 503;
-    err.message = 'Service Unavailable';
-  }
-
-  const statusCode = err.statusCode || 500;
-  const errorMessage = err.message || 'Internal server error';
-
-  if (statusCode >= 500) {
-    const errorId = crypto.randomUUID();
-    // #31 — Prefix error logs with the correlation ID so a single API call can
-    // be traced across every log line it produced.
-    logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
-    return res.status(statusCode).json({
-      success: false,
-      error: statusCode === 500 ? 'Internal Server Error' : errorMessage,
-      reference_id: errorId,
-      correlation_id: req.correlationId,
-      ...(statusCode !== 500 ? { statusCode } : {})
-    });
-  }
-
-  return res.status(statusCode).json({
-    success: false,
-    error: errorMessage,
-    statusCode: statusCode,
-  });
-});
+// Unmatched routes and every error share the standard envelope.
+app.use(notFoundHandler);
+app.use(buildErrorHandler(isPrismaConnectionError));
 
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
