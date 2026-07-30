@@ -120,6 +120,14 @@ const verifyEmailConfirmBodySchema = verifyEmailBodySchema.extend({
     .regex(/^\d{6}$/, 'code must be a 6-digit number'),
 });
 
+/** GET /transactions/export query. */
+const exportQuerySchema = z
+  .object({
+    address: z.string({ error: 'address is required' }).trim().min(1, 'address is required'),
+    order: z.enum(['asc', 'desc']).catch('desc'),
+  })
+  .loose();
+
 /** POST /admin/block */
 const adminBlockBodySchema = z
   .object({
@@ -136,4 +144,5 @@ module.exports = {
   verifyEmailBodySchema,
   verifyEmailConfirmBodySchema,
   adminBlockBodySchema,
+  exportQuerySchema,
 };

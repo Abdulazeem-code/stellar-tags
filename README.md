@@ -318,6 +318,23 @@ A simple health check endpoint.
 - **Returns:** `{ status: 'ok' }`
 - **Status Codes:** `200 OK`.
 
+### `GET /transactions/export`
+Streams the account's payment history as a CSV download.
+- **Query Parameters:** `address` (required) - Stellar public key. `order` (optional) - `desc` (default) or `asc`.
+- **Returns:** `text/csv` with a `Content-Disposition` attachment header. Columns: `id`, `created_at`, `type`, `from`, `to`, `amount`, `asset_type`, `asset_code`, `asset_issuer`, `transaction_hash`.
+- **Status Codes:**
+  - `200 OK`: Stream started. Sent chunked, so there is no `Content-Length`.
+  - `400 Bad Request`: Missing or invalid `address`.
+  - `404 Not Found`: Account not found on Horizon.
+  - `502 Bad Gateway`: Horizon request failed.
+
+Pages of 200 records are fetched from Horizon with its cursor, converted, and
+flushed as they arrive, so neither the full result set nor the full CSV is held
+in memory. Writes respect socket backpressure, and `EXPORT_MAX_PAGES`
+(default 500) bounds a single export. Because the response is committed once
+streaming starts, a mid-stream failure can only be logged and the connection
+cut — the JSON error envelope needs unsent headers.
+
 ### `GET /metrics`
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
 rate limiter so a scraper on a fixed interval is never throttled.
