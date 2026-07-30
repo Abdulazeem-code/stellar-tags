@@ -46,6 +46,25 @@ pub enum Error {
     InvalidRecipient = 8,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    PlatformTreasury,
+    FeeBps,
+    FeeCap,
+    UserVolume(Address),
+    UserSpending(Address),
+    Paused,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSpending {
+    pub last_reset_time: u64,
+    pub accumulated_amount: i128,
+}
+
 #[contract]
 pub struct PaymentRouter;
 
@@ -135,6 +154,12 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Updates the fee basis points. Admin-only.
+    pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
     /// Returns the current protocol fee percentage in basis points (read-only).
     pub fn get_fee(env: Env) -> i128 {
         env.storage()
@@ -162,6 +187,12 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Returns the current protocol fee percentage in basis points (bps).
+    pub fn get_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0)
     /// Pauses or unpauses the payment router. Admin-only. Alias for set_pause.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         Self::set_pause(env, paused)
@@ -201,10 +232,31 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Updates the fee basis points. Admin-only. (Provided for backward compatibility).
-    pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
+    /// Transfer admin ownership to a new address.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let current_admin = Self::require_admin(&env)?;
+        current_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Checks if the contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Pauses or unpauses the contract. Admin-only.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
 
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         env.storage().instance().extend_ttl(
@@ -214,6 +266,16 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &admin, &amount);
+
+        Ok(())
     /// Transfers admin rights to a new address. Requires the current admin's
     /// authorization. Returns `Error::NotInitialized` instead of panicking
     /// if no admin has been set yet.
@@ -416,6 +478,12 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Returns the contract version.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
+    }
+
+    fn require_admin(env: &Env) -> Result<Address, Error> {
     /// Returns the effective fee_bps for a sender after applying any
     /// volume-based tiered discount.
     pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
@@ -459,12 +527,12 @@ mod test {
         Address, Env, Symbol, TryIntoVal,
     };
 
-    fn setup_env() -> (Env, PaymentRouterClient<'static>) {
+    fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
-        (env, client)
+        (env, client, contract_id)
     }
 
     /// Deploys a Stellar Asset Contract test token and returns both the
@@ -479,13 +547,31 @@ mod test {
     }
 
     #[test]
-    fn test_initialize_and_admin_restrictions() {
-        let (env, client) = setup_env();
+    fn test_get_fee() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        assert_eq!(client.get_fee(), 0);
+
+        client.initialize(&admin, &treasury, &150, &5000);
+        assert_eq!(client.get_fee(), 150);
+
+        client.set_fee_bps(&250);
+        assert_eq!(client.get_fee(), 250);
+
+        client.set_fee_config(&300, &10000);
+        assert_eq!(client.get_fee(), 300);
+    }
+
+    #[test]
+    fn test_admin_restrictions_and_updates() {
+        let (env, client, _) = setup_env();
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let new_admin = Address::generate(&env);
-
         // Initialize contract
         client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
@@ -493,19 +579,44 @@ mod test {
         let res = client.try_initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
         assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyInitialized);
 
-        // Set admin can be called (by current admin)
         client.set_admin(&new_admin);
 
+        client.set_fee_config(&200, &2000);
         // Modify config by new admin
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
 
-        // Check if config works with set_platform_treasury
         let new_treasury = Address::generate(&env);
         client.set_platform_treasury(&new_treasury);
     }
 
     #[test]
+    fn test_recover_tokens() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000);
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let token_client = token::Client::new(&env, &token_address);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_address);
+
+        // Simulate tokens accidentally sent directly to the contract address
+        let accidental_amount = 5_000;
+        stellar_asset_client.mint(&contract_id, &accidental_amount);
+
+        assert_eq!(token_client.balance(&contract_id), accidental_amount);
+        assert_eq!(token_client.balance(&admin), 0);
+
+        // Admin recovers tokens
+        let recover_amount = 3_000;
+        client.recover_tokens(&token_address, &recover_amount);
+
+        assert_eq!(token_client.balance(&admin), recover_amount);
+        assert_eq!(token_client.balance(&contract_id), accidental_amount - recover_amount);
     fn test_get_fee() {
         let (env, client) = setup_env();
         let admin = Address::generate(&env);
@@ -527,6 +638,12 @@ mod test {
     }
 
     #[test]
+    fn test_route_payment_calculates_and_sends_fee() {
+        let (env, client, _) = setup_env();
+    }
+
+    #[test]
+    fn test_set_fee_config_emits_event() {
     fn test_set_pause_emits_event() {
         let (env, client) = setup_env();
 
@@ -610,6 +727,15 @@ mod test {
 
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let token_client = token::Client::new(&env, &token_address);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_address);
+
+        let initial_balance = 10_000;
+        stellar_asset_client.mint(&sender, &initial_balance);
+
+        client.initialize(&admin, &treasury, &100, &50);
+
+        let amount_1 = 2000;
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &10_000);
 
@@ -665,13 +791,12 @@ mod test {
         assert_eq!(token_client.balance(&sender), initial_balance - amount_1);
         assert_eq!(client.get_user_volume(&sender), amount_1);
 
+        let amount_2 = 8000;
         // Test fee capped at 50
         let amount_2 = 8000; // 1% of 8000 is 80, which is capped at 50
         client.route_payment(&sender, &recipient, &token_address, &amount_2);
 
-        // Total fee should be 20 + 50 = 70
         assert_eq!(token_client.balance(&treasury), 70);
-        // Total recipient amount should be 1980 + 7950 = 9930
         assert_eq!(token_client.balance(&recipient), 9930);
         assert_eq!(
             token_client.balance(&sender),
@@ -682,7 +807,7 @@ mod test {
 
     #[test]
     fn test_insufficient_balance() {
-        let (env, client) = setup_env();
+        let (env, client, _) = setup_env();
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
@@ -691,6 +816,9 @@ mod test {
 
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_address);
+
+        stellar_asset_client.mint(&sender, &100);
 
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &100);
@@ -706,17 +834,24 @@ mod test {
 
     #[test]
     fn test_daily_limit_and_reset() {
-        let (env, client) = setup_env();
+        let (env, client, _) = setup_env();
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let token_client = token::Client::new(&env, &token_address);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_address);
         let (token_address, token_client, token_admin_client) = setup_token(&env);
 
-        // Daily limit is 1,000,000 * 10,000,000 = 10,000,000,000,000
         let limit = 10_000_000_000_000;
+        stellar_asset_client.mint(&sender, &(limit + 2000));
+
+        client.initialize(&admin, &treasury, &100, &50);
+
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &(limit + 2000));
 
@@ -727,11 +862,9 @@ mod test {
         // Route amount within limit
         client.route_payment(&sender, &recipient, &token_address, &limit);
 
-        // Exceed daily limit
         let res = client.try_route_payment(&sender, &recipient, &token_address, &2000);
         assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
 
-        // Warp time by 24 hours (86,400 seconds)
         let current_time = env.ledger().timestamp();
         let current_protocol_version = env.ledger().protocol_version();
         env.ledger().set(LedgerInfo {
@@ -743,6 +876,7 @@ mod test {
             min_temp_entry_ttl: 16,
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6312000,
+            protocol_version: 21,
         });
 
         // Now routing should be successful again. The first payment pushed the
