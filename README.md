@@ -230,6 +230,28 @@ A simple health check endpoint.
 - **Returns:** `{ status: 'ok' }`
 - **Status Codes:** `200 OK`.
 
+### `GET /metrics`
+Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
+rate limiter so a scraper on a fixed interval is never throttled.
+- **Returns:** all metrics below, prefixed `stellar_tags_`.
+- **Status Codes:** `200 OK`.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
+| `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
+| `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
+| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code` |
+| `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
+| `db_pool_connections_busy` | gauge | Connections executing a query |
+| `db_pool_connections_idle` | gauge | Connections open but unused |
+| `db_pool_queries_waiting` | gauge | Queries queued waiting for a connection |
+| `redis_connections_active` | gauge | `1` while Redis is ready for commands, else `0` |
+
+Memory and CPU come from `prom-client`'s default collectors. The pool gauges read
+Prisma's `$metrics` (which requires the `metrics` preview feature in
+`schema.prisma`) and report `0` when it is unavailable.
+
 ## Architecture notes
 
 - The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.

@@ -122,6 +122,7 @@ jest.mock('../src/metrics', () => ({
   metricsMiddleware: (req, res, next) => next(),
   getMetrics: jest.fn().mockResolvedValue(''),
   getContentType: jest.fn(() => 'text/plain'),
+  setMetricsSources: jest.fn(),
 }));
 
 jest.mock('@sentry/node', () => ({
