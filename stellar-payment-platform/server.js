@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
+const { RedisStore } = require('rate-limit-redis');
 const { createClient } = require('redis');
 const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
@@ -19,7 +19,12 @@ const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
-const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
+const {
+  metricsMiddleware,
+  getMetrics,
+  getContentType,
+  setMetricsSources,
+} = require('./src/metrics');
 const { registerValidator } = require('./src/validators/registerValidator');
 const { validate } = require('./src/middleware/validate');
 const { validationResult } = require('express-validator');
@@ -112,6 +117,8 @@ if (redisClient) {
   redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
 
+setMetricsSources({ prisma, redisClient });
+
 const v1Router = require('./src/routes/v1')(redisClient);
 
 const limiter = rateLimit({
@@ -125,6 +132,9 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
+  // Prometheus scrapes /metrics on a fixed interval from a single address, so
+  // counting those scrapes against the shared quota would 429 the scraper.
+  skip: (req) => req.path === '/metrics',
   // Key by authenticated user identifier when present (address/username),
   // otherwise fall back to client IP. This lets registered/identified users
   // get a per-account quota rather than being grouped by IP.

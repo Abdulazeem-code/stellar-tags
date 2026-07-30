@@ -61,6 +61,17 @@ describe('Prometheus Metrics Endpoint', () => {
       expect(metricsText).toMatch(/stellar_tags_nodejs_|stellar_tags_process_/);
     });
 
+    test('should contain Redis and database connection gauges', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_redis_connections_active');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_open');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_busy');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_idle');
+      expect(metricsText).toContain('stellar_tags_db_pool_queries_waiting');
+    });
+
     test('should contain custom request counter metric', async () => {
       // Make a request to create a metric
       await request(app).get('/health');
