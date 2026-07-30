@@ -6,19 +6,14 @@ const {
   federationIdKey,
   federationLookupCached,
 } = require('../../cache');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { federationQuerySchema } = require('../../schemas');
 
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/federation', etagCache, async (req, res, next) => {
-    const { q, type } = req.query;
-    const queryValue = typeof q === 'string' ? q.trim() : '';
-
-    if (!queryValue) {
-      const error = new Error("Missing 'q' parameter");
-      error.statusCode = 400;
-      return next(error);
-    }
+  router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+    const { q: queryValue, type } = req.query;
 
     try {
       if (type === 'id') {

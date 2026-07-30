@@ -1,18 +1,19 @@
 const express = require('express');
 const { Horizon, StrKey } = require('@stellar/stellar-sdk');
 
+const { validateSchema } = require('../../middleware/validateSchema');
+const { accountPaymentsQuerySchema } = require('../../schemas');
+
 const router = express.Router();
 const HORIZON_BASE = process.env.HORIZON_BASE || 'https://horizon-testnet.stellar.org';
 
-router.get('/accounts/:account/payments', async (req, res, next) => {
+router.get('/accounts/:account/payments', validateSchema({ query: accountPaymentsQuerySchema }), async (req, res, next) => {
   const { account } = req.params;
   if (!account || !StrKey.isValidEd25519PublicKey(account)) {
     return res.status(400).json({ detail: 'Invalid Stellar account' });
   }
 
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
-  const cursor = req.query.cursor;
-  const order = req.query.order === 'asc' ? 'asc' : 'desc';
+  const { limit, cursor, order } = req.query;
 
   try {
     const server = new Horizon.Server(HORIZON_BASE);

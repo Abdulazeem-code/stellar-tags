@@ -68,21 +68,6 @@ jest.mock('../src/multisigner-verifier', () => ({
   }),
 }));
 
-jest.mock('../src/validators/registerValidator', () => ({
-  registerValidator: [
-    {
-      run: jest.fn().mockResolvedValue(undefined),
-    },
-  ],
-}));
-
-jest.mock('express-validator', () => ({
-  validationResult: jest.fn(() => ({
-    isEmpty: () => true,
-    array: () => [],
-  })),
-}));
-
 jest.mock('sqlite3', () => ({
   verbose: () => ({
     Database: jest.fn().mockImplementation((_path, cb) => {

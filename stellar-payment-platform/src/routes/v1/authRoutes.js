@@ -1,33 +1,31 @@
 const express = require('express');
 const xss = require('xss');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { requireJson } = require('../../middleware/requireJson');
+const { verifyEmailBodySchema, verifyEmailConfirmBodySchema } = require('../../schemas');
 
 module.exports = (redisClient) => {
   const router = express.Router();
   const { logger } = require('../../logger');
 
-  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const makeKey = (email) => `email_verification:${email.toLowerCase()}`;
+
+  // Redis holds the OTPs, so an unconfigured client is reported before the
+  // payload is inspected.
+  const requireRedis = (req, res, next) => {
+    if (!redisClient) {
+      const err = new Error('Redis is not configured');
+      err.statusCode = 503;
+      return next(err);
+    }
+    return next();
+  };
 
   // POST /auth/verify-email
   // Body: { email }
-  router.post('/verify-email', async (req, res, next) => {
+  router.post('/verify-email', requireRedis, requireJson, validateSchema({ body: verifyEmailBodySchema }), async (req, res, next) => {
     try {
-      if (!redisClient) {
-        const err = new Error('Redis is not configured');
-        err.statusCode = 503;
-        return next(err);
-      }
-
-      if (!req.is('application/json')) {
-        return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
-      }
-
-      const rawEmail = typeof req.body.email === 'string' ? req.body.email.trim() : '';
-      const safeEmail = xss(rawEmail);
-
-      if (!safeEmail || !EMAIL_RE.test(safeEmail)) {
-        return res.status(400).json({ error: 'Invalid email address' });
-      }
+      const safeEmail = xss(req.body.email);
 
       // Generate 6-digit OTP
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
@@ -48,25 +46,10 @@ module.exports = (redisClient) => {
 
   // POST /auth/verify-email/confirm
   // Body: { email, code }
-  router.post('/verify-email/confirm', async (req, res, next) => {
+  router.post('/verify-email/confirm', requireRedis, requireJson, validateSchema({ body: verifyEmailConfirmBodySchema }), async (req, res, next) => {
     try {
-      if (!redisClient) {
-        const err = new Error('Redis is not configured');
-        err.statusCode = 503;
-        return next(err);
-      }
-
-      if (!req.is('application/json')) {
-        return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
-      }
-
-      const rawEmail = typeof req.body.email === 'string' ? req.body.email.trim() : '';
-      const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
-      const safeEmail = xss(rawEmail);
-
-      if (!safeEmail || !EMAIL_RE.test(safeEmail) || !/^[0-9]{6}$/.test(code)) {
-        return res.status(400).json({ error: 'Invalid email or code' });
-      }
+      const safeEmail = xss(req.body.email);
+      const { code } = req.body;
 
       const key = makeKey(safeEmail);
       const stored = await redisClient.get(key);

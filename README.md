@@ -189,6 +189,39 @@ anything beyond the retention window is deleted, so logs cannot exhaust the disk
 human-readable copy is also printed to the console (silenced when `NODE_ENV=test`, which
 also disables file output so test runs leave no logs behind).
 
+## Request validation
+
+Incoming request bodies and query strings are validated by
+[zod](https://zod.dev) schemas before any route handler runs. Schemas live in
+`stellar-payment-platform/src/schemas/index.js`, and
+`src/middleware/validateSchema.js` turns them into route middleware:
+
+```js
+const { validateSchema } = require('./src/middleware/validateSchema');
+const { registerBodySchema, usersQuerySchema } = require('./src/schemas');
+
+app.post('/register', validateSchema({ body: registerBodySchema }), handler);
+app.get('/users', validateSchema({ query: usersQuerySchema }), handler);
+```
+
+The validated part is replaced with the parsed result, so handlers receive
+values that are already trimmed and coerced — `req.query.limit` is a number,
+not a string — and never re-check types themselves.
+
+Failures short-circuit before the handler and respond with the field-level
+errors, using the status that matches where the bad input came from:
+
+| Failure | Status | Body |
+| --- | --- | --- |
+| Invalid `req.body` | `422 Unprocessable Entity` | `{ success: false, errors: [{ field, message }] }` |
+| Invalid `req.query` | `400 Bad Request` | `{ success: false, errors: [{ field, message }] }` |
+
+Two rules are deliberately *not* in the schemas, because the handlers own them
+and answer `400` with their own domain-specific messages: Stellar address
+format (checked with `StrKey`) and memo pairing/format (checked with
+`validateMemo`). `page` and `limit` clamp to their bounds rather than being
+rejected, so `?limit=1000` still returns the maximum page size.
+
 ## Detailed Endpoint Documentation
 
 The Node.js server (`stellar-payment-platform/server.js`) exposes the following endpoints for username and payment lookups:

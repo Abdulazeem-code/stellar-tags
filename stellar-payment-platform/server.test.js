@@ -553,7 +553,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     expect([200, 201, 409, 401, 404, 400]).toContain(res.status);
   });
 
-  test('rejects registration with short username (express-validator)', async () => {
+  test('rejects registration with short username', async () => {
     const res = await request(app)
       .post('/register')
       .set('Content-Type', 'application/json')

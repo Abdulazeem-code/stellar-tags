@@ -25,9 +25,14 @@ const {
   getContentType,
   setMetricsSources,
 } = require('./src/metrics');
-const { registerValidator } = require('./src/validators/registerValidator');
-const { validate } = require('./src/middleware/validate');
-const { validationResult } = require('express-validator');
+const { validateSchema } = require('./src/middleware/validateSchema');
+const { requireJson } = require('./src/middleware/requireJson');
+const {
+  registerBodySchema,
+  federationQuerySchema,
+  lookupQuerySchema,
+  usersQuerySchema,
+} = require('./src/schemas');
 const Sentry = require('@sentry/node');
 const {
   lookupCached,
@@ -36,7 +41,7 @@ const {
   federationLookupCached,
   invalidateFederationCache,
 } = require('./src/cache');
-const { parsePagination, paginatedResponse } = require('./src/pagination');
+const { paginatedResponse } = require('./src/pagination');
 const {
   normalizeNameTag,
   validateMemo,
@@ -311,15 +316,8 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
-app.get('/federation', etagCache, async (req, res, next) => {
-  const { q, type } = req.query;
-  const queryValue = typeof q === 'string' ? q.trim() : '';
-
-  if (!queryValue) {
-    const error = new Error("Missing 'q' parameter");
-    error.statusCode = 400;
-    return next(error);
-  }
+app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+  const { q: queryValue, type } = req.query;
 
   try {
     if (type === 'id') {
@@ -481,50 +479,20 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
-  if (!req.is('application/json')) {
-    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
-  }
-
-  // Run express-validator chains manually
-  for (const validator of registerValidator) {
-    await validator.run(req);
-  }
-  
-  // Check for validation errors
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(422).json({
-      success: false,
-      errors: errors.array().map(err => ({
-        field: err.path,
-        message: err.msg,
-      })),
-    });
-  }
-
+app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+  // registerBodySchema has already guaranteed that username is a trimmed
+  // 3-20 character alphanumeric string and address is a non-empty trimmed
+  // string, so those shape checks are not repeated here.
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
-  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
-  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
-  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
-  const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
-  const signerAddress = typeof req.body.signerAddress === 'string' ? req.body.signerAddress.trim() : '';
+  const { address, memo_type: memoType, memo, signature = '', signerAddress = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
     return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
   }
 
-  if (!username || !address) {
-    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
-  }
-
-  // Extract the username part before the * for profanity check and length validation
+  // Extract the username part before the * for the profanity check
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-
-  if (usernameLocalPart.length < 3) {
-    return res.status(400).json({ error: "Username must be at least 3 characters long." });
-  }
 
   // Reject usernames containing profanity or offensive words.
   if (profanityFilter.isProfane(usernameLocalPart)) {
@@ -681,15 +649,8 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
 
 app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
-app.get('/lookup', async (req, res, next) => {
-  const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
-  const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
-
-  if (!address && !search) {
-    const error = new Error("Missing required parameter: provide 'address' for exact lookup or 'search' for paginated search");
-    error.statusCode = 400;
-    return next(error);
-  }
+app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
+  const { address = '', search = '' } = req.query;
 
   if (address) {
     try {
@@ -725,7 +686,8 @@ app.get('/lookup', async (req, res, next) => {
     }
   }
 
-  const { page, limit, skip } = parsePagination(req.query);
+  const { page, limit } = req.query;
+  const skip = (page - 1) * limit;
 
   const where = {
     OR: [
@@ -772,10 +734,8 @@ app.get('/lookup', async (req, res, next) => {
   }
 });
 
-app.get('/users', async (req, res, next) => {
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const search = typeof req.query.search === 'string' ? req.query.search : null;
+app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
+  const { page, limit, search = null } = req.query;
   const skip = (page - 1) * limit;
 
   const where = search

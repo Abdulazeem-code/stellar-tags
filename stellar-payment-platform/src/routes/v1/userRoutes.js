@@ -6,13 +6,20 @@ const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
 const { lookupCached, invalidateFederationCache } = require('../../cache');
-const { parsePagination, paginatedResponse } = require('../../pagination');
+const { paginatedResponse } = require('../../pagination');
 const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
   shouldFallbackToLocalRegistry,
 } = require('../../utils');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { requireJson } = require('../../middleware/requireJson');
+const {
+  registerBodySchema,
+  lookupQuerySchema,
+  usersQuerySchema,
+} = require('../../schemas');
 
 const router = express.Router();
 
@@ -97,28 +104,13 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
-router.post('/register', async (req, res, next) => {
-  if (!req.is('application/json')) {
-    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
-  }
+router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
-  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
-  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
-  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
-  const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
+  const { address, memo_type: memoType, memo, signature = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
     return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
-  }
-
-  if (!username || !address) {
-    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
-  }
-
-  const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-  if (usernameLocalPart.length < 3) {
-    return res.status(400).json({ error: "Username must be at least 3 characters long." });
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -220,15 +212,8 @@ router.post('/register', async (req, res, next) => {
 
 router.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
-router.get('/lookup', async (req, res, next) => {
-  const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
-  const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
-
-  if (!address && !search) {
-    const error = new Error("Missing required parameter: provide 'address' for exact lookup or 'search' for paginated search");
-    error.statusCode = 400;
-    return next(error);
-  }
+router.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
+  const { address = '', search = '' } = req.query;
 
   if (address) {
     try {
@@ -254,7 +239,8 @@ router.get('/lookup', async (req, res, next) => {
     }
   }
 
-  const { page, limit, skip } = parsePagination(req.query);
+  const { page, limit } = req.query;
+  const skip = (page - 1) * limit;
   const where = buildUserSearchWhere(search);
 
   try {
@@ -283,9 +269,10 @@ const totalPages = Math.ceil(totalCount / limit);
   }
 });
 
-router.get('/users', async (req, res, next) => {
-  const { page, limit, skip } = parsePagination(req.query);
-  const search = typeof req.query.search === 'string' ? req.query.search : null;
+router.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
+  const { page, limit } = req.query;
+  const skip = (page - 1) * limit;
+  const search = req.query.search ?? null;
   const where = buildUserSearchWhere(search);
 
   try {
