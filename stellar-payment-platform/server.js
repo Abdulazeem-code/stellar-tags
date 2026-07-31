@@ -2,26 +2,55 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
+const { RedisStore } = require('rate-limit-redis');
 const { createClient } = require('redis');
-const { prisma } = require('./prismaClient');
+const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
+const { scheduleSoftDeletePurgeJob } = require('./src/soft-delete-purge-cron');
+const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
-const v1Router = require('./src/routes/v1');
-const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
+const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
+const { logger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
-const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
-const { registerValidator } = require('./src/validators/registerValidator');
-const { validate } = require('./src/middleware/validate');
-const { validationResult } = require('express-validator');
+const {
+  metricsMiddleware,
+  getMetrics,
+  getContentType,
+  setMetricsSources,
+} = require('./src/metrics');
+const { validateSchema } = require('./src/middleware/validateSchema');
+const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
+const { ApiError, errorBody } = require('./src/errors');
+const { requireJson } = require('./src/middleware/requireJson');
+const {
+  registerBodySchema,
+  federationQuerySchema,
+  lookupQuerySchema,
+  usersQuerySchema,
+} = require('./src/schemas');
 const Sentry = require('@sentry/node');
+const {
+  lookupCached,
+  federationNameKey,
+  federationIdKey,
+  federationLookupCached,
+  invalidateFederationCache,
+} = require('./src/cache');
+const { paginatedResponse } = require('./src/pagination');
+const {
+  normalizeNameTag,
+  validateMemo,
+  RESERVED_NAMES,
+  USER_DATABASE,
+  shouldFallbackToLocalRegistry,
+} = require('./src/utils');
 
 dotenv.config();
 
@@ -33,10 +62,15 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
+// #31 — Attach a correlation ID to every request before anything else runs so
+// all downstream middleware, handlers and logs can reference the same trace.
+app.use(correlationId);
+
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
   if (req.timedout) {
-    return res.status(503).json({ error: 'Service Unavailable' });
+    logger.error(`[Correlation ID: ${req.correlationId}] Request Timeout`, err);
+    return next(new ApiError('SERVICE_UNAVAILABLE', undefined, { cause: err }));
   }
   next(err);
 });
@@ -50,7 +84,7 @@ const allowedOrigins = [
   'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
-];
+].filter(Boolean);
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -65,40 +99,89 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-// #31 — Attach a correlation ID to every request before anything else runs so
-// all downstream middleware, handlers and logs can reference the same trace.
-app.use(correlationId);
-
 // Apply metrics middleware to track all HTTP requests
 app.use(metricsMiddleware);
 
+const REDIS_RETRY_MAX = 5;
+const REDIS_RETRY_BASE_DELAY_MS = 500;
+
 const redisClient = process.env.REDIS_URL ? createClient({
-  url: process.env.REDIS_URL
+  url: process.env.REDIS_URL,
+  socket: {
+    reconnectStrategy(retries, cause) {
+      if (retries >= REDIS_RETRY_MAX) {
+        logger.error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`, { cause });
+        return new Error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`);
+      }
+      const delay = Math.min(2 ** retries * REDIS_RETRY_BASE_DELAY_MS, 10000);
+      logger.warn(`Redis connection attempt ${retries + 1} failed, retrying in ${delay}ms...`, { cause });
+      return delay;
+    }
+  }
 }) : null;
 if (redisClient) {
-  redisClient.connect().catch(console.error);
+  redisClient.on('error', (err) => logger.error('Redis client error:', err));
+  redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
 }
+
+setMetricsSources({ prisma, redisClient });
+
+const v1Router = require('./src/routes/v1')(redisClient);
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
+  // Use Redis-backed store when available
   store: redisClient ? new RedisStore({
     sendCommand: (...args) => redisClient.sendCommand(args),
   }) : undefined,
+  // Return the standard RateLimit-* headers only
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  // Prometheus scrapes /metrics on a fixed interval from a single address, so
+  // counting those scrapes against the shared quota would 429 the scraper.
+  skip: (req) => req.path === '/metrics',
+  // Key by authenticated user identifier when present (address/username),
+  // otherwise fall back to client IP. This lets registered/identified users
+  // get a per-account quota rather than being grouped by IP.
+  keyGenerator: (req /*, res */) => {
+    try {
+      // 1) x-api-key (admin or API key users)
+      const apiKey = req.headers['x-api-key'] || req.query.api_key;
+      if (apiKey) return String(apiKey);
+
+      // 2) JSON body address (e.g., /register)
+      if (req.body && typeof req.body.address === 'string' && req.body.address.trim()) {
+        return req.body.address.trim();
+      }
+
+      // 3) Query params: federation (q with type=id) or address param
+      if (req.query) {
+        if (req.query.type === 'id' && typeof req.query.q === 'string' && req.query.q.trim()) {
+          return req.query.q.trim();
+        }
+        if (typeof req.query.address === 'string' && req.query.address.trim()) {
+          return req.query.address.trim();
+        }
+        // Some endpoints use q for lookup by name; not an account id — skip.
+      }
+
+      // 4) URL path pattern: /v1/accounts/:account
+      const m = req.originalUrl && req.originalUrl.match(/\/v1\/accounts\/([^/]+)/i);
+      if (m && m[1]) return decodeURIComponent(m[1]);
+
+      // Default to IP
+      return req.ip || (req.connection && req.connection.remoteAddress) || '';
+    } catch (err) {
+      // On error, fall back to IP so rate limiting still works
+      return req.ip || '';
+    }
+  },
 });
 
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '10kb' }));
-app.use((err, _req, res, next) => {
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    return res.status(400).json({ error: 'Malformed JSON payload' });
-  }
-  next(err);
-});
-
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
@@ -107,9 +190,15 @@ const rejectNestedObjects = (req, res, next) => {
     if (source && typeof source === 'object') {
       for (const val of Object.values(source)) {
         if (!isPrimitive(val)) {
-          return res
-            .status(400)
-            .json({ detail: 'Invalid parameter type: nested objects and arrays are not allowed.' });
+          // Responds directly rather than delegating, so the middleware stays
+          // usable on its own — the same way validateSchema behaves.
+          return res.status(400).json(
+            errorBody(
+              'INVALID_INPUT',
+              'Invalid parameter type: nested objects and arrays are not allowed.',
+              { correlationId: req.correlationId },
+            ),
+          );
         }
       }
     }
@@ -123,21 +212,8 @@ app.use(rejectNestedObjects);
 app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
-
-const USER_DATABASE = {
-  'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-  'lekan*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-};
-
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const normalizeNameTag = (value) => {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (!trimmed) {
-    return '';
-  }
-  return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
-};
+scheduleSoftDeletePurgeJob(prisma);
+const poolMonitor = schedulePoolMonitoring(prisma);
 
 // ---------------------------------------------------------------------------
 // #51 — ETag Caching Middleware for Federation Endpoint
@@ -161,17 +237,6 @@ const etagCache = (req, res, next) => {
   };
 
   next();
-};
-
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
 };
 
 const getLocalUserByAddress = async (address) =>
@@ -206,17 +271,15 @@ const listLocalUsers = async (search, page, limit) => {
   );
 
   const totalCount = Number(countRow?.totalCount || 0);
-
-  return {
-    data: rows.map((user) => ({
+  return paginatedResponse(
+    rows.map((user) => ({
       username: user.username,
       address: user.address,
       created_at: user.created_at,
     })),
     totalCount,
-    totalPages: Math.ceil(totalCount / limit),
-    currentPage: page,
-  };
+    { page, limit },
+  );
 };
 
 const registerLocalUser = async ({ username, address }) => {
@@ -248,6 +311,7 @@ app.get('/metrics', async (req, res) => {
     const metrics = await getMetrics();
     res.end(metrics);
   } catch (err) {
+    logger.error(`[Correlation ID: ${req.correlationId}] Metrics error`, err);
     res.status(500).end(err.message);
   }
 });
@@ -261,73 +325,101 @@ app.get('/federation', limiter, etagCache, async (req, res, next) => {
     error.statusCode = 400;
     return next(error);
   }
+app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+  const { q: queryValue, type } = req.query;
 
   try {
     if (type === 'id') {
-      const row = await prisma.user.findFirst({
-        where: { address: { equals: queryValue, mode: 'insensitive' } },
-        select: { username: true, address: true, memoType: true, memo: true },
+      const cacheKey = federationIdKey(queryValue);
+      const cached = await federationLookupCached(cacheKey, async () => {
+        const row = await prisma.user.findFirst({
+          where: { address: { equals: queryValue, mode: 'insensitive' } },
+          select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
+        });
+
+        if (!row) return null;
+        if (row.flaggedAt) {
+          const forbiddenError = new Error('Address is blocked');
+          forbiddenError.statusCode = 403;
+          throw forbiddenError;
+        }
+
+        const response = {
+          stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
+          account_id: row.address,
+        };
+        if (row.memoType) {
+          response.memo_type = row.memoType;
+          response.memo = row.memo;
+        }
+        return response;
       });
 
-      if (!row) {
+      if (!cached) {
         const notFoundError = new Error('Address not found');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
-      const response = {
-        stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
-        account_id: row.address,
-      };
-      if (row.memoType) {
-        response.memo_type = row.memoType;
-        response.memo = row.memo;
-      }
-      return res.json(response);
+
+      return res.json(cached);
     } else if (type === 'name' || !type) {
       const nameTag = normalizeNameTag(queryValue);
       const queryName = nameTag.toLowerCase();
+      const cacheKey = federationNameKey(queryName);
 
-      let row = null;
-      try {
-        row = await prisma.user.findUnique({
-          where: { username: queryName },
-          select: { address: true, memoType: true, memo: true },
-        });
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
+      const cached = await federationLookupCached(cacheKey, async () => {
+        let row;
+        try {
+          row = await prisma.user.findUnique({
+            where: { username: queryName },
+            select: { address: true, memoType: true, memo: true, flaggedAt: true },
+          });
+
+          if (row && row.flaggedAt) {
+            const forbiddenError = new Error('Address is blocked');
+            forbiddenError.statusCode = 403;
+            throw forbiddenError;
+          }
+        } catch (error) {
+          if (error.statusCode === 403) throw error;
+          if (!shouldFallbackToLocalRegistry(error)) {
+            throw error;
+          }
+
+          const localRow = await getLocalUserByUsername(queryName);
+          row = localRow
+            ? { address: localRow.address, memoType: null, memo: null }
+            : null;
         }
 
-        const localRow = await getLocalUserByUsername(queryName);
-        row = localRow
-          ? { address: localRow.address, memoType: null, memo: null }
-          : null;
-      }
+        const address = row?.address || USER_DATABASE[queryName];
+        if (!address) return null;
 
-      const address = row?.address || USER_DATABASE[queryName];
+        const response = {
+          stellar_address: address,
+          account_id: address,
+        };
+        if (row?.memoType) {
+          response.memo_type = row.memoType;
+          response.memo = row.memo;
+        }
+        return response;
+      });
 
-      if (!address) {
+      if (!cached) {
         const notFoundError = new Error('Name tag not found');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      const response = {
-        stellar_address: address,
-        account_id: address,
-      };
-      if (row?.memoType) {
-        response.memo_type = row.memoType;
-        response.memo = row.memo;
-      }
-      return res.json(response);
+      return res.json(cached);
     } else {
-      return res.status(400).json({
-        error: "Unsupported query type. Supported types: 'id', 'name'",
-      });
+      return next(
+        new ApiError('INVALID_INPUT', "Unsupported query type. Supported types: 'id', 'name'"),
+      );
     }
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -335,31 +427,6 @@ app.get('/federation', limiter, etagCache, async (req, res, next) => {
 
 // Initialise profanity filter once at module load (reused across requests).
 const profanityFilter = new Filter();
-const VALID_MEMO_TYPES = ['text', 'id', 'hash'];
-const MEMO_ID_RE = /^\d+$/;
-const MEMO_HASH_RE = /^[0-9a-fA-F]{64}$/;
-
-const validateMemo = (memoType, memo) => {
-  if (!memoType && !memo) return null;
-  if (memoType && !memo) return 'memo is required when memo_type is provided.';
-  if (!memoType && memo) return 'memo_type is required when memo is provided.';
-  if (!VALID_MEMO_TYPES.includes(memoType)) {
-    return `memo_type must be one of: ${VALID_MEMO_TYPES.join(', ')}.`;
-  }
-  if (memoType === 'text' && Buffer.byteLength(memo, 'utf8') > 28) {
-    return 'memo of type text must not exceed 28 bytes.';
-  }
-  if (memoType === 'id') {
-    if (!MEMO_ID_RE.test(memo) || BigInt(memo) > 18446744073709551615n) {
-      return 'memo of type id must be a valid 64-bit unsigned integer.';
-    }
-  }
-  if (memoType === 'hash' && !MEMO_HASH_RE.test(memo)) {
-    return 'memo of type hash must be a 64-character hex string (32 bytes).';
-  }
-  return null;
-};
-
 const verifyFreighterRegistrationSignature = ({
   username,
   address,
@@ -443,32 +510,29 @@ app.post('/register', limiter, idempotencyMiddleware(redisClient), async (req, r
     });
   }
 
+app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+  // registerBodySchema has already guaranteed that username is a trimmed
+  // 3-20 character alphanumeric string and address is a non-empty trimmed
+  // string, so those shape checks are not repeated here.
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
-  const address = typeof req.body.address === 'string' ? req.body.address.trim() : '';
-  const memoType = typeof req.body.memo_type === 'string' ? req.body.memo_type.trim() : undefined;
-  const memo = typeof req.body.memo === 'string' ? req.body.memo.trim() : undefined;
-  const signature = typeof req.body.signature === 'string' ? req.body.signature.trim() : '';
-  const signerAddress = typeof req.body.signerAddress === 'string' ? req.body.signerAddress.trim() : '';
+  const { address, memo_type: memoType, memo, signature = '', signerAddress = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
-    return res.status(400).json({ error: "Never share your Secret Key. Please register using your Public Key (starts with G)." });
+    return next(
+      new ApiError(
+        'INVALID_INPUT',
+        'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      ),
+    );
   }
 
-  if (!username || !address) {
-    return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
-  }
-
-  // Extract the username part before the * for profanity check and length validation
+  // Extract the username part before the * for the profanity check
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-
-  if (usernameLocalPart.length < 3) {
-    return res.status(400).json({ error: "Username must be at least 3 characters long." });
-  }
 
   // Reject usernames containing profanity or offensive words.
   if (profanityFilter.isProfane(usernameLocalPart)) {
-    return res.status(400).json({ error: 'Username contains restricted words' });
+    return next(new ApiError('INVALID_INPUT', 'Username contains restricted words'));
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -479,14 +543,14 @@ app.post('/register', limiter, idempotencyMiddleware(redisClient), async (req, r
 
   const memoError = validateMemo(memoType, memo);
   if (memoError) {
-    return res.status(400).json({ error: memoError });
+    return next(new ApiError('INVALID_INPUT', memoError));
   }
 
   const normalizedUsername = username.toLowerCase();
 
   const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
   if (RESERVED_NAMES.includes(normalizedUsername)) {
-    return res.status(403).json({ error: "This username is reserved and cannot be registered." });
+    return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
   }
 
   try {
@@ -568,6 +632,8 @@ app.post('/register', limiter, idempotencyMiddleware(redisClient), async (req, r
           ...(memoType && { memoType, memo }),
         },
       });
+      // Invalidate any stale federation cache entries for this username/address
+      invalidateFederationCache(normalizedUsername, address);
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) {
         throw error;
@@ -594,7 +660,7 @@ app.post('/register', limiter, idempotencyMiddleware(redisClient), async (req, r
     });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
-      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
     // Handle verification errors
@@ -610,60 +676,53 @@ app.post('/register', limiter, idempotencyMiddleware(redisClient), async (req, r
     }
 
     // Handle other errors
-    console.error('Registration error:', error.message);
+    logger.error('Registration error:', error.message);
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
   }
 });
 
-app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
+app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
-app.get('/lookup', async (req, res, next) => {
-  const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
-  const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
-
-  if (!address && !search) {
-    const error = new Error("Missing required parameter: provide 'address' for exact lookup or 'search' for paginated search");
-    error.statusCode = 400;
-    return next(error);
-  }
+app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
+  const { address = '', search = '' } = req.query;
 
   if (address) {
     try {
-      let row = null;
-      try {
-        row = await prisma.user.findUnique({
-          where: { address },
-          select: { username: true },
-        });
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
+      const result = await lookupCached(address, async () => {
+        let row;
+        try {
+          row = await prisma.user.findUnique({
+            where: { address },
+            select: { username: true },
+          });
+        } catch (error) {
+          if (!shouldFallbackToLocalRegistry(error)) {
+            throw error;
+          }
+          row = await getLocalUserByAddress(address);
         }
+        return row ? { username: row.username, address } : null;
+      });
 
-        row = await getLocalUserByAddress(address);
-      }
-
-      if (!row) {
+      if (!result) {
         const notFoundError = new Error('Username not found for this address');
         notFoundError.statusCode = 404;
         return next(notFoundError);
       }
 
-      return res.json({ username: row.username, address });
-    } catch (err) {  // <-- 1. Add (err) here
-      // 2. Add this console.log to print the exact reason Prisma is failing
-      console.error("🚨 ACTUAL PRISMA ERROR:", err); 
-      
-      const dbError = new Error('Database lookup failed');
+      return res.json(result);
+    } catch (err) {
+      logger.error("🚨 ACTUAL PRISMA ERROR:", err);
+
+      const dbError = new Error('Database lookup failed', { cause: err });
       dbError.statusCode = 500;
       return next(dbError);
     }
   }
 
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+  const { page, limit } = req.query;
   const skip = (page - 1) * limit;
 
   const where = {
@@ -686,16 +745,15 @@ app.get('/lookup', async (req, res, next) => {
         }),
       ]);
 
-      response = {
-        data: rows.map((user) => ({
+      response = paginatedResponse(
+        rows.map((user) => ({
           username: user.username,
           address: user.address,
           created_at: user.createdAt.toISOString(),
         })),
         totalCount,
-        totalPages: Math.ceil(totalCount / limit),
-        currentPage: page,
-      };
+        { page, limit },
+      );
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) {
         throw error;
@@ -705,17 +763,15 @@ app.get('/lookup', async (req, res, next) => {
     }
 
     return res.json(response);
-  } catch {
-    const dbError = new Error('Database lookup failed');
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
 });
 
-app.get('/users', async (req, res, next) => {
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const search = typeof req.query.search === 'string' ? req.query.search : null;
+app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
+  const { page, limit, search = null } = req.query;
   const skip = (page - 1) * limit;
 
   const where = search
@@ -742,12 +798,25 @@ app.get('/users', async (req, res, next) => {
     const data = rows.map((user) => ({
       username: user.username,
       address: user.address,
-      created_at: user.createdAt.toISOString(),
+      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
     }));
 
-    res.json({ data, totalCount, totalPages, currentPage: page });
-  } catch {
-    const dbError = new Error('Database error');
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
+  } catch (error) {
+    const dbError = new Error('Database error', { cause: error });
     dbError.statusCode = 500;
     return next(dbError);
   }
@@ -755,28 +824,62 @@ app.get('/users', async (req, res, next) => {
 // Mount v1 router for both legacy paths and explicit API versioning
 app.use('/', v1Router);
 app.use('/api/v1', v1Router);
+// Auth endpoints (email OTP verification) - uses Redis when available
+app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
 
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
-  res.send('FEDERATION_SERVER="https://stellar-tags-production.up.railway.app/federation"\n');
+  res.send(`FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`);
 });
 
 app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
+app.get('/health', async (_req, res) => {
+  const checks = { database: null, redis: null };
+  let allOk = true;
+  const errors = [];
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    checks.database = 'ok';
+  } catch {
+    checks.database = 'error';
+    allOk = false;
+    errors.push('Database unavailable');
+  }
+
+  if (redisClient) {
+    try {
+      await redisClient.ping();
+      checks.redis = 'ok';
+    } catch {
+      checks.redis = 'error';
+      allOk = false;
+      errors.push('Redis unavailable');
+    }
+  } else {
+    checks.redis = 'not configured';
+  }
+
+  if (allOk) {
+    res.json({ status: 'ok', ...checks });
+  } else {
+    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
+  }
 });
 
-app.use((err, _req, _res, next) => {
-  if (err.type === 'entity.too.large') {
-    const error = new Error('Payload too large. Maximum allowed size is 10kb.');
-    error.statusCode = 413;
-    return next(error);
+app.get('/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ok', database: 'connected' });
+  } catch (err) {
+    logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
+    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
+
   }
-  next(err);
 });
 
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
@@ -785,53 +888,34 @@ if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
 
-// Global error handling middleware
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, _next) => {
-  const statusCode = err.statusCode || 500;
-  const errorMessage = err.message || 'Internal server error';
-
-  if (statusCode === 500) {
-    const errorId = crypto.randomUUID();
-    // #31 — Prefix error logs with the correlation ID so a single API call can
-    // be traced across every log line it produced.
-    console.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      reference_id: errorId,
-      correlation_id: req.correlationId
-    });
-  }
-
-  return res.status(statusCode).json({
-    success: false,
-    error: errorMessage,
-    statusCode: statusCode,
-  });
-});
+// Unmatched routes and every error share the standard envelope.
+app.use(notFoundHandler);
+app.use(buildErrorHandler(isPrismaConnectionError));
 
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
-const gracefulShutdown = (server, pool, signal) => {
+const gracefulShutdown = (server, prismaClient, signal) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+  logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
+
+  // Stop the pool monitor so it doesn't produce misleading warnings during
+  // the shutdown window.
+  poolMonitor.stop();
 
   const timer = setTimeout(() => {
-    console.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
+    logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`);
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
   server.close(async () => {
     clearTimeout(timer);
     try {
-      await pool.drain();
-      await pool.clear();
+      await prismaClient.$disconnect();
     } catch (err) {
-      console.error('Error draining DB pool during shutdown:', err);
+      logger.error('Error disconnecting Prisma during shutdown:', err);
     }
     process.exit(0);
   });
@@ -840,23 +924,18 @@ const gracefulShutdown = (server, pool, signal) => {
 
 if (require.main === module) {
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server successfully initialized on port ${PORT}`);
+    logger.info(`Server successfully initialized on port ${PORT}`);
   });
 
   server.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+      logger.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
       process.exit(1);
     }
   });
 
-  const prismaPool = {
-    drain: () => Promise.resolve(),
-    clear: () => prisma.$disconnect(),
-  };
-
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prismaPool, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prismaPool, sig));
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
+  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };

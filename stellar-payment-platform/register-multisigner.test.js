@@ -27,6 +27,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
 jest.mock('pdfkit', () => jest.fn());
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
@@ -37,7 +38,9 @@ jest.mock('./prismaClient', () => ({
       count: jest.fn(),
     },
     $transaction: jest.fn(),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock('generic-pool', () => ({
@@ -158,7 +161,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(400);
-      expect(response.body.error).toContain('Invalid Stellar Public Key format');
+      expect(response.body.error.message).toContain('Invalid Stellar Public Key format');
     });
 
     it('should reject request with missing username', async () => {
@@ -171,7 +174,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(422);
-      expect(response.body).toHaveProperty('errors');
+      expect(response.body).toHaveProperty('error.details');
     });
   });
 
@@ -241,7 +244,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
 
       expect(response.status).toBe(401);
       expect(response.body.error).toBeDefined();
-      expect(response.body.error).toMatch(/Signature verification failed|Insufficient signing weight/);
+      expect(response.body.error.message).toMatch(/Signature verification failed|Insufficient signing weight/);
     });
   });
 
@@ -309,7 +312,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(401);
-      expect(response.body.error).toContain('Insufficient signing weight');
+      expect(response.body.error.message).toContain('Insufficient signing weight');
     });
   });
 
@@ -328,7 +331,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(409);
-      expect(response.body.error).toContain('Address already registered');
+      expect(response.body.error.message).toContain('Address already registered');
     });
 
     it('should handle account not found error', async () => {
@@ -347,7 +350,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(404);
-      expect(response.body.error).toContain('Account not found on Horizon');
+      expect(response.body.error.message).toContain('Account not found on Horizon');
     });
   });
 

@@ -11,6 +11,7 @@ jest.mock('../../prismaClient', () => ({
       findUnique: jest.fn().mockResolvedValue(null),
       findFirst: jest.fn().mockResolvedValue(null),
     },
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
 }));
 
@@ -115,7 +116,11 @@ describe('rejectNestedObjects middleware', () => {
       expect(next).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(400);
       expect(res.status(400).json).toHaveBeenCalledWith({
-        detail: 'Invalid parameter type: nested objects and arrays are not allowed.',
+        success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+      },
       });
     });
 
@@ -136,7 +141,11 @@ describe('rejectNestedObjects middleware', () => {
       expect(next).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(400);
       expect(res.status(400).json).toHaveBeenCalledWith({
-        detail: 'Invalid parameter type: nested objects and arrays are not allowed.',
+        success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+      },
       });
     });
 
@@ -178,7 +187,11 @@ describe('rejectNestedObjects middleware', () => {
       rejectNestedObjects(req, res, next);
 
       expect(res.status(400).json).toHaveBeenCalledWith({
-        detail: 'Invalid parameter type: nested objects and arrays are not allowed.',
+        success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+      },
       });
     });
   });
