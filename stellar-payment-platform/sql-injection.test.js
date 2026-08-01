@@ -24,6 +24,11 @@ jest.mock('@stellar/stellar-sdk', () => ({
   StrKey: { isValidEd25519PublicKey: jest.fn(() => true) },
 }));
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+
+jest.mock('redis', () => ({
+  createClient: jest.fn(() => null),
+}));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock to avoid transform errors.
 jest.mock('bad-words', () => {
@@ -45,6 +50,7 @@ jest.mock('./prismaClient', () => ({
     $disconnect: jest.fn().mockResolvedValue(undefined),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 const { prisma } = require('./prismaClient');
@@ -54,6 +60,7 @@ const { prisma } = require('./prismaClient');
 // together in the full suite.
 const getApp = () => {
   let app;
+  process.env.NODE_ENV = 'test';
   jest.isolateModules(() => {
     app = require('./server').app;
   });

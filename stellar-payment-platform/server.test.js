@@ -12,6 +12,7 @@ jest.mock('pdfkit', () => jest.fn());
 // The cleanup cron schedules a recurring job at module load — stub it so the
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock the module so the
 // test suite can require server.js without a transform error.
@@ -36,6 +37,12 @@ jest.mock('./prismaClient', () => ({
     },
     $transaction: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
+  },
+  isPrismaConnectionError: (error) => {
+    const code = typeof error?.code === 'string' ? error.code : '';
+    if (code.startsWith('P10')) return true;
+    const causeCode = typeof error?.cause?.code === 'string' ? error.cause.code : '';
+    return causeCode.startsWith('P10');
   },
 }));
 
@@ -74,6 +81,7 @@ jest.mock('sqlite3', () => ({
 }));
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock('generic-pool', () => ({
   createPool: jest.fn(() => ({
@@ -216,7 +224,11 @@ describe('rejectNestedObjects middleware', () => {
     expect(next).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({
-      detail: 'Invalid parameter type: nested objects and arrays are not allowed.',
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+      },
     });
   });
 
@@ -260,6 +272,7 @@ describe('GET /lookup — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     jest.mock('sqlite3', () => ({
       verbose: () => ({
@@ -376,6 +389,7 @@ describe('GET /users — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     jest.mock('sqlite3', () => ({
       verbose: () => ({
@@ -488,6 +502,7 @@ describe('POST /register — block secret keys', () => {
     }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     ({ app } = require('./server'));
     request = require('supertest');
@@ -503,8 +518,12 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'alice', address: 'SBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      },
     });
   });
 
@@ -514,8 +533,12 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'alice', address: 'sBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "Never share your Secret Key. Please register using your Public Key (starts with G)."
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+        message: 'Never share your Secret Key. Please register using your Public Key (starts with G).',
+      },
     });
   });
 
@@ -542,14 +565,14 @@ describe('POST /register — block secret keys', () => {
     expect([200, 201, 409, 401, 404, 400]).toContain(res.status);
   });
 
-  test('rejects registration with short username (express-validator)', async () => {
+  test('rejects registration with short username', async () => {
     const res = await request(app)
       .post('/register')
       .set('Content-Type', 'application/json')
       .send({ username: 'a', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('rejects 1-character local username payload', async () => {
@@ -559,7 +582,7 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'a', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('rejects 2-character local username payload', async () => {
@@ -569,7 +592,7 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'ab', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('rejects 2-character local username payload with domain suffix', async () => {
@@ -579,7 +602,7 @@ describe('POST /register — block secret keys', () => {
       .send({ username: 'ab*domain.com', address: 'GBCDEFGHIJKLMNOPQRSTUVWXYZ' });
 
     expect(res.status).toBe(422);
-    expect(res.body).toHaveProperty('errors');
+    expect(res.body).toHaveProperty('error.details');
   });
 
   test('allows 3-character username payload', async () => {
@@ -643,7 +666,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'text', memo: 'a'.repeat(29) });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/28 bytes/);
+    expect(res.body.error.message).toMatch(/28 bytes/);
   });
 
   test('accepts valid id memo (64-bit uint)', async () => {
@@ -660,7 +683,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'id', memo: 'notanumber' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/64-bit unsigned integer/);
+    expect(res.body.error.message).toMatch(/64-bit unsigned integer/);
   });
 
   test('accepts valid hash memo (64 hex chars)', async () => {
@@ -678,7 +701,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'hash', memo: 'tooshort' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/64-character hex/);
+    expect(res.body.error.message).toMatch(/64-character hex/);
   });
 
   test('rejects unknown memo_type', async () => {
@@ -686,7 +709,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'return', memo: 'something' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/memo_type must be one of/);
+    expect(res.body.error.message).toMatch(/memo_type must be one of/);
   });
 
   test('rejects memo without memo_type', async () => {
@@ -694,7 +717,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo: 'orphan' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/memo_type is required/);
+    expect(res.body.error.message).toMatch(/memo_type is required/);
   });
 
   test('rejects memo_type without memo', async () => {
@@ -702,7 +725,7 @@ describe('POST /register — memo validation', () => {
       .post('/register')
       .send({ username: 'alice', address: VALID_ADDRESS, memo_type: 'text' });
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/memo is required/);
+    expect(res.body.error.message).toMatch(/memo is required/);
   });
 });
 
@@ -768,6 +791,7 @@ describe('API v1 routing', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
     jest.mock('sqlite3', () => ({
       verbose: () => ({
@@ -895,5 +919,143 @@ describe('Idempotency Middleware', () => {
     
     // Ensure prisma.user.create was only called once
     expect(prisma.user.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Database disconnection — 503 handling', () => {
+  let request;
+  let app;
+  let prisma;
+
+  const makePrismaError = (code) => {
+    const err = new Error(`Prisma ${code}: simulated database connection error`);
+    err.code = code;
+    return err;
+  };
+
+  beforeEach(() => {
+    jest.resetModules();
+
+    jest.mock('dotenv', () => ({ config: jest.fn() }));
+    jest.mock('fs', () => ({ ...jest.requireActual('fs'), mkdirSync: jest.fn() }));
+    jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
+    jest.mock('pdfkit', () => jest.fn());
+    jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+    jest.mock('./src/multisigner-verifier', () => ({
+      verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
+        success: true, accountId: 'GDUMMY', operationType: 'management',
+        requiredThreshold: 1, totalWeight: 1, signatureCount: 1, uniqueSignerCount: 1,
+        signatures: [{ publicKey: 'GDUMMY', weight: 1, isValid: true }],
+        thresholds: { low_threshold: 1, med_threshold: 2, high_threshold: 3 },
+        signerCount: 1, errorMessage: null,
+      }),
+      isSingleSignerAccount: jest.fn().mockReturnValue(true),
+    }));
+
+    jest.mock('sqlite3', () => ({
+      verbose: () => ({
+        Database: jest.fn().mockImplementation((_path, cb) => {
+          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
+          if (cb) cb(null);
+          return db;
+        }),
+      }),
+    }));
+
+    const mockConn = {
+      run: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null); }),
+      get: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null, null); }),
+      all: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null, []); }),
+    };
+
+    jest.mock('generic-pool', () => ({
+      createPool: jest.fn(() => ({
+        acquire: jest.fn().mockResolvedValue(mockConn),
+        release: jest.fn(),
+        drain: jest.fn().mockResolvedValue(undefined),
+        clear: jest.fn().mockResolvedValue(undefined),
+      })),
+    }));
+
+    ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
+    request = require('supertest');
+
+    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
+    prisma.user.findMany.mockReset();
+    prisma.user.count.mockReset();
+    prisma.user.create.mockReset();
+    prisma.$transaction.mockReset();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test.each([
+    ['P1001', 'Connection refused'],
+    ['P1008', 'Connection timeout'],
+    ['P1017', 'Pool timeout'],
+  ])('GET /api/v1/federation returns 503 when Prisma throws %s', async (code) => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get('/api/v1/federation?q=alice*localhost&type=name');
+    expect(res.status).toBe(503);
+    expect(res.body.error.message).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+    ['P1017'],
+  ])('GET /api/v1/lookup returns 503 on address lookup when Prisma throws %s', async (code) => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get(`/api/v1/lookup?address=GABC123`);
+    expect(res.status).toBe(503);
+    expect(res.body.error.message).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+  ])('GET /api/v1/lookup returns 503 on search when Prisma throws %s', async (code) => {
+    prisma.$transaction.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get('/api/v1/lookup?search=alice');
+    expect(res.status).toBe(503);
+    expect(res.body.error.message).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+  ])('GET /api/v1/users returns 503 when Prisma throws %s', async (code) => {
+    prisma.$transaction.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app).get('/api/v1/users');
+    expect(res.status).toBe(503);
+    expect(res.body.error.message).toBe('Service Unavailable');
+  });
+
+  test.each([
+    ['P1001'],
+    ['P1008'],
+  ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+
+    const res = await request(app)
+      .post('/api/v1/register')
+      .send({ username: 'newuser', address: 'GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN' });
+    expect(res.status).toBe(503);
+    expect(res.body.error.message).toBe('Service Unavailable');
+  });
+
+  test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {
+    prisma.user.findUnique.mockRejectedValue(makePrismaError('P1001'));
+
+    const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');
+    expect(res.status).toBe(404);
   });
 });

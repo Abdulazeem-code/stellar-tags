@@ -8,6 +8,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
 jest.mock('pdfkit', () => jest.fn());
 
 jest.mock('../src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock('bad-words', () => {
   return jest.fn().mockImplementation(() => ({

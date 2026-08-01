@@ -50,6 +50,7 @@ jest.mock('../prismaClient', () => ({
 }));
 
 jest.mock('../src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock('../src/multisigner-verifier', () => ({
   verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
@@ -65,21 +66,6 @@ jest.mock('../src/multisigner-verifier', () => ({
     signerCount: 1,
     errorMessage: null,
   }),
-}));
-
-jest.mock('../src/validators/registerValidator', () => ({
-  registerValidator: [
-    {
-      run: jest.fn().mockResolvedValue(undefined),
-    },
-  ],
-}));
-
-jest.mock('express-validator', () => ({
-  validationResult: jest.fn(() => ({
-    isEmpty: () => true,
-    array: () => [],
-  })),
 }));
 
 jest.mock('sqlite3', () => ({
@@ -121,6 +107,7 @@ jest.mock('../src/metrics', () => ({
   metricsMiddleware: (req, res, next) => next(),
   getMetrics: jest.fn().mockResolvedValue(''),
   getContentType: jest.fn(() => 'text/plain'),
+  setMetricsSources: jest.fn(),
 }));
 
 jest.mock('@sentry/node', () => ({
@@ -197,7 +184,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 
@@ -216,7 +207,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 

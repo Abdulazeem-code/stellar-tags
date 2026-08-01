@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { logger } = require('../src/logger');
+const { ApiError } = require('../src/errors');
 
 const IDEMPOTENCY_HEADER = 'X-Idempotency-Key';
 const CACHE_EXPIRATION_SECONDS = 24 * 60 * 60; // 24 hours
@@ -32,7 +33,7 @@ const idempotencyMiddleware = (redisClient) => {
     // 2. Validate the key (basic length check to prevent massive keys)
     const key = idempotencyKey.trim();
     if (!key || key.length > 128) {
-      return res.status(400).json({ error: 'Invalid or too long X-Idempotency-Key' });
+      return next(new ApiError('INVALID_INPUT', 'Invalid or too long X-Idempotency-Key'));
     }
 
     // Include the path in the cache key to avoid collisions across different endpoints
