@@ -13,6 +13,11 @@
 const { Horizon } = require('@stellar/stellar-sdk');
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
+const { poolGet, poolRun } = require('./src/db');
+const {
+  dispatchPaymentWebhooks,
+  scheduleWebhookRetryJob,
+} = require('./src/webhookWorker');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -94,7 +99,6 @@ const watchAccount = (accountId) => {
     .cursor('now')
     .stream({
       onmessage: (payment) => {
-        // Only log payment operations (ignore account_merge, etc.)
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
 
@@ -110,13 +114,24 @@ const watchAccount = (accountId) => {
               logger.error('Failed to emit payment over socket client', err);
             }
           }
+          dispatchPaymentWebhooks({
+            prisma,
+            poolGetFn: poolGet,
+            poolRunFn: poolRun,
+            payment,
+          }).catch((err) =>
+            logger.error(
+              `[${timestamp()}] ⚠️  Webhook dispatch failed for tx ${payment.transaction_hash}:`,
+              err?.message || err,
+            ),
+          );
+        }
       },
       onerror: (error) => {
         logger.error(
           `[${timestamp()}] ⚠️  Stream error for ${accountId}:`,
           error?.message || error,
         );
-        // The SDK handles automatic reconnection for SSE streams
       },
     });
 
@@ -190,6 +205,13 @@ const main = async () => {
 
   // Initial sync
   await syncWatchedAccounts();
+
+  // Schedule webhook retry / liveness pings
+  try {
+    scheduleWebhookRetryJob({ prisma, poolAllFn: require('./src/db').poolAll, poolRunFn: poolRun });
+  } catch (err) {
+    logger.error('Failed to schedule webhook retry job:', err.message);
+  }
 
   // Periodically check for newly registered accounts
   setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);

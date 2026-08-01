@@ -22,7 +22,6 @@
   },
   "dependencies": {
     "@faker-js/faker": "^10.5.0",
-    "@prisma/client": "^6.1.0",
     "@sentry/node": "^10.68.0",
     "@stellar/stellar-sdk": "^16.0.1",
     "bad-words": "^3.0.4",
@@ -33,6 +32,7 @@
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
     "generic-pool": "^3.9.0",
+    "helmet": "^8.3.0",
     "node-cache": "^5.1.2",
     "node-cron": "4.5.0",
     "pdfkit": "^0.15.2",
@@ -50,8 +50,9 @@
     "socket.io-client": "^4.8.0"
   },
   "devDependencies": {
+    "@prisma/client": "^6.19.3",
     "jest": "^29.7.0",
-    "prisma": "^6.1.0",
+    "prisma": "^6.19.3",
     "supertest": "^7.0.0",
     "tsx": "4.23.1"
   }

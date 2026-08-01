@@ -1,6 +1,7 @@
 const express = require('express');
 const userRoutes = require('./userRoutes');
 const receiptRoutes = require('./receiptRoutes');
+const webhookRoutes = require('./webhookRoutes');
 const statsRoutes = require('./statsRoutes');
 const historyRoutes = require('./historyRoutes');
 const exportRoutes = require('./exportRoutes');
