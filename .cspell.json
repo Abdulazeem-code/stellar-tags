@@ -18,6 +18,10 @@
     "GDZST",
     "GDXYZ",
     "keypair",
-    "testuser"
+    "testuser",
+    "serde",
+    "rustc",
+    "uadd",
+    "xffff"
   ]
 }

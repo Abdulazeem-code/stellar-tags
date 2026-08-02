@@ -14,6 +14,7 @@ jest.mock("@stellar/stellar-sdk", () => ({
 
 jest.mock("pdfkit", () => jest.fn());
 jest.mock("./src/cleanup-cron", () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock("./src/soft-delete-purge-cron", () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock("sqlite3", () => ({
   verbose: () => ({
@@ -58,6 +59,7 @@ jest.mock("./prismaClient", () => ({
     },
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock("./src/multisigner-verifier", () => ({
@@ -136,8 +138,7 @@ describe("POST /register - integration test coverage", () => {
     expect(response.status).toBe(409);
     expect(response.body).toMatchObject({
       success: false,
-      error: "Address already registered",
-      statusCode: 409,
+      error: { code: 'CONFLICT', message: 'Address already registered' },
     });
   });
 
@@ -147,7 +148,7 @@ describe("POST /register - integration test coverage", () => {
       .send({ username: "charlie" });
 
     expect(response.status).toBe(422);
-    expect(response.body).toHaveProperty('errors');
-    expect(response.body.errors.some(e => e.field === 'address')).toBe(true);
+    expect(response.body).toHaveProperty('error.details');
+    expect(response.body.error.details.some(e => e.field === 'address')).toBe(true);
   });
 });

@@ -55,6 +55,38 @@ export const resolveRecipient = async (inputValue) => {
   return { tag: normalizedTag };
 };
 
+/**
+ * Pulls a displayable message out of an API error body.
+ *
+ * The API answers `{ success: false, error: { code, message, details } }`. The
+ * flat `error`/`detail`/`message` fallbacks cover responses that do not come
+ * from the platform's error handler, such as a proxy or CDN error page.
+ */
+export const apiErrorMessage = (data, fallback) => {
+  if (data && typeof data === 'object') {
+    const { error } = data;
+    if (error && typeof error === 'object' && error.message) {
+      return error.message;
+    }
+    if (typeof error === 'string' && error) {
+      return error;
+    }
+    if (typeof data.detail === 'string' && data.detail) {
+      return data.detail;
+    }
+    if (typeof data.message === 'string' && data.message) {
+      return data.message;
+    }
+  }
+  return fallback;
+};
+
+/** Field-level validation issues, when the error carries them. */
+export const apiErrorDetails = (data) => {
+  const details = data && data.error && data.error.details;
+  return Array.isArray(details) ? details : [];
+};
+
 export const formatUsername = (value) => {
   if (!value) {
     return '';

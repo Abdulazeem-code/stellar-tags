@@ -1,14 +1,21 @@
 const express = require('express');
 const userRoutes = require('./userRoutes');
-const federationRoutes = require('./federationRoutes');
 const receiptRoutes = require('./receiptRoutes');
+const webhookRoutes = require('./webhookRoutes');
 const statsRoutes = require('./statsRoutes');
+const historyRoutes = require('./historyRoutes');
+const exportRoutes = require('./exportRoutes');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
+  const federationRoutes = require('./federationRoutes')(redisClient);
 
-router.use('/', userRoutes);
-router.use('/', federationRoutes);
-router.use('/', receiptRoutes);
-router.use('/', statsRoutes);
+  router.use('/', userRoutes);
+  router.use('/', federationRoutes);
+  router.use('/', receiptRoutes);
+  router.use('/', historyRoutes);
+  router.use('/', exportRoutes);
+  router.use('/', statsRoutes);
 
-module.exports = router;
+  return router;
+};

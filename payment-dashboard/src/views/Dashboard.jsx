@@ -19,6 +19,7 @@ import {
   formatUsername,
   loadStellarSdk,
   resolveRecipient,
+  apiErrorMessage,
   useNavState,
   useWalletMenu,
 } from './shared';
@@ -138,7 +139,7 @@ function Dashboard({
           return;
         }
 
-        throw new Error((data && data.detail) || `Backend error (${response.status}).`)
+        throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`))
       } catch (error){
         setReceiveAddress(userPublicKey)
         setReceiveTag('')
