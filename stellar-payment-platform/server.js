@@ -860,41 +860,6 @@ if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
 
-// Global error handling middleware
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, _next) => {
-  const statusCode = err.statusCode || 500;
-  const errorMessage = err.message || 'Internal server error';
-
-  if (statusCode >= 500) {
-    const errorId = crypto.randomUUID();
-    // Safely fall back to 'unknown' if correlation middleware has not yet assigned
-    // req.correlationId (e.g. an error thrown before the middleware chain runs).
-    const traceId = req.correlationId || 'unknown';
-    console.error(`[Error ID: ${errorId}] [Trace ID: ${traceId}]`, err);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      reference_id: errorId,
-      trace_id: traceId
-    // #31 — Prefix error logs with the correlation ID so a single API call can
-    // be traced across every log line it produced.
-    logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${errorId}]`, err);
-    return res.status(statusCode).json({
-      success: false,
-      error: statusCode === 500 ? 'Internal Server Error' : errorMessage,
-      reference_id: errorId,
-      correlation_id: req.correlationId,
-      ...(statusCode !== 500 ? { statusCode } : {})
-    });
-  }
-
-  return res.status(statusCode).json({
-    success: false,
-    error: errorMessage,
-    statusCode: statusCode,
-  });
-});
 // Unmatched routes and every error share the standard envelope.
 app.use(notFoundHandler);
 app.use(buildErrorHandler(isPrismaConnectionError));
