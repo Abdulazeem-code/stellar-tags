@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const { logger } = require('../src/logger');
+const { ApiError } = require('../src/errors');
 
 const IDEMPOTENCY_HEADER = 'X-Idempotency-Key';
 const CACHE_EXPIRATION_SECONDS = 24 * 60 * 60; // 24 hours
@@ -31,7 +33,7 @@ const idempotencyMiddleware = (redisClient) => {
     // 2. Validate the key (basic length check to prevent massive keys)
     const key = idempotencyKey.trim();
     if (!key || key.length > 128) {
-      return res.status(400).json({ error: 'Invalid or too long X-Idempotency-Key' });
+      return next(new ApiError('INVALID_INPUT', 'Invalid or too long X-Idempotency-Key'));
     }
 
     // Include the path in the cache key to avoid collisions across different endpoints
@@ -59,7 +61,7 @@ const idempotencyMiddleware = (redisClient) => {
         }
       }
     } catch (err) {
-      console.error('Error reading idempotency key from cache:', err);
+      logger.error('Error reading idempotency key from cache:', err);
       // Fail open: proceed with request if cache is unavailable
     }
 
@@ -78,7 +80,7 @@ const idempotencyMiddleware = (redisClient) => {
           if (redisClient && redisClient.isReady) {
             // Save to redis asynchronously
             redisClient.setEx(cacheKey, CACHE_EXPIRATION_SECONDS, JSON.stringify(cacheData)).catch((err) => {
-              console.error('Error saving idempotency key to redis:', err);
+              logger.error('Error saving idempotency key to redis:', err);
             });
           } else {
             memoryCache.set(cacheKey, {
@@ -97,7 +99,7 @@ const idempotencyMiddleware = (redisClient) => {
             }
           }
         } catch (err) {
-          console.error('Error saving idempotency key to cache:', err);
+          logger.error('Error saving idempotency key to cache:', err);
         }
       }
 

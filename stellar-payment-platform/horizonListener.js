@@ -12,6 +12,12 @@
 
 const { Horizon } = require('@stellar/stellar-sdk');
 const { prisma } = require('./prismaClient');
+const { logger } = require('./src/logger');
+const { poolGet, poolRun } = require('./src/db');
+const {
+  dispatchPaymentWebhooks,
+  scheduleWebhookRetryJob,
+} = require('./src/webhookWorker');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -71,7 +77,7 @@ const watchAccount = (accountId) => {
     return; // Already watching
   }
 
-  console.log(`[${timestamp()}] 👁️  Watching payments for ${accountId}`);
+  logger.info(`[${timestamp()}] 👁️  Watching payments for ${accountId}`);
 
   const closeStream = horizon
     .payments()
@@ -79,17 +85,26 @@ const watchAccount = (accountId) => {
     .cursor('now')
     .stream({
       onmessage: (payment) => {
-        // Only log payment operations (ignore account_merge, etc.)
         if (payment.type === 'payment' || payment.type_i === 1) {
-          console.log(formatPayment(payment, accountId));
+          logger.info(formatPayment(payment, accountId));
+          dispatchPaymentWebhooks({
+            prisma,
+            poolGetFn: poolGet,
+            poolRunFn: poolRun,
+            payment,
+          }).catch((err) =>
+            logger.error(
+              `[${timestamp()}] ⚠️  Webhook dispatch failed for tx ${payment.transaction_hash}:`,
+              err?.message || err,
+            ),
+          );
         }
       },
       onerror: (error) => {
-        console.error(
+        logger.error(
           `[${timestamp()}] ⚠️  Stream error for ${accountId}:`,
           error?.message || error,
         );
-        // The SDK handles automatic reconnection for SSE streams
       },
     });
 
@@ -119,17 +134,17 @@ const syncWatchedAccounts = async () => {
     // Stop watching removed accounts
     for (const [address, closeFn] of activeStreams) {
       if (!currentAddresses.has(address)) {
-        console.log(`[${timestamp()}] 🛑 Stopped watching removed account ${address}`);
+        logger.info(`[${timestamp()}] 🛑 Stopped watching removed account ${address}`);
         if (typeof closeFn === 'function') closeFn();
         activeStreams.delete(address);
       }
     }
 
-    console.log(
+    logger.info(
       `[${timestamp()}] 📡 Actively monitoring ${activeStreams.size} account(s)`,
     );
   } catch (err) {
-    console.error(`[${timestamp()}] ❌ Failed to sync watched accounts:`, err.message);
+    logger.error(`[${timestamp()}] ❌ Failed to sync watched accounts:`, err.message);
   }
 };
 
@@ -137,10 +152,10 @@ const syncWatchedAccounts = async () => {
 // Graceful Shutdown
 // ---------------------------------------------------------------------------
 const shutdown = async () => {
-  console.log(`\n[${timestamp()}] Shutting down Horizon listener...`);
+  logger.info(`\n[${timestamp()}] Shutting down Horizon listener...`);
   for (const [address, closeFn] of activeStreams) {
     if (typeof closeFn === 'function') closeFn();
-    console.log(`  Closed stream for ${address}`);
+    logger.info(`  Closed stream for ${address}`);
   }
   activeStreams.clear();
   await prisma.$disconnect();
@@ -154,21 +169,28 @@ process.on('SIGINT', shutdown);
 // Main
 // ---------------------------------------------------------------------------
 const main = async () => {
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('  Stellar Horizon Payment Listener');
-  console.log(`  Network:  ${NETWORK.toUpperCase()}`);
-  console.log(`  Horizon:  ${HORIZON_URL}`);
-  console.log(`  Poll:     every ${POLL_INTERVAL_MS / 1000}s for new accounts`);
-  console.log('═══════════════════════════════════════════════════════');
+  logger.info('═══════════════════════════════════════════════════════');
+  logger.info('  Stellar Horizon Payment Listener');
+  logger.info(`  Network:  ${NETWORK.toUpperCase()}`);
+  logger.info(`  Horizon:  ${HORIZON_URL}`);
+  logger.info(`  Poll:     every ${POLL_INTERVAL_MS / 1000}s for new accounts`);
+  logger.info('═══════════════════════════════════════════════════════');
 
   // Initial sync
   await syncWatchedAccounts();
+
+  // Schedule webhook retry / liveness pings
+  try {
+    scheduleWebhookRetryJob({ prisma, poolAllFn: require('./src/db').poolAll, poolRunFn: poolRun });
+  } catch (err) {
+    logger.error('Failed to schedule webhook retry job:', err.message);
+  }
 
   // Periodically check for newly registered accounts
   setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
 };
 
 main().catch((err) => {
-  console.error('Fatal error starting Horizon listener:', err);
+  logger.error('Fatal error starting Horizon listener:', err);
   process.exit(1);
 });
