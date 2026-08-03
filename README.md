@@ -16,7 +16,7 @@ Stellar Tags is a payment platform that combines a Soroban smart contract, a Nod
 
 ## Architecture Map
 
-The following diagram maps exactly how data flows between the user, Vercel, Railway, and the Stellar network.
+The following diagram maps exactly how data flows between the user, Render, and the Stellar network.
 
 ```text
 [ User / Browser ]
@@ -29,7 +29,7 @@ The following diagram maps exactly how data flows between the user, Vercel, Rail
        | HTTP API Calls (via VITE_API_BASE)
        v
 [ stellar-payment-platform ] <---> [ PostgreSQL Database ]
-  (server.js: Server router on Railway)      (via Prisma ORM: User/payment layout)
+  (server.js: Server router on Render)        (via Prisma ORM: User/payment layout)
        |
        | Stellar Network / RPC
        v
@@ -127,6 +127,12 @@ Useful Prisma commands (run from `stellar-payment-platform/`):
 > `.env` is gitignored — never commit real credentials. Each contributor keeps
 > their own local `DATABASE_URL`.
 
+### Render deployment
+
+The repository includes a [render.yaml](render.yaml) blueprint for the backend API and its PostgreSQL database. When you deploy from Render, import the blueprint or create the service from the repo so `DATABASE_URL` is injected automatically from the managed database.
+
+If you deploy the backend without the blueprint, make sure the web service has a PostgreSQL `DATABASE_URL` secret configured before startup. The container runs Prisma migrations on boot, so the variable must already exist.
+
 ### Smart contract (Soroban)
 
 ```bash
@@ -166,6 +172,8 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
 - `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
 - `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
+
+For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
 
 ## Logging
 
