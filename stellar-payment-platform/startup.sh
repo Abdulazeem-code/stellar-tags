@@ -6,6 +6,13 @@ set -e
 # this schema (`url` in the datasource block, the "metrics" preview feature).
 PRISMA="./node_modules/.bin/prisma"
 
+if [ -z "${DATABASE_URL:-}" ]; then
+  echo "ERROR: DATABASE_URL is not set." >&2
+  echo "Render must provide a PostgreSQL connection string to this service before startup." >&2
+  echo "Link a Render PostgreSQL instance or set DATABASE_URL in the service environment." >&2
+  exit 1
+fi
+
 if [ ! -x "$PRISMA" ]; then
   echo "ERROR: Prisma CLI not found at $PRISMA." >&2
   echo "It must be a production dependency so it survives 'npm prune --omit=dev'." >&2
