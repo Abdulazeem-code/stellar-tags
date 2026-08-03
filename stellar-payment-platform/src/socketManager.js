@@ -18,28 +18,37 @@ function initSocketServer(httpServer, corsOptions = {}) {
   io.on('connection', (socket) => {
     logger.info(`Socket connected: ${socket.id}`);
 
-    socket.on('authenticate', (payload) => {
+    // The optional ack lets a client wait until it is actually subscribed.
+    // Without it a client that emits `authenticate` and immediately expects
+    // events can miss any payment that arrives before the room join lands.
+    socket.on('authenticate', async (payload, ack) => {
+      let subscribed = false;
       try {
         const address = payload && typeof payload.address === 'string' ? payload.address : null;
         if (address) {
-          socket.join(address);
+          // socket.join can be async in some adapters; await to be safe.
+          await socket.join(address);
           socket.address = address;
+          subscribed = true;
           logger.info(`Socket ${socket.id} joined room for ${address}`);
         }
       } catch (err) {
         logger.error('Socket authenticate error', err);
       }
+      if (typeof ack === 'function') {
+        try { ack({ subscribed }); } catch (e) { /* ignore ack errors */ }
+      }
     });
 
     socket.on('payment', (payload) => {
       try {
-        const { address, payment } = payload || {};
-        if (address && payment) {
-          emitToAddress(address, 'payment', payment);
-          logger.info(`Forwarded payment event to room for address ${address}`);
+        const addr = payload && typeof payload.address === 'string' ? payload.address : null;
+        const payment = payload && payload.payment ? payload.payment : payload;
+        if (addr) {
+          io.to(addr).emit('payment', payment);
         }
       } catch (err) {
-        logger.error('Socket payment forwarding error', err);
+        logger.error('Error handling payment emit', err);
       }
     });
 

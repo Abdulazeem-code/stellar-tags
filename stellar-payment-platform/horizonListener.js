@@ -114,6 +114,7 @@ const watchAccount = (accountId) => {
               logger.error('Failed to emit payment over socket client', err);
             }
           }
+<<<<<<< HEAD
           dispatchPaymentWebhooks({
             prisma,
             poolGetFn: poolGet,
@@ -126,6 +127,8 @@ const watchAccount = (accountId) => {
             ),
           );
         }
+=======
+>>>>>>> 4095f79 (feat(websockets): add Socket.IO server and horizon listener forwarding (fix #430))
       },
       onerror: (error) => {
         logger.error(
