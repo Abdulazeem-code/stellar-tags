@@ -81,11 +81,17 @@ app.set('query parser', 'simple');
 const PORT = process.env.PORT || 5000;
 const STELLAR_TAG_DOMAIN = process.env.STELLAR_TAG_DOMAIN;
 
+const envOrigins = process.env.CORS_ALLOWED_ORIGINS
+  ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : [];
+
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
   'https://stellar-tags.vercel.app',
   STELLAR_TAG_DOMAIN,
+  process.env.VITE_API_BASE,
+  ...envOrigins,
 ].filter(Boolean);
 
 const corsOptions = {
@@ -93,13 +99,15 @@ const corsOptions = {
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
-    return callback(null, false);
+    return callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
   optionsSuccessStatus: 204,
 };
+
+app.use(cors(corsOptions));
 
 // Apply metrics middleware to track all HTTP requests
 app.use(metricsMiddleware);
