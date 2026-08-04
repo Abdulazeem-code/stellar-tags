@@ -10,6 +10,7 @@ jest.mock('./prismaClient', () => ({
     },
     $disconnect: jest.fn().mockResolvedValue(undefined),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock('@stellar/stellar-sdk', () => ({
@@ -20,7 +21,8 @@ jest.mock('@stellar/stellar-sdk', () => ({
 jest.mock('pdfkit', () => jest.fn());
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 
-const { app, prisma } = require('./server');
+const { app } = require('./server');
+const { prisma } = require('./prismaClient');
 
 describe('GET /federation', () => {
   beforeEach(() => {
@@ -31,12 +33,15 @@ describe('GET /federation', () => {
     const response = await request(app).get('/federation');
     expect(response.status).toBe(400);
     expect(response.body).toHaveProperty('error');
-    expect(response.body.error).toBe("Missing 'q' parameter");
+    expect(response.body.error.details[0].message).toBe("Missing 'q' parameter");
   });
 
   test('successfully looks up username and formats Stellar TOML response', async () => {
-    prisma.user.findUnique.mockResolvedValue({
+    prisma.user.findFirst.mockResolvedValue({
+      username: 'alice',
       address: 'GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G',
+      memoType: 'text',
+      memo: 'PlatformPayment',
     });
 
     const response = await request(app).get('/federation?q=alice*localhost');
@@ -48,19 +53,19 @@ describe('GET /federation', () => {
       memo_type: 'text',
       memo: 'PlatformPayment',
     });
-    expect(prisma.user.findUnique).toHaveBeenCalledWith({
-      where: { username: 'alice*localhost' },
-      select: { address: true },
+    expect(prisma.user.findFirst).toHaveBeenCalledWith({
+      where: { username: 'alice*localhost', deletedAt: null },
+      select: { address: true, memoType: true, memo: true, flaggedAt: true },
     });
   });
 
   test('returns 404 for missing username lookup', async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
 
     const response = await request(app).get('/federation?q=unknown*localhost');
     
     expect(response.status).toBe(404);
-    expect(response.body.error).toBe('Name tag not found');
+    expect(response.body.error.message).toBe('Name tag not found');
   });
 
   test('successfully looks up address when type=id', async () => {
@@ -83,6 +88,6 @@ describe('GET /federation', () => {
     const response = await request(app).get('/federation?type=id&q=UNKNOWNADDRESS');
     
     expect(response.status).toBe(404);
-    expect(response.body.error).toBe('Address not found');
+    expect(response.body.error.message).toBe('Address not found');
   });
 });
