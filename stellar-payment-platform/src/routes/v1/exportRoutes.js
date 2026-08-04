@@ -7,6 +7,7 @@ const { validateSchema } = require('../../middleware/validateSchema');
 const { exportQuerySchema } = require('../../schemas');
 const { ApiError } = require('../../errors');
 const { logger } = require('../../logger');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 
 const router = express.Router();
 
@@ -105,7 +106,7 @@ const writeChunk = async (res, chunk) => {
 router.get(
   '/transactions/export',
   validateSchema({ query: exportQuerySchema }),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     const { address, order } = req.query;
 
     if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -179,7 +180,7 @@ router.get(
       );
       return res.destroy(err);
     }
-  },
+  }),
 );
 
 module.exports = router;

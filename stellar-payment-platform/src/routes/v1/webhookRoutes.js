@@ -6,6 +6,7 @@ const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 
 const router = express.Router();
 
@@ -145,7 +146,7 @@ const isValidWebhookUrl = (url) => {
   }
 };
 
-router.post('/webhooks', async (req, res, next) => {
+router.post('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json')) {
       return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
@@ -215,9 +216,9 @@ router.post('/webhooks', async (req, res, next) => {
     generic.statusCode = 500;
     return next(generic);
   }
-});
+}));
 
-router.get('/webhooks', async (req, res, next) => {
+router.get('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
       return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
@@ -269,9 +270,9 @@ router.get('/webhooks', async (req, res, next) => {
     generic.statusCode = 500;
     return next(generic);
   }
-});
+}));
 
-router.delete('/webhooks/:id', async (req, res, next) => {
+router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
       return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
@@ -311,7 +312,7 @@ router.delete('/webhooks/:id', async (req, res, next) => {
     generic.statusCode = 500;
     return next(generic);
   }
-});
+}));
 
 router.all('/webhooks', (req, res) => {
   if (req.method !== 'GET' && req.method !== 'POST') {

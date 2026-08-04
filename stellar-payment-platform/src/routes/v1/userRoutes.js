@@ -7,6 +7,7 @@ const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
 const { lookupCached, invalidateFederationCache } = require('../../cache');
 const { paginatedResponse } = require('../../pagination');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 const {
   normalizeNameTag,
   validateMemo,
@@ -106,7 +107,7 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
-router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
   const { address, memo_type: memoType, memo, signature = '' } = req.body;
@@ -215,13 +216,13 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     registrationError.statusCode = 500;
     return next(registrationError);
   }
-});
+}));
 
 router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
 // #18 — Soft-delete endpoint. Sets deleted_at to now() instead of running a
 // hard DELETE so the row is preserved for historical auditing.
-router.delete('/register/:username', async (req, res, next) => {
+router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   const username = normalizeNameTag(
     typeof req.params.username === 'string' ? req.params.username.trim() : '',
   ).toLowerCase();
@@ -258,9 +259,9 @@ router.delete('/register/:username', async (req, res, next) => {
     dbError.statusCode = 500;
     return next(dbError);
   }
-});
+}));
 
-router.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
+router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
   if (address) {
@@ -316,9 +317,9 @@ const totalPages = Math.ceil(totalCount / limit);
     dbError.statusCode = 500;
     return next(dbError);
   }
-});
+}));
 
-router.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
+router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
   const { page, limit } = req.query;
   const skip = (page - 1) * limit;
   const search = req.query.search ?? null;
@@ -361,6 +362,6 @@ const totalPages = Math.ceil(totalCount / limit);
     dbError.statusCode = 500;
     return next(dbError);
   }
-});
+}));
 
 module.exports = router;
