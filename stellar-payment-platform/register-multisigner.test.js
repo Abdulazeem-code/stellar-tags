@@ -31,9 +31,8 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
-      findUnique: jest.fn(),
-      create: jest.fn(),
       findFirst: jest.fn(),
+      create: jest.fn(),
       findMany: jest.fn(),
       count: jest.fn(),
     },
@@ -106,9 +105,9 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
     ({ prisma } = require('./prismaClient'));
     verifyMultiSignerThreshold = require('./src/multisigner-verifier').verifyMultiSignerThreshold;
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.create.mockReset();
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockResolvedValue({
       username: 'alice*localhost',
       address: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
@@ -320,7 +319,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
     it('should reject duplicate address registration', async () => {
       const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
       
-      prisma.user.findUnique.mockResolvedValue({ username: 'existing' });
+      prisma.user.findFirst.mockResolvedValue({ username: 'existing' });
 
       const response = await request(app)
         .post('/register')

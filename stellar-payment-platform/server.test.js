@@ -29,11 +29,10 @@ jest.mock('@prisma/client', () => ({
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
-      findUnique: jest.fn(),
+      findFirst: jest.fn(),
       findMany: jest.fn(),
       count: jest.fn(),
       create: jest.fn(),
-      findFirst: jest.fn(),
     },
     $transaction: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
@@ -114,7 +113,7 @@ describe('gracefulShutdown', () => {
     };
     exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
     jest.spyOn(console, 'log').mockImplementation(() => {});
-    jest.spyOn(console, 'error').mockImplementation(() => {});
+    
   });
 
   afterEach(() => {
@@ -322,7 +321,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     ({ prisma } = require('./prismaClient'));
     request = require('supertest');
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.findMany.mockReset();
     prisma.user.count.mockReset();
     prisma.$transaction = jest.fn();
@@ -338,7 +337,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
   });
 
   test('exact address lookup returns single record (backward compat)', async () => {
-    prisma.user.findUnique.mockResolvedValue({ username: 'alice*localhost' });
+    prisma.user.findFirst.mockResolvedValue({ username: 'alice*localhost' });
 
     const res = await request(app).get(`/lookup?address=${VALID_ADDRESS}`);
     expect(res.status).toBe(200);
@@ -632,9 +631,9 @@ describe('POST /register — memo validation', () => {
     ({ prisma } = require('./prismaClient'));
     request = require('supertest');
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.create.mockReset();
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockResolvedValue({
       username: 'alice*localhost',
       address: VALID_ADDRESS,
@@ -742,12 +741,12 @@ describe('GET /federation — memo fields in response', () => {
     ({ prisma } = require('./prismaClient'));
     request = require('supertest');
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.findFirst.mockReset();
   });
 
   test('omits memo fields when user has no memo configured', async () => {
-    prisma.user.findUnique.mockResolvedValue({ address: VALID_ADDRESS, memoType: null, memo: null });
+    prisma.user.findFirst.mockResolvedValue({ address: VALID_ADDRESS, memoType: null, memo: null });
     const res = await request(app).get('/federation?q=alice*localhost&type=name');
     expect(res.status).toBe(200);
     expect(res.body).not.toHaveProperty('memo_type');
@@ -755,8 +754,9 @@ describe('GET /federation — memo fields in response', () => {
   });
 
   test('returns stored text memo in federation response', async () => {
-    prisma.user.findUnique.mockResolvedValue({ address: VALID_ADDRESS, memoType: 'text', memo: 'pay123' });
+    prisma.user.findFirst.mockResolvedValue({ address: VALID_ADDRESS, memoType: 'text', memo: 'pay123' });
     const res = await request(app).get('/federation?q=alice*localhost&type=name');
+    console.warn('RES BODY:', res.body);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ memo_type: 'text', memo: 'pay123' });
   });
@@ -877,7 +877,7 @@ describe('Idempotency Middleware', () => {
     ({ prisma } = require('./prismaClient'));
     request = require('supertest');
     
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockResolvedValue({
       id: 1,
       username: 'idempotent-user',
@@ -981,7 +981,7 @@ describe('Database disconnection — 503 handling', () => {
     ({ prisma } = require('./prismaClient'));
     request = require('supertest');
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.findFirst.mockReset();
     prisma.user.findMany.mockReset();
     prisma.user.count.mockReset();
@@ -998,7 +998,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1008', 'Connection timeout'],
     ['P1017', 'Pool timeout'],
   ])('GET /api/v1/federation returns 503 when Prisma throws %s', async (code) => {
-    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app).get('/api/v1/federation?q=alice*localhost&type=name');
     expect(res.status).toBe(503);
@@ -1010,7 +1010,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1008'],
     ['P1017'],
   ])('GET /api/v1/lookup returns 503 on address lookup when Prisma throws %s', async (code) => {
-    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app).get(`/api/v1/lookup?address=GABC123`);
     expect(res.status).toBe(503);
@@ -1043,7 +1043,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1001'],
     ['P1008'],
   ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
-    prisma.user.findUnique.mockRejectedValue(makePrismaError(code));
+    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app)
       .post('/api/v1/register')
@@ -1053,7 +1053,7 @@ describe('Database disconnection — 503 handling', () => {
   });
 
   test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {
-    prisma.user.findUnique.mockRejectedValue(makePrismaError('P1001'));
+    prisma.user.findFirst.mockRejectedValue(makePrismaError('P1001'));
 
     const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');
     expect(res.status).toBe(404);

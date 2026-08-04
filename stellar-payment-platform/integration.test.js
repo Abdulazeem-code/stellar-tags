@@ -43,21 +43,37 @@ jest.mock('./prismaClient', () => {
         return { ...row };
       }),
       findFirst: jest.fn(async ({ where, select }) => {
-        const addr = where?.address?.equals;
-        if (!addr) return null;
-        for (const entry of mockDb.values()) {
-          if (entry.address.toLowerCase() === addr.toLowerCase()) {
-            if (select) {
-              const result = {};
-              for (const key of Object.keys(select)) {
-                if (select[key]) result[key] = entry[key];
+        let row = null;
+        if (where.username) {
+          const uname = typeof where.username === 'object' ? where.username.equals : where.username;
+          if (uname) {
+            for (const entry of mockDb.values()) {
+              if (entry.username === uname) {
+                row = entry;
+                break;
               }
-              return result;
             }
-            return { ...entry };
+          }
+        } else if (where.address) {
+          const addr = typeof where.address === 'object' ? where.address.equals : where.address;
+          if (addr) {
+            for (const entry of mockDb.values()) {
+              if (entry.address.toLowerCase() === addr.toLowerCase()) {
+                row = entry;
+                break;
+              }
+            }
           }
         }
-        return null;
+        if (!row) return null;
+        if (select) {
+          const result = {};
+          for (const key of Object.keys(select)) {
+            if (select[key]) result[key] = row[key];
+          }
+          return result;
+        }
+        return { ...row };
       }),
       findMany: jest.fn(async ({ where, skip, take } = {}) => {
         let results = Array.from(mockDb.values());
@@ -183,6 +199,7 @@ describe('API Integration Lifecycle Suite', () => {
     const queryRes = await request(app)
       .get(`/api/v1/lookup?address=${user1.address}`);
 
+    console.warn('QUERY RES BODY:', queryRes.body);
     expect(queryRes.status).toBe(200);
     expect(queryRes.body).toMatchObject({
       username: user1.federationTag,

@@ -327,7 +327,7 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
       const cacheKey = federationIdKey(queryValue);
       const cached = await federationLookupCached(cacheKey, async () => {
         const row = await prisma.user.findFirst({
-          where: { address: { equals: queryValue, mode: 'insensitive' } },
+          where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
           select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
         });
 
@@ -364,8 +364,8 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
       const cached = await federationLookupCached(cacheKey, async () => {
         let row;
         try {
-          row = await prisma.user.findUnique({
-            where: { username: queryName },
+          row = await prisma.user.findFirst({
+            where: { username: queryName, deletedAt: null },
             select: { address: true, memoType: true, memo: true, flaggedAt: true },
           });
 
@@ -528,8 +528,8 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   try {
     let existing = null;
     try {
-      existing = await prisma.user.findUnique({
-        where: { address },
+      existing = await prisma.user.findFirst({
+        where: { address, deletedAt: null },
       });
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) {
@@ -665,8 +665,8 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
       const result = await lookupCached(address, async () => {
         let row;
         try {
-          row = await prisma.user.findUnique({
-            where: { address },
+          row = await prisma.user.findFirst({
+            where: { address, deletedAt: null },
             select: { username: true },
           });
         } catch (error) {
@@ -698,6 +698,7 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
   const skip = (page - 1) * limit;
 
   const where = {
+    deletedAt: null,
     OR: [
       { username: { contains: search, mode: 'insensitive' } },
       { address: { contains: search, mode: 'insensitive' } },
@@ -748,12 +749,13 @@ app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, 
 
   const where = search
     ? {
+        deletedAt: null,
         OR: [
           { username: { contains: search, mode: 'insensitive' } },
           { address: { contains: search, mode: 'insensitive' } },
         ],
       }
-    : {};
+    : { deletedAt: null };
 
   try {
     const [totalCount, rows] = await prisma.$transaction([
