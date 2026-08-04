@@ -1,5 +1,6 @@
 const express = require('express');
 const { invalidateFederationCache } = require('../../federationCache');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -18,7 +19,7 @@ const adminAuth = (req, res, next) => {
   next();
 };
 
-router.post('/admin/block', adminAuth, async (req, res, next) => {
+router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
   const prisma = getPrisma();
   const { address } = req.body;
   
@@ -66,7 +67,7 @@ router.post('/admin/block', adminAuth, async (req, res, next) => {
       }
       return next(error);
     }
-  });
+  }));
 
   return router;
 };

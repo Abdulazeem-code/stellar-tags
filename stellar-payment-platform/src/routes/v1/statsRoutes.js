@@ -2,6 +2,7 @@ const express = require('express');
 const { prisma } = require('../../../prismaClient');
 const { poolGet } = require('../../db');
 const { logger } = require('../../logger');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 
 const router = express.Router();
 
@@ -18,7 +19,7 @@ const shouldFallbackToLocalRegistry = (error) => {
   );
 };
 
-router.get('/stats', async (req, res, next) => {
+router.get('/stats', asyncHandler(async (req, res, next) => {
   try {
     let totalRegisteredUsers;
     let activeTokens;
@@ -58,6 +59,6 @@ router.get('/stats', async (req, res, next) => {
     statsError.statusCode = 500;
     return next(statsError);
   }
-});
+}));
 
 module.exports = router;

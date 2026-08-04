@@ -9,11 +9,12 @@ const {
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { federationQuerySchema } = require('../../schemas');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+  router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
 
     try {
@@ -87,7 +88,7 @@ module.exports = (redisClient) => {
       dbError.statusCode = 500;
       return next(dbError);
     }
-  });
+  }));
 
   return router;
 };

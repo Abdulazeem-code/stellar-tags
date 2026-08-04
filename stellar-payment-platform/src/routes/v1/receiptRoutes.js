@@ -3,13 +3,14 @@ const { Horizon } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
 
 const { ApiError } = require('../../errors');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 
 const router = express.Router();
 
 const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
 
-router.get('/receipts/:txHash', async (req, res, next) => {
+router.get('/receipts/:txHash', asyncHandler(async (req, res, next) => {
   const { txHash } = req.params;
 
   if (!TX_HASH_RE.test(txHash)) {
@@ -72,6 +73,6 @@ router.get('/receipts/:txHash', async (req, res, next) => {
   });
 
   doc.end();
-});
+}));
 
 module.exports = router;
