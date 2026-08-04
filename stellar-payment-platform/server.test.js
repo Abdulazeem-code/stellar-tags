@@ -627,6 +627,7 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
       error: "Username is reserved."
     });
   });
+});
 
 describe('POST /register — memo validation', () => {
   let request;
