@@ -21,7 +21,7 @@ module.exports = (redisClient) => {
         const cacheKey = federationIdKey(queryValue);
         const cached = await federationLookupCached(cacheKey, async () => {
           const row = await prisma.user.findFirst({
-            where: { address: { equals: queryValue, mode: 'insensitive' } },
+            where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
             select: { username: true, address: true, memoType: true, memo: true },
           });
 
@@ -51,8 +51,8 @@ module.exports = (redisClient) => {
         const cacheKey = federationNameKey(queryName);
 
         const cached = await federationLookupCached(cacheKey, async () => {
-          const row = await prisma.user.findUnique({
-            where: { username: queryName },
+          const row = await prisma.user.findFirst({
+            where: { username: queryName, deletedAt: null },
             select: { address: true, memoType: true, memo: true },
           });
 

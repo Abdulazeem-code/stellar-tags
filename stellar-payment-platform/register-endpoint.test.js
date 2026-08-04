@@ -55,6 +55,7 @@ jest.mock("./prismaClient", () => ({
   prisma: {
     user: {
       findUnique: jest.fn(),
+      findFirst: jest.fn(),
       create: jest.fn(),
     },
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
@@ -93,12 +94,12 @@ describe("POST /register - integration test coverage", () => {
     ({ app } = require("./server"));
     ({ prisma } = require("./prismaClient"));
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.create.mockReset();
   });
 
   test("registers successfully with valid payload", async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockResolvedValue({
       username: "alice*localhost",
       address: VALID_ADDRESS,
@@ -114,8 +115,8 @@ describe("POST /register - integration test coverage", () => {
       username: "alice*localhost",
       address: VALID_ADDRESS,
     });
-    expect(prisma.user.findUnique).toHaveBeenCalledWith({
-      where: { address: VALID_ADDRESS },
+    expect(prisma.user.findFirst).toHaveBeenCalledWith({
+      where: { address: VALID_ADDRESS, deletedAt: null },
     });
     expect(prisma.user.create).toHaveBeenCalledWith({
       data: {
@@ -126,7 +127,7 @@ describe("POST /register - integration test coverage", () => {
   });
 
   test("returns 409 when address already exists", async () => {
-    prisma.user.findUnique.mockResolvedValue({
+    prisma.user.findFirst.mockResolvedValue({
       username: "existing*localhost",
       address: VALID_ADDRESS,
     });
