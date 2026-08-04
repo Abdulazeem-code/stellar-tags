@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    BytesN, Env, Vec,
+    BytesN, Env, Vec, Symbol,
 };
 
 #[contracttype]
@@ -124,6 +124,11 @@ impl PaymentRouter {
     ) -> Result<(), Error> {
         // Require sender auth
         sender.require_auth();
+
+        env.events().publish(
+            (Symbol::new(env, "payment_initiated"), sender.clone()),
+            amount,
+        );
 
         // Prevent self-routing
         if sender == recipient {
@@ -622,6 +627,42 @@ mod test {
         assert_eq!(topics.len(), 1);
         let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
         assert_eq!(topic, symbol_short!("pause"));
+    }
+
+    #[test]
+    fn test_route_payment_emits_payment_initiated_event() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &5_000);
+
+        let events = env.events().all();
+        assert!(!events.is_empty());
+        
+        let mut found = false;
+        for (_, topics, data) in events.iter() {
+            if topics.len() > 0 {
+                if let Ok(topic_sym) = topics.get(0).unwrap().try_into_val(&env) {
+                    let sym: Symbol = topic_sym;
+                    if sym == Symbol::new(&env, "payment_initiated") {
+                        found = true;
+                        let amt: i128 = data.try_into_val(&env).unwrap();
+                        assert_eq!(amt, 5_000);
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found, "payment_initiated event not found");
     }
 
     #[test]
