@@ -36,6 +36,11 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stellar_tags?schema=public
       REDIS_URL: redis://redis:6379
       PORT: "5000"
+      LOG_DIR: /app/logs
+    volumes:
+      # Keep rotated logs across container restarts. The transports cap the
+      # volume's growth by rotating daily / at 20MB and pruning old archives.
+      - backendlogs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,3 +61,4 @@ services:
 
 volumes:
   pgdata:
+  backendlogs:

@@ -7,6 +7,8 @@ import NetworkBadge from '../NetworkBadge';
 import { useDebounce } from '../useDebounce';
 import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
+import RecentAddresses from '../components/RecentAddresses';
+import { useRecentAddresses } from '../useRecentAddresses';
 import {
   API_BASE,
   CONTRACT_ID,
@@ -17,6 +19,7 @@ import {
   formatUsername,
   loadStellarSdk,
   resolveRecipient,
+  apiErrorMessage,
   useNavState,
   useWalletMenu,
 } from './shared';
@@ -52,6 +55,8 @@ function Dashboard({
     action()
   }
   const [nameTag, setNameTag] = useState('')
+  const [showRecent, setShowRecent] = useState(false);
+  const { recentAddresses, saveAddress, clearAddresses } = useRecentAddresses();
   const recipientRef = useRef(null);
   const debouncedNameTag = useDebounce(nameTag, 300)
   const [amount, setAmount] = useState('')
@@ -129,11 +134,12 @@ function Dashboard({
             "#D97706",
             "#FEF3C7",
           );
-          onRegistrationStateChange("new");
+          // Change "new" to "skipped" to break the infinite redirect loop
+          onRegistrationStateChange("skipped"); 
           return;
         }
 
-        throw new Error((data && data.detail) || `Backend error (${response.status}).`)
+        throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`))
       } catch (error){
         setReceiveAddress(userPublicKey)
         setReceiveTag('')
@@ -340,6 +346,7 @@ function Dashboard({
         );
 
         displayMessage("Payment successful!", "#059669", "#D1FAE5");
+        saveAddress(recipientInput);
         setAmount("");
         onRefreshBalance();
         window.dispatchEvent(new Event("stellar:tx-update"));
@@ -514,7 +521,7 @@ function Dashboard({
               <div className="balance-error">{balanceError}</div>
             )}
             <div className="metric">
-              {balance !== null
+              {userPublicKey && balance !== null
                 ? showBalance
                   ? balance.toLocaleString(undefined, {
                       minimumFractionDigits: 2,
@@ -565,15 +572,32 @@ function Dashboard({
                   <div className="wallet-status">{walletLabel}</div>
                 )}
                 <label>Recipient username or address</label>
-                <input
-                  ref={recipientRef}
-                  type="text"
-                  value={nameTag}
-                  onChange={(event) => setNameTag(event.target.value)}
-                  placeholder="e.g., walzeem or G..."
-                  autoComplete="off"
-                  disabled={!userPublicKey || isProcessing}
-                />
+                <div style={{ position: 'relative' }}>
+                  <input
+                    ref={recipientRef}
+                    type="text"
+                    value={nameTag}
+                    onChange={(event) => {
+                      setNameTag(event.target.value);
+                      setShowRecent(true);
+                    }}
+                    onFocus={() => setShowRecent(true)}
+                    placeholder="e.g., walzeem or G..."
+                    autoComplete="off"
+                    disabled={!userPublicKey || isProcessing}
+                  />
+                  <RecentAddresses
+                    addresses={recentAddresses}
+                    isVisible={showRecent && recentAddresses.length > 0}
+                    onSelect={(address) => {
+                      setNameTag(address);
+                      setShowRecent(false);
+                      recipientRef.current?.focus();
+                    }}
+                    onClear={clearAddresses}
+                    onClose={() => setShowRecent(false)}
+                  />
+                </div>
                 {nameTag === userPublicKey && (
                   <span className="field-error">Warning: You are sending funds to your own address.</span>
                 )}
@@ -671,17 +695,18 @@ function Dashboard({
                     </div>
                   </div>
                 )}
-              </div>
-            )}
-            {receiveStatus.text && (
-              <div
-                id="receive-status-box"
-                style={{
-                  color: receiveStatus.color,
-                  backgroundColor: receiveStatus.bgColor,
-                }}
-              >
-                {receiveStatus.text}
+                {receiveStatus.text && (
+                  <div
+                    id="receive-status-box"
+                    style={{
+                      color: receiveStatus.color,
+                      backgroundColor: receiveStatus.bgColor,
+                      marginTop: "16px", // Adds a little breathing room below the QR code!
+                    }}
+                  >
+                    {receiveStatus.text}
+                  </div>
+                )}
               </div>
             )}
             {status.text && (

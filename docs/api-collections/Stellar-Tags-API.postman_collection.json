@@ -1,0 +1,106 @@
+{
+  "info": {
+    "name": "Stellar Tags API",
+    "description": "API Blueprint Collection for Stellar Tags (/lookup, /register, and /health).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Check if the API is running."
+      },
+      "response": []
+    },
+    {
+      "name": "Register User",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"testuser\",\n  \"address\": \"GAE2S2XKT6H2A4ZJ6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4\",\n  \"memo_type\": \"text\",\n  \"memo\": \"My Memo\",\n  \"signature\": \"\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/register",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "register"
+          ]
+        },
+        "description": "Registers a new user address with a name tag."
+      },
+      "response": []
+    },
+    {
+      "name": "Lookup User",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/lookup?address=GAE2S2XKT6H2A4ZJ6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4&search=test&page=1&limit=10",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "lookup"
+          ],
+          "query": [
+            {
+              "key": "address",
+              "value": "GAE2S2XKT6H2A4ZJ6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4",
+              "description": "Search by exact Stellar public key (optional)."
+            },
+            {
+              "key": "search",
+              "value": "test",
+              "description": "Search by username or address (optional, paginated)."
+            },
+            {
+              "key": "page",
+              "value": "1",
+              "description": "Pagination page number (default: 1)."
+            },
+            {
+              "key": "limit",
+              "value": "10",
+              "description": "Results per page (default: 10, max: 100)."
+            }
+          ]
+        },
+        "description": "Looks up a user's details by their Stellar address or name."
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5000",
+      "type": "string"
+    }
+  ]
+}

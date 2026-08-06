@@ -29,7 +29,7 @@ jobs:
         run: npm ci
 
       - name: Run Backend Tests
-        run: npm test
+        run: NODE_ENV=test npm test
 
   frontend-checks:
     name: Frontend Vercel Build Check
@@ -49,7 +49,7 @@ jobs:
           cache-dependency-path: ./payment-dashboard/package-lock.json
           
       - name: Install Frontend Dependencies
-        run: npm ci
+        run: npm install --legacy-peer-deps
         
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build

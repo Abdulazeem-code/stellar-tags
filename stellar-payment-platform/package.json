@@ -5,9 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
-    "test": "jest --forceExit",
+    "dev": "tsx watch server.js",
+    "test": "jest --forceExit --maxWorkers=2",
     "test:integration": "TEST_API_URL=http://localhost:5001 jest --forceExit --testPathPattern=integration",
+    "test:load": "artillery run artillery.yml",
     "listener": "node horizonListener.js",
     "db:seed": "node scripts/seed.js",
     "prisma:generate": "prisma generate",
@@ -21,8 +22,10 @@
   },
   "dependencies": {
     "@faker-js/faker": "^10.5.0",
-    "@prisma/client": "^6.1.0",
+    "@prisma/client": "^6.19.3",
+    "@sentry/node": "^10.68.0",
     "@stellar/stellar-sdk": "^16.0.1",
+    "bad-words": "^3.0.4",
     "compression": "^1.8.1",
     "connect-timeout": "^1.9.1",
     "cors": "^2.8.5",
@@ -30,16 +33,25 @@
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
     "generic-pool": "^3.9.0",
+    "helmet": "^8.3.0",
+    "node-cache": "^5.1.2",
     "node-cron": "4.5.0",
     "pdfkit": "^0.15.2",
+    "pino": "^10.0.0",
+    "prisma": "^6.19.3",
+    "prom-client": "^15.1.3",
     "rate-limit-redis": "^4.2.0",
     "redis": "^4.7.0",
     "sqlite3": "^5.1.7",
-    "xss": "^1.0.15"
+    "uuid": "^9.0.1",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "xss": "^1.0.15",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "jest": "^29.7.0",
-    "prisma": "^6.1.0",
-    "supertest": "^7.0.0"
+    "supertest": "^7.0.0",
+    "tsx": "4.23.1"
   }
 }

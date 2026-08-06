@@ -33,6 +33,14 @@ jest.mock('pdfkit', () => {
 jest.mock('dotenv', () => ({ config: jest.fn() }));
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+
+// bad-words ships as ESM; Jest runs in CJS mode — mock it to avoid transform errors.
+jest.mock('bad-words', () => {
+  return jest.fn().mockImplementation(() => ({
+    isProfane: jest.fn(() => false),
+  }));
+});
 
 // The receipts endpoint never touches the database, but loading server.js does
 // instantiate the Prisma client — mock it so no real connection is created.
@@ -47,6 +55,7 @@ jest.mock('./prismaClient', () => ({
     },
     $transaction: jest.fn((ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
 }));
 
@@ -91,14 +100,14 @@ describe('GET /api/v1/receipts/:txHash', () => {
     const res = await request(app).get('/api/v1/receipts/not-a-real-hash');
 
     expect(res.status).toBe(400);
-    expect(res.body.detail).toBe('Invalid transaction hash format');
+    expect(res.body.error.message).toBe('Invalid transaction hash format');
   });
 
   test('hash with invalid chars returns 400', async () => {
     const res = await request(app).get(`/api/v1/receipts/${'z'.repeat(64)}`);
 
     expect(res.status).toBe(400);
-    expect(res.body.detail).toBe('Invalid transaction hash format');
+    expect(res.body.error.message).toBe('Invalid transaction hash format');
   });
 
   test('nonexistent hash returns 404', async () => {
@@ -107,7 +116,7 @@ describe('GET /api/v1/receipts/:txHash', () => {
     const res = await request(app).get(`/api/v1/receipts/${VALID_HASH}`);
 
     expect(res.status).toBe(404);
-    expect(res.body.detail).toBe('Transaction not found');
+    expect(res.body.error.message).toBe('Transaction not found');
   });
 
   test('SDK network failure returns 500', async () => {
@@ -116,7 +125,7 @@ describe('GET /api/v1/receipts/:txHash', () => {
     const res = await request(app).get(`/api/v1/receipts/${VALID_HASH}`);
 
     expect(res.status).toBe(500);
-    expect(res.body.detail).toBe('Failed to fetch transaction');
+    expect(res.body.error.message).toBe('Failed to fetch transaction');
   });
 
   test('Soroban tx with no native payment op falls back gracefully', async () => {

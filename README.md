@@ -16,7 +16,7 @@ Stellar Tags is a payment platform that combines a Soroban smart contract, a Nod
 
 ## Architecture Map
 
-The following diagram maps exactly how data flows between the user, Vercel, Railway, and the Stellar network.
+The following diagram maps exactly how data flows between the user, Render, and the Stellar network.
 
 ```text
 [ User / Browser ]
@@ -29,7 +29,7 @@ The following diagram maps exactly how data flows between the user, Vercel, Rail
        | HTTP API Calls (via VITE_API_BASE)
        v
 [ stellar-payment-platform ] <---> [ PostgreSQL Database ]
-  (server.js: Server router on Railway)      (via Prisma ORM: User/payment layout)
+  (server.js: Server router on Render)        (via Prisma ORM: User/payment layout)
        |
        | Stellar Network / RPC
        v
@@ -127,6 +127,12 @@ Useful Prisma commands (run from `stellar-payment-platform/`):
 > `.env` is gitignored — never commit real credentials. Each contributor keeps
 > their own local `DATABASE_URL`.
 
+### Render deployment
+
+The repository includes a [render.yaml](render.yaml) blueprint for the backend API and its PostgreSQL database. When you deploy from Render, import the blueprint or create the service from the repo so `DATABASE_URL` is injected automatically from the managed database.
+
+If you deploy the backend without the blueprint, make sure the web service has a PostgreSQL `DATABASE_URL` secret configured before startup. The container runs Prisma migrations on boot, so the variable must already exist.
+
 ### Smart contract (Soroban)
 
 ```bash
@@ -162,6 +168,122 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `PORT` - (Optional) The port for the Node.js server to listen on. Defaults to `5000`.
 - `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default) or `public`.
 - `STELLAR_TAG_DOMAIN` - (Optional) Extra origin to add to the CORS allow-list.
+- `LOG_DIR` - (Optional) Directory for the rotating log files. Defaults to `stellar-payment-platform/logs`.
+- `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
+- `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
+- `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
+
+For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
+
+## Logging
+
+The server logs through a shared [Winston](https://github.com/winstonjs/winston) logger
+(`stellar-payment-platform/src/logger.js`). Import it instead of calling `console` directly:
+
+```js
+const { logger } = require('./src/logger');
+
+logger.info('Registered tag', { correlationId: req.correlationId, tag });
+logger.error(err);
+```
+
+Log records are written as JSON to `stellar-payment-platform/logs/`:
+
+- `application-YYYY-MM-DD.log` - everything at `LOG_LEVEL` and above.
+- `error-YYYY-MM-DD.log` - errors only, so incidents are easy to find.
+
+Both files rotate **daily and whenever they pass 20MB**, older files are gzipped, and
+anything beyond the retention window is deleted, so logs cannot exhaust the disk. A
+human-readable copy is also printed to the console (silenced when `NODE_ENV=test`, which
+also disables file output so test runs leave no logs behind).
+
+## Error responses
+
+Every API error leaves the server in one shape, produced by a single terminal
+handler (`stellar-payment-platform/src/middleware/errorHandler.js`):
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "Invalid request body",
+    "details": [{ "field": "username", "message": "username is required" }]
+  },
+  "correlation_id": "3f2a…",
+  "reference_id": "9b41…"
+}
+```
+
+`error.code` is the stable part of the contract — branch on it rather than on
+the status or the message text, which may be reworded. `details` appears only
+when the failure is field-level. `correlation_id` is on every error;
+`reference_id` is added on `5xx` and matches the logged stack.
+
+| Code | Status | Raised when |
+| --- | --- | --- |
+| `INVALID_INPUT` | 400 | Malformed query, JSON, or a rejected value |
+| `UNAUTHENTICATED` | 401 | Missing or failed signature verification |
+| `FORBIDDEN` | 403 | Reserved name, blocked address |
+| `NOT_FOUND` | 404 | No such tag, address, or route |
+| `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
+| `CONFLICT` | 409 | Username or address already registered |
+| `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
+| `VALIDATION_FAILED` | 422 | Body failed its schema |
+| `RATE_LIMITED` | 429 | Rate limit exhausted |
+| `INTERNAL_ERROR` | 500 | Unhandled failure |
+| `UPSTREAM_ERROR` | 502 | Horizon or another upstream failed |
+| `SERVICE_UNAVAILABLE` | 503 | Database or Redis unreachable, request timeout |
+
+To raise one, throw or pass an `ApiError` — the handler is the only place that
+turns an error into a response:
+
+```js
+const { ApiError } = require('./src/errors');
+
+return next(new ApiError('CONFLICT', 'Address already registered'));
+```
+
+A `5xx` from an unexpected throw always reports the generic message so
+internals are never leaked; the real error goes to the log under
+`reference_id`. A message passed deliberately to `ApiError` is sent as written.
+
+`GET /health` is exempt: it reports component status (`{ status, database,
+redis }`) rather than an API error.
+
+## Request validation
+
+Incoming request bodies and query strings are validated by
+[zod](https://zod.dev) schemas before any route handler runs. Schemas live in
+`stellar-payment-platform/src/schemas/index.js`, and
+`src/middleware/validateSchema.js` turns them into route middleware:
+
+```js
+const { validateSchema } = require('./src/middleware/validateSchema');
+const { registerBodySchema, usersQuerySchema } = require('./src/schemas');
+
+app.post('/register', validateSchema({ body: registerBodySchema }), handler);
+app.get('/users', validateSchema({ query: usersQuerySchema }), handler);
+```
+
+The validated part is replaced with the parsed result, so handlers receive
+values that are already trimmed and coerced — `req.query.limit` is a number,
+not a string — and never re-check types themselves.
+
+Failures short-circuit before the handler and respond with the field-level
+errors, using the status that matches where the bad input came from:
+
+| Failure | Status | Body |
+| --- | --- | --- |
+| Invalid `req.body` | `422 Unprocessable Entity` | `{ success: false, errors: [{ field, message }] }` |
+| Invalid `req.query` | `400 Bad Request` | `{ success: false, errors: [{ field, message }] }` |
+
+Two rules are deliberately *not* in the schemas, because the handlers own them
+and answer `400` with their own domain-specific messages: Stellar address
+format (checked with `StrKey`) and memo pairing/format (checked with
+`validateMemo`). `page` and `limit` clamp to their bounds rather than being
+rejected, so `?limit=1000` still returns the maximum page size.
 
 ## Detailed Endpoint Documentation
 
@@ -203,6 +325,52 @@ Resolves a given Stellar address to its registered username.
 A simple health check endpoint.
 - **Returns:** `{ status: 'ok' }`
 - **Status Codes:** `200 OK`.
+
+### `GET /transactions/export`
+Streams the account's payment history as a CSV download.
+- **Query Parameters:** `address` (required) - Stellar public key. `order` (optional) - `desc` (default) or `asc`.
+- **Returns:** `text/csv` with a `Content-Disposition` attachment header. Columns: `id`, `created_at`, `type`, `from`, `to`, `amount`, `asset_type`, `asset_code`, `asset_issuer`, `transaction_hash`.
+- **Status Codes:**
+  - `200 OK`: Stream started. Sent chunked, so there is no `Content-Length`.
+  - `400 Bad Request`: Missing or invalid `address`.
+  - `404 Not Found`: Account not found on Horizon.
+  - `502 Bad Gateway`: Horizon request failed.
+
+Pages of 200 records are fetched from Horizon with its cursor, converted, and
+flushed as they arrive, so neither the full result set nor the full CSV is held
+in memory: heap use plateaus around 18MB whether the export is 5,000 rows or
+100,000. Writes respect socket backpressure, and `EXPORT_MAX_PAGES`
+(default 500) bounds a single export — a truncated export is logged as a
+warning. Because the response is committed once streaming starts, a mid-stream
+failure can only be logged and the connection cut, since the JSON error
+envelope needs unsent headers.
+
+The `/payments` collection mixes operation types that name the same concepts
+differently, so participant and amount columns are normalised per type: a
+`create_account` reports `funder`/`account`/`starting_balance` and an
+`account_merge` reports `account`/`into`.
+
+### `GET /metrics`
+Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
+rate limiter so a scraper on a fixed interval is never throttled.
+- **Returns:** all metrics below, prefixed `stellar_tags_`.
+- **Status Codes:** `200 OK`.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
+| `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
+| `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
+| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code` |
+| `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
+| `db_pool_connections_busy` | gauge | Connections executing a query |
+| `db_pool_connections_idle` | gauge | Connections open but unused |
+| `db_pool_queries_waiting` | gauge | Queries queued waiting for a connection |
+| `redis_connections_active` | gauge | `1` while Redis is ready for commands, else `0` |
+
+Memory and CPU come from `prom-client`'s default collectors. The pool gauges read
+Prisma's `$metrics` (which requires the `metrics` preview feature in
+`schema.prisma`) and report `0` when it is unavailable.
 
 ## Architecture notes
 

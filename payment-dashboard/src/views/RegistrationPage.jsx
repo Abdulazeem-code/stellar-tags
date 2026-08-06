@@ -1,7 +1,5 @@
 import { useEffect, useState } from 'react';
-import freighterApi from '@stellar/freighter-api';
-import LoadingSpinner from '../components/LoadingSpinner';
-import { API_BASE, normalizeNameTag } from './shared';
+import { API_BASE, apiErrorMessage, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -13,6 +11,9 @@ function RegistrationPage({
 }) {
   const [username, setUsername] = useState("");
   const [usernameError, setUsernameError] = useState("");
+  const [memoType, setMemoType] = useState("");
+  const [memo, setMemo] = useState("");
+  const [memoError, setMemoError] = useState("");
   const [status, setStatus] = useState({
     text: "Connect a wallet to begin your registration.",
     tone: "neutral",
@@ -52,30 +53,25 @@ function RegistrationPage({
     checkExisting();
   }, [userPublicKey, onRegistered]);
 
+  // 2. Updated to use the universal walletKit modal instead of Freighter specifically
   const handleConnect = async () => {
     setIsConnecting(true);
     try {
-      const connectionStatus = await freighterApi.isConnected();
-      const isInstalled =
-        connectionStatus.isConnected !== undefined
-          ? connectionStatus.isConnected
-          : connectionStatus;
-
-      if (!isInstalled) {
-        setStatusMessage("Freighter is not installed or locked.", "error");
-        return;
-      }
-
-      const response = await freighterApi.requestAccess();
-      if (response.error) {
-        setStatusMessage("Wallet connection failed.", "error");
-        return;
-      }
-
-      setUserPublicKey(response.address);
-      setStatusMessage("Wallet connected. Pick your username.", "success");
+      await walletKit.openModal({
+        onWalletSelected: async (option) => {
+          walletKit.setWallet(option.id);
+          const addressResponse = await walletKit.getAddress();
+          
+          const publicKey = typeof addressResponse === 'string' 
+            ? addressResponse 
+            : addressResponse.address;
+          
+          setUserPublicKey(publicKey);
+          setStatusMessage(`Wallet connected. Pick your username.`, "success");
+        }
+      });
     } catch {
-      setStatusMessage("Unable to connect to Freighter.", "error");
+      setStatusMessage("Wallet connection cancelled or failed.", "error");
     } finally {
       setIsConnecting(false);
     }
@@ -106,22 +102,62 @@ function RegistrationPage({
       return;
     }
 
+    // Validate memo fields before signing
+    if (memoType && !memo) {
+      setMemoError("Memo value is required when a memo type is selected.");
+      return;
+    }
+    if (!memoType && memo) {
+      setMemoError("Please select a memo type.");
+      return;
+    }
+    if (memoType === "text" && memo.length > 28) {
+      setMemoError("Text memo must not exceed 28 characters.");
+      return;
+    }
+    setMemoError("");
+
     setIsSubmitting(true);
+    // 3. Removed the hardcoded Freighter text
     setStatusMessage(
-      "Approve the signature request in Freighter...",
+      "Approve the signature request in your wallet...", 
       "neutral",
     );
 
     let signature;
+    let signerAddress;
     try {
       const message = `register:${normalizedUsername}:${userPublicKey}`;
-      const result = await freighterApi.signMessage(message, {
-        address: userPublicKey,
-      });
-      if (result.error) throw new Error(result.error);
-      signature = result.signedMessage;
+      
+      // 4. Use walletKit to sign the data dynamically based on the selected wallet
+      // Note: Some wallet kit versions wrap this differently. If signBlob is unavailable, 
+      // check your specific @creit.tech/stellar-wallets-kit version docs for message signing.
+      const result = await walletKit.signBlob 
+        ? await walletKit.signBlob(message) 
+        : await walletKit.signMessage(message, { address: userPublicKey });
+      
+      if (result && result.error) throw new Error(result.error);
+      
+      signature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
+      
+      if (!signature) {
+        throw new Error("Failed to capture signature from wallet.");
+      }
+
+      signerAddress = userPublicKey; 
+      
     } catch (err) {
-      setStatusMessage(err.message || "Signature request cancelled.", "error");
+      // Check if it's the specific LOBSTR unsupported error
+      if (err.message && err.message.includes("signMessage")) {
+        setStatusMessage(
+          "LOBSTR does not support registration signatures. Please click 'Back to dashboard' to skip this step, or connect with Freighter.", 
+          "error"
+        );
+      } else {
+        // Handle all other normal errors
+        setStatusMessage(err.message || "Signature request cancelled.", "error");
+      }
+      setIsSubmitting(false);
       return;
     }
 
@@ -137,18 +173,27 @@ function RegistrationPage({
           username: normalizedUsername,
           address: userPublicKey,
           signature,
+          signerAddress,
+          ...(memoType && memo && { memo_type: memoType, memo }),
         }),
       })
         .then(async (response) => {
           const data = await response.json().catch(() => null);
           if (!response.ok) {
-            throw new Error((data && data.detail) || "Registration failed.");
+            throw new Error(
+              apiErrorMessage(data, "Registration failed."),
+            );
           }
-
           return data;
         })
         .then(() => {
           setStatusMessage("Username reserved and saved.", "success");
+          
+          setTimeout(() => {
+            if (typeof onRegistered === 'function') {
+              onRegistered();
+            }
+          }, 1500);
         })
         .catch((error) => {
           setStatusMessage(error.message || "Registration failed.", "error");
@@ -201,8 +246,9 @@ function RegistrationPage({
             <p>Secure a username that resolves to your wallet instantly.</p>
           </div>
           <div>
+            {/* 5. Removed hardcoded Freighter marketing copy */}
             <h3>Seamless onboarding</h3>
-            <p>Freighter brings you in with a single approval.</p>
+            <p>Connect your preferred wallet with a single approval.</p>
           </div>
           <div>
             <h3>Verified presence</h3>
@@ -251,6 +297,59 @@ function RegistrationPage({
               {username.length} / 30
             </span>
           </div>
+
+          <label className="form-field">
+            Memo type <span className="optional-label">(optional)</span>
+            <select
+              value={memoType}
+              onChange={(event) => {
+                setMemoType(event.target.value);
+                setMemo("");
+                setMemoError("");
+              }}
+            >
+              <option value="">None</option>
+              <option value="text">Text</option>
+              <option value="id">ID</option>
+              <option value="hash">Hash</option>
+            </select>
+          </label>
+
+          {memoType && (
+            <label className="form-field">
+              Memo value
+              <input
+                type="text"
+                placeholder={
+                  memoType === "text"
+                    ? "Up to 28 characters"
+                    : memoType === "id"
+                    ? "64-bit unsigned integer"
+                    : "64-character hex string"
+                }
+                value={memo}
+                maxLength={memoType === "text" ? 28 : undefined}
+                onChange={(event) => {
+                  setMemo(event.target.value);
+                  setMemoError("");
+                }}
+                aria-describedby={memoError ? "memo-error" : undefined}
+                aria-invalid={!!memoError}
+              />
+              {memoType === "text" && (
+                <span
+                  className={`char-counter${memo.length >= 28 ? " char-counter--limit" : ""}`}
+                >
+                  {memo.length} / 28
+                </span>
+              )}
+              {memoError && (
+                <span id="memo-error" className="field-error" role="alert">
+                  {memoError}
+                </span>
+              )}
+            </label>
+          )}
           <button
             className="primary-button"
             type="submit"
@@ -267,8 +366,8 @@ function RegistrationPage({
             Back to dashboard
           </button>
           <p>Wallet required to finalize registration.</p>
+          {/* 6. Removed hardcoded Freighter badge */}
           <div className="badge-row">
-            <span>Freighter</span>
             <span>Stellar Testnet</span>
             <span>Secure</span>
           </div>

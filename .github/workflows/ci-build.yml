@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           cd payment-dashboard
-          npm ci
+          npm install --legacy-peer-deps
 
       - name: Build
         run: |

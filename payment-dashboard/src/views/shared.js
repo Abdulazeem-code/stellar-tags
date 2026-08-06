@@ -1,9 +1,18 @@
+import { 
+  StellarWalletsKit, 
+  WalletNetwork,
+  FreighterModule, 
+  xBullModule,
+  AlbedoModule,
+  LobstrModule
+} from '@creit.tech/stellar-wallets-kit';
 import { useEffect, useRef, useState } from 'react';
 
 export const CONTRACT_ID = 'CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER';
 export const TREASURY_ADDRESS = 'GAAFWEZKDYPXLTQGKQ3F23TXWYQUDAYTDW7P7VUQSVJFW2GWC4Y6LWST';
 export const TOKEN_ADDRESS = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
-export const API_BASE = 'https://stellar-tags-production.up.railway.app';
+export const API_BASE =
+  import.meta.env.VITE_API_BASE || 'https://stellar-tags.onrender.com';
 export const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 export const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 export const ANALYTICS_WINDOW_MS = 60 * 60 * 1000;
@@ -44,6 +53,38 @@ export const resolveRecipient = async (inputValue) => {
 
   const normalizedTag = normalizeNameTag(trimmed);
   return { tag: normalizedTag };
+};
+
+/**
+ * Pulls a displayable message out of an API error body.
+ *
+ * The API answers `{ success: false, error: { code, message, details } }`. The
+ * flat `error`/`detail`/`message` fallbacks cover responses that do not come
+ * from the platform's error handler, such as a proxy or CDN error page.
+ */
+export const apiErrorMessage = (data, fallback) => {
+  if (data && typeof data === 'object') {
+    const { error } = data;
+    if (error && typeof error === 'object' && error.message) {
+      return error.message;
+    }
+    if (typeof error === 'string' && error) {
+      return error;
+    }
+    if (typeof data.detail === 'string' && data.detail) {
+      return data.detail;
+    }
+    if (typeof data.message === 'string' && data.message) {
+      return data.message;
+    }
+  }
+  return fallback;
+};
+
+/** Field-level validation issues, when the error carries them. */
+export const apiErrorDetails = (data) => {
+  const details = data && data.error && data.error.details;
+  return Array.isArray(details) ? details : [];
 };
 
 export const formatUsername = (value) => {
@@ -117,3 +158,15 @@ export const useWalletMenu = () => {
 
   return { menuRef, isOpen, setIsOpen };
 };
+
+// Initialize the multi-wallet kit with strictly V1 syntax
+export const walletKit = new StellarWalletsKit({
+  network: WalletNetwork.TESTNET, 
+  selectedWalletId: 'freighter',
+  modules: [
+    new FreighterModule(),
+    new xBullModule(),
+    new AlbedoModule(),
+    new LobstrModule()
+  ],
+});

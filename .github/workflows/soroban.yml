@@ -1,0 +1,34 @@
+name: Soroban Contract CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  contract-checks:
+    name: Contract Build & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Run contract tests
+        run: cargo test --verbose
+
+      - name: Build contract to WASM
+        run: cargo build --target wasm32-unknown-unknown --release
