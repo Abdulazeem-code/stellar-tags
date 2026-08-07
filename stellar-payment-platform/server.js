@@ -18,6 +18,7 @@ const compression = require('compression');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
+const pinoHttp = require('pino-http');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const {
@@ -66,12 +67,13 @@ const app = express();
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
 app.use(helmet());
 
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
   if (req.timedout) {
-    logger.error(`[Correlation ID: ${req.correlationId}] Request Timeout`, err);
+    logger.error(err, `[Correlation ID: ${req.correlationId}] Request Timeout`);
     return next(new ApiError('SERVICE_UNAVAILABLE', undefined, { cause: err }));
   }
   next(err);
@@ -120,18 +122,18 @@ const redisClient = process.env.REDIS_URL ? createClient({
   socket: {
     reconnectStrategy(retries, cause) {
       if (retries >= REDIS_RETRY_MAX) {
-        logger.error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`, { cause });
+        logger.error({ cause }, `Redis connection failed after ${REDIS_RETRY_MAX} retries`);
         return new Error(`Redis connection failed after ${REDIS_RETRY_MAX} retries`);
       }
       const delay = Math.min(2 ** retries * REDIS_RETRY_BASE_DELAY_MS, 10000);
-      logger.warn(`Redis connection attempt ${retries + 1} failed, retrying in ${delay}ms...`, { cause });
+      logger.warn({ cause }, `Redis connection attempt ${retries + 1} failed, retrying in ${delay}ms...`);
       return delay;
     }
   }
 }) : null;
 if (redisClient) {
-  redisClient.on('error', (err) => logger.error('Redis client error:', err));
-  redisClient.connect().catch((err) => logger.error('Redis connection error:', err));
+  redisClient.on('error', (err) => logger.error(err, 'Redis client error:'));
+  redisClient.connect().catch((err) => logger.error(err, 'Redis connection error:'));
 }
 
 setMetricsSources({ prisma, redisClient });
@@ -332,7 +334,7 @@ app.get('/metrics', async (req, res) => {
     const metrics = await getMetrics();
     res.end(metrics);
   } catch (err) {
-    logger.error(`[Correlation ID: ${req.correlationId}] Metrics error`, err);
+    logger.error(err, `[Correlation ID: ${req.correlationId}] Metrics error`);
     res.status(500).end(err.message);
   }
 });
@@ -671,7 +673,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
     }
 
     // Handle other errors
-    logger.error('Registration error:', error.message);
+    logger.error({ err: error.message }, 'Registration error:');
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
@@ -709,7 +711,7 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
 
       return res.json(result);
     } catch (err) {
-      logger.error("🚨 ACTUAL PRISMA ERROR:", err);
+      logger.error(err, "🚨 ACTUAL PRISMA ERROR:");
 
       const dbError = new Error('Database lookup failed', { cause: err });
       dbError.statusCode = 500;
@@ -873,7 +875,7 @@ app.get('/health', async (req, res) => {
     await prisma.$queryRaw`SELECT 1`;
     res.json({ status: 'ok', database: 'connected' });
   } catch (err) {
-    logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
+    logger.error(err, `[Correlation ID: ${req.correlationId}] Database unavailable`);
     res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
 
   }
@@ -912,7 +914,7 @@ const gracefulShutdown = (server, prismaClient, signal) => {
     try {
       await prismaClient.$disconnect();
     } catch (err) {
-      logger.error('Error disconnecting Prisma during shutdown:', err);
+      logger.error(err, 'Error disconnecting Prisma during shutdown:');
     }
     process.exit(0);
   });
@@ -926,7 +928,7 @@ if (require.main === module) {
 
   server.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
-      logger.error(`Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+      logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
       process.exit(1);
     }
   });
