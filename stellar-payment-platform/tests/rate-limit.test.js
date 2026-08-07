@@ -156,13 +156,14 @@ describe('Rate Limiting — express-rate-limit', () => {
       expect(res.headers['ratelimit-limit']).toBe('100');
     });
 
-    it('does NOT include deprecated X-RateLimit-* headers', async () => {
+    it('includes X-RateLimit-* legacy headers', async () => {
       const res = await request(app)
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.headers).not.toHaveProperty('x-ratelimit-limit');
-      expect(res.headers).not.toHaveProperty('x-ratelimit-remaining');
+      expect(res.headers).toHaveProperty('x-ratelimit-limit');
+      expect(res.headers).toHaveProperty('x-ratelimit-remaining');
+      expect(res.headers).toHaveProperty('x-ratelimit-reset');
     });
   });
 
