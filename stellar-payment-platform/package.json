@@ -47,7 +47,12 @@
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0",
     "xss": "^1.0.15",
-    "zod": "^4.4.3"
+<<<<<<< HEAD
+    "zod": "^4.4.3",
+=======
+>>>>>>> 4095f79 (feat(websockets): add Socket.IO server and horizon listener forwarding (fix #430))
+    "socket.io": "^4.8.0",
+    "socket.io-client": "^4.8.0"
   },
   "devDependencies": {
     "jest": "^29.7.0",

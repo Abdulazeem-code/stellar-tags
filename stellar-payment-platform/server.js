@@ -920,7 +920,21 @@ const gracefulShutdown = (server, prismaClient, signal) => {
 
 
 if (require.main === module) {
-  const server = app.listen(PORT, '0.0.0.0', () => {
+  const http = require('http');
+  const { initSocketServer } = require('./src/socketManager');
+
+  const server = http.createServer(app);
+
+  // Initialize Socket.IO on the HTTP server so the same port serves both
+  // the API and WebSocket connections.
+  try {
+    initSocketServer(server);
+    logger.info('Socket.IO initialized');
+  } catch (err) {
+    logger.error('Failed to initialize Socket.IO', err);
+  }
+
+  server.listen(PORT, '0.0.0.0', () => {
     logger.info(`Server successfully initialized on port ${PORT}`);
   });
 
