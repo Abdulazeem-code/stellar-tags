@@ -147,7 +147,7 @@ const poolAll = (sql, params) =>
     } catch (_) { /* index already exists, safe to ignore */ }
     logger.info(`Database pool initialised — max ${dbConfig.connectionLimit} connections, ${dbConfig.poolTimeout}s timeout`);
   } catch (err) {
-    logger.error('Failed to initialise database schema:', err);
+    logger.error(err, 'Failed to initialise database schema:');
     process.exit(1);
   }
 })();

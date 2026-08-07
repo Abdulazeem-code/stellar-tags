@@ -18,7 +18,7 @@ jest.mock('../middleware/idempotency', () => ({ idempotencyMiddleware: () => (re
 jest.mock('sqlite3', () => ({}));
 jest.mock('../src/multisigner-verifier', () => ({}));
 jest.mock('../src/db', () => ({}));
-jest.mock('../src/logger', () => ({ logger: { info: jest.fn(), error: jest.fn(), warn: jest.fn() } }));
+jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }) }));
 jest.mock('../src/metrics', () => ({ metricsMiddleware: (req, res, next) => next(), getMetrics: jest.fn(), getContentType: jest.fn(), setMetricsSources: jest.fn() }));
 jest.mock('@sentry/node', () => ({ init: jest.fn(), setupExpressErrorHandler: jest.fn() }));
 jest.mock('../src/cache', () => ({}));
