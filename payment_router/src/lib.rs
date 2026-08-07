@@ -31,6 +31,7 @@ pub enum DataKey {
     MaxAmount,
     UserVolume(Address),
     UserSpending(Address),
+    Blacklist(Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -53,6 +54,8 @@ pub enum Error {
     InvalidFeeRate = 7,
     /// Sender and recipient addresses are the same (self-routing not allowed).
     InvalidRecipient = 8,
+    /// Recipient address is blacklisted.
+    Blacklisted = 9,
 }
 
 #[contract]
@@ -133,6 +136,11 @@ impl PaymentRouter {
         // Prevent self-routing
         if sender == recipient {
             return Err(Error::InvalidRecipient);
+        }
+
+        // Check if recipient is blacklisted
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
         }
 
         // Validate amount bounds
@@ -357,6 +365,36 @@ impl PaymentRouter {
             .persistent()
             .get(&DataKey::UserVolume(user))
             .unwrap_or(0)
+    }
+
+    /// Adds an address to the blacklist. Admin-only.
+    pub fn blacklist_address(env: Env, address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().persistent().set(&DataKey::Blacklist(address.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Blacklist(address),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Removes an address from the blacklist. Admin-only.
+    pub fn unblacklist_address(env: Env, address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().persistent().remove(&DataKey::Blacklist(address));
+
+        Ok(())
+    }
+
+    /// Returns whether an address is blacklisted.
+    pub fn is_blacklisted(env: Env, address: Address) -> bool {
+        env.storage().persistent().get(&DataKey::Blacklist(address)).unwrap_or(false)
     }
 
     /// Returns the effective fee_bps for a sender after applying any
@@ -1012,6 +1050,35 @@ mod test {
         });
         assert_eq!(stored_admin.clone(), Some(admin.clone()));
         assert_eq!(stored_admin.unwrap(), admin);
+    }
+
+    #[test]
+    fn test_blacklist_recipient() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Blacklist the recipient
+        client.blacklist_address(&recipient);
+        assert!(client.is_blacklisted(&recipient));
+
+        // Route payment should fail
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::Blacklisted);
+
+        // Unblacklist and try again
+        client.unblacklist_address(&recipient);
+        assert!(!client.is_blacklisted(&recipient));
+
+        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &1000);
     }
 
     #[test]
