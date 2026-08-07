@@ -1,3 +1,4 @@
+require('./config/envCheck');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -106,7 +107,7 @@ const corsOptions = {
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-  optionsSuccessStatus: 204,
+  optionsSuccessStatus: 204
 };
 
 app.use(cors(corsOptions));
@@ -193,6 +194,8 @@ const limiter = rateLimit({
 });
 
 app.use(cors(corsOptions));
+app.use(express.json());
+
 app.use(limiter);
 app.use(express.json({ limit: '10kb' }));
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
