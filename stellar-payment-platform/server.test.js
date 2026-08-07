@@ -739,6 +739,168 @@ describe('POST /register — memo validation', () => {
   });
 });
 
+describe('POST /register — memo XSS sanitization', () => {
+  let request;
+  let app;
+  let prisma;
+
+  const VALID_ADDRESS = 'GBCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+  beforeEach(() => {
+    jest.resetModules();
+    ({ app } = require('./server'));
+    ({ prisma } = require('./prismaClient'));
+    request = require('supertest');
+
+    prisma.user.findUnique.mockReset();
+    prisma.user.create.mockReset();
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.create.mockResolvedValue({
+      username: 'xssuser*localhost',
+      address: VALID_ADDRESS,
+      memoType: 'text',
+      memo: '',
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('strips ALL HTML tags <script> tags from text memo before saving', async () => {
+    // Inner text is preserved so the sanitized memo still has content.
+    const dangerous = '<b>safe text</b><script>alert(1)</script>';
+    const expected = 'safe text';
+    prisma.user.create.mockResolvedValue({
+      username: 'xssuser*localhost',
+      address: VALID_ADDRESS,
+      memoType: 'text',
+      memo: expected,
+    });
+
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'xssuser', address: VALID_ADDRESS, memo_type: 'text', memo: dangerous });
+
+    expect(res.status).toBe(201);
+    expect(res.body.memo).not.toMatch(/<script/i);
+    expect(res.body.memo).not.toMatch(/<\/script>/i);
+    expect(res.body.memo).not.toMatch(/[<>]/);
+
+    // Verify the value passed to Prisma is sanitized — no angle brackets.
+    const createCall = prisma.user.create.mock.calls[0][0];
+    expect(createCall.data.memo).toBe(expected);
+    expect(createCall.data.memo).not.toMatch(/[<>]/);
+  });
+
+  test('strips arbitrary HTML tags but preserves inner text', async () => {
+    const dangerous = '<b>hello <i>world</i></b>';
+    const expected = 'hello world';
+    prisma.user.create.mockResolvedValue({
+      username: 'xssuser*localhost',
+      address: VALID_ADDRESS,
+      memoType: 'text',
+      memo: expected,
+    });
+
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'xssuser', address: VALID_ADDRESS, memo_type: 'text', memo: dangerous });
+
+    expect(res.status).toBe(201);
+    expect(res.body.memo).toBe(expected);
+
+    const createCall = prisma.user.create.mock.calls[0][0];
+    expect(createCall.data.memo).toBe(expected);
+    expect(createCall.data.memo).not.toMatch(/[<>]/);
+  });
+
+  test('strips javascript: URLs from anchor tags (event-handler vector)', async () => {
+    const dangerous = '<a href="javascript:alert(1)">click me</a>';
+    const expected = 'click me';
+    prisma.user.create.mockResolvedValue({
+      username: 'xssuser*localhost',
+      address: VALID_ADDRESS,
+      memoType: 'text',
+      memo: expected,
+    });
+
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'xssuser', address: VALID_ADDRESS, memo_type: 'text', memo: dangerous });
+
+    expect(res.status).toBe(201);
+    // Sanitized memo MUST NOT contain the dangerous javascript: scheme.
+    expect(res.body.memo).not.toMatch(/javascript:/i);
+    expect(res.body.memo).not.toMatch(/[<>]/);
+    expect(res.body.memo).toBe(expected);
+  });
+
+  test('leaves plain text memo unchanged', async () => {
+    const plain = 'payment 12345';
+    prisma.user.create.mockResolvedValue({
+      username: 'xssuser*localhost',
+      address: VALID_ADDRESS,
+      memoType: 'text',
+      memo: plain,
+    });
+
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'xssuser', address: VALID_ADDRESS, memo_type: 'text', memo: plain });
+
+    expect(res.status).toBe(201);
+    expect(res.body.memo).toBe(plain);
+  });
+
+  test('rejects memo that sanitized to empty string', async () => {
+    // <script>alert(1)</script> -> '' (only HTML, no inner text)
+    const dangerous = '<script>alert(1)</script>';
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'xssuser', address: VALID_ADDRESS, memo_type: 'text', memo: dangerous });
+
+    // The memo becomes "" after sanitization, and validateMemo rejects a
+    // memoType with an empty memo (never reaches the DB).
+    expect(res.status).toBe(400);
+    expect(prisma.user.create).not.toHaveBeenCalled();
+  });
+
+  test('leaves numeric id memo unchanged (id is strict digits)', async () => {
+    const numeric = '12345678';
+    prisma.user.create.mockResolvedValue({
+      username: 'xssuser*localhost',
+      address: VALID_ADDRESS,
+      memoType: 'id',
+      memo: numeric,
+    });
+
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'xssuser', address: VALID_ADDRESS, memo_type: 'id', memo: numeric });
+
+    expect(res.status).toBe(201);
+    expect(res.body.memo).toBe(numeric);
+  });
+
+  test('leaves hex hash memo unchanged (hash is strict hex)', async () => {
+    const hex = 'a'.repeat(64);
+    prisma.user.create.mockResolvedValue({
+      username: 'xssuser*localhost',
+      address: VALID_ADDRESS,
+      memoType: 'hash',
+      memo: hex,
+    });
+
+    const res = await request(app)
+      .post('/register')
+      .send({ username: 'xssuser', address: VALID_ADDRESS, memo_type: 'hash', memo: hex });
+
+    expect(res.status).toBe(201);
+    expect(res.body.memo).toBe(hex);
+  });
+});
+
 describe('GET /federation — memo fields in response', () => {
   let request;
   let app;
