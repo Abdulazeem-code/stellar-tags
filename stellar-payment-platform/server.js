@@ -147,7 +147,7 @@ const limiter = rateLimit({
   }) : undefined,
   // Return the standard RateLimit-* headers only
   standardHeaders: true,
-  legacyHeaders: false,
+  legacyHeaders: true,
   message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
   // Prometheus scrapes /metrics on a fixed interval from a single address, so
   // counting those scrapes against the shared quota would 429 the scraper.
