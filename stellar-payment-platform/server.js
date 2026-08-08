@@ -477,11 +477,17 @@ const verifyFreighterRegistrationSignature = ({
   const payload = Buffer.concat([prefix, messageBytes]);
   const messageHash = crypto.createHash('sha256').update(payload).digest();
 
-  // Verify against the hashed payload, not the raw string!
+  // Verify against the hashed payload (SEP-0053) first
   if (!keypair.verify(messageHash, signatureBuffer)) {
-    const error = new Error('Signature verification failed.');
-    error.statusCode = 401;
-    throw error;
+    // If that fails, try verifying the raw message directly in case the wallet used signBlob
+    if (!keypair.verify(messageBytes, signatureBuffer)) {
+      // Also try verifying the payload without hashing it
+      if (!keypair.verify(payload, signatureBuffer)) {
+        const error = new Error('Signature verification failed.');
+        error.statusCode = 401;
+        throw error;
+      }
+    }
   }
 
   if (claimedSigner !== address) {
