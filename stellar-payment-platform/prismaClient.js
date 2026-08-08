@@ -13,6 +13,9 @@ logger.info('--- PRISMA CLIENT INITIALIZED ---');
 
 let prisma;
 try {
+  if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is not set');
+  }
   const { PrismaClient } = require('@prisma/client');
   prisma = new PrismaClient();
 } catch (err) {
