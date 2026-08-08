@@ -465,7 +465,19 @@ const verifyFreighterRegistrationSignature = ({
   if (Buffer.isBuffer(signature)) {
     signatureBuffer = signature;
   } else if (typeof signature === 'string') {
-    signatureBuffer = Buffer.from(signature, 'base64');
+    // If it's a 128-char hex string
+    if (signature.length === 128 && /^[0-9a-fA-F]+$/.test(signature)) {
+      signatureBuffer = Buffer.from(signature, 'hex');
+    } else {
+      signatureBuffer = Buffer.from(signature, 'base64');
+      // If the resulting buffer is 86-88 bytes long, it might be the ASCII bytes of a base64 string (double encoded)
+      if (signatureBuffer.length >= 80 && signatureBuffer.length <= 90) {
+        const text = signatureBuffer.toString('utf8');
+        if (/^[a-zA-Z0-9+/]+={0,2}$/.test(text)) {
+          signatureBuffer = Buffer.from(text, 'base64');
+        }
+      }
+    }
   } else {
     throw new Error('Invalid message signature format.');
   }
