@@ -1,6 +1,6 @@
 'use strict';
 
-const REQUIRED_ENV_VARS = ['PORT', 'DB_PATH'];
+const REQUIRED_ENV_VARS = ['PORT'];
 
 for (const key of REQUIRED_ENV_VARS) {
   if (!process.env[key]) {
