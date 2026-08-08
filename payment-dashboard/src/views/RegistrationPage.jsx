@@ -155,7 +155,13 @@ function RegistrationPage({
         for (let i = 0; i < uint8.length; i++) {
           binary += String.fromCharCode(uint8[i]);
         }
-        signature = btoa(binary);
+        // If the walletKit accidentally returned the ASCII bytes of the base64 string,
+        // 'binary' will just be the base64 string itself. We shouldn't double-encode it.
+        if (binary.length >= 80 && binary.length <= 90 && /^[a-zA-Z0-9+/]+={0,2}$/.test(binary)) {
+          signature = binary;
+        } else {
+          signature = btoa(binary);
+        }
       } else {
         signature = rawSignature;
       }
