@@ -55,7 +55,7 @@ const [activeView, setActiveView] = useState('dashboard')
               : addressResponse.address;
             
             // Now that publicKey is officially created, we can fetch the user
-            const dbResponse = await fetch(`${API_BASE}/api/user/${publicKey}`);
+            const dbResponse = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(publicKey)}`);
             
             if (dbResponse.ok) {
               setRegistrationState("existing");
