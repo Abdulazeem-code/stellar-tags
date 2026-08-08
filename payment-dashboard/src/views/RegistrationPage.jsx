@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { API_BASE, apiErrorMessage, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
+import { API_BASE, apiErrorMessage, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -82,7 +82,6 @@ function RegistrationPage({
     
     event.preventDefault();
     const cleaned = username.trim();
-    const normalizedUsername = normalizeNameTag(cleaned);
 
     if (!userPublicKey) {
       setStatusMessage("Connect a wallet before registering.", "error");
@@ -127,7 +126,7 @@ function RegistrationPage({
     let signature;
     let signerAddress;
     try {
-      const message = `register:${normalizedUsername}:${userPublicKey}`;
+      const message = `register:${cleaned.toLowerCase()}:${userPublicKey}`;
       
       // 4. Use walletKit to sign the data dynamically based on the selected wallet
       // Note: Some wallet kit versions wrap this differently. If signBlob is unavailable, 
