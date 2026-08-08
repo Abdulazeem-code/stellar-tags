@@ -138,7 +138,15 @@ function RegistrationPage({
       
       if (result && result.error) throw new Error(result.error);
       
-      signature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
+      let rawSignature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
+      
+      // walletKit might return a Uint8Array or Buffer. Convert to base64 string.
+      if (typeof rawSignature === 'object' && rawSignature !== null) {
+        const uint8 = new Uint8Array(Object.values(rawSignature));
+        signature = btoa(String.fromCharCode.apply(null, uint8));
+      } else {
+        signature = rawSignature;
+      }
       
       if (!signature) {
         throw new Error("Failed to capture signature from wallet.");

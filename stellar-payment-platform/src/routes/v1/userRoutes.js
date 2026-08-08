@@ -132,11 +132,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     return next(new ApiError('INVALID_INPUT', memoError));
   }
 
-  if (signature && !StrKey.isValidEd25519PublicKey(signature)) {
-    const error = new Error('Invalid Stellar Public Key format.');
-    error.statusCode = 400;
-    return next(error);
-  }
+
 
   const normalizedUsername = username.toLowerCase();
 
