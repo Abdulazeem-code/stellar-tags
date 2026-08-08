@@ -61,6 +61,7 @@ const [activeView, setActiveView] = useState('dashboard')
               setRegistrationState("existing");
             } else if (dbResponse.status === 404) {
               setRegistrationState("new");
+              handleNavigate("register");
             }
 
             // Save the address to state so the UI updates
