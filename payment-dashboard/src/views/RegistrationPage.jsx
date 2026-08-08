@@ -178,7 +178,7 @@ function RegistrationPage({
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          username: normalizedUsername,
+          username: cleaned.toLowerCase(),
           address: userPublicKey,
           signature,
           signerAddress,
