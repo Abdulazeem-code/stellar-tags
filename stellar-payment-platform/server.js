@@ -495,7 +495,7 @@ const verifyFreighterRegistrationSignature = ({
     if (!keypair.verify(messageBytes, signatureBuffer)) {
       // Also try verifying the payload without hashing it
       if (!keypair.verify(payload, signatureBuffer)) {
-        const error = new Error(`Signature verification failed. msg=${message}, len=${signatureBuffer.length}, hex=${signatureBuffer.toString('hex').substring(0,10)}`);
+        const error = new Error('Signature verification failed.');
         error.statusCode = 401;
         throw error;
       }
