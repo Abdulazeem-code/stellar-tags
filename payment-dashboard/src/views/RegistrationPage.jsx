@@ -139,10 +139,23 @@ function RegistrationPage({
       
       let rawSignature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
       
-      // walletKit might return a Uint8Array or Buffer. Convert to base64 string.
+      // walletKit might return a Uint8Array or Buffer object. Convert to base64 string.
       if (typeof rawSignature === 'object' && rawSignature !== null) {
-        const uint8 = new Uint8Array(Object.values(rawSignature));
-        signature = btoa(String.fromCharCode.apply(null, uint8));
+        let uint8;
+        if (rawSignature.type === 'Buffer' && Array.isArray(rawSignature.data)) {
+          uint8 = new Uint8Array(rawSignature.data);
+        } else if (rawSignature instanceof Uint8Array) {
+          uint8 = rawSignature;
+        } else if (rawSignature.buffer instanceof ArrayBuffer) {
+          uint8 = new Uint8Array(rawSignature.buffer);
+        } else {
+          uint8 = new Uint8Array(Object.values(rawSignature));
+        }
+        let binary = '';
+        for (let i = 0; i < uint8.length; i++) {
+          binary += String.fromCharCode(uint8[i]);
+        }
+        signature = btoa(binary);
       } else {
         signature = rawSignature;
       }
