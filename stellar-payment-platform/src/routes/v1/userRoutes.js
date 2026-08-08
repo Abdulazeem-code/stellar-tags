@@ -110,7 +110,7 @@ const registerLocalUser = async ({ username, address }) => {
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
-  const { address, memo_type: memoType, memo, signature = '' } = req.body;
+  const { address, memo_type: memoType, memo, signature = '', signerAddress = '' } = req.body;
 
   if (address.toUpperCase().startsWith('S')) {
     return next(
@@ -152,8 +152,9 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     }
 
     let verificationResult = null;
-    if (signature) {
-      verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+    const signerToVerify = signerAddress || address;
+    if (signerToVerify) {
+      verificationResult = await verifyMultiSignerThreshold(address, [signerToVerify], {
         operationType: 'management',
       });
 
