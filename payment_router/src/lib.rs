@@ -24,6 +24,7 @@ pub struct Payment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    Governance,
     PlatformTreasury,
     FeeBps,
     FeeCap,
@@ -87,6 +88,17 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
+    }
+
+    fn require_fee_authority(env: &Env) -> Result<(), Error> {
+        if let Some(gov) = env.storage().instance().get::<_, Address>(&DataKey::Governance) {
+            gov.require_auth();
+            Ok(())
+        } else {
+            let admin = Self::require_admin(env)?;
+            admin.require_auth();
+            Ok(())
+        }
     }
 
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
@@ -290,10 +302,20 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Updates the fee basis points and fee cap. Admin-only.
-    pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+    pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
+        env.storage().instance().set(&DataKey::Governance, &gov);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Updates the fee basis points and fee cap. Admin-only.
+    pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+        Self::require_fee_authority(&env)?;
 
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
@@ -311,8 +333,7 @@ impl PaymentRouter {
 
     /// Updates the fee basis points. Admin-only.
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_fee_authority(&env)?;
 
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         env.storage().instance().extend_ttl(
@@ -1107,5 +1128,24 @@ mod test {
         assert_eq!(eurc_like_client.balance(&sender), 4_000);
         assert_eq!(eurc_like_client.balance(&recipient), 990);
         assert_eq!(client.get_user_volume(&sender), 3_000);
+    }
+
+    #[test]
+    fn test_governance_takes_over_fees() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let gov = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.set_fee_bps(&150);
+        assert_eq!(client.get_fee(), 150);
+
+        client.set_governance(&gov);
+
+        client.set_fee_bps(&200);
+        assert_eq!(client.get_fee(), 200);
     }
 }
