@@ -140,6 +140,16 @@ cd payment_router
 cargo build
 ```
 
+## Webhook signature verification
+
+Every webhook delivery includes an HMAC-SHA256 signature in the
+`X-Webhook-Signature` header (and the backward-compatible alias
+`X-Stellar-Tags-Signature`). Merchants must verify this signature before
+trusting the payload.
+
+See [docs/webhook-signature-verification.md](docs/webhook-signature-verification.md)
+for step-by-step verification examples in Node.js, Python, and Go.
+
 ## Tests
 
 ```bash
