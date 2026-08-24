@@ -54,6 +54,7 @@ const {
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require('./src/utils');
+const { createGraphQLMiddleware } = require('./src/graphql');
 
 dotenv.config();
 
@@ -912,6 +913,28 @@ if (process.env.SENTRY_DSN) {
 app.use(notFoundHandler);
 app.use(buildErrorHandler(isPrismaConnectionError));
 
+// ---------------------------------------------------------------------------
+// GraphQL endpoint bootstrap
+// ---------------------------------------------------------------------------
+// Apollo Server 4 is async to start.  We mount the middleware after start()
+// resolves so the /graphql route is available before the HTTP server accepts
+// connections.  The function is exported so tests can call it too.
+// ---------------------------------------------------------------------------
+
+/**
+ * Start Apollo Server and attach the /graphql route to `app`.
+ * Must be awaited before `app.listen`.
+ *
+ * @param {import('http').Server} [httpServer] - The HTTP server (enables drain plugin).
+ */
+async function setupGraphQL(httpServer) {
+  const graphqlMiddleware = await createGraphQLMiddleware({ httpServer, corsOptions });
+  // express.json() is already applied globally, but Apollo needs it on the
+  // route as well when CORS pre-flight is handled separately.
+  app.use('/graphql', express.json(), graphqlMiddleware);
+  logger.info('[graphql] /graphql endpoint mounted');
+}
+
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
@@ -943,19 +966,30 @@ const gracefulShutdown = (server, prismaClient, signal) => {
 
 
 if (require.main === module) {
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    logger.info(`Server successfully initialized on port ${PORT}`);
-  });
+  (async () => {
+    const http = require('http');
+    const httpServer = http.createServer(app);
 
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
-      process.exit(1);
-    }
-  });
+    // Boot Apollo Server and mount /graphql before accepting connections.
+    await setupGraphQL(httpServer);
 
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
+    httpServer.listen(PORT, '0.0.0.0', () => {
+      logger.info(`Server successfully initialized on port ${PORT}`);
+    });
+
+    httpServer.on('error', (e) => {
+      if (e.code === 'EADDRINUSE') {
+        logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+        process.exit(1);
+      }
+    });
+
+    process.on('SIGTERM', (sig) => gracefulShutdown(httpServer, prisma, sig));
+    process.on('SIGINT', (sig) => gracefulShutdown(httpServer, prisma, sig));
+  })().catch((err) => {
+    logger.error(err, 'Fatal error during server startup');
+    process.exit(1);
+  });
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo, setupGraphQL };
