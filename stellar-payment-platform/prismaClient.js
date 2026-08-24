@@ -33,6 +33,18 @@ try {
       create: async () => ({}),
       count: async () => 0,
     },
+    admin: {
+      update: async () => {
+        const e = new Error('P2025: mock - record not found');
+        e.code = 'P2025';
+        throw e;
+      },
+      findUnique: async () => null,
+      findFirst: async () => null,
+      findMany: async () => [],
+      create: async () => ({}),
+      count: async () => 0,
+    },
     $transaction: async (queries) => Promise.all(queries),
     $queryRaw: async () => [],
   };
