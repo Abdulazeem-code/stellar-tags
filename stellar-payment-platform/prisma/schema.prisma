@@ -11,7 +11,7 @@ datasource db {
 
 generator client {
   provider        = "prisma-client-js"
-  previewFeatures = ["metrics"]
+  previewFeatures = ["metrics", "tracing"]
 }
 
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
