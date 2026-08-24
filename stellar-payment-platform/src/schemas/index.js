@@ -135,6 +135,38 @@ const adminBlockBodySchema = z
   })
   .loose();
 
+/**
+ * GET /admin/export query.
+ *
+ * - `format`    csv (default) | json
+ * - `startDate` optional ISO date string (YYYY-MM-DD), inclusive lower bound
+ * - `endDate`   optional ISO date string (YYYY-MM-DD), inclusive upper bound
+ */
+const adminExportQuerySchema = z
+  .object({
+    format: z.enum(['csv', 'json']).catch('csv'),
+    startDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD')
+      .optional(),
+    endDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD')
+      .optional(),
+  })
+  .loose()
+  .refine(
+    (value) => {
+      if (value.startDate && value.endDate) {
+        return new Date(value.startDate) <= new Date(value.endDate);
+      }
+      return true;
+    },
+    { error: 'startDate must be on or before endDate', path: ['startDate'] },
+  );
+
 module.exports = {
   registerBodySchema,
   federationQuerySchema,
@@ -145,4 +177,5 @@ module.exports = {
   verifyEmailConfirmBodySchema,
   adminBlockBodySchema,
   exportQuerySchema,
+  adminExportQuerySchema,
 };
