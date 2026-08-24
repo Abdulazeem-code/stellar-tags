@@ -6,7 +6,8 @@
     "start": "npm --prefix stellar-payment-platform start",
     "lint": "eslint .",
     "prepare": "husky",
-    "load:test": "artillery run artillery.yml"
+    "load:test": "artillery run artillery.yml",
+    "generate:bindings": "bash scripts/generate-bindings.sh"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
