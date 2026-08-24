@@ -27,6 +27,7 @@ pub enum DataKey {
     PlatformTreasury,
     FeeBps,
     FeeCap,
+        MinLimit,
     Paused,
     MaxAmount,
     UserVolume(Address),
@@ -150,6 +151,16 @@ impl PaymentRouter {
             .get(&DataKey::MaxAmount)
             .unwrap_or(Self::MAX_AMOUNT);
         if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+
+        // Enforce optional admin-configured minimum payment limit
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount < min_limit {
             return Err(Error::LimitExceeded);
         }
 
@@ -315,6 +326,19 @@ impl PaymentRouter {
         admin.require_auth();
 
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Sets the minimum allowed routing amount. Admin-only.
+    pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::MinLimit, &min_limit);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
