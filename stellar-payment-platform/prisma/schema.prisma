@@ -63,7 +63,7 @@ model PaymentIntent {
   from       String
   to         String
   amount     String
-  asset      String?  
+  asset      String?
   memoType   String?  @map("memo_type")
   memo       String?
   status     String   @default("pending")
@@ -71,5 +71,10 @@ model PaymentIntent {
 
   @@index([to])
   @@index([from])
+  // Composite index for dashboard-style list queries that filter by status
+  // and sort/filter by date (e.g. "pending intents created since X"), so
+  // those WHERE ... ORDER BY combinations use an index scan instead of a
+  // full table scan.
+  @@index([status, createdAt])
   @@map("payment_intents")
 }
