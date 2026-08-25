@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
+    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address,
     BytesN, Env, Symbol, Vec,
 };
 
@@ -237,6 +237,7 @@ impl PaymentRouter {
     }
 
     /// Core payment logic shared by `route_payment` and `route_payments`.
+    #[allow(clippy::too_many_arguments)]
     fn process_single_payment(
         env: &Env,
         sender: &Address,
@@ -1467,18 +1468,14 @@ mod test {
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
         let init_cpu = env.budget().cpu_instruction_cost();
         let init_mem = env.budget().memory_bytes_cost();
-        std::println!("GAS REPORT: initialize");
-        std::println!("CPU Instructions: {}", init_cpu);
-        std::println!("Memory Bytes: {}", init_mem);
+        log!(&env, "GAS REPORT: initialize - CPU: {}, Mem: {}", init_cpu, init_mem);
 
         // Reset budget before route_payment
         env.budget().reset_default();
         client.route_payment(&sender, &recipient, &token_address, &5_000);
         let route_cpu = env.budget().cpu_instruction_cost();
         let route_mem = env.budget().memory_bytes_cost();
-        std::println!("GAS REPORT: route_payment");
-        std::println!("CPU Instructions: {}", route_cpu);
-        std::println!("Memory Bytes: {}", route_mem);
+        log!(&env, "GAS REPORT: route_payment - CPU: {}, Mem: {}", route_cpu, route_mem);
 
         env.budget().print();
 
