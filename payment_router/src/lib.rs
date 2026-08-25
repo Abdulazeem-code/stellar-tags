@@ -109,7 +109,7 @@ pub enum DataKey {
     PlatformTreasury,
     FeeBps,
     FeeCap,
-        MinLimit,
+    MinLimit,
     Paused,
     MaxAmount,
     UserVolume(Address),

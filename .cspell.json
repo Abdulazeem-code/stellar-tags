@@ -21,6 +21,9 @@
     "testuser",
     "serde",
     "rustc",
+    "HMAC",
+    "hmac",
+    "libquery",
     "uadd",
     "xffff"
   ]
