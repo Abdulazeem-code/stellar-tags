@@ -930,7 +930,7 @@ mod test {
 
         let mut found = false;
         for (_, topics, data) in events.iter() {
-            if topics.len() > 0 {
+            if !topics.is_empty() {
                 if let Ok(topic_sym) = topics.get(0).unwrap().try_into_val(&env) {
                     let sym: Symbol = topic_sym;
                     if sym == Symbol::new(&env, "payment_initiated") {
@@ -1010,11 +1010,11 @@ mod test {
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
         // Initially not paused
-        assert_eq!(client.is_paused(), false);
+        assert!(!client.is_paused());
 
         // Pause
         client.set_pause(&true);
-        assert_eq!(client.is_paused(), true);
+        assert!(client.is_paused());
 
         // Route payment should fail when paused
         let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
@@ -1022,7 +1022,7 @@ mod test {
 
         // Unpause via set_paused alias
         client.set_paused(&false);
-        assert_eq!(client.is_paused(), false);
+        assert!(!client.is_paused());
 
         // Route payment should succeed now
         client.route_payment(&sender, &recipient, &token_address, &1000);
