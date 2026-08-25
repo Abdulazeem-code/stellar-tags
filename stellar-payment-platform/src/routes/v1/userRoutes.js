@@ -52,6 +52,16 @@ router.post('/register', async (req, res, next) => {
     return res.status(400).json({ error: 'Missing required fields: username and address are both required.' });
   }
 
+  const BLOCKED_EXCHANGES = [
+    "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
+    "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
+    "GBV4ZDEPNQ2FKSPKGJP2YKDAIZWQ2XKRQD4V4ACH3TCTXTGLWEBDU3OS"
+  ];
+
+  if (BLOCKED_EXCHANGES.includes(address) && !memo) {
+    return res.status(400).json({ error: "Cannot map federation addresses directly to custodial exchange master wallets." });
+  }
+
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
   if (usernameLocalPart.length < 3) {
     return res.status(400).json({ error: "Username must be at least 3 characters long." });
