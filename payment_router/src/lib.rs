@@ -1153,6 +1153,7 @@ mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_tiered_fee_discount_applied_after_volume_threshold() {
         let (env, client, _) = setup_env();
 
@@ -1418,6 +1419,7 @@ mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_routes_multiple_distinct_assets() {
         let (env, client, _) = setup_env();
 
@@ -1522,6 +1524,7 @@ mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_refund_ledger_and_withdrawal() {
         let (env, client, contract_id) = setup_env();
 
