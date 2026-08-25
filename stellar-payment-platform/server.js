@@ -926,8 +926,24 @@ app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, 
 // Mount v1 router for both legacy paths and explicit API versioning
 app.use('/', v1Router);
 app.use('/api/v1', v1Router);
+// #492 — Strict rate limiter for auth/login endpoints. These are prime
+// brute-force targets, so they get a much tighter budget than the global
+// limiter. Uses the same Redis-backed store so the limit is shared across
+// all distributed nodes.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: true,
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  keyGenerator: (req) => req.ip || (req.connection && req.connection.remoteAddress) || '',
+});
+
 // Auth endpoints (email OTP verification) - uses Redis when available
-app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+app.use('/auth', authLimiter, require('./src/routes/v1/authRoutes')(redisClient));
 
 // #497 — Expose RSA public key as a JWKS document so external services can
 // verify RS256-signed tokens without sharing a secret.
