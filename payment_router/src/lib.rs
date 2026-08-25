@@ -105,6 +105,7 @@ pub struct Payment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    Governance,
     PlatformTreasury,
     FeeBps,
     FeeCap,
@@ -169,6 +170,19 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Fee authority helper: if a Governance address is set it takes exclusive
+    /// control over fee updates; otherwise the admin retains that right.
+    fn require_fee_authority(env: &Env) -> Result<(), Error> {
+        if let Some(gov) = env.storage().instance().get::<DataKey, Address>(&DataKey::Governance) {
+            gov.require_auth();
+            Ok(())
+        } else {
+            let admin = Self::require_admin(env)?;
+            admin.require_auth();
+            Ok(())
+        }
     }
 
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
@@ -384,10 +398,10 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Updates the fee basis points and fee cap. Admin-only.
+    /// Updates the fee basis points and fee cap.
+    /// Requires governance authority if a governance address is set; otherwise admin-only.
     pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_fee_authority(&env)?;
 
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
@@ -403,12 +417,25 @@ impl PaymentRouter {
         Self::set_fee_config_legacy(env, fee_bps, fee_cap)
     }
 
-    /// Updates the fee basis points. Admin-only.
+    /// Updates the fee basis points.
+    /// Requires governance authority if a governance address is set; otherwise admin-only.
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_fee_authority(&env)?;
 
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Sets the governance contract address. After this call, only the governance
+    /// contract can update fees. Admin-only — can only be set once per governance cycle.
+    pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Governance, &gov);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1329,5 +1356,27 @@ mod test {
         
         assert!(route_cpu <= max_cpu, "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}", route_cpu, max_cpu);
         assert!(route_mem <= max_mem, "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}", route_mem, max_mem);
+    }
+
+    #[test]
+    fn test_governance_takes_over_fees() {
+        let (_, client, _) = setup_env();
+
+        let admin = Address::generate(&client.env);
+        let treasury = Address::generate(&client.env);
+        let gov = Address::generate(&client.env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Admin can still update fees before governance is set
+        client.set_fee_bps(&150);
+        assert_eq!(client.get_fee(), 150);
+
+        // Admin hands control over to governance
+        client.set_governance(&gov);
+
+        // Governance address can now update the fee
+        client.set_fee_bps(&200);
+        assert_eq!(client.get_fee(), 200);
     }
 }
