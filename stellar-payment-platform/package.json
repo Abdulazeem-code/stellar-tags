@@ -15,7 +15,10 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "contract:build": "node ../scripts/deploy.js build",
+    "contract:deploy": "node ../scripts/deploy.js deploy",
+    "contract:upgrade": "node ../scripts/deploy.js upgrade"
   },
   "jest": {
     "testEnvironment": "node"
