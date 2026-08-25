@@ -95,7 +95,7 @@ const authenticateWebhookCall = async (req) => {
   } catch (err) {
     if (!shouldFallbackToLocalRegistry(err)) throw err;
     const localRow = await poolGet(
-      'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+      'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
       [normalizedUsername],
     );
     userRecord = localRow
@@ -189,7 +189,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
 
       await poolRun(
         `INSERT INTO webhooks (id, username, url, secret, created_at, last_sent_at, failing_since)
-         VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
+         VALUES ($1, $2, $3, $4, $5, NULL, NULL)`,
         [id, user.username, rawUrl, secret, now.toISOString()],
       );
       webhook = { id, username: user.username, url: rawUrl, createdAt: now.toISOString() };
@@ -236,7 +236,7 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
       const rows = await poolAll(
         `SELECT id, username, url, created_at, last_sent_at, failing_since
-         FROM webhooks WHERE username = ? ORDER BY created_at DESC`,
+         FROM webhooks WHERE username = $1 ORDER BY created_at DESC`,
         [user.username],
       );
       webhooks = rows.map((r) => ({
@@ -294,7 +294,7 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
       const result = await poolRun(
-        'DELETE FROM webhooks WHERE id = ? AND username = ?',
+        'DELETE FROM webhooks WHERE id = $1 AND username = $2',
         [id, user.username],
       );
       deletedCount = result?.changes || 0;

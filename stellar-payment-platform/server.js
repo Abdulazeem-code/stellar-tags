@@ -267,13 +267,13 @@ const etagCache = (req, res, next) => {
 
 const getLocalUserByAddress = async (address) =>
   poolGet(
-    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
+    'SELECT username, address FROM username_registry WHERE address = $1 LIMIT 1',
     [address],
   );
 
 const getLocalUserByUsername = async (username) =>
   poolGet(
-    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+    'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
     [username],
   );
 
@@ -283,17 +283,17 @@ const listLocalUsers = async (search, page, limit) => {
   const rows = await poolAll(
     `SELECT username, address, created_at
      FROM username_registry
-     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE
+     WHERE username ILIKE $1 OR address ILIKE $1
      ORDER BY created_at DESC
-     LIMIT ? OFFSET ?`,
-    [searchPattern, searchPattern, limit, skip],
+     LIMIT $2 OFFSET $3`,
+    [searchPattern, limit, skip],
   );
 
   const countRow = await poolGet(
-    `SELECT COUNT(*) AS totalCount
+    `SELECT COUNT(*) AS "totalCount"
      FROM username_registry
-     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE`,
-    [searchPattern, searchPattern],
+     WHERE username ILIKE $1 OR address ILIKE $1`,
+    [searchPattern],
   );
 
   const totalCount = Number(countRow?.totalCount || 0);
@@ -325,7 +325,7 @@ const registerLocalUser = async ({ username, address }) => {
 
   await poolRun(
     `INSERT INTO username_registry (username, address, created_at)
-     VALUES (?, ?, ?)`,
+     VALUES ($1, $2, $3)`,
     [username, address, new Date().toISOString()],
   );
 };
@@ -677,7 +677,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+    if (error.code === 'SQLITE_CONSTRAINT' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     

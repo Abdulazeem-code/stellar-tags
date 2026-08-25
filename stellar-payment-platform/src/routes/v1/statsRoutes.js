@@ -35,10 +35,10 @@ router.get('/stats', asyncHandler(async (req, res, next) => {
       }
 
       const totalCountRow = await poolGet(
-        'SELECT COUNT(*) AS totalCount FROM username_registry',
+        'SELECT COUNT(*) AS "totalCount" FROM username_registry',
       );
       const activeCountRow = await poolGet(
-        'SELECT COUNT(*) AS activeCount FROM username_registry WHERE flagged_at IS NULL',
+        'SELECT COUNT(*) AS "activeCount" FROM username_registry WHERE flagged_at IS NULL',
       );
       totalRegisteredUsers = Number(totalCountRow?.totalCount || 0);
       activeTokens = Number(activeCountRow?.activeCount || 0);

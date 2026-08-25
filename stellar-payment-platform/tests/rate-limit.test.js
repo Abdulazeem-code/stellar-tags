@@ -68,38 +68,16 @@ jest.mock('../src/multisigner-verifier', () => ({
   }),
 }));
 
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn((sql, cb2) => cb2 && cb2(null)),
-        close: jest.fn((cb2) => cb2 && cb2()),
-      };
-      if (cb) cb(null);
-      return db;
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    connect: jest.fn().mockResolvedValue({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      release: jest.fn(),
     }),
-  }),
-}));
-
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, null);
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+    end: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
+    options: { max: 10 },
   })),
 }));
 
