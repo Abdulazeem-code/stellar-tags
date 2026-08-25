@@ -9,17 +9,24 @@
  * Routes
  *  POST /admin/block          – flag (soft-block) an address
  *  GET  /admin/export         – stream transaction records as CSV or JSON
+ *  GET  /admin/stats/routing  – fetch historical payment routing statistics
  */
 
 const express = require('express');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { validateSchema } = require('../../middleware/validateSchema');
-const { adminBlockBodySchema, adminExportQuerySchema } = require('../../schemas');
+const {
+  adminBlockBodySchema,
+  adminExportQuerySchema,
+  adminRoutingStatsQuerySchema,
+} = require('../../schemas');
 const { streamAdminExport } = require('../../utils/exporter');
+const { getRoutingStats } = require('../../services/statsService');
 const { invalidateFederationCache } = require('../../cache');
 const { logger } = require('../../logger');
 
 module.exports = (redisClient) => {
+
   const router = express.Router();
 
   // ── Admin authentication middleware ──────────────────────────────────────
@@ -123,5 +130,42 @@ module.exports = (redisClient) => {
     }),
   );
 
+  // ── GET /admin/stats/routing ─────────────────────────────────────────────
+
+  /**
+   * Returns historical payment routing aggregation statistics (volume, fees, counts)
+   * grouped by day, week, or month with optional date-range and asset filtering.
+   *
+   * Query parameters:
+   *  - startDate (optional) YYYY-MM-DD inclusive lower bound on createdAt
+   *  - endDate   (optional) YYYY-MM-DD inclusive upper bound on createdAt
+   *  - groupBy   (optional) 'day' (default) | 'week' | 'month'
+   *  - interval  (optional) alias for groupBy
+   *  - assetCode (optional) filter by asset code
+   */
+  router.get(
+    '/admin/stats/routing',
+    adminAuth,
+    validateSchema({ query: adminRoutingStatsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { startDate, endDate, groupBy, interval, assetCode } = req.query;
+      const prisma = getPrisma();
+
+      const stats = await getRoutingStats({
+        prisma,
+        startDate,
+        endDate,
+        groupBy: interval || groupBy || 'day',
+        assetCode,
+      });
+
+      return res.status(200).json({
+        success: true,
+        ...stats,
+      });
+    }),
+  );
+
   return router;
 };
+

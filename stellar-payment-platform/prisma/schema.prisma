@@ -53,3 +53,22 @@ model Webhook {
   @@index([lastSentAt])
   @@map("webhooks")
 }
+
+// Payment records for routing, statistics, and auditing.
+model Payment {
+  id              String   @id @default(uuid())
+  createdAt       DateTime @default(now()) @map("created_at")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  fee             Float    @default(0)
+  assetCode       String?  @map("asset_code")
+  transactionHash String?  @map("transaction_hash")
+  status          String   @default("completed")
+
+  @@index([createdAt])
+  @@index([fromAddress])
+  @@index([toAddress])
+  @@map("payments")
+}
+
