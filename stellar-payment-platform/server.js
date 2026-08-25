@@ -54,6 +54,7 @@ const {
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require('./src/utils');
+const { mountGraphQL } = require('./src/graphql');
 
 dotenv.config();
 
@@ -222,7 +223,12 @@ const rejectNestedObjects = (req, res, next) => {
   next();
 };
 
-app.use(rejectNestedObjects);
+// GraphQL requests legitimately carry nested `variables` and `extensions`
+// objects in their JSON body — exempt /graphql from the flat-body guard.
+app.use((req, res, next) => {
+  if (req.path === '/graphql') return next();
+  return rejectNestedObjects(req, res, next);
+});
 
 // Enable HTTP response compression for responses exceeding 1KB (1024 bytes)
 app.use(compression({ threshold: 1024 }));
@@ -908,6 +914,35 @@ if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
 
+// Reserve the /graphql path in the Express stack before notFoundHandler so
+// that mountGraphQL (called asynchronously during startup) can still attach
+// its middleware and requests are not swallowed by the 404 handler first.
+//
+// graphqlDispatch is replaced by the real Apollo expressMiddleware once
+// mountGraphQL is called.  Until then every request to /graphql is held in
+// a small queue (bounded to 50) and flushed the moment Apollo is ready.
+let _apolloHandler = null;
+const _gqlQueue = [];
+const MAX_QUEUE = 50;
+// Called by mountGraphQL to install the real handler and drain the queue.
+const installGraphQLHandler = (middleware) => {
+  _apolloHandler = middleware;
+  while (_gqlQueue.length) {
+    const { req, res, next } = _gqlQueue.shift();
+    _apolloHandler(req, res, next);
+  }
+};
+
+app.use('/graphql', (req, res, next) => {
+  if (_apolloHandler) return _apolloHandler(req, res, next);
+  if (_gqlQueue.length >= MAX_QUEUE) {
+    return res.status(503).json(
+      errorBody('SERVICE_UNAVAILABLE', 'GraphQL endpoint is still initialising, please retry.'),
+    );
+  }
+  _gqlQueue.push({ req, res, next });
+});
+
 // Unmatched routes and every error share the standard envelope.
 app.use(notFoundHandler);
 app.use(buildErrorHandler(isPrismaConnectionError));
@@ -943,19 +978,35 @@ const gracefulShutdown = (server, prismaClient, signal) => {
 
 
 if (require.main === module) {
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    logger.info(`Server successfully initialized on port ${PORT}`);
-  });
+  // Apollo Server must be started (awaited) before the HTTP server begins
+  // accepting connections, so the startup block becomes an async IIFE.
+  (async () => {
+    const http = require('http');
+    const httpServer = http.createServer(app);
 
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
-      process.exit(1);
-    }
-  });
+    // Mount the GraphQL endpoint at /graphql.
+    // Pass httpServer so the drain plugin can delay shutdown until in-flight
+    // GraphQL requests have settled.
+    await mountGraphQL({ app, httpServer, path: '/graphql', installHandler: installGraphQLHandler });
 
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
+    httpServer.listen(PORT, '0.0.0.0', () => {
+      logger.info(`Server successfully initialized on port ${PORT}`);
+      logger.info(`GraphQL endpoint available at http://localhost:${PORT}/graphql`);
+    });
+
+    httpServer.on('error', (e) => {
+      if (e.code === 'EADDRINUSE') {
+        logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+        process.exit(1);
+      }
+    });
+
+    process.on('SIGTERM', (sig) => gracefulShutdown(httpServer, prisma, sig));
+    process.on('SIGINT', (sig) => gracefulShutdown(httpServer, prisma, sig));
+  })().catch((err) => {
+    logger.error(err, 'Failed to start server');
+    process.exit(1);
+  });
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo, installGraphQLHandler };
