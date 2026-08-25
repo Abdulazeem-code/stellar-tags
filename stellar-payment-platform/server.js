@@ -929,6 +929,23 @@ app.use('/api/v1', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
 
+// #497 — Expose RSA public key as a JWKS document so external services can
+// verify RS256-signed tokens without sharing a secret.
+app.get('/.well-known/jwks.json', (_req, res) => {
+  try {
+    const { getJwks } = require('./src/utils/jwt');
+    const jwks = getJwks();
+    res.setHeader('Content-Type', 'application/json');
+    // Cache for 1 hour — key rotations are infrequent and consumers should
+    // re-fetch on verification failure anyway.
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.json(jwks);
+  } catch (err) {
+    logger.warn({ err }, 'JWKS endpoint: JWT_PUBLIC_KEY is not configured');
+    return res.status(503).json({ error: 'JWKS not available: public key not configured.' });
+  }
+});
+
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
