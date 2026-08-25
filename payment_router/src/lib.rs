@@ -114,6 +114,7 @@ pub enum DataKey {
     UserVolume(Address),
     UserSpending(Address),
     Blacklist(Address),
+    RefundBalance(Address, Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -138,6 +139,8 @@ pub enum Error {
     InvalidRecipient = 8,
     /// Recipient address is blacklisted.
     Blacklisted = 9,
+    /// Requested refund withdrawal amount is zero or exceeds available refund balance.
+    NoRefundAvailable = 10,
 }
 
 #[contract]
@@ -194,6 +197,28 @@ impl PaymentRouter {
         );
 
         Ok((platform_treasury, fee_bps, fee_cap))
+    }
+
+    fn get_refund_balance_internal(env: &Env, user: &Address, token: &Address) -> i128 {
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    fn credit_refund_balance(env: &Env, user: &Address, token: &Address, amount: i128) {
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_balance = current_balance + amount;
+        env.storage().persistent().set(&key, &new_balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("refunded"), user.clone(), token.clone()),
+            amount,
+        );
     }
 
     /// Core payment logic shared by `route_payment` and `route_payments`.
@@ -309,7 +334,19 @@ impl PaymentRouter {
             token_client.transfer(sender, platform_treasury, &fee_amount);
         }
         if remainder > 0 {
-            token_client.transfer(sender, recipient, &remainder);
+            // Attempt to transfer remainder directly to recipient.
+            // If recipient cannot receive tokens (e.g. missing trustline or rejection),
+            // transfer funds into the contract and credit the sender's internal refund ledger.
+            match token_client.try_transfer(sender, recipient, &remainder) {
+                Ok(Ok(())) => {
+                    log!(env, "Remaining balance routed to recipient");
+                }
+                _ => {
+                    log!(env, "Recipient transfer failed; crediting sender refund balance");
+                    token_client.transfer(sender, &env.current_contract_address(), &remainder);
+                    Self::credit_refund_balance(env, sender, token_address, remainder);
+                }
+            }
         }
 
         // Record cumulative volume
@@ -331,7 +368,6 @@ impl PaymentRouter {
         );
 
         log!(env, "Platform fee routed to treasury");
-        log!(env, "Remaining balance routed to recipient");
 
         Ok(())
     }
@@ -615,6 +651,68 @@ impl PaymentRouter {
         }
 
         Ok(())
+    }
+
+    /// Returns the available internal refund balance for a user and token.
+    pub fn get_refund_balance(env: Env, user: Address, token: Address) -> i128 {
+        Self::get_refund_balance_internal(&env, &user, &token)
+    }
+
+    /// Withdraws a specific amount from the user's internal refund balance.
+    pub fn withdraw_refund(
+        env: Env,
+        user: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        user.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
+        if amount > current_balance {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        let new_balance = current_balance - amount;
+        if new_balance > 0 {
+            env.storage().persistent().set(&key, &new_balance);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &user, &amount);
+
+        env.events().publish(
+            (symbol_short!("withdrawn"), user.clone(), token.clone()),
+            amount,
+        );
+
+        log!(&env, "Refund balance withdrawn by user");
+        Ok(())
+    }
+
+    /// Claims and withdraws the entire available refund balance for a user and token.
+    pub fn claim_all_refunds(env: Env, user: Address, token: Address) -> Result<i128, Error> {
+        user.require_auth();
+
+        let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
+        if current_balance <= 0 {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        Self::withdraw_refund(env, user, token, current_balance)?;
+        Ok(current_balance)
     }
 
     /// Admin-only emergency withdrawal of tokens held by this contract.
@@ -1329,5 +1427,51 @@ mod test {
         
         assert!(route_cpu <= max_cpu, "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}", route_cpu, max_cpu);
         assert!(route_mem <= max_mem, "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}", route_mem, max_mem);
+    }
+
+    #[test]
+    fn test_refund_ledger_and_withdrawal() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+
+        // Initially zero refund balance
+        assert_eq!(client.get_refund_balance(&user, &token_address), 0);
+
+        // Simulate stranded tokens in contract and credit internal refund balance
+        let refund_amount = 5_000i128;
+        stellar_asset_client.mint(&contract_id, &refund_amount);
+
+        env.as_contract(&contract_id, || {
+            PaymentRouter::credit_refund_balance(&env, &user, &token_address, refund_amount);
+        });
+
+        assert_eq!(client.get_refund_balance(&user, &token_address), refund_amount);
+
+        // User withdraws partial refund
+        let partial_amount = 2_000i128;
+        client.withdraw_refund(&user, &token_address, &partial_amount);
+
+        assert_eq!(token_client.balance(&user), partial_amount);
+        assert_eq!(
+            client.get_refund_balance(&user, &token_address),
+            refund_amount - partial_amount
+        );
+
+        // User claims remaining refunds with claim_all_refunds
+        let claimed = client.claim_all_refunds(&user, &token_address);
+        assert_eq!(claimed, refund_amount - partial_amount);
+        assert_eq!(token_client.balance(&user), refund_amount);
+        assert_eq!(client.get_refund_balance(&user, &token_address), 0);
+
+        // Trying to withdraw again should fail with NoRefundAvailable
+        let res = client.try_withdraw_refund(&user, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoRefundAvailable);
     }
 }
