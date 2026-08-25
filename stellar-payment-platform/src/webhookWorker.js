@@ -1,10 +1,28 @@
 const crypto = require('crypto');
-const cron = require('node-cron');
+const { Queue, Worker } = require('bullmq');
+const { createRedisConnection } = require('./config/redis');
 const { logger } = require('./logger');
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
-const MAX_RETRY_BACKLOG_DAYS = 3;
-const RETRY_JOB_CRON = '*/5 * * * *'; // every 5 minutes
+const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
+const MAX_WEBHOOK_ATTEMPTS = 5;
+const WEBHOOK_BACKOFF_DELAY_MS = 1_000;
+const WEBHOOK_WORKER_CONCURRENCY = 5;
+
+const WEBHOOK_JOB_OPTIONS = Object.freeze({
+  attempts: MAX_WEBHOOK_ATTEMPTS,
+  backoff: {
+    type: 'exponential',
+    delay: WEBHOOK_BACKOFF_DELAY_MS,
+  },
+  removeOnComplete: 1_000,
+  removeOnFail: 5_000,
+});
+
+let webhookQueue;
+let webhookWorker;
+let queueConnection;
+let workerConnection;
 
 const shouldFallbackToLocalRegistry = (error) => {
   const code = typeof error?.code === 'string' ? error.code : '';
@@ -31,26 +49,19 @@ const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
         username: true,
         url: true,
         secret: true,
-        failingSince: true,
       },
     });
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
 
     const rows = await poolGetFn(
-      `SELECT w.id, w.username, w.url, w.secret, w.failing_since
+      `SELECT w.id, w.username, w.url, w.secret
        FROM webhooks w
        INNER JOIN username_registry u ON u.username = w.username
        WHERE u.address = ?`,
       [stellarAddress],
     );
-    return (rows || []).map((r) => ({
-      id: r.id,
-      username: r.username,
-      url: r.url,
-      secret: r.secret,
-      failingSince: r.failing_since ? new Date(r.failing_since) : null,
-    }));
+    return rows || [];
   }
 };
 
@@ -61,7 +72,7 @@ const sendWebhook = async (url, payload, secret) => {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -71,14 +82,12 @@ const sendWebhook = async (url, payload, secret) => {
       body: rawBody,
       signal: controller.signal,
     });
-    clearTimeout(timeoutId);
-    if (!res.ok) {
-      throw new Error(`Webhook responded with HTTP ${res.status}`);
+    if (!response.ok) {
+      throw new Error(`Webhook responded with HTTP ${response.status}`);
     }
     return { ok: true };
-  } catch (err) {
+  } finally {
     clearTimeout(timeoutId);
-    throw err;
   }
 };
 
@@ -91,7 +100,7 @@ const markWebhookSuccess = async (prisma, poolRunFn, webhookId, now) => {
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     await poolRunFn(
-      `UPDATE webhooks SET last_sent_at = ?, failing_since = NULL WHERE id = ?`,
+      'UPDATE webhooks SET last_sent_at = ?, failing_since = NULL WHERE id = ?',
       [now.toISOString(), webhookId],
     );
   }
@@ -114,41 +123,116 @@ const markWebhookFailure = async (prisma, poolRunFn, webhookId, now) => {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     await poolRunFn(
       `UPDATE webhooks
-       SET last_sent_at = ?,
-           failing_since = COALESCE(failing_since, ?)
+       SET last_sent_at = ?, failing_since = COALESCE(failing_since, ?)
        WHERE id = ?`,
       [now.toISOString(), now.toISOString(), webhookId],
     );
   }
 };
 
+const processWebhookJob = async (job, { prisma, poolRunFn }) => {
+  const { webhook, payload } = job.data;
+  const now = new Date();
+
+  try {
+    await sendWebhook(webhook.url, payload, webhook.secret);
+  } catch (error) {
+    try {
+      await markWebhookFailure(prisma, poolRunFn, webhook.id, now);
+    } catch (databaseError) {
+      logger.error(
+        `[webhook-worker] Failed to mark failure for webhook ${webhook.id}: ${databaseError.message}`,
+      );
+    }
+    throw error;
+  }
+
+  try {
+    await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
+  } catch (databaseError) {
+    logger.error(
+      `[webhook-worker] Failed to mark success for webhook ${webhook.id}: ${databaseError.message}`,
+    );
+  }
+
+  logger.info(
+    `[webhook-worker] Delivered event=${payload.event_id} webhook=${webhook.id} attempt=${job.attemptsMade + 1}`,
+  );
+};
+
+const getWebhookQueue = () => {
+  if (!webhookQueue) {
+    queueConnection = createRedisConnection();
+    webhookQueue = new Queue(WEBHOOK_QUEUE_NAME, { connection: queueConnection });
+    webhookQueue.on('error', (error) => {
+      logger.error(`[webhook-queue] Redis error: ${error.message}`);
+    });
+  }
+  return webhookQueue;
+};
+
+const startWebhookWorker = ({ prisma, poolRunFn }) => {
+  if (webhookWorker) return webhookWorker;
+
+  workerConnection = createRedisConnection();
+  webhookWorker = new Worker(
+    WEBHOOK_QUEUE_NAME,
+    (job) => processWebhookJob(job, { prisma, poolRunFn }),
+    {
+      connection: workerConnection,
+      concurrency: WEBHOOK_WORKER_CONCURRENCY,
+    },
+  );
+
+  webhookWorker.on('failed', (job, error) => {
+    const maxAttempts = job?.opts?.attempts || MAX_WEBHOOK_ATTEMPTS;
+    const attemptsMade = job?.attemptsMade || 1;
+    const status = attemptsMade < maxAttempts
+      ? `retry scheduled (${attemptsMade}/${maxAttempts})`
+      : `retries exhausted (${attemptsMade}/${maxAttempts})`;
+    logger.error(
+      `[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; ${status}`,
+    );
+  });
+  webhookWorker.on('error', (error) => {
+    logger.error(`[webhook-worker] Redis error: ${error.message}`);
+  });
+
+  logger.info(
+    `[webhook-worker] Started queue=${WEBHOOK_QUEUE_NAME} concurrency=${WEBHOOK_WORKER_CONCURRENCY}`,
+  );
+  return webhookWorker;
+};
+
+const buildJobId = (webhookId, eventId) => {
+  return crypto.createHash('sha256').update(`${webhookId}:${eventId}`).digest('hex');
+};
+
+const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
+  return queue.add(
+    'deliver',
+    { webhook, payload },
+    {
+      ...WEBHOOK_JOB_OPTIONS,
+      backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
+      jobId: buildJobId(webhook.id, payload.event_id),
+    },
+  );
+};
+
 const formatAsset = (payment) => {
-  if (!payment) return 'native';
-  if (payment.asset_type === 'native') return 'native';
+  if (!payment || payment.asset_type === 'native') return 'native';
   return `${payment.asset_code}:${payment.asset_issuer}`;
 };
 
-const dispatchPaymentWebhooks = async ({
-  prisma,
-  poolGetFn,
-  poolRunFn,
-  payment,
-}) => {
-  if (!payment) return;
-  if (payment.type !== 'payment' && payment.type_i !== 1) return;
+const dispatchPaymentWebhooks = async ({ prisma, poolGetFn, payment, queue }) => {
+  if (!payment || (payment.type !== 'payment' && payment.type_i !== 1)) return;
 
   const recipientAddress = payment.to;
   if (!recipientAddress) return;
 
-  let webhooks;
-  try {
-    webhooks = await fetchWebhooksForAddress(prisma, poolGetFn, recipientAddress);
-  } catch (err) {
-    logger.error(`[webhook-worker] Failed to fetch webhooks for ${recipientAddress}:`, err.message);
-    return;
-  }
-
-  if (!webhooks || webhooks.length === 0) return;
+  const webhooks = await fetchWebhooksForAddress(prisma, poolGetFn, recipientAddress);
+  if (!webhooks.length) return;
 
   const payload = {
     event: 'payment.received',
@@ -169,101 +253,39 @@ const dispatchPaymentWebhooks = async ({
     },
   };
 
-  for (const wh of webhooks) {
-    const now = new Date();
-    try {
-      await sendWebhook(wh.url, payload, wh.secret);
-      try {
-        await markWebhookSuccess(prisma, poolRunFn, wh.id, now);
-      } catch (dbErr) {
-        logger.error(`[webhook-worker] Failed to mark success for webhook ${wh.id}:`, dbErr.message);
-      }
-      logger.info(`[webhook-worker] Dispatched payment webhook id=${wh.id} url=${wh.url} recipient=${recipientAddress}`);
-    } catch (err) {
-      try {
-        await markWebhookFailure(prisma, poolRunFn, wh.id, now);
-      } catch (dbErr) {
-        logger.error(`[webhook-worker] Failed to mark failure for webhook ${wh.id}:`, dbErr.message);
-      }
-      logger.error(`[webhook-worker] Webhook delivery failed id=${wh.id} url=${wh.url}:`, err.message);
-    }
-  }
-};
-
-const listStaleFailingWebhooks = async (prisma, poolAllFn) => {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - MAX_RETRY_BACKLOG_DAYS);
-  try {
-    return await prisma.webhook.findMany({
-      where: {
-        failingSince: { not: null, gte: cutoff },
-      },
-      select: {
-        id: true,
-        username: true,
-        url: true,
-        secret: true,
-      },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-    const rows = await poolAllFn(
-      `SELECT id, username, url, secret FROM webhooks
-       WHERE failing_since IS NOT NULL AND failing_since >= ?`,
-      [cutoff.toISOString()],
+  const deliveryQueue = queue || getWebhookQueue();
+  await Promise.all(webhooks.map(async (webhook) => {
+    await enqueueWebhookDelivery(webhook, payload, deliveryQueue);
+    logger.info(
+      `[webhook-queue] Enqueued event=${payload.event_id} webhook=${webhook.id} recipient=${recipientAddress}`,
     );
-    return (rows || []).map((r) => ({
-      id: r.id,
-      username: r.username,
-      url: r.url,
-      secret: r.secret,
-    }));
-  }
+  }));
 };
 
-const sendLivenessPing = async (prisma, poolRunFn, webhook) => {
-  const payload = {
-    event: 'webhook.ping',
-    event_id: `ping-${crypto.randomBytes(16).toString('hex')}`,
-    timestamp: new Date().toISOString(),
-    data: { message: 'ping' },
-  };
-  const now = new Date();
-  try {
-    await sendWebhook(webhook.url, payload, webhook.secret);
-    await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
-    return true;
-  } catch (err) {
-    await markWebhookFailure(prisma, poolRunFn, webhook.id, now);
-    return false;
-  }
-};
+const closeWebhookQueue = async () => {
+  const resources = [webhookWorker, webhookQueue].filter(Boolean);
+  await Promise.all(resources.map((resource) => resource.close()));
 
-const scheduleWebhookRetryJob = ({ prisma, poolAllFn, poolRunFn }) => {
-  cron.schedule(RETRY_JOB_CRON, async () => {
-    logger.info('[webhook-worker] Running periodic liveness pings for failing webhooks…');
-    try {
-      const hooks = await listStaleFailingWebhooks(prisma, poolAllFn);
-      if (hooks.length === 0) return;
-      let recovered = 0;
-      for (const wh of hooks) {
-        const ok = await sendLivenessPing(prisma, poolRunFn, wh);
-        if (ok) recovered += 1;
-      }
-      logger.info(
-        `[webhook-worker] Liveness pings done. total=${hooks.length}, recovered=${recovered}`,
-      );
-    } catch (err) {
-      logger.error('[webhook-worker] Retry job failed:', err.message);
-    }
-  });
-  logger.info(`[webhook-worker] Retry/liveness job scheduled (cron: ${RETRY_JOB_CRON}).`);
+  const connections = [workerConnection, queueConnection].filter(Boolean);
+  await Promise.all(connections.map((connection) => connection.quit()));
+
+  webhookWorker = undefined;
+  webhookQueue = undefined;
+  workerConnection = undefined;
+  queueConnection = undefined;
 };
 
 module.exports = {
   dispatchPaymentWebhooks,
-  scheduleWebhookRetryJob,
+  enqueueWebhookDelivery,
+  startWebhookWorker,
+  closeWebhookQueue,
+  processWebhookJob,
   sendWebhook,
   computeSignature,
   WEBHOOK_TIMEOUT_MS,
+  WEBHOOK_QUEUE_NAME,
+  MAX_WEBHOOK_ATTEMPTS,
+  WEBHOOK_BACKOFF_DELAY_MS,
+  WEBHOOK_JOB_OPTIONS,
 };
