@@ -53,3 +53,23 @@ model Webhook {
   @@index([lastSentAt])
   @@map("webhooks")
 }
+
+// PaymentIntent model for storing requested payment registrations. These are
+// created via the bulk registration endpoint and persisted atomically using
+// `prisma.$transaction`.
+model PaymentIntent {
+  id         String   @id @default(uuid())
+  externalId String?  @map("external_id")
+  from       String
+  to         String
+  amount     String
+  asset      String?  
+  memoType   String?  @map("memo_type")
+  memo       String?
+  status     String   @default("pending")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([to])
+  @@index([from])
+  @@map("payment_intents")
+}
