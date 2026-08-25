@@ -997,7 +997,7 @@ app.use(buildErrorHandler(isPrismaConnectionError));
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
-const gracefulShutdown = (server, prismaClient, signal) => {
+const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
@@ -1019,6 +1019,13 @@ const gracefulShutdown = (server, prismaClient, signal) => {
     } catch (err) {
       logger.error(err, 'Error disconnecting Prisma during shutdown:');
     }
+    if (redis) {
+      try {
+        await redis.quit();
+      } catch (err) {
+        logger.error(err, 'Error disconnecting Redis during shutdown:');
+      }
+    }
     process.exit(0);
   });
 };
@@ -1036,8 +1043,8 @@ if (require.main === module) {
     }
   });
 
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
