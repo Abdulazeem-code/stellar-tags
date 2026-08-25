@@ -350,6 +350,21 @@ differently, so participant and amount columns are normalised per type: a
 `create_account` reports `funder`/`account`/`starting_balance` and an
 `account_merge` reports `account`/`into`.
 
+### `GET /admin/export`
+Streams transaction records from the database as a CSV or NDJSON download for external accounting.
+- **Query Parameters:**
+  - `format` (optional) – `csv` (default) or `json`.
+  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
+  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
+- **Returns:** `text/csv` or `application/x-ndjson` with a `Content-Disposition: attachment` header.
+- **Status Codes:**
+  - `200 OK`: Stream started.
+  - `400 Bad Request`: Invalid date format or `startDate` after `endDate`.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
+
 ### `GET /metrics`
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
 rate limiter so a scraper on a fixed interval is never throttled.
