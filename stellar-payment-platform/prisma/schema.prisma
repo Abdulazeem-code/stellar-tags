@@ -54,6 +54,17 @@ model Webhook {
   @@map("webhooks")
 }
 
+// Approved merchant frontend origins allowed to call the API. CORS
+// validation (see server.js) checks incoming Origin headers against this
+// table, with results cached in Redis so most requests avoid a DB round trip.
+model ApprovedOrigin {
+  id        String   @id @default(uuid())
+  origin    String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("approved_origins")
+}
+
 // PaymentIntent model for storing requested payment registrations. These are
 // created via the bulk registration endpoint and persisted atomically using
 // `prisma.$transaction`.
