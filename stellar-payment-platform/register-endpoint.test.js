@@ -16,38 +16,11 @@ jest.mock("pdfkit", () => jest.fn());
 jest.mock("./src/cleanup-cron", () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock("./src/soft-delete-purge-cron", () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
-jest.mock("sqlite3", () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn(function (...args) {
-          const fn = args.find((a) => typeof a === "function");
-          if (fn) fn.call(this, null);
-        }),
-        serialize: jest.fn((fn) => fn && fn()),
-        close: jest.fn((cb) => cb && cb()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
-}));
-
-jest.mock("generic-pool", () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === "function");
-        if (fn) fn.call(this, null, undefined);
-      }),
-      all: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === "function");
-        if (fn) fn.call(this, null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+jest.mock("pg", () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    on: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   })),
 }));
 
