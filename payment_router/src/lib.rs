@@ -1569,6 +1569,28 @@ mod test {
         let res = client.try_withdraw_refund(&user, &token_address, &100);
         assert_eq!(res.unwrap_err().unwrap(), Error::NoRefundAvailable);
     }
+
+    #[test]
+    fn test_governance_takes_over_fees() {
+        let (_, client, _) = setup_env();
+
+        let admin = Address::generate(&client.env);
+        let treasury = Address::generate(&client.env);
+        let gov = Address::generate(&client.env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Admin can still update fees before governance is set
+        client.set_fee_bps(&150);
+        assert_eq!(client.get_fee(), 150);
+
+        // Admin hands control over to governance
+        client.set_governance(&gov);
+
+        // Governance address can now update the fee
+        client.set_fee_bps(&200);
+        assert_eq!(client.get_fee(), 200);
+    }
 }
 
 /// Property-based tests for fee calculation logic.
@@ -1776,27 +1798,5 @@ mod prop_tests {
                 fee_discounted, fee_full
             );
         }
-    }
-
-    #[test]
-    fn test_governance_takes_over_fees() {
-        let (_, client, _) = setup_env();
-
-        let admin = Address::generate(&client.env);
-        let treasury = Address::generate(&client.env);
-        let gov = Address::generate(&client.env);
-
-        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
-
-        // Admin can still update fees before governance is set
-        client.set_fee_bps(&150);
-        assert_eq!(client.get_fee(), 150);
-
-        // Admin hands control over to governance
-        client.set_governance(&gov);
-
-        // Governance address can now update the fee
-        client.set_fee_bps(&200);
-        assert_eq!(client.get_fee(), 200);
     }
 }
