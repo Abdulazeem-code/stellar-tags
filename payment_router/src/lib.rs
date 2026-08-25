@@ -175,7 +175,11 @@ impl PaymentRouter {
     /// Fee authority helper: if a Governance address is set it takes exclusive
     /// control over fee updates; otherwise the admin retains that right.
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
-        if let Some(gov) = env.storage().instance().get::<DataKey, Address>(&DataKey::Governance) {
+        if let Some(gov) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Governance)
+        {
             gov.require_auth();
             Ok(())
         } else {
@@ -354,7 +358,10 @@ impl PaymentRouter {
                     log!(env, "Remaining balance routed to recipient");
                 }
                 _ => {
-                    log!(env, "Recipient transfer failed; crediting sender refund balance");
+                    log!(
+                        env,
+                        "Recipient transfer failed; crediting sender refund balance"
+                    );
                     token_client.transfer(sender, &env.current_contract_address(), &remainder);
                     Self::credit_refund_balance(env, sender, token_address, remainder);
                 }
