@@ -35,7 +35,7 @@ jobs:
       - name: Install and run cargo-dylint
         run: |
           cargo install cargo-dylint --force || true
-          cargo dylint --all-targets --all-features -- -D warnings
+          cargo dylint --all -- -D warnings
 
       - name: Install and run cargo-audit
         run: |
