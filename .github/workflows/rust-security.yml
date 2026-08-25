@@ -10,6 +10,9 @@ jobs:
   security:
     name: Static security analysis
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
     env:
       RUSTFLAGS: "-D warnings"
     steps:
