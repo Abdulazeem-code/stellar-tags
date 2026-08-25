@@ -1537,7 +1537,10 @@ mod test {
             PaymentRouter::credit_refund_balance(&env, &user, &token_address, refund_amount);
         });
 
-        assert_eq!(client.get_refund_balance(&user, &token_address), refund_amount);
+        assert_eq!(
+            client.get_refund_balance(&user, &token_address),
+            refund_amount
+        );
 
         // User withdraws partial refund
         let partial_amount = 2_000i128;
