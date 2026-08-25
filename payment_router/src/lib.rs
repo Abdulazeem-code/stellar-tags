@@ -1108,4 +1108,342 @@ mod test {
         assert_eq!(eurc_like_client.balance(&recipient), 990);
         assert_eq!(client.get_user_volume(&sender), 3_000);
     }
+
+    // ── New edge-case tests added for #522 ──────────────────────────────────
+
+    /// `amount = 0` must be rejected with `LimitExceeded` (amount <= 0 guard).
+    #[test]
+    fn test_zero_amount_rejected() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &0);
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+    }
+
+    /// A negative amount must also be rejected with `LimitExceeded`.
+    #[test]
+    fn test_negative_amount_rejected() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &-1);
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+    }
+
+    /// An amount exceeding max_amount must be rejected with `LimitExceeded`.
+    #[test]
+    fn test_amount_exceeds_max_amount_rejected() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _tc, sac) = setup_token(&env);
+
+        let max_amount = 5_000i128;
+        client.initialize(&admin, &treasury, &100, &50, &max_amount);
+
+        sac.mint(&sender, &100_000);
+
+        // Exactly at max_amount — should succeed
+        client.route_payment(&sender, &recipient, &token_address, &max_amount);
+
+        // One over — should fail
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &(max_amount + 1));
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+    }
+
+    /// `route_payment` before `initialize` returns `NotInitialized`.
+    #[test]
+    fn test_route_payment_not_initialized() {
+        let (env, client, _) = setup_env();
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1_000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NotInitialized);
+    }
+
+    /// `route_payments` (batch) — happy path: all payments succeed and balances
+    /// are updated correctly.
+    #[test]
+    fn test_route_payments_batch_success() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient1 = Address::generate(&env);
+        let recipient2 = Address::generate(&env);
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        // fee = 100 bps, cap = i128::MAX (no cap)
+        client.initialize(&admin, &treasury, &100, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+
+        let payments = vec![
+            &env,
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient1.clone(),
+                token_address: token_address.clone(),
+                amount: 1_000,
+            },
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient2.clone(),
+                token_address: token_address.clone(),
+                amount: 2_000,
+            },
+        ];
+
+        client.route_payments(&payments);
+
+        // fee for 1_000 @ 100 bps = 10; recipient1 gets 990
+        // fee for 2_000 @ 100 bps = 20; recipient2 gets 1980
+        assert_eq!(token_client.balance(&recipient1), 990);
+        assert_eq!(token_client.balance(&recipient2), 1_980);
+        assert_eq!(token_client.balance(&treasury), 30);
+        assert_eq!(token_client.balance(&sender), 10_000 - 3_000);
+        assert_eq!(client.get_user_volume(&sender), 3_000);
+    }
+
+    /// `route_payments` — if any payment in the batch fails, the whole call
+    /// returns an error (atomic batch).
+    #[test]
+    fn test_route_payments_batch_fails_on_bad_payment() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Second payment uses sender == recipient (self-routing) which is invalid
+        let payments = vec![
+            &env,
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token_address: token_address.clone(),
+                amount: 1_000,
+            },
+            Payment {
+                sender: sender.clone(),
+                recipient: sender.clone(), // invalid — self-routing
+                token_address: token_address.clone(),
+                amount: 500,
+            },
+        ];
+
+        let res = client.try_route_payments(&payments);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
+    }
+
+    /// `route_payments` — rejects when contract is paused.
+    #[test]
+    fn test_route_payments_paused() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.set_pause(&true);
+
+        let payments = vec![
+            &env,
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token_address: token_address.clone(),
+                amount: 1_000,
+            },
+        ];
+
+        let res = client.try_route_payments(&payments);
+        assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
+    }
+
+    /// `route_payments` — a blacklisted recipient in the batch is rejected.
+    #[test]
+    fn test_route_payments_blacklisted_recipient() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let bad_recipient = Address::generate(&env);
+        let (token_address, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.blacklist_address(&bad_recipient);
+
+        let payments = vec![
+            &env,
+            Payment {
+                sender: sender.clone(),
+                recipient: bad_recipient.clone(),
+                token_address: token_address.clone(),
+                amount: 1_000,
+            },
+        ];
+
+        let res = client.try_route_payments(&payments);
+        assert_eq!(res.unwrap_err().unwrap(), Error::Blacklisted);
+    }
+
+    /// `transfer_admin` correctly moves admin rights to a new address.
+    #[test]
+    fn test_transfer_admin() {
+        let (env, client, contract_addr) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.transfer_admin(&new_admin);
+
+        let stored: Option<Address> = env.as_contract(&contract_addr, || {
+            env.storage().instance().get(&DataKey::Admin)
+        });
+        assert_eq!(stored, Some(new_admin));
+    }
+
+    /// `transfer_admin` before `initialize` returns `NotInitialized`.
+    #[test]
+    fn test_transfer_admin_not_initialized() {
+        let (env, client, _) = setup_env();
+        let new_admin = Address::generate(&env);
+
+        let res = client.try_transfer_admin(&new_admin);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NotInitialized);
+    }
+
+    /// `emergency_withdraw` correctly transfers tokens from the contract to admin.
+    #[test]
+    fn test_emergency_withdraw() {
+        let (env, client, contract_addr) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        let deposited = 8_000i128;
+        sac.mint(&contract_addr, &deposited);
+
+        assert_eq!(token_client.balance(&contract_addr), deposited);
+
+        let withdraw = 3_000i128;
+        client.emergency_withdraw(&token_address, &withdraw);
+
+        assert_eq!(token_client.balance(&admin), withdraw);
+        assert_eq!(token_client.balance(&contract_addr), deposited - withdraw);
+    }
+
+    /// `version()` returns the compile-time constant `1`.
+    #[test]
+    fn test_version() {
+        let (_env, client, _) = setup_env();
+        assert_eq!(client.version(), 1);
+    }
+
+    /// `add_supported_token` is a no-op and never errors.
+    #[test]
+    fn test_add_supported_token_noop() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, _tc, _sac) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        // Should not panic or error
+        client.add_supported_token(&token_address);
+    }
+
+    /// `set_fee_config_legacy` updates both fee_bps and fee_cap.
+    #[test]
+    fn test_set_fee_config_legacy() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Update to 200 bps with a higher cap
+        client.set_fee_config_legacy(&200, &500);
+        assert_eq!(client.get_fee(), 200);
+
+        // Route and verify new fee applies: 200 bps of 1_000 = 20
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+        assert_eq!(token_client.balance(&treasury), 20);
+        assert_eq!(token_client.balance(&recipient), 980);
+    }
+
+    /// `get_effective_fee_bps` returns 0 when the contract is not initialized.
+    #[test]
+    fn test_get_effective_fee_bps_uninitialized() {
+        let (env, client, _) = setup_env();
+        let sender = Address::generate(&env);
+        // No storage entry for FeeBps — should return 0
+        assert_eq!(client.get_effective_fee_bps(&sender), 0);
+    }
+
+    /// `get_user_volume` returns 0 for a user who has never sent a payment.
+    #[test]
+    fn test_get_user_volume_no_history() {
+        let (env, client, _) = setup_env();
+        let user = Address::generate(&env);
+        assert_eq!(client.get_user_volume(&user), 0);
+    }
+
+    /// Fee is capped at the payment amount when fee_cap is larger than amount.
+    /// With fee_bps = 10_000 (100%) the fee equals the full amount, so
+    /// the remainder = 0 and only the fee transfer is executed.
+    #[test]
+    fn test_fee_capped_at_amount() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &1_000);
+
+        // 100% fee, cap far above amount
+        client.initialize(&admin, &treasury, &10_000, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+
+        // All goes to treasury; recipient gets nothing
+        assert_eq!(token_client.balance(&treasury), 1_000);
+        assert_eq!(token_client.balance(&recipient), 0);
+    }
 }
