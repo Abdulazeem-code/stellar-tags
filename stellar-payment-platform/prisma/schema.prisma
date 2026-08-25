@@ -66,6 +66,7 @@ model PaymentIntent {
   asset      String?  
   memoType   String?  @map("memo_type")
   memo       String?
+  metadata   Json?
   status     String   @default("pending")
   createdAt  DateTime @default(now()) @map("created_at")
 
