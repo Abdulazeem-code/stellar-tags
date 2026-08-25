@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    BytesN, Env, Vec, Symbol,
+    BytesN, Env, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -37,8 +37,8 @@ fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> B
 
     // Bytes 8..24 — accumulated_amount (i128 big-endian)
     let a_bytes = accumulated_amount.to_be_bytes();
-    buf[8]  = a_bytes[0];
-    buf[9]  = a_bytes[1];
+    buf[8] = a_bytes[0];
+    buf[9] = a_bytes[1];
     buf[10] = a_bytes[2];
     buf[11] = a_bytes[3];
     buf[12] = a_bytes[4];
@@ -64,16 +64,13 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
 
     // last_reset_time — bytes 0..8
     let last_reset_time = u64::from_be_bytes([
-        buf[0], buf[1], buf[2], buf[3],
-        buf[4], buf[5], buf[6], buf[7],
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
 
     // accumulated_amount — bytes 8..24
     let accumulated_amount = i128::from_be_bytes([
-        buf[8],  buf[9],  buf[10], buf[11],
-        buf[12], buf[13], buf[14], buf[15],
-        buf[16], buf[17], buf[18], buf[19],
-        buf[20], buf[21], buf[22], buf[23],
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
     ]);
 
     (last_reset_time, accumulated_amount)
@@ -108,7 +105,7 @@ pub enum DataKey {
     PlatformTreasury,
     FeeBps,
     FeeCap,
-        MinLimit,
+    MinLimit,
     Paused,
     MaxAmount,
     UserVolume(Address),
@@ -279,9 +276,10 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
-        env.storage()
-            .persistent()
-            .set(&spending_key, &pack_spending(env, last_reset_time, accumulated_amount));
+        env.storage().persistent().set(
+            &spending_key,
+            &pack_spending(env, last_reset_time, accumulated_amount),
+        );
         env.storage().persistent().extend_ttl(
             &spending_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,
@@ -359,7 +357,9 @@ impl PaymentRouter {
             .set(&DataKey::PlatformTreasury, &platform_treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
-        env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -431,10 +431,7 @@ impl PaymentRouter {
 
     /// Returns the current protocol fee percentage in basis points.
     pub fn get_fee(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
     /// Pauses or unpauses the payment router. Admin-only.
@@ -479,7 +476,9 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        env.storage().persistent().set(&DataKey::Blacklist(address.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Blacklist(address.clone()), &true);
         env.storage().persistent().extend_ttl(
             &DataKey::Blacklist(address),
             Self::PERSISTENT_LIFETIME_THRESHOLD,
@@ -494,24 +493,25 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        env.storage().persistent().remove(&DataKey::Blacklist(address));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Blacklist(address));
 
         Ok(())
     }
 
     /// Returns whether an address is blacklisted.
     pub fn is_blacklisted(env: Env, address: Address) -> bool {
-        env.storage().persistent().get(&DataKey::Blacklist(address)).unwrap_or(false)
+        env.storage()
+            .persistent()
+            .get(&DataKey::Blacklist(address))
+            .unwrap_or(false)
     }
 
     /// Returns the effective fee_bps for a sender after applying any
     /// volume-based tiered discount.
     pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
-        let fee_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0);
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let user_volume = Self::get_user_volume(env.clone(), sender);
         if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
@@ -788,11 +788,13 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
-        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &5_000);
+        client
+            .mock_all_auths()
+            .route_payment(&sender, &recipient, &token_address, &5_000);
 
         let events = env.events().all();
         assert!(!events.is_empty());
-        
+
         let mut found = false;
         for (_, topics, data) in events.iter() {
             if topics.len() > 0 {
@@ -996,10 +998,7 @@ mod test {
         // Now routing should succeed again. The first payment pushed volume past
         // VOLUME_THRESHOLD, so the halved rate applies: 2000 * 50 bps = 10.
         client.route_payment(&sender, &recipient, &token_address, &2000);
-        assert_eq!(
-            token_client.balance(&recipient),
-            (limit - 50) + (2000 - 10)
-        );
+        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 10));
     }
 
     #[test]
@@ -1040,14 +1039,23 @@ mod test {
         sac.mint(&sender, &total_mint);
 
         // Initialize with 1% fee (100 bps) and no cap
-        client.initialize(&admin, &treasury, &100, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         // First payment: volume is 0 (< threshold), full fee applies
         client.route_payment(&sender, &recipient, &token_address, &first_amount);
 
         let full_fee_first = (first_amount * 100) / 10_000;
         assert_eq!(token_client.balance(&treasury), full_fee_first);
-        assert_eq!(token_client.balance(&recipient), first_amount - full_fee_first);
+        assert_eq!(
+            token_client.balance(&recipient),
+            first_amount - full_fee_first
+        );
         assert_eq!(client.get_user_volume(&sender), first_amount);
         // Volume is now past threshold, so next call gets the discount
         assert_eq!(client.get_effective_fee_bps(&sender), 50);
@@ -1056,7 +1064,10 @@ mod test {
         client.route_payment(&sender, &recipient, &token_address, &second_amount);
 
         let discounted_fee = (second_amount * 50) / 10_000;
-        assert_eq!(token_client.balance(&treasury), full_fee_first + discounted_fee);
+        assert_eq!(
+            token_client.balance(&treasury),
+            full_fee_first + discounted_fee
+        );
         assert_eq!(
             token_client.balance(&recipient),
             (first_amount - full_fee_first) + (second_amount - discounted_fee)
@@ -1076,7 +1087,13 @@ mod test {
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &1_000_000);
 
-        client.initialize(&admin, &treasury, &100, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         // No volume yet
         assert_eq!(client.get_effective_fee_bps(&sender), 100);
@@ -1101,7 +1118,13 @@ mod test {
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &platform_treasury, &40, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &platform_treasury,
+            &40,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
@@ -1256,7 +1279,9 @@ mod test {
         client.unblacklist_address(&recipient);
         assert!(!client.is_blacklisted(&recipient));
 
-        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &1000);
+        client
+            .mock_all_auths()
+            .route_payment(&sender, &recipient, &token_address, &1000);
     }
 
     #[test]
@@ -1268,7 +1293,13 @@ mod test {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        client.initialize(&admin, &treasury, &100, &1_000_000, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
         let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
@@ -1316,7 +1347,7 @@ mod test {
         std::println!("GAS REPORT: route_payment");
         std::println!("CPU Instructions: {}", route_cpu);
         std::println!("Memory Bytes: {}", route_mem);
-        
+
         env.budget().print();
 
         // Fails CI if gas costs exceed defined thresholds
@@ -1324,10 +1355,30 @@ mod test {
         let max_cpu = 5_000_000;
         let max_mem = 2_000_000;
 
-        assert!(init_cpu <= max_cpu, "initialize CPU cost exceeded threshold! Cost: {}, Threshold: {}", init_cpu, max_cpu);
-        assert!(init_mem <= max_mem, "initialize Memory cost exceeded threshold! Cost: {}, Threshold: {}", init_mem, max_mem);
-        
-        assert!(route_cpu <= max_cpu, "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}", route_cpu, max_cpu);
-        assert!(route_mem <= max_mem, "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}", route_mem, max_mem);
+        assert!(
+            init_cpu <= max_cpu,
+            "initialize CPU cost exceeded threshold! Cost: {}, Threshold: {}",
+            init_cpu,
+            max_cpu
+        );
+        assert!(
+            init_mem <= max_mem,
+            "initialize Memory cost exceeded threshold! Cost: {}, Threshold: {}",
+            init_mem,
+            max_mem
+        );
+
+        assert!(
+            route_cpu <= max_cpu,
+            "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}",
+            route_cpu,
+            max_cpu
+        );
+        assert!(
+            route_mem <= max_mem,
+            "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}",
+            route_mem,
+            max_mem
+        );
     }
 }
