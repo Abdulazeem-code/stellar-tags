@@ -28,6 +28,10 @@ model User {
   webhooks  Webhook[] // <-- add this line
 
   @@index([username])
+  // Serves the keyset (cursor) pagination seeks used by the /users and
+  // /lookup list endpoints: (created_at DESC, username DESC) walks this
+  // index backwards, so page depth no longer affects query cost.
+  @@index([createdAt, username])
   @@map("username_registry")
 }
 
@@ -48,4 +52,24 @@ model Webhook {
   @@index([username])
   @@index([lastSentAt])
   @@map("webhooks")
+}
+
+// PaymentIntent model for storing requested payment registrations. These are
+// created via the bulk registration endpoint and persisted atomically using
+// `prisma.$transaction`.
+model PaymentIntent {
+  id         String   @id @default(uuid())
+  externalId String?  @map("external_id")
+  from       String
+  to         String
+  amount     String
+  asset      String?  
+  memoType   String?  @map("memo_type")
+  memo       String?
+  status     String   @default("pending")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([to])
+  @@index([from])
+  @@map("payment_intents")
 }
