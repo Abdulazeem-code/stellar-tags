@@ -33,6 +33,28 @@ try {
       create: async () => ({}),
       count: async () => 0,
     },
+    auditLog: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      findFirst: async () => null,
+      create: async (args) => args.data || {},
+      count: async () => 0,
+    },
+    webhook: {
+      findUnique: async () => null,
+      findFirst: async () => null,
+      findMany: async () => [],
+      create: async () => ({}),
+      update: async () => ({}),
+      delete: async () => ({}),
+      count: async () => 0,
+    },
+    paymentIntent: {
+      create: async (args) => args.data || {},
+      findMany: async () => [],
+      findUnique: async () => null,
+      count: async () => 0,
+    },
     $transaction: async (queries) => Promise.all(queries),
     $queryRaw: async () => [],
   };

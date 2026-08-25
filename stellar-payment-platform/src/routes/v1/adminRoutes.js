@@ -9,11 +9,13 @@
  * Routes
  *  POST /admin/block          – flag (soft-block) an address
  *  GET  /admin/export         – stream transaction records as CSV or JSON
+ *  GET  /admin/audit-logs     – retrieve recent admin audit logs
  */
 
 const express = require('express');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { validateSchema } = require('../../middleware/validateSchema');
+const { auditLogMiddleware } = require('../../middleware/auditLog');
 const { adminBlockBodySchema, adminExportQuerySchema } = require('../../schemas');
 const { streamAdminExport } = require('../../utils/exporter');
 const { invalidateFederationCache } = require('../../cache');
@@ -22,7 +24,11 @@ const { logger } = require('../../logger');
 module.exports = (redisClient) => {
   const router = express.Router();
 
+  // ── Intercept mutating admin requests for audit logging ───────────────────
+  router.use(auditLogMiddleware);
+
   // ── Admin authentication middleware ──────────────────────────────────────
+
 
   const adminAuth = (req, res, next) => {
     const apiKey = req.headers['x-api-key'] || req.query.api_key;
@@ -123,5 +129,33 @@ module.exports = (redisClient) => {
     }),
   );
 
+  // ── GET /admin/audit-logs ────────────────────────────────────────────────
+
+  /**
+   * Retrieves recent admin audit logs.
+   *
+   * Query parameters:
+   *  - limit (optional) integer between 1 and 100, default 50
+   */
+  router.get(
+    '/admin/audit-logs',
+    adminAuth,
+    asyncHandler(async (req, res) => {
+      const prisma = getPrisma();
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+      const logs = await prisma.auditLog.findMany({
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+      });
+
+      return res.status(200).json({
+        success: true,
+        count: logs.length,
+        data: logs,
+      });
+    }),
+  );
+
   return router;
 };
+

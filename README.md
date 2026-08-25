@@ -375,7 +375,20 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
 
 Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
 
+### `GET /admin/audit-logs`
+Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
+- **Query Parameters:**
+  - `limit` (optional) – Maximum number of records to return (1-100, default 50).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
+- **Status Codes:**
+  - `200 OK`: Audit logs retrieved successfully.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
+
 ### `GET /metrics`
+
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
 rate limiter so a scraper on a fixed interval is never throttled.
 - **Returns:** all metrics below, prefixed `stellar_tags_`.
