@@ -54,6 +54,7 @@ const {
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require('./src/utils');
+const { attachGraphQL } = require('./src/graphql');
 
 dotenv.config();
 
@@ -846,6 +847,9 @@ app.use('/', v1Router);
 app.use('/api/v1', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+// Apollo is mounted after body parsing so its context and resolvers receive
+// the same request metadata as the REST API.
+const graphqlServer = attachGraphQL(app);
 
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -958,4 +962,4 @@ if (require.main === module) {
   process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo, graphqlServer };

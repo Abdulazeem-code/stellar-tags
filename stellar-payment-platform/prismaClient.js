@@ -33,6 +33,13 @@ try {
       create: async () => ({}),
       count: async () => 0,
     },
+    webhook: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      create: async () => ({}),
+      update: async () => ({}),
+      deleteMany: async () => ({ count: 0 }),
+    },
     $transaction: async (queries) => Promise.all(queries),
     $queryRaw: async () => [],
   };
