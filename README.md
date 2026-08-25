@@ -397,6 +397,16 @@ Memory and CPU come from `prom-client`'s default collectors. The pool gauges rea
 Prisma's `$metrics` (which requires the `metrics` preview feature in
 `schema.prisma`) and report `0` when it is unavailable.
 
+## Smart Contract Refund Mechanism
+
+When a recipient cannot receive routed tokens (e.g. missing trustline, invalid contract recipient, or transfer rejection), the `PaymentRouter` smart contract prevents whole-transaction aborts by capturing the unrouteable tokens into the contract and crediting the sender's internal refund ledger (`DataKey::RefundBalance(user, token)`).
+
+### Claiming Refunds
+Users can query and withdraw their credited refunds at any time using the pull-based withdrawal pattern:
+- `get_refund_balance(user: Address, token: Address) -> i128`: Query available internal refund balance.
+- `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
+- `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
+
 ## Architecture notes
 
 - The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.
