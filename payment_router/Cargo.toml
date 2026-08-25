@@ -30,3 +30,7 @@ debug-assertions = false
 panic = "abort"
 codegen-units = 1
 lto = true
+
+[package.metadata]
+strict-clippy = true
+clippy-note = "CI enforces 'cargo clippy --all-targets --all-features -- -D warnings'"
