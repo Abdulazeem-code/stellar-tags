@@ -1108,4 +1108,48 @@ mod test {
         assert_eq!(eurc_like_client.balance(&recipient), 990);
         assert_eq!(client.get_user_volume(&sender), 3_000);
     }
+
+    #[test]
+    fn test_benchmark_gas_costs() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        // Reset budget before initialization
+        env.budget().reset_default();
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        let init_cpu = env.budget().cpu_instruction_cost();
+        let init_mem = env.budget().memory_bytes_cost();
+        std::println!("GAS REPORT: initialize");
+        std::println!("CPU Instructions: {}", init_cpu);
+        std::println!("Memory Bytes: {}", init_mem);
+
+        // Reset budget before route_payment
+        env.budget().reset_default();
+        client.route_payment(&sender, &recipient, &token_address, &5_000);
+        let route_cpu = env.budget().cpu_instruction_cost();
+        let route_mem = env.budget().memory_bytes_cost();
+        std::println!("GAS REPORT: route_payment");
+        std::println!("CPU Instructions: {}", route_cpu);
+        std::println!("Memory Bytes: {}", route_mem);
+        
+        env.budget().print();
+
+        // Fails CI if gas costs exceed defined thresholds
+        // Set reasonable thresholds (e.g. 5M CPU and 2MB Mem per call)
+        let max_cpu = 5_000_000;
+        let max_mem = 2_000_000;
+
+        assert!(init_cpu <= max_cpu, "initialize CPU cost exceeded threshold! Cost: {}, Threshold: {}", init_cpu, max_cpu);
+        assert!(init_mem <= max_mem, "initialize Memory cost exceeded threshold! Cost: {}, Threshold: {}", init_mem, max_mem);
+        
+        assert!(route_cpu <= max_cpu, "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}", route_cpu, max_cpu);
+        assert!(route_mem <= max_mem, "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}", route_mem, max_mem);
+    }
 }
