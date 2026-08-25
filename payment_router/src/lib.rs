@@ -1416,6 +1416,66 @@ mod test {
         assert_eq!(client.get_user_volume(&sender), 3_000);
     }
 
+    /// Verifies that `route_payments` routes a batch of payments across
+    /// disparate tokens in a single atomic transaction, charging the correct
+    /// fee per token and crediting each recipient independently.
+    #[test]
+    fn test_route_payments_multi_token_batch() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient_a = Address::generate(&env);
+        let recipient_b = Address::generate(&env);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
+        let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
+        assert_ne!(usdc_like_address, eurc_like_address);
+
+        usdc_like_admin_client.mint(&sender, &10_000);
+        eurc_like_admin_client.mint(&sender, &5_000);
+
+        let payments = vec![
+            &env,
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient_a.clone(),
+                token_address: usdc_like_address.clone(),
+                amount: 2_000,
+            },
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient_b.clone(),
+                token_address: eurc_like_address.clone(),
+                amount: 1_000,
+            },
+        ];
+
+        client.route_payments(&payments);
+
+        // USDC-like payment: 2_000 with 100 bps fee => 20 fee, 1_980 to recipient_a
+        assert_eq!(usdc_like_client.balance(&sender), 8_000);
+        assert_eq!(usdc_like_client.balance(&recipient_a), 1_980);
+        assert_eq!(usdc_like_client.balance(&treasury), 20);
+
+        // EURC-like payment: 1_000 with 100 bps fee => 10 fee, 990 to recipient_b
+        assert_eq!(eurc_like_client.balance(&sender), 4_000);
+        assert_eq!(eurc_like_client.balance(&recipient_b), 990);
+        assert_eq!(eurc_like_client.balance(&treasury), 10);
+
+        // Volume aggregates across both tokens for the sender
+        assert_eq!(client.get_user_volume(&sender), 3_000);
+    }
+
     #[test]
     fn test_benchmark_gas_costs() {
         let (env, client, _) = setup_env();
