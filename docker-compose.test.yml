@@ -16,6 +16,17 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+      
+  horizon-test:
+    image: stellar/quickstart:latest
+    command: --standalone
+    environment:
+      NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    networks:
+      - stellar-test-net
 
 networks:
   stellar-test-net:
