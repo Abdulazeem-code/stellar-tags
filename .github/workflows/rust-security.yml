@@ -22,13 +22,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
           components: clippy, rustfmt
-
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ./payment_router
 
       - name: Verify formatting
         run: |
@@ -37,6 +31,11 @@ jobs:
       - name: Run clippy (deny warnings)
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Install and run cargo-dylint
+        run: |
+          cargo install cargo-dylint --force || true
+          cargo dylint --all-targets --all-features -- -D warnings
 
       - name: Install and run cargo-audit
         run: |

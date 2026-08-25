@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    BytesN, Env, Vec, Symbol,
+    BytesN, Env, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -37,8 +37,8 @@ fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> B
 
     // Bytes 8..24 — accumulated_amount (i128 big-endian)
     let a_bytes = accumulated_amount.to_be_bytes();
-    buf[8]  = a_bytes[0];
-    buf[9]  = a_bytes[1];
+    buf[8] = a_bytes[0];
+    buf[9] = a_bytes[1];
     buf[10] = a_bytes[2];
     buf[11] = a_bytes[3];
     buf[12] = a_bytes[4];
@@ -64,16 +64,13 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
 
     // last_reset_time — bytes 0..8
     let last_reset_time = u64::from_be_bytes([
-        buf[0], buf[1], buf[2], buf[3],
-        buf[4], buf[5], buf[6], buf[7],
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
 
     // accumulated_amount — bytes 8..24
     let accumulated_amount = i128::from_be_bytes([
-        buf[8],  buf[9],  buf[10], buf[11],
-        buf[12], buf[13], buf[14], buf[15],
-        buf[16], buf[17], buf[18], buf[19],
-        buf[20], buf[21], buf[22], buf[23],
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
     ]);
 
     (last_reset_time, accumulated_amount)
@@ -115,6 +112,7 @@ pub enum DataKey {
     UserVolume(Address),
     UserSpending(Address),
     Blacklist(Address),
+    RefundBalance(Address, Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -139,6 +137,8 @@ pub enum Error {
     InvalidRecipient = 8,
     /// Recipient address is blacklisted.
     Blacklisted = 9,
+    /// Requested refund withdrawal amount is zero or exceeds available refund balance.
+    NoRefundAvailable = 10,
 }
 
 #[contract]
@@ -208,6 +208,28 @@ impl PaymentRouter {
         );
 
         Ok((platform_treasury, fee_bps, fee_cap))
+    }
+
+    fn get_refund_balance_internal(env: &Env, user: &Address, token: &Address) -> i128 {
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    fn credit_refund_balance(env: &Env, user: &Address, token: &Address, amount: i128) {
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_balance = current_balance + amount;
+        env.storage().persistent().set(&key, &new_balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("refunded"), user.clone(), token.clone()),
+            amount,
+        );
     }
 
     /// Core payment logic shared by `route_payment` and `route_payments`.
@@ -293,9 +315,10 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
-        env.storage()
-            .persistent()
-            .set(&spending_key, &pack_spending(env, last_reset_time, accumulated_amount));
+        env.storage().persistent().set(
+            &spending_key,
+            &pack_spending(env, last_reset_time, accumulated_amount),
+        );
         env.storage().persistent().extend_ttl(
             &spending_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,
@@ -323,7 +346,19 @@ impl PaymentRouter {
             token_client.transfer(sender, platform_treasury, &fee_amount);
         }
         if remainder > 0 {
-            token_client.transfer(sender, recipient, &remainder);
+            // Attempt to transfer remainder directly to recipient.
+            // If recipient cannot receive tokens (e.g. missing trustline or rejection),
+            // transfer funds into the contract and credit the sender's internal refund ledger.
+            match token_client.try_transfer(sender, recipient, &remainder) {
+                Ok(Ok(())) => {
+                    log!(env, "Remaining balance routed to recipient");
+                }
+                _ => {
+                    log!(env, "Recipient transfer failed; crediting sender refund balance");
+                    token_client.transfer(sender, &env.current_contract_address(), &remainder);
+                    Self::credit_refund_balance(env, sender, token_address, remainder);
+                }
+            }
         }
 
         // Record cumulative volume
@@ -345,7 +380,6 @@ impl PaymentRouter {
         );
 
         log!(env, "Platform fee routed to treasury");
-        log!(env, "Remaining balance routed to recipient");
 
         Ok(())
     }
@@ -373,7 +407,9 @@ impl PaymentRouter {
             .set(&DataKey::PlatformTreasury, &platform_treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
-        env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -458,10 +494,7 @@ impl PaymentRouter {
 
     /// Returns the current protocol fee percentage in basis points.
     pub fn get_fee(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
     /// Pauses or unpauses the payment router. Admin-only.
@@ -506,7 +539,9 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        env.storage().persistent().set(&DataKey::Blacklist(address.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Blacklist(address.clone()), &true);
         env.storage().persistent().extend_ttl(
             &DataKey::Blacklist(address),
             Self::PERSISTENT_LIFETIME_THRESHOLD,
@@ -521,24 +556,25 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        env.storage().persistent().remove(&DataKey::Blacklist(address));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Blacklist(address));
 
         Ok(())
     }
 
     /// Returns whether an address is blacklisted.
     pub fn is_blacklisted(env: Env, address: Address) -> bool {
-        env.storage().persistent().get(&DataKey::Blacklist(address)).unwrap_or(false)
+        env.storage()
+            .persistent()
+            .get(&DataKey::Blacklist(address))
+            .unwrap_or(false)
     }
 
     /// Returns the effective fee_bps for a sender after applying any
     /// volume-based tiered discount.
     pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
-        let fee_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0);
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let user_volume = Self::get_user_volume(env.clone(), sender);
         if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
@@ -642,6 +678,68 @@ impl PaymentRouter {
         }
 
         Ok(())
+    }
+
+    /// Returns the available internal refund balance for a user and token.
+    pub fn get_refund_balance(env: Env, user: Address, token: Address) -> i128 {
+        Self::get_refund_balance_internal(&env, &user, &token)
+    }
+
+    /// Withdraws a specific amount from the user's internal refund balance.
+    pub fn withdraw_refund(
+        env: Env,
+        user: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        user.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
+        if amount > current_balance {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        let new_balance = current_balance - amount;
+        if new_balance > 0 {
+            env.storage().persistent().set(&key, &new_balance);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &user, &amount);
+
+        env.events().publish(
+            (symbol_short!("withdrawn"), user.clone(), token.clone()),
+            amount,
+        );
+
+        log!(&env, "Refund balance withdrawn by user");
+        Ok(())
+    }
+
+    /// Claims and withdraws the entire available refund balance for a user and token.
+    pub fn claim_all_refunds(env: Env, user: Address, token: Address) -> Result<i128, Error> {
+        user.require_auth();
+
+        let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
+        if current_balance <= 0 {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        Self::withdraw_refund(env, user, token, current_balance)?;
+        Ok(current_balance)
     }
 
     /// Admin-only emergency withdrawal of tokens held by this contract.
@@ -815,11 +913,13 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
-        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &5_000);
+        client
+            .mock_all_auths()
+            .route_payment(&sender, &recipient, &token_address, &5_000);
 
         let events = env.events().all();
         assert!(!events.is_empty());
-        
+
         let mut found = false;
         for (_, topics, data) in events.iter() {
             if topics.len() > 0 {
@@ -1023,10 +1123,7 @@ mod test {
         // Now routing should succeed again. The first payment pushed volume past
         // VOLUME_THRESHOLD, so the halved rate applies: 2000 * 50 bps = 10.
         client.route_payment(&sender, &recipient, &token_address, &2000);
-        assert_eq!(
-            token_client.balance(&recipient),
-            (limit - 50) + (2000 - 10)
-        );
+        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 10));
     }
 
     #[test]
@@ -1067,14 +1164,23 @@ mod test {
         sac.mint(&sender, &total_mint);
 
         // Initialize with 1% fee (100 bps) and no cap
-        client.initialize(&admin, &treasury, &100, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         // First payment: volume is 0 (< threshold), full fee applies
         client.route_payment(&sender, &recipient, &token_address, &first_amount);
 
         let full_fee_first = (first_amount * 100) / 10_000;
         assert_eq!(token_client.balance(&treasury), full_fee_first);
-        assert_eq!(token_client.balance(&recipient), first_amount - full_fee_first);
+        assert_eq!(
+            token_client.balance(&recipient),
+            first_amount - full_fee_first
+        );
         assert_eq!(client.get_user_volume(&sender), first_amount);
         // Volume is now past threshold, so next call gets the discount
         assert_eq!(client.get_effective_fee_bps(&sender), 50);
@@ -1083,7 +1189,10 @@ mod test {
         client.route_payment(&sender, &recipient, &token_address, &second_amount);
 
         let discounted_fee = (second_amount * 50) / 10_000;
-        assert_eq!(token_client.balance(&treasury), full_fee_first + discounted_fee);
+        assert_eq!(
+            token_client.balance(&treasury),
+            full_fee_first + discounted_fee
+        );
         assert_eq!(
             token_client.balance(&recipient),
             (first_amount - full_fee_first) + (second_amount - discounted_fee)
@@ -1103,7 +1212,13 @@ mod test {
         let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
         sac.mint(&sender, &1_000_000);
 
-        client.initialize(&admin, &treasury, &100, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         // No volume yet
         assert_eq!(client.get_effective_fee_bps(&sender), 100);
@@ -1128,7 +1243,13 @@ mod test {
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &platform_treasury, &40, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &platform_treasury,
+            &40,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         let token_admin = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract(token_admin.clone());
@@ -1283,7 +1404,9 @@ mod test {
         client.unblacklist_address(&recipient);
         assert!(!client.is_blacklisted(&recipient));
 
-        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &1000);
+        client
+            .mock_all_auths()
+            .route_payment(&sender, &recipient, &token_address, &1000);
     }
 
     #[test]
@@ -1295,7 +1418,13 @@ mod test {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        client.initialize(&admin, &treasury, &100, &1_000_000, &PaymentRouter::MAX_AMOUNT);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
 
         let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
         let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
@@ -1343,7 +1472,7 @@ mod test {
         std::println!("GAS REPORT: route_payment");
         std::println!("CPU Instructions: {}", route_cpu);
         std::println!("Memory Bytes: {}", route_mem);
-        
+
         env.budget().print();
 
         // Fails CI if gas costs exceed defined thresholds
@@ -1351,11 +1480,285 @@ mod test {
         let max_cpu = 5_000_000;
         let max_mem = 2_000_000;
 
-        assert!(init_cpu <= max_cpu, "initialize CPU cost exceeded threshold! Cost: {}, Threshold: {}", init_cpu, max_cpu);
-        assert!(init_mem <= max_mem, "initialize Memory cost exceeded threshold! Cost: {}, Threshold: {}", init_mem, max_mem);
-        
-        assert!(route_cpu <= max_cpu, "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}", route_cpu, max_cpu);
-        assert!(route_mem <= max_mem, "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}", route_mem, max_mem);
+        assert!(
+            init_cpu <= max_cpu,
+            "initialize CPU cost exceeded threshold! Cost: {}, Threshold: {}",
+            init_cpu,
+            max_cpu
+        );
+        assert!(
+            init_mem <= max_mem,
+            "initialize Memory cost exceeded threshold! Cost: {}, Threshold: {}",
+            init_mem,
+            max_mem
+        );
+
+        assert!(
+            route_cpu <= max_cpu,
+            "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}",
+            route_cpu,
+            max_cpu
+        );
+        assert!(
+            route_mem <= max_mem,
+            "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}",
+            route_mem,
+            max_mem
+        );
+    }
+
+    #[test]
+    fn test_refund_ledger_and_withdrawal() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+
+        // Initially zero refund balance
+        assert_eq!(client.get_refund_balance(&user, &token_address), 0);
+
+        // Simulate stranded tokens in contract and credit internal refund balance
+        let refund_amount = 5_000i128;
+        stellar_asset_client.mint(&contract_id, &refund_amount);
+
+        env.as_contract(&contract_id, || {
+            PaymentRouter::credit_refund_balance(&env, &user, &token_address, refund_amount);
+        });
+
+        assert_eq!(client.get_refund_balance(&user, &token_address), refund_amount);
+
+        // User withdraws partial refund
+        let partial_amount = 2_000i128;
+        client.withdraw_refund(&user, &token_address, &partial_amount);
+
+        assert_eq!(token_client.balance(&user), partial_amount);
+        assert_eq!(
+            client.get_refund_balance(&user, &token_address),
+            refund_amount - partial_amount
+        );
+
+        // User claims remaining refunds with claim_all_refunds
+        let claimed = client.claim_all_refunds(&user, &token_address);
+        assert_eq!(claimed, refund_amount - partial_amount);
+        assert_eq!(token_client.balance(&user), refund_amount);
+        assert_eq!(client.get_refund_balance(&user, &token_address), 0);
+
+        // Trying to withdraw again should fail with NoRefundAvailable
+        let res = client.try_withdraw_refund(&user, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoRefundAvailable);
+    }
+}
+
+/// Property-based tests for fee calculation logic.
+///
+/// These tests exercise the pure arithmetic used in `process_single_payment`
+/// without touching the Soroban environment so they can run as ordinary host
+/// tests powered by proptest.
+///
+/// The invariants verified across 10,000 random inputs are:
+/// 1. **Conservation**: `fee_amount + remainder == amount`
+/// 2. **Non-negative fee**: `fee_amount >= 0`
+/// 3. **Non-negative remainder**: `remainder >= 0`
+/// 4. **Cap enforcement**: `fee_amount <= fee_cap`
+/// 5. **Fee never exceeds amount**: `fee_amount <= amount`
+#[cfg(test)]
+mod prop_tests {
+    use proptest::prelude::*;
+
+    // --- constants mirrored from the contract ---
+    const BPS_DIVISOR: i128 = 10_000;
+    /// Maximum valid fee in basis points (100% = 10 000 bps).
+    const MAX_FEE_BPS: i128 = 10_000;
+    /// Upper bound for a single payment amount (matches contract MAX_AMOUNT).
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000;
+
+    // --- pure fee calculation logic (mirrors process_single_payment) ---
+
+    /// Computes `(fee_amount, remainder)` exactly as the contract does.
+    ///
+    /// `user_volume_above_threshold` stands in for the tiered-discount check:
+    /// when `true` the effective fee is halved.
+    fn compute_fee(
+        amount: i128,
+        fee_bps: i128,
+        fee_cap: i128,
+        user_volume_above_threshold: bool,
+    ) -> (i128, i128) {
+        let effective_fee_bps = if user_volume_above_threshold {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+
+        let mut fee_amount = (amount * effective_fee_bps) / BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        let remainder = amount - fee_amount;
+        (fee_amount, remainder)
+    }
+
+    // -----------------------------------------------------------------------
+    // Strategies
+    // -----------------------------------------------------------------------
+
+    /// A valid payment amount: 1 ..= MAX_AMOUNT (positive, within contract bounds).
+    fn valid_amount() -> impl Strategy<Value = i128> {
+        1i128..=MAX_AMOUNT
+    }
+
+    /// A valid fee in basis points: 0 ..= 10 000 (0% to 100%).
+    fn valid_fee_bps() -> impl Strategy<Value = i128> {
+        0i128..=MAX_FEE_BPS
+    }
+
+    /// A valid fee cap: 0 ..= MAX_AMOUNT.
+    fn valid_fee_cap() -> impl Strategy<Value = i128> {
+        0i128..=MAX_AMOUNT
+    }
+
+    // -----------------------------------------------------------------------
+    // Property: fee_amount + remainder == amount  (conservation of funds)
+    // -----------------------------------------------------------------------
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        /// Funds are fully conserved: every strobe of the amount ends up either
+        /// in the treasury (fee) or the recipient (remainder), never lost or
+        /// created.
+        #[test]
+        fn prop_fee_plus_remainder_equals_amount(
+            amount in valid_amount(),
+            fee_bps in valid_fee_bps(),
+            fee_cap in valid_fee_cap(),
+            above_threshold in any::<bool>(),
+        ) {
+            let (fee_amount, remainder) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
+            prop_assert_eq!(
+                fee_amount + remainder,
+                amount,
+                "fee_amount ({}) + remainder ({}) != amount ({})",
+                fee_amount, remainder, amount
+            );
+        }
+
+        /// The fee is always non-negative — the treasury never receives a
+        /// negative transfer.
+        #[test]
+        fn prop_fee_amount_is_non_negative(
+            amount in valid_amount(),
+            fee_bps in valid_fee_bps(),
+            fee_cap in valid_fee_cap(),
+            above_threshold in any::<bool>(),
+        ) {
+            let (fee_amount, _) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
+            prop_assert!(
+                fee_amount >= 0,
+                "fee_amount ({}) must be >= 0",
+                fee_amount
+            );
+        }
+
+        /// The remainder is always non-negative — the recipient never receives a
+        /// negative transfer.
+        #[test]
+        fn prop_remainder_is_non_negative(
+            amount in valid_amount(),
+            fee_bps in valid_fee_bps(),
+            fee_cap in valid_fee_cap(),
+            above_threshold in any::<bool>(),
+        ) {
+            let (_, remainder) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
+            prop_assert!(
+                remainder >= 0,
+                "remainder ({}) must be >= 0",
+                remainder
+            );
+        }
+
+        /// The fee never exceeds the configured cap.
+        #[test]
+        fn prop_fee_respects_cap(
+            amount in valid_amount(),
+            fee_bps in valid_fee_bps(),
+            fee_cap in valid_fee_cap(),
+            above_threshold in any::<bool>(),
+        ) {
+            let (fee_amount, _) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
+            prop_assert!(
+                fee_amount <= fee_cap,
+                "fee_amount ({}) exceeds fee_cap ({})",
+                fee_amount, fee_cap
+            );
+        }
+
+        /// The fee never exceeds the payment amount itself — the sender cannot
+        /// be charged more than they are sending.
+        #[test]
+        fn prop_fee_never_exceeds_amount(
+            amount in valid_amount(),
+            fee_bps in valid_fee_bps(),
+            fee_cap in valid_fee_cap(),
+            above_threshold in any::<bool>(),
+        ) {
+            let (fee_amount, _) = compute_fee(amount, fee_bps, fee_cap, above_threshold);
+            prop_assert!(
+                fee_amount <= amount,
+                "fee_amount ({}) exceeds amount ({})",
+                fee_amount, amount
+            );
+        }
+
+        /// When the fee rate is zero the entire amount flows to the recipient.
+        #[test]
+        fn prop_zero_fee_bps_means_no_fee(
+            amount in valid_amount(),
+            fee_cap in valid_fee_cap(),
+            above_threshold in any::<bool>(),
+        ) {
+            let (fee_amount, remainder) = compute_fee(amount, 0, fee_cap, above_threshold);
+            prop_assert_eq!(fee_amount, 0, "fee_amount must be 0 when fee_bps is 0");
+            prop_assert_eq!(remainder, amount, "remainder must equal amount when fee_bps is 0");
+        }
+
+        /// When the fee cap is zero no fee is ever collected regardless of the
+        /// rate.
+        #[test]
+        fn prop_zero_fee_cap_means_no_fee(
+            amount in valid_amount(),
+            fee_bps in valid_fee_bps(),
+            above_threshold in any::<bool>(),
+        ) {
+            let (fee_amount, remainder) = compute_fee(amount, fee_bps, 0, above_threshold);
+            prop_assert_eq!(fee_amount, 0, "fee_amount must be 0 when fee_cap is 0");
+            prop_assert_eq!(remainder, amount, "remainder must equal amount when fee_cap is 0");
+        }
+
+        /// The tiered discount never produces a *higher* fee than the standard
+        /// rate: halving the bps can only leave the fee equal or reduce it.
+        #[test]
+        fn prop_tiered_discount_never_increases_fee(
+            amount in valid_amount(),
+            fee_bps in valid_fee_bps(),
+            fee_cap in valid_fee_cap(),
+        ) {
+            let (fee_full, _) = compute_fee(amount, fee_bps, fee_cap, false);
+            let (fee_discounted, _) = compute_fee(amount, fee_bps, fee_cap, true);
+            prop_assert!(
+                fee_discounted <= fee_full,
+                "discounted fee ({}) must be <= full fee ({})",
+                fee_discounted, fee_full
+            );
+        }
     }
 
     #[test]
