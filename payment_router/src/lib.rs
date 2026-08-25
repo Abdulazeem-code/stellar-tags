@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    BytesN, Env, Vec, Symbol,
+    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address,
+    Bytes, BytesN, Env, Vec, Symbol,
 };
 
 #[contracttype]
@@ -18,6 +18,7 @@ pub struct Payment {
     pub recipient: Address,
     pub token_address: Address,
     pub amount: i128,
+    pub memo: Bytes,
 }
 
 #[contracttype]
@@ -56,6 +57,8 @@ pub enum Error {
     InvalidRecipient = 8,
     /// Recipient address is blacklisted.
     Blacklisted = 9,
+    /// Memo field exceeds maximum allowed length.
+    InvalidMemo = 10,
 }
 
 #[contract]
@@ -124,6 +127,7 @@ impl PaymentRouter {
         platform_treasury: &Address,
         fee_bps: i128,
         fee_cap: i128,
+        memo: &Bytes,
     ) -> Result<(), Error> {
         // Require sender auth
         sender.require_auth();
@@ -230,11 +234,18 @@ impl PaymentRouter {
             Self::PERSISTENT_BUMP_AMOUNT,
         );
 
-        // Emit routed event
-        env.events().publish(
-            (symbol_short!("routed"), sender.clone(), recipient.clone()),
-            amount,
-        );
+        // Emit routed event with memo
+        if memo.len() > 0 {
+            env.events().publish(
+                (symbol_short!("routed"), sender.clone(), recipient.clone(), memo.clone()),
+                amount,
+            );
+        } else {
+            env.events().publish(
+                (symbol_short!("routed"), sender.clone(), recipient.clone()),
+                amount,
+            );
+        }
 
         log!(env, "Platform fee routed to treasury");
         log!(env, "Remaining balance routed to recipient");
@@ -466,6 +477,7 @@ impl PaymentRouter {
         recipient: Address,
         token_address: Address,
         amount: i128,
+        memo: Bytes,
     ) -> Result<(), Error> {
         if Self::is_paused(env.clone()) {
             return Err(Error::Paused);
@@ -482,6 +494,40 @@ impl PaymentRouter {
             &platform_treasury,
             fee_bps,
             fee_cap,
+            &memo,
+        )
+    }
+
+    /// Routes a payment from a sender to a recipient with a memo as Bytes.
+    /// The memo will be validated for length (max 32 bytes).
+    pub fn route_payment_with_memo(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        memo_bytes: Bytes,
+    ) -> Result<(), Error> {
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        if memo_bytes.len() > 32 {
+            return Err(Error::InvalidMemo);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+            &memo_bytes,
         )
     }
 
@@ -504,6 +550,7 @@ impl PaymentRouter {
                 &platform_treasury,
                 fee_bps,
                 fee_cap,
+                &payment.memo,
             )?;
         }
 
@@ -681,7 +728,7 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
-        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &5_000);
+        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &5_000, &soroban_sdk::Bytes::new(&env));
 
         let events = env.events().all();
         assert!(!events.is_empty());
@@ -720,7 +767,7 @@ mod test {
         client.add_supported_token(&token_address);
 
         let amount = 2_000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount);
+        client.route_payment(&sender, &recipient, &token_address, &amount, &soroban_sdk::Bytes::new(&env));
 
         let events = env.events().all();
         assert!(!events.is_empty());
@@ -775,7 +822,7 @@ mod test {
         assert_eq!(client.is_paused(), true);
 
         // Route payment should fail when paused
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000, &soroban_sdk::Bytes::new(&env));
         assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
 
         // Unpause via set_paused alias
@@ -783,7 +830,7 @@ mod test {
         assert_eq!(client.is_paused(), false);
 
         // Route payment should succeed now
-        client.route_payment(&sender, &recipient, &token_address, &1000);
+        client.route_payment(&sender, &recipient, &token_address, &1000, &soroban_sdk::Bytes::new(&env));
     }
 
     #[test]
@@ -807,7 +854,7 @@ mod test {
 
         // Test normal fee calculation: 1% of 2000 = 20, below cap of 50
         let amount_1 = 2000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount_1);
+        client.route_payment(&sender, &recipient, &token_address, &amount_1, &soroban_sdk::Bytes::new(&env));
 
         assert_eq!(token_client.balance(&treasury), 20);
         assert_eq!(token_client.balance(&recipient), 1980);
@@ -816,7 +863,7 @@ mod test {
 
         // Test fee capped at 50: 1% of 8000 = 80, capped to 50
         let amount_2 = 8000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount_2);
+        client.route_payment(&sender, &recipient, &token_address, &amount_2, &soroban_sdk::Bytes::new(&env));
 
         assert_eq!(token_client.balance(&treasury), 70);
         assert_eq!(token_client.balance(&recipient), 9930);
@@ -843,7 +890,7 @@ mod test {
         client.add_supported_token(&token_address);
 
         // Route payment of 500 when balance is only 100
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &500, &soroban_sdk::Bytes::new(&env));
         assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
     }
 
@@ -866,10 +913,10 @@ mod test {
         client.add_supported_token(&token_address);
 
         // Route amount up to daily limit
-        client.route_payment(&sender, &recipient, &token_address, &limit);
+        client.route_payment(&sender, &recipient, &token_address, &limit, &soroban_sdk::Bytes::new(&env));
 
         // Next payment should exceed daily limit
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &2000);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &2000, &soroban_sdk::Bytes::new(&env));
         assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
 
         // Advance time past 24 hours to reset the daily limit
@@ -888,7 +935,7 @@ mod test {
 
         // Now routing should succeed again. The first payment pushed volume past
         // VOLUME_THRESHOLD, so the halved rate applies: 2000 * 50 bps = 10.
-        client.route_payment(&sender, &recipient, &token_address, &2000);
+        client.route_payment(&sender, &recipient, &token_address, &2000, &soroban_sdk::Bytes::new(&env));
         assert_eq!(
             token_client.balance(&recipient),
             (limit - 50) + (2000 - 10)
@@ -909,7 +956,7 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
-        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
+        let res = client.try_route_payment(&sender, &sender, &token_address, &1000, &soroban_sdk::Bytes::new(&env));
         assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
     }
 
@@ -936,7 +983,7 @@ mod test {
         client.initialize(&admin, &treasury, &100, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
 
         // First payment: volume is 0 (< threshold), full fee applies
-        client.route_payment(&sender, &recipient, &token_address, &first_amount);
+        client.route_payment(&sender, &recipient, &token_address, &first_amount, &soroban_sdk::Bytes::new(&env));
 
         let full_fee_first = (first_amount * 100) / 10_000;
         assert_eq!(token_client.balance(&treasury), full_fee_first);
@@ -946,7 +993,7 @@ mod test {
         assert_eq!(client.get_effective_fee_bps(&sender), 50);
 
         // Second payment: volume > threshold, 50% discount applies
-        client.route_payment(&sender, &recipient, &token_address, &second_amount);
+        client.route_payment(&sender, &recipient, &token_address, &second_amount, &soroban_sdk::Bytes::new(&env));
 
         let discounted_fee = (second_amount * 50) / 10_000;
         assert_eq!(token_client.balance(&treasury), full_fee_first + discounted_fee);
@@ -975,7 +1022,7 @@ mod test {
         assert_eq!(client.get_effective_fee_bps(&sender), 100);
 
         // Route a small payment (below threshold)
-        client.route_payment(&sender, &recipient, &token_address, &1000);
+        client.route_payment(&sender, &recipient, &token_address, &1000, &soroban_sdk::Bytes::new(&env));
 
         // Volume is 1000, far below 10,000 XLM threshold
         assert_eq!(client.get_effective_fee_bps(&sender), 100);
@@ -1007,7 +1054,7 @@ mod test {
         client.add_supported_token(&token_address);
 
         let amount = 100_000_000i128;
-        client.route_payment(&sender, &recipient, &token_address, &amount);
+        client.route_payment(&sender, &recipient, &token_address, &amount, &soroban_sdk::Bytes::new(&env));
 
         let expected_fee = 400_000i128;
         let expected_recipient_amount = amount - expected_fee;
@@ -1071,14 +1118,14 @@ mod test {
         assert!(client.is_blacklisted(&recipient));
 
         // Route payment should fail
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000, &soroban_sdk::Bytes::new(&env));
         assert_eq!(res.unwrap_err().unwrap(), Error::Blacklisted);
 
         // Unblacklist and try again
         client.unblacklist_address(&recipient);
         assert!(!client.is_blacklisted(&recipient));
 
-        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &1000);
+        client.mock_all_auths().route_payment(&sender, &recipient, &token_address, &1000, &soroban_sdk::Bytes::new(&env));
     }
 
     #[test]
@@ -1099,8 +1146,8 @@ mod test {
         usdc_like_admin_client.mint(&sender, &10_000);
         eurc_like_admin_client.mint(&sender, &5_000);
 
-        client.route_payment(&sender, &recipient, &usdc_like_address, &2_000);
-        client.route_payment(&sender, &recipient, &eurc_like_address, &1_000);
+        client.route_payment(&sender, &recipient, &usdc_like_address, &2_000, &soroban_sdk::Bytes::new(&env));
+        client.route_payment(&sender, &recipient, &eurc_like_address, &1_000, &soroban_sdk::Bytes::new(&env));
 
         assert_eq!(usdc_like_client.balance(&sender), 8_000);
         assert_eq!(usdc_like_client.balance(&recipient), 1_980);
@@ -1108,4 +1155,72 @@ mod test {
         assert_eq!(eurc_like_client.balance(&recipient), 990);
         assert_eq!(client.get_user_volume(&sender), 3_000);
     }
+
+    #[test]
+    fn test_route_payment_with_memo() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        client.initialize(&admin, &platform_treasury, &40, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = StellarAssetClient::new(&env, &token_address);
+        let token_client = token::Client::new(&env, &token_address);
+
+        let initial_balance = 1_000_000_000i128;
+        sac.mint(&sender, &initial_balance);
+
+        let amount = 100_000_000i128;
+        let memo = Bytes::from_slice(&env, b"invoice123");
+        client.route_payment_with_memo(&sender, &recipient, &token_address, &amount, &memo);
+
+        let expected_fee = 400_000i128;
+        let expected_recipient_amount = amount - expected_fee;
+
+        assert_eq!(token_client.balance(&sender), initial_balance - amount);
+        assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
+        assert_eq!(token_client.balance(&platform_treasury), expected_fee);
+
+        // Verify the event was emitted (event structure check is complex in tests)
+        // The payment routing should have completed successfully with memo
+    }
+
+    #[test]
+    fn test_route_payment_with_invalid_memo() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        client.initialize(&admin, &platform_treasury, &40, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = StellarAssetClient::new(&env, &token_address);
+
+        sac.mint(&sender, &1_000_000_000i128);
+
+        let amount = 100_000_000i128;
+        let invalid_memo = Bytes::from_slice(&env, b"123456789012345678901234567890123");
+        
+        // This should fail with InvalidMemo error
+        let result = client.try_route_payment_with_memo(&sender, &recipient, &token_address, &amount, &invalid_memo);
+        assert!(result.is_err());
+    }
+
 }
