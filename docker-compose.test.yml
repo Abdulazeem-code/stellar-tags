@@ -17,6 +17,31 @@ services:
       retries: 5
       start_period: 10s
 
+  # Standalone Stellar network (Soroban-enabled) used by the contract
+  # integration tests. Exposes both the Horizon REST API (8000) and the
+  # Soroban RPC endpoint (8000/rpc) so the Rust SDK can submit real
+  # transactions against a local network.
+  stellar-standalone:
+    image: stellar/quickstart:latest
+    command: [
+      "--standalone",
+      "--enable-soroban-rpc",
+      "--enable-core-artifacts",
+      "--local",
+    ]
+    environment:
+      ENABLE_LOGS: "true"
+    ports:
+      - "8000:8000"
+    networks:
+      - stellar-test-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
 networks:
   stellar-test-net:
     driver: bridge
