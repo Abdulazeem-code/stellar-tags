@@ -1,4 +1,8 @@
 #![no_std]
+#![deny(warnings)]
+#![deny(clippy::all)]
+#![deny(clippy::pedantic)]
+#![deny(clippy::nursery)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
     BytesN, Env, Vec, Symbol,
