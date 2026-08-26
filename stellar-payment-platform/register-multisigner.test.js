@@ -27,57 +27,27 @@ jest.mock('@stellar/stellar-sdk', () => ({
 jest.mock('pdfkit', () => jest.fn());
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
-      findUnique: jest.fn(),
-      create: jest.fn(),
       findFirst: jest.fn(),
+      create: jest.fn(),
       findMany: jest.fn(),
       count: jest.fn(),
     },
     $transaction: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call({ lastID: 1, changes: 1 }, null);
-      }),
-      get: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call(this, null, undefined);
-      }),
-      all: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call(this, null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    on: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   })),
-}));
-
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn(function (...args) {
-          const fn = args.find((a) => typeof a === 'function');
-          if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-        }),
-        serialize: jest.fn((fn) => fn && fn()),
-        close: jest.fn((cb) => cb && cb()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
 }));
 
 const request = require('supertest');
@@ -104,9 +74,9 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
     ({ prisma } = require('./prismaClient'));
     verifyMultiSignerThreshold = require('./src/multisigner-verifier').verifyMultiSignerThreshold;
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.create.mockReset();
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockResolvedValue({
       username: 'alice*localhost',
       address: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
@@ -129,10 +99,6 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
       signerCount: 1,
       errorMessage: null,
     });
-
-    // Mock pool
-    const genericPool = require('generic-pool');
-    mockPool = await genericPool.createPool().acquire();
   });
 
   describe('Validation Tests', () => {
@@ -159,7 +125,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(400);
-      expect(response.body.error).toContain('Invalid Stellar Public Key format');
+      expect(response.body.error.message).toContain('Invalid Stellar Public Key format');
     });
 
     it('should reject request with missing username', async () => {
@@ -172,7 +138,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(422);
-      expect(response.body).toHaveProperty('errors');
+      expect(response.body).toHaveProperty('error.details');
     });
   });
 
@@ -242,7 +208,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
 
       expect(response.status).toBe(401);
       expect(response.body.error).toBeDefined();
-      expect(response.body.error).toMatch(/Signature verification failed|Insufficient signing weight/);
+      expect(response.body.error.message).toMatch(/Signature verification failed|Insufficient signing weight/);
     });
   });
 
@@ -310,7 +276,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(401);
-      expect(response.body.error).toContain('Insufficient signing weight');
+      expect(response.body.error.message).toContain('Insufficient signing weight');
     });
   });
 
@@ -318,7 +284,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
     it('should reject duplicate address registration', async () => {
       const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
       
-      prisma.user.findUnique.mockResolvedValue({ username: 'existing' });
+      prisma.user.findFirst.mockResolvedValue({ username: 'existing' });
 
       const response = await request(app)
         .post('/register')
@@ -329,7 +295,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(409);
-      expect(response.body.error).toContain('Address already registered');
+      expect(response.body.error.message).toContain('Address already registered');
     });
 
     it('should handle account not found error', async () => {
@@ -348,7 +314,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(404);
-      expect(response.body.error).toContain('Account not found on Horizon');
+      expect(response.body.error.message).toContain('Account not found on Horizon');
     });
   });
 

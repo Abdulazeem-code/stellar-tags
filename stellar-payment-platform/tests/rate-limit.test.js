@@ -50,6 +50,7 @@ jest.mock('../prismaClient', () => ({
 }));
 
 jest.mock('../src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 jest.mock('../src/multisigner-verifier', () => ({
   verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
@@ -67,53 +68,11 @@ jest.mock('../src/multisigner-verifier', () => ({
   }),
 }));
 
-jest.mock('../src/validators/registerValidator', () => ({
-  registerValidator: [
-    {
-      run: jest.fn().mockResolvedValue(undefined),
-    },
-  ],
-}));
-
-jest.mock('express-validator', () => ({
-  validationResult: jest.fn(() => ({
-    isEmpty: () => true,
-    array: () => [],
-  })),
-}));
-
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn((sql, cb2) => cb2 && cb2(null)),
-        close: jest.fn((cb2) => cb2 && cb2()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
-}));
-
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, null);
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    on: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   })),
 }));
 
@@ -121,6 +80,7 @@ jest.mock('../src/metrics', () => ({
   metricsMiddleware: (req, res, next) => next(),
   getMetrics: jest.fn().mockResolvedValue(''),
   getContentType: jest.fn(() => 'text/plain'),
+  setMetricsSources: jest.fn(),
 }));
 
 jest.mock('@sentry/node', () => ({
@@ -169,13 +129,14 @@ describe('Rate Limiting — express-rate-limit', () => {
       expect(res.headers['ratelimit-limit']).toBe('100');
     });
 
-    it('does NOT include deprecated X-RateLimit-* headers', async () => {
+    it('includes X-RateLimit-* legacy headers', async () => {
       const res = await request(app)
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.headers).not.toHaveProperty('x-ratelimit-limit');
-      expect(res.headers).not.toHaveProperty('x-ratelimit-remaining');
+      expect(res.headers).toHaveProperty('x-ratelimit-limit');
+      expect(res.headers).toHaveProperty('x-ratelimit-remaining');
+      expect(res.headers).toHaveProperty('x-ratelimit-reset');
     });
   });
 
@@ -197,7 +158,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 
@@ -216,7 +181,11 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.body).toEqual({
-        error: 'Too many requests, please try again later.',
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
       });
     });
 
