@@ -716,7 +716,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+    if (error.code === '23505' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
@@ -929,6 +929,26 @@ app.use('/api/v1', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
 
+// API key management endpoints (rotation, invalidation, listing)
+app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
+
+// #497 — Expose RSA public key as a JWKS document so external services can
+// verify RS256-signed tokens without sharing a secret.
+app.get('/.well-known/jwks.json', (_req, res) => {
+  try {
+    const { getJwks } = require('./src/utils/jwt');
+    const jwks = getJwks();
+    res.setHeader('Content-Type', 'application/json');
+    // Cache for 1 hour — key rotations are infrequent and consumers should
+    // re-fetch on verification failure anyway.
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.json(jwks);
+  } catch (err) {
+    logger.warn({ err }, 'JWKS endpoint: JWT_PUBLIC_KEY is not configured');
+    return res.status(503).json({ error: 'JWKS not available: public key not configured.' });
+  }
+});
+
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
@@ -997,7 +1017,7 @@ app.use(buildErrorHandler(isPrismaConnectionError));
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
-const gracefulShutdown = (server, prismaClient, signal) => {
+const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
@@ -1019,6 +1039,13 @@ const gracefulShutdown = (server, prismaClient, signal) => {
     } catch (err) {
       logger.error(err, 'Error disconnecting Prisma during shutdown:');
     }
+    if (redis) {
+      try {
+        await redis.quit();
+      } catch (err) {
+        logger.error(err, 'Error disconnecting Redis during shutdown:');
+      }
+    }
     process.exit(0);
   });
 };
@@ -1036,8 +1063,8 @@ if (require.main === module) {
     }
   });
 
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };

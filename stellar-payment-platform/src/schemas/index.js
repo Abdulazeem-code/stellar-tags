@@ -175,6 +175,67 @@ const adminExportQuerySchema = z
     { error: 'startDate must be on or before endDate', path: ['startDate'] },
   );
 
+/** POST /auth/api-keys - generate a new API key */
+const createApiKeyBodySchema = z
+  .object({
+    name: z
+      .string({ error: 'name is required' })
+      .trim()
+      .min(1, 'name cannot be empty')
+      .max(100, 'name must be 100 characters or less'),
+    owner_id: z
+      .string({ error: 'owner_id is required' })
+      .trim()
+      .min(1, 'owner_id cannot be empty')
+      .max(256, 'owner_id must be 256 characters or less'),
+    scopes: z
+      .string()
+      .trim()
+      .optional()
+      .default('read,write')
+      .refine(
+        (val) => val.split(',').every((s) => ['read', 'write', 'admin'].includes(s.trim())),
+        { error: 'scopes must be a comma-separated list of: read, write, admin' },
+      ),
+    expires_in_hours: z
+      .number({ error: 'expires_in_hours must be a number' })
+      .int()
+      .min(1, 'expires_in_hours must be at least 1')
+      .max(8760, 'expires_in_hours must be at most 8760 (1 year)')
+      .optional(),
+  })
+  .loose();
+
+/** POST /auth/api-keys/:id/revoke - revoke an API key */
+const revokeApiKeyBodySchema = z
+  .object({
+    revoked_by: z
+      .string({ error: 'revoked_by is required' })
+      .trim()
+      .min(1, 'revoked_by cannot be empty')
+      .max(256, 'revoked_by must be 256 characters or less'),
+  })
+  .loose();
+
+/** POST /auth/api-keys/:id/rotate - rotate an API key */
+const rotateApiKeyBodySchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(1, 'name cannot be empty')
+      .max(100, 'name must be 100 characters or less')
+      .optional(),
+    grace_period_hours: z
+      .number({ error: 'grace_period_hours must be a number' })
+      .int()
+      .min(0, 'grace_period_hours must be at least 0')
+      .max(24, 'grace_period_hours must be at most 24')
+      .default(1)
+      .optional(),
+  })
+  .loose();
+
 module.exports = {
   registerBodySchema,
   federationQuerySchema,
@@ -186,4 +247,7 @@ module.exports = {
   adminBlockBodySchema,
   exportQuerySchema,
   adminExportQuerySchema,
+  createApiKeyBodySchema,
+  revokeApiKeyBodySchema,
+  rotateApiKeyBodySchema,
 };
