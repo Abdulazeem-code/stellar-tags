@@ -407,6 +407,42 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
 
+## Smart Contract Deployment & Upgrades
+
+The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts/deploy_contract.sh`) to automate WASM compilation, optimization, network deployment, contract initialization, and contract upgrades.
+
+### CLI Usage
+
+```bash
+# Display help and available options
+./scripts/deploy_contract.sh --help
+
+# Deploy contract to testnet (compiles, optimizes, deploys, and updates .env configs)
+./scripts/deploy_contract.sh deploy --network testnet
+
+# Dry-run deployment (simulates workflow without on-chain transactions)
+./scripts/deploy_contract.sh deploy --network testnet --dry-run
+
+# Deploy with custom admin and funding source
+./scripts/deploy_contract.sh deploy --network testnet --source S... --admin G... --treasury G...
+
+# Deploy to mainnet
+./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
+
+# Upgrade an existing contract to newly compiled WASM
+./scripts/deploy_contract.sh upgrade --contract-id CDNQ7... --network testnet --source S...
+
+# Compile and optimize WASM only
+./scripts/deploy_contract.sh build
+```
+
+### Automation & Config Updates
+
+Upon successful deployment, the tool automatically updates the contract address across:
+- `stellar-payment-platform/.env` (`PAYMENT_ROUTER_CONTRACT_ID`, `CONTRACT_ID`)
+- `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
+- `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
+
 ## Architecture notes
 
 - The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.
@@ -416,3 +452,4 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 ## License
 
 See [LICENSE](LICENSE).
+
