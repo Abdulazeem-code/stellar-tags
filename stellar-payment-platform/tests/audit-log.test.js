@@ -28,6 +28,9 @@ jest.mock('../prismaClient', () => ({
       create: jest.fn(),
       update: mockUserUpdate,
     },
+    payment: {
+      findMany: jest.fn().mockResolvedValue([]),
+    },
     auditLog: {
       create: mockAuditLogCreate,
       findMany: mockAuditLogFindMany,
@@ -217,6 +220,45 @@ describe('Admin Audit Logging System', () => {
 
       await new Promise((resolve) => setImmediate(resolve));
       expect(mockAuditLogCreate).toHaveBeenCalled();
+    });
+
+    it('createAuditLogMiddleware respects custom methods and custom prismaClient', async () => {
+      const customPrisma = { auditLog: { create: jest.fn().mockResolvedValue({}) } };
+      const mw = createAuditLogMiddleware({ methods: ['DELETE'], prismaClient: customPrisma });
+      const reqPost = { method: 'POST', originalUrl: '/test' };
+      const reqDelete = {
+        method: 'DELETE',
+        originalUrl: '/test-delete',
+        path: '/test-delete',
+        headers: { 'x-user-id': 'custom-user' },
+        body: {},
+      };
+      let deleteFinishCb;
+      const resDelete = {
+        statusCode: 200,
+        on: jest.fn((event, cb) => {
+          if (event === 'finish') deleteFinishCb = cb;
+        }),
+      };
+      const nextPost = jest.fn();
+      const nextDelete = jest.fn();
+
+      mw(reqPost, {}, nextPost);
+      expect(nextPost).toHaveBeenCalled();
+
+      mw(reqDelete, resDelete, nextDelete);
+      expect(nextDelete).toHaveBeenCalled();
+      expect(resDelete.on).toHaveBeenCalledWith('finish', expect.any(Function));
+
+      deleteFinishCb();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(customPrisma.auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: 'DELETE /test-delete',
+          method: 'DELETE',
+          userId: 'custom-user',
+        }),
+      });
     });
   });
 

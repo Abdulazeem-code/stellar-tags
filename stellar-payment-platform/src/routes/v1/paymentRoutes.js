@@ -39,6 +39,7 @@ router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSch
         asset: intent.asset,
         memoType: intent.memo_type,
         memo: intent.memo,
+        metadata: intent.metadata,
       },
     }));
 

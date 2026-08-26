@@ -169,6 +169,7 @@ const dispatchPaymentWebhooks = async ({
       asset_issuer: payment.asset_issuer || null,
       created_at: payment.created_at || null,
       paging_token: payment.paging_token || null,
+      metadata: payment.metadata ?? null,
     },
   };
 

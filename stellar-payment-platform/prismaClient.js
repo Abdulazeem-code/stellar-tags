@@ -40,6 +40,11 @@ try {
       create: async (args) => args.data || {},
       count: async () => 0,
     },
+    payment: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      count: async () => 0,
+    },
     webhook: {
       findUnique: async () => null,
       findFirst: async () => null,
