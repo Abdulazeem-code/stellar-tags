@@ -16,6 +16,12 @@ const paginationFields = {
   limit: clampedInt(10, 1, 100),
 };
 
+// Opaque keyset-pagination continuation token. Only shape-checked here; the
+// handlers own decoding and answer 400 on an unparseable cursor.
+const cursorField = {
+  cursor: z.string().trim().min(1).max(512).optional(),
+};
+
 // Lookup keys are passed to the database as-is, so they are only checked for
 // type and length here. Format checking of addresses stays with StrKey in the
 // handlers, which knows the real Stellar base32 alphabet and checksum.
@@ -80,6 +86,7 @@ const lookupQuerySchema = z
     address: optionalLookupString,
     search: optionalLookupString,
     ...paginationFields,
+    ...cursorField,
   })
   .loose()
   .refine((value) => Boolean(value.address || value.search), {
@@ -93,6 +100,7 @@ const usersQuerySchema = z
   .object({
     search: optionalLookupString,
     ...paginationFields,
+    ...cursorField,
   })
   .loose();
 
@@ -135,6 +143,99 @@ const adminBlockBodySchema = z
   })
   .loose();
 
+/**
+ * GET /admin/export query.
+ *
+ * - `format`    csv (default) | json
+ * - `startDate` optional ISO date string (YYYY-MM-DD), inclusive lower bound
+ * - `endDate`   optional ISO date string (YYYY-MM-DD), inclusive upper bound
+ */
+const adminExportQuerySchema = z
+  .object({
+    format: z.enum(['csv', 'json']).catch('csv'),
+    startDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD')
+      .optional(),
+    endDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD')
+      .optional(),
+  })
+  .loose()
+  .refine(
+    (value) => {
+      if (value.startDate && value.endDate) {
+        return new Date(value.startDate) <= new Date(value.endDate);
+      }
+      return true;
+    },
+    { error: 'startDate must be on or before endDate', path: ['startDate'] },
+  );
+
+/** POST /auth/api-keys - generate a new API key */
+const createApiKeyBodySchema = z
+  .object({
+    name: z
+      .string({ error: 'name is required' })
+      .trim()
+      .min(1, 'name cannot be empty')
+      .max(100, 'name must be 100 characters or less'),
+    owner_id: z
+      .string({ error: 'owner_id is required' })
+      .trim()
+      .min(1, 'owner_id cannot be empty')
+      .max(256, 'owner_id must be 256 characters or less'),
+    scopes: z
+      .string()
+      .trim()
+      .optional()
+      .default('read,write')
+      .refine(
+        (val) => val.split(',').every((s) => ['read', 'write', 'admin'].includes(s.trim())),
+        { error: 'scopes must be a comma-separated list of: read, write, admin' },
+      ),
+    expires_in_hours: z
+      .number({ error: 'expires_in_hours must be a number' })
+      .int()
+      .min(1, 'expires_in_hours must be at least 1')
+      .max(8760, 'expires_in_hours must be at most 8760 (1 year)')
+      .optional(),
+  })
+  .loose();
+
+/** POST /auth/api-keys/:id/revoke - revoke an API key */
+const revokeApiKeyBodySchema = z
+  .object({
+    revoked_by: z
+      .string({ error: 'revoked_by is required' })
+      .trim()
+      .min(1, 'revoked_by cannot be empty')
+      .max(256, 'revoked_by must be 256 characters or less'),
+  })
+  .loose();
+
+/** POST /auth/api-keys/:id/rotate - rotate an API key */
+const rotateApiKeyBodySchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(1, 'name cannot be empty')
+      .max(100, 'name must be 100 characters or less')
+      .optional(),
+    grace_period_hours: z
+      .number({ error: 'grace_period_hours must be a number' })
+      .int()
+      .min(0, 'grace_period_hours must be at least 0')
+      .max(24, 'grace_period_hours must be at most 24')
+      .default(1)
+      .optional(),
+  })
+  .loose();
+
 module.exports = {
   registerBodySchema,
   federationQuerySchema,
@@ -145,4 +246,8 @@ module.exports = {
   verifyEmailConfirmBodySchema,
   adminBlockBodySchema,
   exportQuerySchema,
+  adminExportQuerySchema,
+  createApiKeyBodySchema,
+  revokeApiKeyBodySchema,
+  rotateApiKeyBodySchema,
 };
