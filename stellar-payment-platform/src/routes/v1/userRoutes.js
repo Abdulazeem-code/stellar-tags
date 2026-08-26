@@ -128,6 +128,25 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     );
   }
 
+  if (!username || !address) {
+    return next(new ApiError('INVALID_INPUT', 'Missing required fields: username and address are both required.'));
+  }
+
+  const BLOCKED_EXCHANGES = [
+    "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
+    "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
+    "GBV4ZDEPNQ2FKSPKGJP2YKDAIZWQ2XKRQD4V4ACH3TCTXTGLWEBDU3OS"
+  ];
+
+  if (BLOCKED_EXCHANGES.includes(address) && !memo) {
+    return next(new ApiError('INVALID_INPUT', "Cannot map federation addresses directly to custodial exchange master wallets."));
+  }
+
+  const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
+  if (usernameLocalPart.length < 3) {
+    return next(new ApiError('INVALID_INPUT', "Username must be at least 3 characters long."));
+  }
+
   if (!StrKey.isValidEd25519PublicKey(address)) {
     const error = new Error('Invalid Stellar Public Key format.');
     error.statusCode = 400;
