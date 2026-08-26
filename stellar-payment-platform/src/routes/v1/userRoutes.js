@@ -201,7 +201,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+    if (error.code === '23505' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     

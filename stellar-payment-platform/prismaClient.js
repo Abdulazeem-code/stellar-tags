@@ -5,10 +5,9 @@ logger.info('--- PRISMA CLIENT INITIALIZED ---');
 // ---------------------------------------------------------------------------
 // A single PrismaClient instance is reused across the server and the Horizon
 // listener. Prisma manages its own connection pool internally, so there is no
-// need for the manual generic-pool wiring the SQLite implementation required.
+// PostgreSQL connection pooling is handled internally by Prisma.
 //
-// The pool size and timeout can be tuned via the DATABASE_URL query string,
-// e.g. ?connection_limit=10&pool_timeout=5
+// Pool size and timeout are configured in the Prisma schema and connection string.
 // ---------------------------------------------------------------------------
 
 let prisma;
