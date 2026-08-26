@@ -1,13 +1,15 @@
 const express = require('express');
-const { Horizon } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
 
 const { ApiError } = require('../../errors');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const {
+  fetchTransaction,
+  fetchPaymentsForTransaction,
+} = require('../../services/stellarService');
 
 const router = express.Router();
 
-const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
 
 router.get('/receipts/:txHash', asyncHandler(async (req, res, next) => {
@@ -21,17 +23,19 @@ router.get('/receipts/:txHash', asyncHandler(async (req, res, next) => {
   let paymentOps;
 
   try {
-    const server = new Horizon.Server(HORIZON_BASE);
     [tx, paymentOps] = await Promise.all([
-      server.transactions().transaction(txHash).call(),
-      server.payments().forTransaction(txHash).call(),
+      fetchTransaction(txHash),
+      fetchPaymentsForTransaction(txHash),
     ]);
   } catch (err) {
+    if (err?.code === 'EOPENBREAKER') {
+      return next(new ApiError('SERVICE_UNAVAILABLE', 'Stellar Horizon is temporarily unavailable; please try again later'));
+    }
     if (err && err.response && err.response.status === 404) {
       return next(new ApiError('NOT_FOUND', 'Transaction not found'));
     }
     return next(
-      new ApiError('INTERNAL_ERROR', 'Failed to fetch transaction', { statusCode: 500, cause: err }),
+      new ApiError('UPSTREAM_ERROR', 'Failed to fetch transaction from Horizon', { cause: err }),
     );
   }
 
