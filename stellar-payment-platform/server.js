@@ -929,6 +929,9 @@ app.use('/api/v1', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
 
+// API key management endpoints (rotation, invalidation, listing)
+app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
+
 // #497 — Expose RSA public key as a JWKS document so external services can
 // verify RS256-signed tokens without sharing a secret.
 app.get('/.well-known/jwks.json', (_req, res) => {
