@@ -375,7 +375,20 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
 
 Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
 
+### `GET /admin/audit-logs`
+Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
+- **Query Parameters:**
+  - `limit` (optional) – Maximum number of records to return (1-100, default 50).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
+- **Status Codes:**
+  - `200 OK`: Audit logs retrieved successfully.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
+
 ### `GET /metrics`
+
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
 rate limiter so a scraper on a fixed interval is never throttled.
 - **Returns:** all metrics below, prefixed `stellar_tags_`.
@@ -407,6 +420,42 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
 
+## Smart Contract Deployment & Upgrades
+
+The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts/deploy_contract.sh`) to automate WASM compilation, optimization, network deployment, contract initialization, and contract upgrades.
+
+### CLI Usage
+
+```bash
+# Display help and available options
+./scripts/deploy_contract.sh --help
+
+# Deploy contract to testnet (compiles, optimizes, deploys, and updates .env configs)
+./scripts/deploy_contract.sh deploy --network testnet
+
+# Dry-run deployment (simulates workflow without on-chain transactions)
+./scripts/deploy_contract.sh deploy --network testnet --dry-run
+
+# Deploy with custom admin and funding source
+./scripts/deploy_contract.sh deploy --network testnet --source S... --admin G... --treasury G...
+
+# Deploy to mainnet
+./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
+
+# Upgrade an existing contract to newly compiled WASM
+./scripts/deploy_contract.sh upgrade --contract-id CDNQ7... --network testnet --source S...
+
+# Compile and optimize WASM only
+./scripts/deploy_contract.sh build
+```
+
+### Automation & Config Updates
+
+Upon successful deployment, the tool automatically updates the contract address across:
+- `stellar-payment-platform/.env` (`PAYMENT_ROUTER_CONTRACT_ID`, `CONTRACT_ID`)
+- `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
+- `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
+
 ## Architecture notes
 
 - The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.
@@ -416,3 +465,4 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 ## License
 
 See [LICENSE](LICENSE).
+

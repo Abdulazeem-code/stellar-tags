@@ -42,43 +42,12 @@ jest.mock('./prismaClient', () => ({
   isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call({ lastID: 1, changes: 1 }, null);
-      }),
-      get: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call(this, null, undefined);
-      }),
-      all: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call(this, null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    on: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   })),
-}));
-
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn(function (...args) {
-          const fn = args.find((a) => typeof a === 'function');
-          if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-        }),
-        serialize: jest.fn((fn) => fn && fn()),
-        close: jest.fn((cb) => cb && cb()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
 }));
 
 const request = require('supertest');
@@ -130,10 +99,6 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
       signerCount: 1,
       errorMessage: null,
     });
-
-    // Mock pool
-    const genericPool = require('generic-pool');
-    mockPool = await genericPool.createPool().acquire();
   });
 
   describe('Validation Tests', () => {
