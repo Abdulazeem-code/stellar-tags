@@ -42,6 +42,7 @@
     "jsonwebtoken": "9.0.2",
     "node-cache": "^5.1.2",
     "node-cron": "4.5.0",
+    "opossum": "^10.0.0",
     "pdfkit": "^0.15.2",
     "pg": "^8.13.3",
     "pino": "^10.3.1",
