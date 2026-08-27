@@ -99,3 +99,23 @@ model PaymentIntent {
   @@index([status, createdAt])
   @@map("payment_intents")
 }
+
+// AuditLog model for tracking all mutating admin actions and security events.
+model AuditLog {
+  id         String   @id @default(uuid())
+  action     String
+  method     String
+  path       String
+  userId     String?  @map("user_id")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  statusCode Int?     @map("status_code")
+  payload    String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@index([userId])
+  @@index([action])
+  @@map("audit_logs")
+}
+
