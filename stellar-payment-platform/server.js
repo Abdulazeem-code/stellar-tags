@@ -32,6 +32,7 @@ const { validateSchema } = require('./src/middleware/validateSchema');
 const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
 const { ApiError, errorBody } = require('./src/errors');
 const { requireJson } = require('./src/middleware/requireJson');
+const { apiVersion } = require('./src/middleware/apiVersion');
 const {
   registerBodySchema,
   federationQuerySchema,
@@ -147,6 +148,7 @@ if (redisClient) {
 setMetricsSources({ prisma, redisClient });
 
 const v1Router = require('./src/routes/v1')(redisClient);
+const v2Router = require('./src/routes/v2')(redisClient);
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -923,9 +925,17 @@ app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, 
     return next(dbError);
   }
 });
-// Mount v1 router for both legacy paths and explicit API versioning
-app.use('/', v1Router);
+// Request versioning: URI (/api/v1, /api/v2) first, then Accept-Version /
+// API-Version header, defaulting to v1. Routers below then decide routing.
+app.use(apiVersion);
+
+// v2 first so an explicit /api/v2 request wins over the unversioned fallback.
+app.use('/api/v2', v2Router);
+// Explicit v1 mount, then /api (no version) and the legacy unversioned root
+// both resolve to v1 so existing clients keep working unchanged.
 app.use('/api/v1', v1Router);
+app.use('/api', v1Router);
+app.use('/', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
 
