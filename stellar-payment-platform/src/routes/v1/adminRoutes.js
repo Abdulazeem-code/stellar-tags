@@ -33,7 +33,19 @@ module.exports = (redisClient) => {
   // Streams all payment records as CSV (default) or NDJSON.
   // Supports optional startDate / endDate query params for filtering.
   // Paginates internally using cursor-based pages so memory stays bounded.
-  router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /admin/export:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/export
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     const { format = 'csv', startDate, endDate } = req.query;
 
     // Validate date range when provided
@@ -115,7 +127,19 @@ module.exports = (redisClient) => {
     }
   }));
 
-  router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /admin/block:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /admin/block
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     const prisma = getPrisma();
     const { address } = req.body;
 
@@ -154,7 +178,19 @@ module.exports = (redisClient) => {
    * Query parameters:
    *  - limit (optional) integer between 1 and 100, default 50
    */
-  router.get(
+  
+/**
+ * @openapi
+ * /admin/audit-logs:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/audit-logs
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get(
     '/admin/audit-logs',
     adminAuth,
     asyncHandler(async (req, res) => {

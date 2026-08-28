@@ -114,6 +114,18 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
+
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /register
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
@@ -245,6 +257,18 @@ router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWE
 
 // #18 — Soft-delete endpoint. Sets deleted_at to now() instead of running a
 // hard DELETE so the row is preserved for historical auditing.
+
+/**
+ * @openapi
+ * /register/:username:
+ *   delete:
+ *     tags:
+ *       - v1
+ *     description: DELETE /register/:username
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   const username = normalizeNameTag(
     typeof req.params.username === 'string' ? req.params.username.trim() : '',
@@ -284,6 +308,18 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   }
 }));
 
+
+/**
+ * @openapi
+ * /lookup:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /lookup
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
@@ -368,6 +404,18 @@ const totalPages = Math.ceil(totalCount / limit);
   }
 }));
 
+
+/**
+ * @openapi
+ * /users:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /users
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);

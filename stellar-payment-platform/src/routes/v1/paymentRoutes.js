@@ -11,6 +11,18 @@ const { logger } = require('../../logger');
 const router = express.Router();
 
 // POST /payments/bulk
+
+/**
+ * @openapi
+ * /payments/bulk:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /payments/bulk
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSchema }), asyncHandler(async (req, res, next) => {
   const intents = req.body;
 

@@ -12,6 +12,18 @@ const router = express.Router();
 
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
 
+
+/**
+ * @openapi
+ * /receipts/:txHash:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /receipts/:txHash
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/receipts/:txHash', asyncHandler(async (req, res, next) => {
   const { txHash } = req.params;
 
