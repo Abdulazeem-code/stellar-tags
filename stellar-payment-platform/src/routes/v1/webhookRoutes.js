@@ -1,7 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
-const { prisma } = require('../../../prismaClient');
+const { prisma, withTransaction } = require('../../../prismaClient');
 const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
@@ -177,14 +177,16 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
 
     let webhook;
     try {
-      webhook = await prisma.webhook.create({
-        data: {
-          id,
-          username: user.username,
-          url: rawUrl,
-          secret,
-          createdAt: now,
-        },
+      webhook = await withTransaction(async (tx) => {
+        return await tx.webhook.create({
+          data: {
+            id,
+            username: user.username,
+            url: rawUrl,
+            secret,
+            createdAt: now,
+          },
+        });
       });
     } catch (error) {
       if (

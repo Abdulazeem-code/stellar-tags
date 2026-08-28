@@ -17,7 +17,7 @@ module.exports = (redisClient) => {
   router.use(auditLogMiddleware);
 
   const getPrisma = () => {
-    return require('../../../prismaClient').prisma;
+    return require('../../../prismaClient');
   };
 
 
@@ -78,7 +78,7 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Cache-Control', 'no-store');
 
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     let skip = 0;
     let headerWritten = false;
 
@@ -140,7 +140,7 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
  *         description: Success
  */
 router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+    const { prisma, withTransaction } = getPrisma();
     const { address } = req.body;
 
     if (!address || typeof address !== 'string') {
@@ -148,13 +148,16 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     }
 
     try {
-      const updatedUser = await prisma.user.update({
-        where: { address },
-        data: { flaggedAt: new Date() },
-      });
+      const updatedUser = await withTransaction(async (tx) => {
+        const user = await tx.user.update({
+          where: { address },
+          data: { flaggedAt: new Date() },
+        });
 
-      await invalidateFederationCache(redisClient, updatedUser.address, updatedUser.username);
-      await invalidateStatsCache(redisClient);
+        await invalidateFederationCache(redisClient, user.address, user.username);
+        await invalidateStatsCache(redisClient);
+        return user;
+      });
 
       return res.status(200).json({
         message: 'Address successfully blocked',
@@ -194,7 +197,7 @@ router.get(
     '/admin/audit-logs',
     adminAuth,
     asyncHandler(async (req, res) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
       const logs = await prisma.auditLog.findMany({
         take: limit,
