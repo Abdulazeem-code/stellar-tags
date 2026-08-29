@@ -403,7 +403,7 @@ rate limiter so a scraper on a fixed interval is never throttled.
 | `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
 | `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
 | `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
-| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code` |
+| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code`; buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s |
 | `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
 | `db_pool_connections_busy` | gauge | Connections executing a query |
 | `db_pool_connections_idle` | gauge | Connections open but unused |
