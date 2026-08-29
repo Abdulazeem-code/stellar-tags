@@ -1490,6 +1490,17 @@ mod test {
     }
 
     #[test]
+    fn test_version_reports_contract_version() {
+        let (_env, client, _) = setup_env();
+
+        // #269 — the version view is callable without initialization and
+        // returns the compiled-in contract version so a UI can check
+        // compatibility before interacting with the contract.
+        assert_eq!(client.version(), PaymentRouter::VERSION);
+        assert_eq!(client.version(), 1);
+    }
+
+    #[test]
     fn test_admin_restrictions_and_updates() {
         let (env, client, _) = setup_env();
 
