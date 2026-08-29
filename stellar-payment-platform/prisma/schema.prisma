@@ -54,6 +54,7 @@ model Webhook {
   user         User      @relation(fields: [username], references: [username], onDelete: Cascade)
   url          String
   secret       String // HMAC-SHA256 signing secret for payload verification
+  events       String[]  @default(["*"]) // Optional event filter; "*" preserves the legacy all-events behavior.
   createdAt    DateTime  @default(now()) @map("created_at")
   lastSentAt   DateTime? @map("last_sent_at")
   failingSince DateTime? @map("failing_since")

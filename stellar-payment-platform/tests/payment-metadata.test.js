@@ -130,4 +130,70 @@ describe('payment intent metadata', () => {
     const requestBody = JSON.parse(fetchSpy.mock.calls[0][1].body);
     expect(requestBody.data.metadata).toEqual(metadata);
   });
+
+  test('delivers payment events only when the merchant subscribed to payment.received', async () => {
+    const prisma = {
+      webhook: {
+        findMany: jest.fn().mockResolvedValue([{
+          id: 'webhook-1',
+          url: 'https://merchant.example/webhooks',
+          secret: 'secret',
+          events: ['payment.received'],
+        }]),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200 });
+
+    await dispatchPaymentWebhooks({
+      prisma,
+      poolGetFn: jest.fn(),
+      poolRunFn: jest.fn(),
+      payment: {
+        id: 'payment-2',
+        type: 'payment',
+        transaction_hash: 'transaction-2',
+        from: 'GSOURCE',
+        to: 'GDESTINATION',
+        amount: '25.00',
+        asset_type: 'native',
+      },
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const requestBody = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(requestBody.event).toBe('payment.received');
+  });
+
+  test('skips delivery for unsubscribed webhook event types', async () => {
+    const prisma = {
+      webhook: {
+        findMany: jest.fn().mockResolvedValue([{
+          id: 'webhook-1',
+          url: 'https://merchant.example/webhooks',
+          secret: 'secret',
+          events: ['registration.updated'],
+        }]),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200 });
+
+    await dispatchPaymentWebhooks({
+      prisma,
+      poolGetFn: jest.fn(),
+      poolRunFn: jest.fn(),
+      payment: {
+        id: 'payment-3',
+        type: 'payment',
+        transaction_hash: 'transaction-3',
+        from: 'GSOURCE',
+        to: 'GDESTINATION',
+        amount: '25.00',
+        asset_type: 'native',
+      },
+    });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 });
