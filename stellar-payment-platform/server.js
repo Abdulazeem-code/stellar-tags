@@ -1062,19 +1062,44 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
 
 
 if (require.main === module) {
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    logger.info(`Server successfully initialized on port ${PORT}`);
-  });
+  const { checkMigrations, enforceMigrationPolicy } = require('./src/migrate-check');
 
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+  const startServer = () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      logger.info(`Server successfully initialized on port ${PORT}`);
+    });
+
+    server.on('error', (e) => {
+      if (e.code === 'EADDRINUSE') {
+        logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+        process.exit(1);
+      }
+    });
+
+    process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+    process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+  };
+
+  // Verify the database is not out of sync with the Prisma migrations before
+  // binding a port, so schema drift surfaces as a clear startup error instead
+  // of a cryptic failure on the first query. In strict mode this exits
+  // (non-zero) when migrations are pending; in permissive mode it warns and
+  // continues. The server only boots once the result is known.
+  checkMigrations()
+    .then((result) => {
+      const { shouldExit } = enforceMigrationPolicy(result);
+      if (shouldExit) {
+        logger.error('[migrate-check] Aborting startup: database migrations are not applied.');
+        process.exit(1);
+      }
+      startServer();
+    })
+    .catch((err) => {
+      // Unexpected failure running the check itself — refuse to start deceptively
+      // healthy when we couldn't validate schema parity.
+      logger.error(err, '[migrate-check] Failed to verify migration status at startup.');
       process.exit(1);
-    }
-  });
-
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+    });
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
