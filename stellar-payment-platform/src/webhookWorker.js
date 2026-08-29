@@ -1,20 +1,11 @@
 const crypto = require('crypto');
 const cron = require('node-cron');
 const { logger } = require('./logger');
+const { shouldFallbackToLocalRegistry } = require('./utils');
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
 const MAX_RETRY_BACKLOG_DAYS = 3;
 const RETRY_JOB_CRON = '*/5 * * * *'; // every 5 minutes
-
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
-};
 
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
