@@ -281,10 +281,10 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
   });
 
   describe('Account Lookup and Conflict Detection', () => {
-    it('should reject duplicate address registration', async () => {
+    it('should reject registration once the address has 5 usernames', async () => {
       const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
-      
-      prisma.user.findFirst.mockResolvedValue({ username: 'existing' });
+
+      prisma.user.count.mockResolvedValue(5);
 
       const response = await request(app)
         .post('/register')
@@ -295,7 +295,24 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(409);
-      expect(response.body.error.message).toContain('Address already registered');
+      expect(response.body.error.message).toMatch(/maximum of 5/);
+    });
+
+    it('should register an additional username as an alias for an existing address', async () => {
+      const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
+
+      prisma.user.count.mockResolvedValue(2);
+
+      const response = await request(app)
+        .post('/register')
+        .send({
+          username: 'newuser',
+          address: accountId,
+          signature: accountId,
+        });
+
+      expect(response.status).toBe(201);
+      expect(response.body).toMatchObject({ ok: true, is_primary: false });
     });
 
     it('should handle account not found error', async () => {
