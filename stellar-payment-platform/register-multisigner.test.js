@@ -27,17 +27,19 @@ jest.mock('@stellar/stellar-sdk', () => ({
 jest.mock('pdfkit', () => jest.fn());
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {
-      findUnique: jest.fn(),
-      create: jest.fn(),
       findFirst: jest.fn(),
+      create: jest.fn(),
       findMany: jest.fn(),
       count: jest.fn(),
     },
     $transaction: jest.fn(),
+    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock('generic-pool', () => ({
@@ -103,9 +105,9 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
     ({ prisma } = require('./prismaClient'));
     verifyMultiSignerThreshold = require('./src/multisigner-verifier').verifyMultiSignerThreshold;
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
     prisma.user.create.mockReset();
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockResolvedValue({
       username: 'alice*localhost',
       address: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
@@ -158,18 +160,20 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(400);
-      expect(response.body.error).toContain('Invalid Stellar Public Key format');
+      expect(response.body.error.message).toContain('Invalid Stellar Public Key format');
     });
 
     it('should reject request with missing username', async () => {
       const response = await request(app)
         .post('/register')
+        .set('Content-Type', 'application/json')
         .send({
           address: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
           signature: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
         });
 
-      expect(response.status).toBe(400);
+      expect(response.status).toBe(422);
+      expect(response.body).toHaveProperty('error.details');
     });
   });
 
@@ -239,7 +243,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
 
       expect(response.status).toBe(401);
       expect(response.body.error).toBeDefined();
-      expect(response.body.error).toMatch(/Signature verification failed|Insufficient signing weight/);
+      expect(response.body.error.message).toMatch(/Signature verification failed|Insufficient signing weight/);
     });
   });
 
@@ -307,7 +311,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(401);
-      expect(response.body.error).toContain('Insufficient signing weight');
+      expect(response.body.error.message).toContain('Insufficient signing weight');
     });
   });
 
@@ -315,7 +319,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
     it('should reject duplicate address registration', async () => {
       const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
       
-      prisma.user.findUnique.mockResolvedValue({ username: 'existing' });
+      prisma.user.findFirst.mockResolvedValue({ username: 'existing' });
 
       const response = await request(app)
         .post('/register')
@@ -326,7 +330,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(409);
-      expect(response.body.error).toContain('Address already registered');
+      expect(response.body.error.message).toContain('Address already registered');
     });
 
     it('should handle account not found error', async () => {
@@ -345,7 +349,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(404);
-      expect(response.body.error).toContain('Account not found on Horizon');
+      expect(response.body.error.message).toContain('Account not found on Horizon');
     });
   });
 

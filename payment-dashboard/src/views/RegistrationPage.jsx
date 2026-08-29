@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { API_BASE, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
+import { API_BASE, apiErrorMessage, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -11,6 +11,9 @@ function RegistrationPage({
 }) {
   const [username, setUsername] = useState("");
   const [usernameError, setUsernameError] = useState("");
+  const [memoType, setMemoType] = useState("");
+  const [memo, setMemo] = useState("");
+  const [memoError, setMemoError] = useState("");
   const [status, setStatus] = useState({
     text: "Connect a wallet to begin your registration.",
     tone: "neutral",
@@ -99,6 +102,21 @@ function RegistrationPage({
       return;
     }
 
+    // Validate memo fields before signing
+    if (memoType && !memo) {
+      setMemoError("Memo value is required when a memo type is selected.");
+      return;
+    }
+    if (!memoType && memo) {
+      setMemoError("Please select a memo type.");
+      return;
+    }
+    if (memoType === "text" && memo.length > 28) {
+      setMemoError("Text memo must not exceed 28 characters.");
+      return;
+    }
+    setMemoError("");
+
     setIsSubmitting(true);
     // 3. Removed the hardcoded Freighter text
     setStatusMessage(
@@ -156,13 +174,14 @@ function RegistrationPage({
           address: userPublicKey,
           signature,
           signerAddress,
+          ...(memoType && memo && { memo_type: memoType, memo }),
         }),
       })
         .then(async (response) => {
           const data = await response.json().catch(() => null);
           if (!response.ok) {
             throw new Error(
-              (data && (data.error || data.detail || data.message)) || "Registration failed.",
+              apiErrorMessage(data, "Registration failed."),
             );
           }
           return data;
@@ -278,6 +297,59 @@ function RegistrationPage({
               {username.length} / 30
             </span>
           </div>
+
+          <label className="form-field">
+            Memo type <span className="optional-label">(optional)</span>
+            <select
+              value={memoType}
+              onChange={(event) => {
+                setMemoType(event.target.value);
+                setMemo("");
+                setMemoError("");
+              }}
+            >
+              <option value="">None</option>
+              <option value="text">Text</option>
+              <option value="id">ID</option>
+              <option value="hash">Hash</option>
+            </select>
+          </label>
+
+          {memoType && (
+            <label className="form-field">
+              Memo value
+              <input
+                type="text"
+                placeholder={
+                  memoType === "text"
+                    ? "Up to 28 characters"
+                    : memoType === "id"
+                    ? "64-bit unsigned integer"
+                    : "64-character hex string"
+                }
+                value={memo}
+                maxLength={memoType === "text" ? 28 : undefined}
+                onChange={(event) => {
+                  setMemo(event.target.value);
+                  setMemoError("");
+                }}
+                aria-describedby={memoError ? "memo-error" : undefined}
+                aria-invalid={!!memoError}
+              />
+              {memoType === "text" && (
+                <span
+                  className={`char-counter${memo.length >= 28 ? " char-counter--limit" : ""}`}
+                >
+                  {memo.length} / 28
+                </span>
+              )}
+              {memoError && (
+                <span id="memo-error" className="field-error" role="alert">
+                  {memoError}
+                </span>
+              )}
+            </label>
+          )}
           <button
             className="primary-button"
             type="submit"
