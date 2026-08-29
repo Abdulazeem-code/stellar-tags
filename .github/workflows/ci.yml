@@ -28,8 +28,20 @@ jobs:
       - name: Install Backend Dependencies
         run: npm ci
 
-      - name: Run Backend Tests
-        run: NODE_ENV=test npm test
+      # Run the full suite with coverage so the thresholds in package.json
+      # fail the build whenever coverage regresses below the floor.
+      - name: Run Backend Tests (with coverage thresholds)
+        run: NODE_ENV=test npm run test:coverage
+
+      - name: Upload Coverage Report
+        # Upload even when the thresholds fail, so the drop is visible in the
+        # artifact (see stellar-payment-platform/coverage/lcov-report/).
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage-report
+          path: stellar-payment-platform/coverage
+          retention-days: 14
 
       - name: Run Memory Leak Detection Tests (#511)
         run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory

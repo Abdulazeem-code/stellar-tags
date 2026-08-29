@@ -166,6 +166,16 @@ cd ../payment_router
 cargo test
 ```
 
+### Coverage
+
+The server runs with coverage in CI via `npm run test:coverage` (same as
+`npm test` plus `--coverage`). Minimum coverage thresholds are set in
+`stellar-payment-platform/package.json` under `jest.coverageThreshold` — CI
+fails the build when coverage drops below the floor, and the `lcov`/HTML report
+is uploaded as a build artifact. Raise the thresholds as coverage improves so
+the floor keeps pace with the suite.
+
+
 ## Environment variables
 
 To ensure a seamless local developer installation requiring zero guesswork, please configure the following environment variables in their respective directories:
