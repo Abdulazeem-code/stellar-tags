@@ -59,6 +59,8 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  MAX_USERNAMES_PER_ADDRESS,
+  PRIMARY_USERNAME_ORDER,
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require('./src/utils');
@@ -349,14 +351,9 @@ const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
   );
 };
 
-const registerLocalUser = async ({ username, address }) => {
-  const existingByAddress = await getLocalUserByAddress(address);
-  if (existingByAddress) {
-    const conflictError = new Error('Address already registered');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
+const registerLocalUser = async ({ username, address, isPrimary = false }) => {
+  // #613 — several usernames may share an address, so an existing address is
+  // no longer a conflict; only a duplicate username is.
   const existingByUsername = await getLocalUserByUsername(username);
   if (existingByUsername) {
     const conflictError = new Error('Username is already taken. Please choose another.');
@@ -365,9 +362,9 @@ const registerLocalUser = async ({ username, address }) => {
   }
 
   await poolRun(
-    `INSERT INTO username_registry (username, address, created_at)
-     VALUES (?, ?, ?)`,
-    [username, address, new Date().toISOString()],
+    `INSERT INTO username_registry (username, address, is_primary, created_at)
+     VALUES (?, ?, ?, ?)`,
+    [username, address, isPrimary, new Date().toISOString()],
   );
 };
 
@@ -390,9 +387,12 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
     if (type === 'id') {
       const cacheKey = federationIdKey(queryValue);
       const cached = await federationLookupCached(cacheKey, async () => {
+        // #613 — an address can have several usernames; a reverse lookup
+        // resolves to the primary one.
         const row = await prisma.user.findFirst({
           where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
           select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
+          orderBy: PRIMARY_USERNAME_ORDER,
         });
 
         if (!row) return null;
@@ -613,9 +613,13 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   }
 
   try {
-    let existing = null;
+    // #613 — an address may carry several usernames (aliases). Registration
+    // adds another while the address is under the cap; the first username
+    // registered for an address becomes its primary. Reverse (type=id)
+    // federation lookups resolve to that primary.
+    let usernameCount = 0;
     try {
-      existing = await prisma.user.findFirst({
+      usernameCount = await prisma.user.count({
         where: { address, deletedAt: null },
       });
     } catch (error) {
@@ -623,14 +627,20 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         throw error;
       }
 
-      existing = await getLocalUserByAddress(address);
+      // Degraded path: the exact alias count is unavailable, so fall back to
+      // a presence check. The 5-username cap is enforced best-effort here.
+      usernameCount = (await getLocalUserByAddress(address)) ? 1 : 0;
     }
 
-    if (existing) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+    if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
+      return next(
+        new ApiError(
+          'CONFLICT',
+          `This address already has the maximum of ${MAX_USERNAMES_PER_ADDRESS} federation usernames.`,
+        ),
+      );
     }
+    const isPrimary = usernameCount === 0;
 
     let verificationResult = null;
     if (signature) {
@@ -688,6 +698,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         data: {
           username: normalizedUsername,
           address,
+          isPrimary,
           ...(memoType && { memoType, memo }),
         },
       });
@@ -698,13 +709,14 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         throw error;
       }
 
-      await registerLocalUser({ username: normalizedUsername, address });
+      await registerLocalUser({ username: normalizedUsername, address, isPrimary });
     }
 
     return res.status(201).json({
       ok: true,
       username: normalizedUsername,
       address,
+      is_primary: isPrimary,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
       ...(verificationResult && {
         verification: {
@@ -752,9 +764,11 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
       const result = await lookupCached(address, async () => {
         let row;
         try {
+          // #613 — an address can have several usernames; return the primary.
           row = await prisma.user.findFirst({
             where: { address, deletedAt: null },
             select: { username: true },
+            orderBy: PRIMARY_USERNAME_ORDER,
           });
         } catch (error) {
           if (!shouldFallbackToLocalRegistry(error)) {

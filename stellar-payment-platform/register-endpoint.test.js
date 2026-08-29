@@ -29,6 +29,7 @@ jest.mock("./prismaClient", () => ({
     user: {
       findUnique: jest.fn(),
       findFirst: jest.fn(),
+      count: jest.fn(),
       create: jest.fn(),
     },
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
@@ -68,11 +69,12 @@ describe("POST /register - integration test coverage", () => {
     ({ prisma } = require("./prismaClient"));
 
     prisma.user.findFirst.mockReset();
+    prisma.user.count.mockReset();
     prisma.user.create.mockReset();
   });
 
   test("registers successfully with valid payload", async () => {
-    prisma.user.findFirst.mockResolvedValue(null);
+    prisma.user.count.mockResolvedValue(0);
     prisma.user.create.mockResolvedValue({
       username: "alice*localhost",
       address: VALID_ADDRESS,
@@ -87,21 +89,24 @@ describe("POST /register - integration test coverage", () => {
       ok: true,
       username: "alice*localhost",
       address: VALID_ADDRESS,
+      is_primary: true,
     });
-    expect(prisma.user.findFirst).toHaveBeenCalledWith({
+    expect(prisma.user.count).toHaveBeenCalledWith({
       where: { address: VALID_ADDRESS, deletedAt: null },
     });
     expect(prisma.user.create).toHaveBeenCalledWith({
       data: {
         username: "alice*localhost",
         address: VALID_ADDRESS,
+        isPrimary: true,
       },
     });
   });
 
-  test("returns 409 when address already exists", async () => {
-    prisma.user.findFirst.mockResolvedValue({
-      username: "existing*localhost",
+  test("registers an alias (non-primary) when the address already has a username", async () => {
+    prisma.user.count.mockResolvedValue(1);
+    prisma.user.create.mockResolvedValue({
+      username: "bob*localhost",
       address: VALID_ADDRESS,
     });
 
@@ -109,11 +114,31 @@ describe("POST /register - integration test coverage", () => {
       .post("/register")
       .send({ username: "bob", address: VALID_ADDRESS });
 
+    expect(response.status).toBe(201);
+    expect(response.body).toMatchObject({ ok: true, is_primary: false });
+    expect(prisma.user.create).toHaveBeenCalledWith({
+      data: {
+        username: "bob*localhost",
+        address: VALID_ADDRESS,
+        isPrimary: false,
+      },
+    });
+  });
+
+  test("returns 409 once the address has the maximum of 5 usernames", async () => {
+    prisma.user.count.mockResolvedValue(5);
+
+    const response = await request(app)
+      .post("/register")
+      .send({ username: "sixth", address: VALID_ADDRESS });
+
     expect(response.status).toBe(409);
     expect(response.body).toMatchObject({
       success: false,
-      error: { code: 'CONFLICT', message: 'Address already registered' },
+      error: { code: 'CONFLICT' },
     });
+    expect(response.body.error.message).toMatch(/maximum of 5/);
+    expect(prisma.user.create).not.toHaveBeenCalled();
   });
 
   test("returns 422 when required payload fields are missing", async () => {

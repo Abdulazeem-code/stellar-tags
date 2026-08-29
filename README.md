@@ -237,7 +237,7 @@ when the failure is field-level. `correlation_id` is on every error;
 | `FORBIDDEN` | 403 | Reserved name, blocked address |
 | `NOT_FOUND` | 404 | No such tag, address, or route |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
-| `CONFLICT` | 409 | Username or address already registered |
+| `CONFLICT` | 409 | Username already taken, or an address is at its 5-username limit |
 | `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
 | `VALIDATION_FAILED` | 422 | Body failed its schema |
@@ -252,7 +252,7 @@ turns an error into a response:
 ```js
 const { ApiError } = require('./src/errors');
 
-return next(new ApiError('CONFLICT', 'Address already registered'));
+return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
 ```
 
 A `5xx` from an unexpected throw always reports the generic message so
@@ -310,19 +310,23 @@ Resolves a given username tag to a Stellar address.
   - `500 Internal Server Error`: Database lookup failed.
 
 ### `POST /register`
-Registers a new username and associates it with a Stellar address.
+Registers a new username and associates it with a Stellar address. An address
+may hold up to 5 usernames (aliases), e.g. `payments*domain` and
+`support*domain` for one business account. The first username registered for an
+address is its primary; reverse (`type=id`) federation lookups resolve to it.
 - **Body Parameters (JSON):** 
   - `username` (string) - The desired username.
   - `address` (string) - The user's Stellar address.
-- **Returns:** A JSON object with registration details `{ ok: true, username, address }`.
+- **Returns:** A JSON object with registration details `{ ok: true, username, address, is_primary }`.
 - **Status Codes:**
   - `200 OK`: Registration successful.
   - `400 Bad Request`: Missing `username` or `address`.
-  - `409 Conflict`: Address or username already registered.
+  - `409 Conflict`: Username already taken, or the address already has the maximum of 5 usernames.
   - `500 Internal Server Error`: Database lookup or insertion failed.
 
 ### `GET /lookup`
-Resolves a given Stellar address to its registered username.
+Resolves a given Stellar address to its registered username. When an address has
+several usernames, the primary one is returned.
 - **Query Parameter:** `address` (string) - The Stellar address to lookup.
 - **Returns:** A JSON object with `username` and `address`.
 - **Status Codes:**
@@ -443,7 +447,7 @@ The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts
 ./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
 
 # Upgrade an existing contract to newly compiled WASM
-./scripts/deploy_contract.sh upgrade --contract-id CDNQ7... --network testnet --source S...
+./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S...
 
 # Compile and optimize WASM only
 ./scripts/deploy_contract.sh build
