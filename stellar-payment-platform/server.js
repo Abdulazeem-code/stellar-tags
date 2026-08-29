@@ -18,8 +18,7 @@ const timeout = require('connect-timeout');
 const compression = require('compression');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
-const { logger } = require('./src/logger');
-const pinoHttp = require('pino-http');
+const { logger, httpLogger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const {
@@ -80,7 +79,7 @@ const app = express();
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
-app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
+app.use(httpLogger);
 app.use(helmet());
 
 app.use(timeout('10s'));
