@@ -7,21 +7,11 @@ const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { shouldFallbackToLocalRegistry } = require('../../utils');
 
 const router = express.Router();
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
-};
 
 const verifyFreighterSignedMessage = ({
   message,
@@ -86,7 +76,7 @@ const authenticateWebhookCall = async (req) => {
 
   const normalizedUsername = normalizeNameTag(rawUsername).toLowerCase();
 
-  let userRecord = null;
+  let userRecord;
   try {
     userRecord = await prisma.user.findUnique({
       where: { username: normalizedUsername },
