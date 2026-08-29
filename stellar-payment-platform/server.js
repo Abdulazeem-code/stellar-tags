@@ -32,6 +32,7 @@ const { validateSchema } = require('./src/middleware/validateSchema');
 const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
 const { ApiError, errorBody } = require('./src/errors');
 const { requireJson } = require('./src/middleware/requireJson');
+const { bodySizeLimit } = require('./src/middleware/bodyLimit');
 const { apiVersion } = require('./src/middleware/apiVersion');
 const { deprecationMiddleware } = require('./src/middleware/deprecation');
 const {
@@ -206,10 +207,13 @@ const limiter = rateLimit({
 });
 
 app.use(cors(corsOptions));
-app.use(express.json());
+
+// #588 — Per-route request body size limits. A single JSON parser enforces a
+// cap that depends on the endpoint type (auth 1kb / standard 10kb / bulk 100kb)
+// instead of the previous uniform 10kb, and answers oversized payloads with 413.
+app.use(bodySizeLimit);
 
 app.use(limiter);
-app.use(express.json({ limit: '10kb' }));
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
