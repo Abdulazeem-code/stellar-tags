@@ -206,6 +206,21 @@ const limiter = rateLimit({
   },
 });
 
+// Per-IP limiter specifically for sensitive, unauthenticated endpoints.
+// Keys strictly by client IP so brute-force/spam from a single source is
+// blocked regardless of how many account ids are rotated in the payload.
+const ipLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: true,
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  keyGenerator: (req) => req.ip || (req.connection && req.connection.remoteAddress) || '',
+});
+
 app.use(cors(corsOptions));
 
 // #588 — Per-route request body size limits. A single JSON parser enforces a
@@ -385,7 +400,7 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
-app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+app.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
   const { q: queryValue, type } = req.query;
 
   try {
@@ -569,7 +584,7 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   // registerBodySchema has already guaranteed that username is a trimmed
   // 3-20 character alphanumeric string and address is a non-empty trimmed
   // string, so those shape checks are not repeated here.
