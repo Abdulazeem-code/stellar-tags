@@ -10,17 +10,17 @@
 //   HORIZON_NETWORK=public npm run listener  (mainnet)
 // ---------------------------------------------------------------------------
 
-const { Horizon } = require('@stellar/stellar-sdk');
-const { prisma } = require('./prismaClient');
+const { Horizon } = require("@stellar/stellar-sdk");
+const { prisma } = require("./prismaClient");
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
+const NETWORK = process.env.HORIZON_NETWORK || "testnet";
 
 const HORIZON_URLS = {
-  testnet: 'https://horizon-testnet.stellar.org',
-  public: 'https://horizon.stellar.org',
+  testnet: "https://horizon-testnet.stellar.org",
+  public: "https://horizon.stellar.org",
 };
 
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
@@ -40,10 +40,10 @@ const activeStreams = new Map();
 const timestamp = () => new Date().toISOString();
 
 const formatPayment = (payment, trackedAccount) => {
-  const direction = payment.to === trackedAccount ? 'INCOMING' : 'OUTGOING';
+  const direction = payment.to === trackedAccount ? "INCOMING" : "OUTGOING";
   const asset =
-    payment.asset_type === 'native'
-      ? 'XLM'
+    payment.asset_type === "native"
+      ? "XLM"
       : `${payment.asset_code}:${payment.asset_issuer}`;
 
   return [
@@ -54,8 +54,8 @@ const formatPayment = (payment, trackedAccount) => {
     `  Amount:      ${payment.amount} ${asset}`,
     `  Tx Hash:     ${payment.transaction_hash}`,
     `  Created:     ${payment.created_at}`,
-    '  ─────────────────────────────────────────',
-  ].join('\n');
+    "  ─────────────────────────────────────────",
+  ].join("\n");
 };
 
 // ---------------------------------------------------------------------------
@@ -76,11 +76,11 @@ const watchAccount = (accountId) => {
   const closeStream = horizon
     .payments()
     .forAccount(accountId)
-    .cursor('now')
+    .cursor("now")
     .stream({
       onmessage: (payment) => {
         // Only log payment operations (ignore account_merge, etc.)
-        if (payment.type === 'payment' || payment.type_i === 1) {
+        if (payment.type === "payment" || payment.type_i === 1) {
           console.log(formatPayment(payment, accountId));
         }
       },
@@ -103,7 +103,8 @@ const watchAccount = (accountId) => {
 const syncWatchedAccounts = async () => {
   try {
     const rows = await prisma.user.findMany({
-      distinct: ['address'],
+      where: { deletedAt: null },
+      distinct: ["address"],
       select: { address: true },
     });
 
@@ -119,8 +120,10 @@ const syncWatchedAccounts = async () => {
     // Stop watching removed accounts
     for (const [address, closeFn] of activeStreams) {
       if (!currentAddresses.has(address)) {
-        console.log(`[${timestamp()}] 🛑 Stopped watching removed account ${address}`);
-        if (typeof closeFn === 'function') closeFn();
+        console.log(
+          `[${timestamp()}] 🛑 Stopped watching removed account ${address}`,
+        );
+        if (typeof closeFn === "function") closeFn();
         activeStreams.delete(address);
       }
     }
@@ -129,7 +132,10 @@ const syncWatchedAccounts = async () => {
       `[${timestamp()}] 📡 Actively monitoring ${activeStreams.size} account(s)`,
     );
   } catch (err) {
-    console.error(`[${timestamp()}] ❌ Failed to sync watched accounts:`, err.message);
+    console.error(
+      `[${timestamp()}] ❌ Failed to sync watched accounts:`,
+      err.message,
+    );
   }
 };
 
@@ -139,7 +145,7 @@ const syncWatchedAccounts = async () => {
 const shutdown = async () => {
   console.log(`\n[${timestamp()}] Shutting down Horizon listener...`);
   for (const [address, closeFn] of activeStreams) {
-    if (typeof closeFn === 'function') closeFn();
+    if (typeof closeFn === "function") closeFn();
     console.log(`  Closed stream for ${address}`);
   }
   activeStreams.clear();
@@ -147,19 +153,19 @@ const shutdown = async () => {
   process.exit(0);
 };
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 const main = async () => {
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('  Stellar Horizon Payment Listener');
+  console.log("═══════════════════════════════════════════════════════");
+  console.log("  Stellar Horizon Payment Listener");
   console.log(`  Network:  ${NETWORK.toUpperCase()}`);
   console.log(`  Horizon:  ${HORIZON_URL}`);
   console.log(`  Poll:     every ${POLL_INTERVAL_MS / 1000}s for new accounts`);
-  console.log('═══════════════════════════════════════════════════════');
+  console.log("═══════════════════════════════════════════════════════");
 
   // Initial sync
   await syncWatchedAccounts();
@@ -169,6 +175,6 @@ const main = async () => {
 };
 
 main().catch((err) => {
-  console.error('Fatal error starting Horizon listener:', err);
+  console.error("Fatal error starting Horizon listener:", err);
   process.exit(1);
 });

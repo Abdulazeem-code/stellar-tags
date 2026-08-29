@@ -1,4 +1,4 @@
-const cron = require('node-cron');
+const cron = require("node-cron");
 
 /**
  * Number of days after which a registration is considered stale.
@@ -14,7 +14,7 @@ const STALE_THRESHOLD_DAYS = 90;
  * hygiene purposes.
  */
 const ACTIVE_NETWORK_ADDRESSES = new Set([
-  'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+  "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ",
 ]);
 
 /**
@@ -38,12 +38,15 @@ async function runCleanup(prisma) {
 
   const activeAddresses = [...ACTIVE_NETWORK_ADDRESSES];
 
-  // 1. Delete stale rows that are NOT active network addresses.
-  const pruneResult = await prisma.user.deleteMany({
+  // 1. Soft-delete stale rows that are NOT active network addresses.
+  // Mark them with a `deleted_at` timestamp instead of removing them.
+  const pruneResult = await prisma.user.updateMany({
     where: {
       createdAt: { lt: cutoff },
       address: { notIn: activeAddresses },
+      deletedAt: null,
     },
+    data: { deletedAt: new Date() },
   });
 
   // 2. Flag stale rows that ARE active network addresses.
@@ -52,6 +55,7 @@ async function runCleanup(prisma) {
       createdAt: { lt: cutoff },
       address: { in: activeAddresses },
       flaggedAt: null,
+      deletedAt: null,
     },
     data: { flaggedAt: new Date() },
   });
@@ -67,19 +71,21 @@ async function runCleanup(prisma) {
  */
 function scheduleCleanupJob(prisma) {
   // Cron expression: "0 0 * * 0" → runs at 00:00 every Sunday.
-  cron.schedule('0 0 * * 0', async () => {
-    console.log('[cleanup-cron] Starting stale-account sweep…');
+  cron.schedule("0 0 * * 0", async () => {
+    console.log("[cleanup-cron] Starting stale-account sweep…");
     try {
       const { pruned, flagged } = await runCleanup(prisma);
       console.log(
         `[cleanup-cron] Sweep complete – pruned: ${pruned}, flagged: ${flagged}`,
       );
     } catch (err) {
-      console.error('[cleanup-cron] Sweep failed:', err.message);
+      console.error("[cleanup-cron] Sweep failed:", err.message);
     }
   });
 
-  console.log('[cleanup-cron] Weekly cleanup job scheduled (Sundays at midnight).');
+  console.log(
+    "[cleanup-cron] Weekly cleanup job scheduled (Sundays at midnight).",
+  );
 }
 
 module.exports = { scheduleCleanupJob, runCleanup, STALE_THRESHOLD_DAYS };
