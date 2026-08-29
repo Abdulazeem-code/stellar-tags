@@ -5,6 +5,7 @@ const webhookRoutes = require('./webhookRoutes');
 const statsRoutes = require('./statsRoutes');
 const historyRoutes = require('./historyRoutes');
 const exportRoutes = require('./exportRoutes');
+const paymentRoutes = require('./paymentRoutes');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -18,6 +19,8 @@ module.exports = (redisClient) => {
   router.use('/', exportRoutes);
   router.use('/', statsRoutes(redisClient));
   router.use('/', adminRoutes);
+  router.use('/', webhookRoutes(redisClient));
+  router.use('/', paymentRoutes(redisClient));
 
   return router;
 };

@@ -8,8 +8,15 @@ const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { shouldFallbackToLocalRegistry } = require('../../utils');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
+
+  // ── Idempotency protection for mutating webhook routes (POST /webhooks and
+  // DELETE /webhooks/:id). Duplicate requests within 24h return the cached
+  // 2xx response. Read-only GET /webhooks is ignored. ────────────────────────
+  router.use(idempotencyMiddleware(redisClient));
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
@@ -323,11 +330,12 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   }
 }));
 
-router.all('/webhooks', (req, res) => {
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
-  }
-  res.status(404).end();
-});
+  router.all('/webhooks', (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method Not Allowed' });
+    }
+    res.status(404).end();
+  });
 
-module.exports = router;
+  return router;
+};

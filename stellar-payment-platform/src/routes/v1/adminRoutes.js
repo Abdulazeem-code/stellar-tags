@@ -5,6 +5,7 @@ const { invalidateFederationCache } = require('../../federationCache');
 const { invalidateStatsCache } = require('../../cache/statsCache');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
 
 // PAGE_SIZE for the admin export cursor-based pagination
@@ -15,6 +16,10 @@ module.exports = (redisClient) => {
 
   // ── Intercept mutating admin requests for audit logging ───────────────────
   router.use(auditLogMiddleware);
+
+  // ── Idempotency protection for all mutating admin routes (POST/PUT/DELETE).
+  // GET endpoints (export, audit-logs) are ignored by the middleware. ────────
+  router.use(idempotencyMiddleware(redisClient));
 
   const getPrisma = () => {
     return require('../../../prismaClient').prisma;
