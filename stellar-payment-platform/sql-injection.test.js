@@ -37,6 +37,18 @@ jest.mock('bad-words', () => {
   }));
 });
 
+// The GraphQL layer (Apollo Server) imports `graphql` as a peer. When this
+// test uses jest.isolateModules() it creates a fresh module registry, which
+// loads a second copy of `graphql`. Apollo then detects two module realms and
+// throws "Cannot use GraphQLObjectType from another module or realm". Mock the
+// entire GraphQL module so the server starts without Apollo.
+jest.mock('./src/graphql', () => ({
+  attachGraphQL: (app) => ({
+    server: { stop: jest.fn().mockResolvedValue(undefined) },
+    ready: Promise.resolve(),
+  }),
+}));
+
 jest.mock('./prismaClient', () => ({
   prisma: {
     user: {

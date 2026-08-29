@@ -202,6 +202,10 @@ app.use(express.json({ limit: '10kb' }));
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
+  // GraphQL requests legitimately contain nested objects (variables, extensions,
+  // etc.), so skip this check for the /graphql endpoint.
+  if (req.path === '/graphql') return next();
+
   const sources = [req.query, req.body];
   for (const source of sources) {
     if (source && typeof source === 'object') {
