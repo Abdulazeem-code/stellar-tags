@@ -32,6 +32,7 @@ const { validateSchema } = require('./src/middleware/validateSchema');
 const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
 const { ApiError, errorBody } = require('./src/errors');
 const { requireJson } = require('./src/middleware/requireJson');
+const { graphqlMiddleware } = require('./src/graphql');
 const {
   registerBodySchema,
   federationQuerySchema,
@@ -201,6 +202,11 @@ app.use(express.json({ limit: '10kb' }));
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
+  // GraphQL variables are intentionally nested; REST endpoints retain the
+  // existing flat-parameter restriction.
+  if (req.path === '/graphql' || req.originalUrl?.startsWith('/graphql/')) {
+    return next();
+  }
   const sources = [req.query, req.body];
   for (const source of sources) {
     if (source && typeof source === 'object') {
@@ -846,6 +852,7 @@ app.use('/', v1Router);
 app.use('/api/v1', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+app.use('/graphql', graphqlMiddleware);
 
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
