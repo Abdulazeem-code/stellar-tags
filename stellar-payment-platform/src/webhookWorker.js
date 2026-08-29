@@ -20,6 +20,17 @@ const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 };
 
+const webhookEventMatches = (webhook, eventName) => {
+  const subscriptions = Array.isArray(webhook?.events) ? webhook.events : ['*'];
+  const normalized = subscriptions
+    .filter((value) => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (normalized.length === 0 || normalized.includes('*')) return true;
+  return normalized.includes(eventName);
+};
+
 const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
   try {
     return await prisma.webhook.findMany({
@@ -31,14 +42,15 @@ const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
         username: true,
         url: true,
         secret: true,
-        failingSince: true,
+       events: true,
+       failingSince: true,
       },
     });
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
 
     const rows = await poolGetFn(
-      `SELECT w.id, w.username, w.url, w.secret, w.failing_since
+      `SELECT w.id, w.username, w.url, w.secret, w.events, w.failing_since
        FROM webhooks w
        INNER JOIN username_registry u ON u.username = w.username
        WHERE u.address = ?`,
@@ -49,6 +61,7 @@ const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
       username: r.username,
       url: r.url,
       secret: r.secret,
+      events: Array.isArray(r.events) ? r.events : (typeof r.events === 'string' ? JSON.parse(r.events || '[]') : ['*']),
       failingSince: r.failing_since ? new Date(r.failing_since) : null,
     }));
   }
@@ -174,6 +187,11 @@ const dispatchPaymentWebhooks = async ({
   };
 
   for (const wh of webhooks) {
+    if (!webhookEventMatches(wh, payload.event)) {
+      logger.info(`[webhook-worker] Skipping webhook id=${wh.id} url=${wh.url} for event=${payload.event} due to subscription filter`);
+      continue;
+    }
+
     const now = new Date();
     try {
       await sendWebhook(wh.url, payload, wh.secret);
@@ -207,12 +225,13 @@ const listStaleFailingWebhooks = async (prisma, poolAllFn) => {
         username: true,
         url: true,
         secret: true,
+       events: true,
       },
     });
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     const rows = await poolAllFn(
-      `SELECT id, username, url, secret FROM webhooks
+      `SELECT id, username, url, secret, events FROM webhooks
        WHERE failing_since IS NOT NULL AND failing_since >= ?`,
       [cutoff.toISOString()],
     );
@@ -221,11 +240,16 @@ const listStaleFailingWebhooks = async (prisma, poolAllFn) => {
       username: r.username,
       url: r.url,
       secret: r.secret,
+      events: Array.isArray(r.events) ? r.events : (typeof r.events === 'string' ? JSON.parse(r.events || '[]') : ['*']),
     }));
   }
 };
 
 const sendLivenessPing = async (prisma, poolRunFn, webhook) => {
+  if (!webhookEventMatches(webhook, 'webhook.ping')) {
+    return false;
+  }
+
   const payload = {
     event: 'webhook.ping',
     event_id: `ping-${crypto.randomBytes(16).toString('hex')}`,
