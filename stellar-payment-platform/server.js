@@ -33,6 +33,7 @@ const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHa
 const { ApiError, errorBody } = require('./src/errors');
 const { requireJson } = require('./src/middleware/requireJson');
 const { apiVersion } = require('./src/middleware/apiVersion');
+const { deprecationMiddleware } = require('./src/middleware/deprecation');
 const {
   registerBodySchema,
   federationQuerySchema,
@@ -942,6 +943,10 @@ app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, 
 // Request versioning: URI (/api/v1, /api/v2) first, then Accept-Version /
 // API-Version header, defaulting to v1. Routers below then decide routing.
 app.use(apiVersion);
+
+// RFC 8594 deprecation headers: attaches Deprecation/Sunset/Link to endpoints
+// listed in src/config/deprecations.js and logs a server-side warning.
+app.use(deprecationMiddleware());
 
 // v2 first so an explicit /api/v2 request wins over the unversioned fallback.
 app.use('/api/v2', v2Router);
