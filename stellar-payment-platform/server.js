@@ -1007,49 +1007,47 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', async (_req, res) => {
+app.get('/health', async (req, res) => {
   const checks = { database: null, redis: null };
   let allOk = true;
   const errors = [];
 
   try {
     await prisma.$queryRaw`SELECT 1`;
-    checks.database = 'ok';
-  } catch {
-    checks.database = 'error';
+    checks.database = 'up';
+  } catch (err) {
+    checks.database = 'down';
     allOk = false;
     errors.push('Database unavailable');
+    logger.error(err, `[Correlation ID: ${req.correlationId}] Database health check failed`);
   }
 
   if (redisClient) {
     try {
       await redisClient.ping();
-      checks.redis = 'ok';
-    } catch {
-      checks.redis = 'error';
+      checks.redis = 'up';
+    } catch (err) {
+      checks.redis = 'down';
       allOk = false;
       errors.push('Redis unavailable');
+      logger.error(err, `[Correlation ID: ${req.correlationId}] Redis health check failed`);
     }
   } else {
     checks.redis = 'not configured';
   }
 
-  if (allOk) {
-    res.json({ status: 'ok', ...checks });
-  } else {
-    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
-  }
-});
+  const response = {
+    status: allOk ? 'UP' : 'DOWN',
+    timestamp: new Date().toISOString(),
+    ...checks,
+  };
 
-app.get('/health', async (req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok', database: 'connected' });
-  } catch (err) {
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Database unavailable`);
-    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
-
+  if (!allOk) {
+    response.message = errors.join(', ');
+    return res.status(503).json(response);
   }
+
+  return res.status(200).json(response);
 });
 
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
