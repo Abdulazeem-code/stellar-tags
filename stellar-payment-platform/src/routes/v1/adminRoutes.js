@@ -4,7 +4,17 @@ const express = require('express');
 const { invalidateFederationCache } = require('../../federationCache');
 const { invalidateStatsCache } = require('../../cache/statsCache');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { auditLogMiddleware } = require('../../middleware/auditLog');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
+const {
+  parsePagination,
+  paginatedResponse,
+  parseCursorQuery,
+  paginateByKeyset,
+  cursorPaginatedResponse,
+  keysetWhereDesc
+} = require('../../pagination');
 
 // PAGE_SIZE for the admin export cursor-based pagination
 const EXPORT_PAGE_SIZE = 500;
@@ -12,9 +22,17 @@ const EXPORT_PAGE_SIZE = 500;
 module.exports = (redisClient) => {
   const router = express.Router();
 
+  // ── Intercept mutating admin requests for audit logging ───────────────────
+  router.use(auditLogMiddleware);
+
+  // ── Idempotency protection for all mutating admin routes (POST/PUT/DELETE).
+  // GET endpoints (export, audit-logs) are ignored by the middleware. ────────
+  router.use(idempotencyMiddleware(redisClient));
+
   const getPrisma = () => {
     return require('../../../prismaClient').prisma;
   };
+
 
   const adminAuth = (req, res, next) => {
     const apiKey = req.headers['x-api-key'] || req.query.api_key;
@@ -141,5 +159,101 @@ module.exports = (redisClient) => {
     }
   }));
 
+  // ── GET /admin/users/blocked ─────────────────────────────────────────────
+  router.get('/admin/users/blocked', adminAuth, asyncHandler(async (req, res, next) => {
+    const prisma = getPrisma();
+    const { search, cursor, page } = req.query;
+
+    const where = {
+      flaggedAt: { not: null }
+    };
+
+    if (search) {
+      where.OR = [
+        { username: { contains: search } },
+        { address: { contains: search } }
+      ];
+    }
+
+    if (cursor !== undefined || (page === undefined && cursor === undefined)) {
+      // Keyset (cursor) pagination
+      const { limit, cursor: parsedCursor, invalid } = parseCursorQuery(req.query);
+      if (invalid) {
+        return res.status(400).json({ error: 'Invalid cursor' });
+      }
+
+      if (parsedCursor) {
+        where.AND = [keysetWhereDesc(parsedCursor)];
+      }
+
+      const users = await prisma.user.findMany({
+        where,
+        take: limit + 1,
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        select: {
+          username: true,
+          address: true,
+          flaggedAt: true,
+          createdAt: true
+        }
+      });
+
+      const { rows, hasMore, nextCursor } = paginateByKeyset(users, limit);
+      return res.status(200).json(cursorPaginatedResponse(rows, { limit, nextCursor, hasMore }));
+    } else {
+      // Offset pagination
+      const { page: parsedPage, limit, skip } = parsePagination(req.query);
+      
+      const [totalCount, users] = await prisma.$transaction([
+        prisma.user.count({ where }),
+        prisma.user.findMany({
+          where,
+          skip,
+          take: limit,
+          orderBy: { createdAt: 'desc' },
+          select: {
+            username: true,
+            address: true,
+            flaggedAt: true,
+            createdAt: true
+          }
+        })
+      ]);
+      
+      return res.status(200).json(paginatedResponse(users, totalCount, { page: parsedPage, limit }));
+    }
+  }));
+
+  // ── GET /admin/audit-logs ────────────────────────────────────────────────
+
+  /**
+   * Retrieves recent admin audit logs.
+   *
+   * Query parameters:
+   *  - limit (optional) integer between 1 and 100, default 50
+   */
+  router.get(
+    '/admin/audit-logs',
+    adminAuth,
+    asyncHandler(async (req, res) => {
+      const prisma = getPrisma();
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+      const logs = await prisma.auditLog.findMany({
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+      });
+
+      return res.status(200).json({
+        success: true,
+        count: logs.length,
+        data: logs,
+      });
+    }),
+  );
+
   return router;
 };
+

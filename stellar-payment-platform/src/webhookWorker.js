@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { Queue, Worker } = require('bullmq');
 const { createRedisConnection } = require('./config/redis');
 const { logger } = require('./logger');
+const { shouldFallbackToLocalRegistry } = require('./utils');
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
 const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
@@ -24,18 +25,19 @@ let webhookWorker;
 let queueConnection;
 let workerConnection;
 
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
-};
-
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+};
+
+const webhookEventMatches = (webhook, eventName) => {
+  const subscriptions = Array.isArray(webhook?.events) ? webhook.events : ['*'];
+  const normalized = subscriptions
+    .filter((value) => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (normalized.length === 0 || normalized.includes('*')) return true;
+  return normalized.includes(eventName);
 };
 
 const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
@@ -58,7 +60,7 @@ const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
       `SELECT w.id, w.username, w.url, w.secret
        FROM webhooks w
        INNER JOIN username_registry u ON u.username = w.username
-       WHERE u.address = ?`,
+       WHERE u.address = $1`,
       [stellarAddress],
     );
     return rows || [];
