@@ -2,8 +2,7 @@ const { rpc, Contract, xdr, scValToNative, TransactionBuilder, Account, Keypair,
 
 const RPC_URL = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
 const CONTRACT_ID = process.env.CONTRACT_ID;
-// Assume testnet by default if not specified with a safe fallback to prevent tests from crashing
-const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || (Networks && Networks.TESTNET) || 'Test SDF Network ; September 2015';
+
 
 let cache = {
   data: null,
@@ -22,6 +21,9 @@ async function getContractStatus() {
     return cache.data;
   }
 
+  // Initialize lazily to avoid breaking unit tests that mock stellar-sdk
+  // Assume testnet by default if not specified with a safe fallback to prevent tests from crashing
+  const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || (Networks && Networks.TESTNET) || 'Test SDF Network ; September 2015';
   const server = new rpc.Server(RPC_URL);
   const contract = new Contract(CONTRACT_ID);
   

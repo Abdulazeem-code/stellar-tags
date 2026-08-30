@@ -20,6 +20,8 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  MAX_USERNAMES_PER_ADDRESS,
+  PRIMARY_USERNAME_ORDER,
   shouldFallbackToLocalRegistry,
 } = require('../../utils');
 const { validateSchema } = require('../../middleware/validateSchema');
@@ -168,15 +170,22 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   }
 
   try {
-    const existing = await prisma.user.findFirst({
-      where: { address, deletedAt: null }
+    // #613 — an address may carry several usernames (aliases). Registration
+    // adds another while the address is under the cap; the first username
+    // registered for an address becomes its primary.
+    const usernameCount = await prisma.user.count({
+      where: { address, deletedAt: null },
     });
 
-    if (existing) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+    if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
+      return next(
+        new ApiError(
+          'CONFLICT',
+          `This address already has the maximum of ${MAX_USERNAMES_PER_ADDRESS} federation usernames.`,
+        ),
+      );
     }
+    const isPrimary = usernameCount === 0;
 
     let verificationResult = null;
     const signerToVerify = signerAddress || address;
@@ -198,6 +207,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       data: {
         username: normalizedUsername,
         address,
+        isPrimary,
         ...(memoType && { memoType, memo }),
       },
     });
@@ -208,6 +218,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       ok: true,
       username: normalizedUsername,
       address,
+      is_primary: isPrimary,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
       ...(verificationResult && {
         verification: {
@@ -321,9 +332,11 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
   if (address) {
     try {
       const result = await lookupCached(address, async () => {
+        // #613 — an address can have several usernames; return the primary.
         const row = await prisma.user.findFirst({
           where: { address, deletedAt: null },
           select: { username: true },
+          orderBy: PRIMARY_USERNAME_ORDER,
         });
         return row ? { username: row.username, address } : null;
       });

@@ -982,7 +982,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1001'],
     ['P1008'],
   ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
-    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
+    prisma.user.count.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app)
       .post('/api/v1/register')

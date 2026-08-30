@@ -163,8 +163,9 @@ describe('#35 Injection safety — POST /register (address conflict check)', () 
       // Either created (201) or rejected as a conflict (409) — never a crash.
       expect([201, 409]).toContain(res.status);
 
-      expect(prisma.user.findFirst).toHaveBeenCalledTimes(1);
-      const arg = prisma.user.findFirst.mock.calls[0][0];
+      // The address feeds the alias-count check as a bound Prisma argument.
+      expect(prisma.user.count).toHaveBeenCalledTimes(1);
+      const arg = prisma.user.count.mock.calls[0][0];
       expect(arg.where.address).toBe(payload);
     },
   );

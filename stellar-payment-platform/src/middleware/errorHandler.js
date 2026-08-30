@@ -8,7 +8,7 @@ const { ApiError, codeForStatus, errorBody, DEFAULT_MESSAGES } = require('../err
  * Maps errors thrown by libraries, which carry their own conventions rather
  * than a code, onto the platform's codes.
  */
-const classify = (err, isPrismaConnectionError) => {
+const classify = (err, req, isPrismaConnectionError) => {
   if (err instanceof ApiError) {
     return {
       code: err.code,
@@ -30,10 +30,12 @@ const classify = (err, isPrismaConnectionError) => {
 
   // body-parser rejects oversized payloads with its own type tag.
   if (err.type === 'entity.too.large') {
+    const bytes = req && req.bodySizeLimit;
+    const maxKb = bytes ? Math.round(bytes / 1024) : 10;
     return {
       code: 'PAYLOAD_TOO_LARGE',
       statusCode: 413,
-      message: 'Payload too large. Maximum allowed size is 10kb.',
+      message: `Payload too large. Maximum allowed size for this endpoint is ${maxKb}kb.`,
     };
   }
 
@@ -67,7 +69,7 @@ const classify = (err, isPrismaConnectionError) => {
 const buildErrorHandler = (isPrismaConnectionError) =>
   // eslint-disable-next-line no-unused-vars
   (err, req, res, _next) => {
-    const { code, statusCode, message, details, expected } = classify(err, isPrismaConnectionError);
+    const { code, statusCode, message, details, expected } = classify(err, req, isPrismaConnectionError);
 
     if (res.headersSent) {
       return;
