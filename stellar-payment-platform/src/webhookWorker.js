@@ -44,7 +44,7 @@ const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
       `SELECT w.id, w.username, w.url, w.secret, w.events, w.failing_since
        FROM webhooks w
        INNER JOIN username_registry u ON u.username = w.username
-       WHERE u.address = ?`,
+       WHERE u.address = $1`,
       [stellarAddress],
     );
     return (rows || []).map((r) => ({
@@ -98,7 +98,7 @@ const markWebhookSuccess = async (prisma, poolRunFn, webhookId, now) => {
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     await poolRunFn(
-      `UPDATE webhooks SET last_sent_at = ?, failing_since = NULL WHERE id = ?`,
+      `UPDATE webhooks SET last_sent_at = $1, failing_since = NULL WHERE id = $2`,
       [now.toISOString(), webhookId],
     );
   }
@@ -121,9 +121,9 @@ const markWebhookFailure = async (prisma, poolRunFn, webhookId, now) => {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     await poolRunFn(
       `UPDATE webhooks
-       SET last_sent_at = ?,
-           failing_since = COALESCE(failing_since, ?)
-       WHERE id = ?`,
+       SET last_sent_at = $1,
+           failing_since = COALESCE(failing_since, $2)
+       WHERE id = $3`,
       [now.toISOString(), now.toISOString(), webhookId],
     );
   }
@@ -223,7 +223,7 @@ const listStaleFailingWebhooks = async (prisma, poolAllFn) => {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     const rows = await poolAllFn(
       `SELECT id, username, url, secret, events FROM webhooks
-       WHERE failing_since IS NOT NULL AND failing_since >= ?`,
+       WHERE failing_since IS NOT NULL AND failing_since >= $1`,
       [cutoff.toISOString()],
     );
     return (rows || []).map((r) => ({
