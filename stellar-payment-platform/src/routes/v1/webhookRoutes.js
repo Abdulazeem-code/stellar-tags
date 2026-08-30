@@ -8,8 +8,15 @@ const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { shouldFallbackToLocalRegistry } = require('../../utils');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
+
+  // ── Idempotency protection for mutating webhook routes (POST /webhooks and
+  // DELETE /webhooks/:id). Duplicate requests within 24h return the cached
+  // 2xx response. Read-only GET /webhooks is ignored. ────────────────────────
+  router.use(idempotencyMiddleware(redisClient));
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
@@ -85,7 +92,7 @@ const authenticateWebhookCall = async (req) => {
   } catch (err) {
     if (!shouldFallbackToLocalRegistry(err)) throw err;
     const localRow = await poolGet(
-      'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+      'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
       [normalizedUsername],
     );
     userRecord = localRow
@@ -149,6 +156,123 @@ const normalizeWebhookEvents = (input) => {
 
   return events;
 };
+const getWebhookSecret = (req) => {
+  const headerValue = req.get ? req.get('X-Webhook-Secret') || req.get('X-Stellar-Tags-Secret') : '';
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const secret = typeof body.secret === 'string' ? body.secret : (typeof body.webhookSecret === 'string' ? body.webhookSecret : headerValue);
+  return typeof secret === 'string' && secret.trim() ? secret.trim() : '';
+};
+
+const getPayloadForVerification = (body) => {
+  if (body && typeof body === 'object' && !Array.isArray(body) && Object.prototype.hasOwnProperty.call(body, 'payload')) {
+   return body.payload;
+  }
+
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+   const { secret, webhookSecret, signature, ...rest } = body;
+   if (Object.keys(rest).length > 0) {
+     return rest;
+   }
+  }
+
+  return body;
+};
+
+const normalizeSignature = (value) => {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/^sha256=/i, '');
+};
+
+const getSigningPayloadBuffer = (payload) => {
+  if (Buffer.isBuffer(payload)) return payload;
+  if (typeof payload === 'string') return Buffer.from(payload, 'utf8');
+  if (payload === undefined || payload === null) {
+   throw new Error('Missing required field: payload.');
+  }
+  return Buffer.from(JSON.stringify(payload), 'utf8');
+};
+
+router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
+  try {
+   const secret = getWebhookSecret(req);
+   if (!secret) {
+     return res.status(400).json({
+       ok: false,
+       error: {
+         code: 'MISSING_WEBHOOK_SECRET',
+         message: 'Missing required webhook secret. Provide secret or webhookSecret in the request body or X-Webhook-Secret header.',
+       },
+     });
+   }
+
+   const signatureHeader = normalizeSignature(
+     req.get ? (req.get('X-Webhook-Signature') || req.get('X-Stellar-Tags-Signature') || req.body?.signature) : (req.body?.signature || '')
+   );
+   if (!signatureHeader) {
+     return res.status(400).json({
+       ok: false,
+       error: {
+         code: 'MISSING_SIGNATURE',
+         message: 'Missing required X-Webhook-Signature header.',
+       },
+     });
+   }
+
+   const payload = getPayloadForVerification(req.body);
+   const rawPayload = getSigningPayloadBuffer(payload);
+   const expectedSignature = crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
+
+   const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+   const receivedBuffer = Buffer.from(signatureHeader, 'hex');
+
+   if (expectedBuffer.length !== receivedBuffer.length) {
+     return res.status(401).json({
+       ok: false,
+       valid: false,
+       error: {
+         code: 'INVALID_WEBHOOK_SIGNATURE',
+         message: 'The provided signature does not match the webhook secret and payload.',
+       },
+       expectedSignature,
+       receivedSignature: signatureHeader,
+     });
+   }
+
+   let valid;
+   try {
+     valid = crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+   } catch (error) {
+     valid = false;
+   }
+
+   if (!valid) {
+     return res.status(401).json({
+       ok: false,
+       valid: false,
+       error: {
+         code: 'INVALID_WEBHOOK_SIGNATURE',
+         message: 'The provided signature does not match the webhook secret and payload.',
+       },
+       expectedSignature,
+       receivedSignature: signatureHeader,
+     });
+   }
+
+   return res.status(200).json({
+     ok: true,
+     valid: true,
+     message: 'Webhook signature verification succeeded.',
+     expectedSignature,
+     receivedSignature: signatureHeader,
+   });
+  } catch (err) {
+   if (err.statusCode) return next(err);
+   logger.error('[webhooks] POST /webhooks/verify-test failed:', err.message);
+   const error = new Error(err.message || 'Failed to verify webhook signature');
+   error.statusCode = 400;
+   return next(error);
+  }
+}));
 
 router.post('/webhooks', asyncHandler(async (req, res, next) => {
   try {
@@ -195,7 +319,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
 
       await poolRun(
         `INSERT INTO webhooks (id, username, url, secret, events, created_at, last_sent_at, failing_since)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)`,
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)`,
         [id, user.username, rawUrl, secret, JSON.stringify(events), now.toISOString()],
       );
       webhook = { id, username: user.username, url: rawUrl, events, createdAt: now.toISOString() };
@@ -243,7 +367,7 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
       const rows = await poolAll(
         `SELECT id, username, url, events, created_at, last_sent_at, failing_since
-         FROM webhooks WHERE username = ? ORDER BY created_at DESC`,
+         FROM webhooks WHERE username = $1 ORDER BY created_at DESC`,
         [user.username],
       );
       webhooks = rows.map((r) => ({
@@ -303,7 +427,7 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
       const result = await poolRun(
-        'DELETE FROM webhooks WHERE id = ? AND username = ?',
+        'DELETE FROM webhooks WHERE id = $1 AND username = $2',
         [id, user.username],
       );
       deletedCount = result?.changes || 0;
@@ -323,11 +447,12 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   }
 }));
 
-router.all('/webhooks', (req, res) => {
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
-  }
-  res.status(404).end();
-});
+  router.all('/webhooks', (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method Not Allowed' });
+    }
+    res.status(404).end();
+  });
 
-module.exports = router;
+  return router;
+};

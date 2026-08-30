@@ -15,7 +15,18 @@ jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: 
 jest.mock('../src/db-pool-monitor', () => ({ schedulePoolMonitoring: jest.fn(() => ({ stop: jest.fn() })) }));
 jest.mock('../middleware/correlation', () => ({ correlationId: (req, res, next) => next() }));
 jest.mock('../middleware/idempotency', () => ({ idempotencyMiddleware: () => (req, res, next) => next() }));
-jest.mock('pg', () => ({}));
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    connect: jest.fn().mockResolvedValue({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      release: jest.fn(),
+    }),
+    end: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
+    options: { max: 10 },
+  })),
+}));
 jest.mock('../src/multisigner-verifier', () => ({}));
 jest.mock('../src/db', () => ({}));
 jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }) }));
