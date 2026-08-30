@@ -1,7 +1,5 @@
 const express = require('express');
-const { prisma } = require('../../../prismaClient');
-const { normalizeNameTag, etagCache, USER_DATABASE } = require('../../db');
-const { PRIMARY_USERNAME_ORDER } = require('../../utils');
+const { normalizeNameTag, etagCache } = require('../../db');
 const {
   federationNameKey,
   federationIdKey,
@@ -11,6 +9,7 @@ const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { federationQuerySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { resolveFederationId, resolveFederationName } = require('../../services/federationService');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -22,25 +21,7 @@ module.exports = (redisClient) => {
       if (type === 'id') {
         const cacheKey = federationIdKey(queryValue);
         const cached = await federationLookupCached(cacheKey, async () => {
-          // #613 — an address can have several usernames; a reverse lookup
-          // resolves to the primary one.
-          const row = await prisma.user.findFirst({
-            where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
-            select: { username: true, address: true, memoType: true, memo: true },
-            orderBy: PRIMARY_USERNAME_ORDER,
-          });
-
-          if (!row) return null;
-
-          const response = {
-            stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
-            account_id: row.address,
-          };
-          if (row.memoType) {
-            response.memo_type = row.memoType;
-            response.memo = row.memo;
-          }
-          return response;
+          return await resolveFederationId(queryValue);
         });
 
         if (!cached) {
@@ -56,23 +37,7 @@ module.exports = (redisClient) => {
         const cacheKey = federationNameKey(queryName);
 
         const cached = await federationLookupCached(cacheKey, async () => {
-          const row = await prisma.user.findFirst({
-            where: { username: queryName, deletedAt: null },
-            select: { address: true, memoType: true, memo: true },
-          });
-
-          const address = row?.address || USER_DATABASE[queryName];
-          if (!address) return null;
-
-          const response = {
-            stellar_address: address,
-            account_id: address,
-          };
-          if (row?.memoType) {
-            response.memo_type = row.memoType;
-            response.memo = row.memo;
-          }
-          return response;
+          return await resolveFederationName(queryName);
         });
 
         if (!cached) {
@@ -88,6 +53,9 @@ module.exports = (redisClient) => {
         );
       }
     } catch (error) {
+      if (error.statusCode === 403) {
+        return next(error);
+      }
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
