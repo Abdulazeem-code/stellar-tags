@@ -14,39 +14,13 @@ jest.mock("@stellar/stellar-sdk", () => ({
 
 jest.mock("pdfkit", () => jest.fn());
 jest.mock("./src/cleanup-cron", () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock("./src/soft-delete-purge-cron", () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
-jest.mock("sqlite3", () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn(function (...args) {
-          const fn = args.find((a) => typeof a === "function");
-          if (fn) fn.call(this, null);
-        }),
-        serialize: jest.fn((fn) => fn && fn()),
-        close: jest.fn((cb) => cb && cb()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
-}));
-
-jest.mock("generic-pool", () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === "function");
-        if (fn) fn.call(this, null, undefined);
-      }),
-      all: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === "function");
-        if (fn) fn.call(this, null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+jest.mock("pg", () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    on: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   })),
 }));
 
@@ -54,10 +28,13 @@ jest.mock("./prismaClient", () => ({
   prisma: {
     user: {
       findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      count: jest.fn(),
       create: jest.fn(),
     },
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
+  isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock("./src/multisigner-verifier", () => ({
@@ -91,12 +68,13 @@ describe("POST /register - integration test coverage", () => {
     ({ app } = require("./server"));
     ({ prisma } = require("./prismaClient"));
 
-    prisma.user.findUnique.mockReset();
+    prisma.user.findFirst.mockReset();
+    prisma.user.count.mockReset();
     prisma.user.create.mockReset();
   });
 
   test("registers successfully with valid payload", async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.count.mockResolvedValue(0);
     prisma.user.create.mockResolvedValue({
       username: "alice*localhost",
       address: VALID_ADDRESS,
@@ -111,21 +89,24 @@ describe("POST /register - integration test coverage", () => {
       ok: true,
       username: "alice*localhost",
       address: VALID_ADDRESS,
+      is_primary: true,
     });
-    expect(prisma.user.findUnique).toHaveBeenCalledWith({
-      where: { address: VALID_ADDRESS },
+    expect(prisma.user.count).toHaveBeenCalledWith({
+      where: { address: VALID_ADDRESS, deletedAt: null },
     });
     expect(prisma.user.create).toHaveBeenCalledWith({
       data: {
         username: "alice*localhost",
         address: VALID_ADDRESS,
+        isPrimary: true,
       },
     });
   });
 
-  test("returns 409 when address already exists", async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      username: "existing*localhost",
+  test("registers an alias (non-primary) when the address already has a username", async () => {
+    prisma.user.count.mockResolvedValue(1);
+    prisma.user.create.mockResolvedValue({
+      username: "bob*localhost",
       address: VALID_ADDRESS,
     });
 
@@ -133,12 +114,31 @@ describe("POST /register - integration test coverage", () => {
       .post("/register")
       .send({ username: "bob", address: VALID_ADDRESS });
 
+    expect(response.status).toBe(201);
+    expect(response.body).toMatchObject({ ok: true, is_primary: false });
+    expect(prisma.user.create).toHaveBeenCalledWith({
+      data: {
+        username: "bob*localhost",
+        address: VALID_ADDRESS,
+        isPrimary: false,
+      },
+    });
+  });
+
+  test("returns 409 once the address has the maximum of 5 usernames", async () => {
+    prisma.user.count.mockResolvedValue(5);
+
+    const response = await request(app)
+      .post("/register")
+      .send({ username: "sixth", address: VALID_ADDRESS });
+
     expect(response.status).toBe(409);
     expect(response.body).toMatchObject({
       success: false,
-      error: "Address already registered",
-      statusCode: 409,
+      error: { code: 'CONFLICT' },
     });
+    expect(response.body.error.message).toMatch(/maximum of 5/);
+    expect(prisma.user.create).not.toHaveBeenCalled();
   });
 
   test("returns 422 when required payload fields are missing", async () => {
@@ -147,7 +147,7 @@ describe("POST /register - integration test coverage", () => {
       .send({ username: "charlie" });
 
     expect(response.status).toBe(422);
-    expect(response.body).toHaveProperty('errors');
-    expect(response.body.errors.some(e => e.field === 'address')).toBe(true);
+    expect(response.body).toHaveProperty('error.details');
+    expect(response.body.error.details.some(e => e.field === 'address')).toBe(true);
   });
 });
