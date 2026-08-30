@@ -2,16 +2,15 @@
 
 const express = require('express');
 const { once } = require('events');
-const { Horizon, StrKey } = require('@stellar/stellar-sdk');
+const { StrKey } = require('@stellar/stellar-sdk');
 const { validateSchema } = require('../../middleware/validateSchema');
 const { exportQuerySchema } = require('../../schemas');
 const { ApiError } = require('../../errors');
 const { logger } = require('../../logger');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { fetchFirstPaymentsPage, wrapPageWithBreaker } = require('../../services/stellarService');
 
 const router = express.Router();
-
-const HORIZON_BASE = process.env.HORIZON_BASE || 'https://horizon-testnet.stellar.org';
 
 // Horizon caps a page at 200. Records are converted and flushed one page at a
 // time, so memory stays bounded by the page rather than by the export size.
@@ -115,9 +114,11 @@ router.get(
 
     let page;
     try {
-      const server = new Horizon.Server(HORIZON_BASE);
-      page = await server.payments().forAccount(address).order(order).limit(PAGE_SIZE).call();
+      page = await fetchFirstPaymentsPage({ address, order, pageSize: PAGE_SIZE });
     } catch (err) {
+      if (err?.code === 'EOPENBREAKER') {
+        return next(new ApiError('SERVICE_UNAVAILABLE', 'Stellar Horizon is temporarily unavailable; please try again later'));
+      }
       if (err && err.response && err.response.status === 404) {
         return next(new ApiError('NOT_FOUND', 'Account not found'));
       }
@@ -159,7 +160,7 @@ router.get(
           truncated = true;
           break;
         }
-        page = await page.next();
+        page = wrapPageWithBreaker(await page.next());
       }
 
       if (truncated) {
