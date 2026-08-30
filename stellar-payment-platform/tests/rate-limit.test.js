@@ -68,38 +68,11 @@ jest.mock('../src/multisigner-verifier', () => ({
   }),
 }));
 
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn((sql, cb2) => cb2 && cb2(null)),
-        close: jest.fn((cb2) => cb2 && cb2()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
-}));
-
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, null);
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    on: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   })),
 }));
 
@@ -132,7 +105,7 @@ describe('Rate Limiting — express-rate-limit', () => {
   describe('standard headers', () => {
     it('includes RateLimit-Limit header on /federation', async () => {
       const res = await request(app)
-        .get('/federation')
+        .get('/api/v1/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.headers).toHaveProperty('ratelimit-limit');
@@ -141,7 +114,7 @@ describe('Rate Limiting — express-rate-limit', () => {
 
     it('includes RateLimit-Remaining header on /federation', async () => {
       const res = await request(app)
-        .get('/federation')
+        .get('/api/v1/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.headers).toHaveProperty('ratelimit-remaining');
@@ -149,7 +122,7 @@ describe('Rate Limiting — express-rate-limit', () => {
 
     it('includes RateLimit-Limit header on /register', async () => {
       const res = await request(app)
-        .post('/register')
+        .post('/api/v1/register')
         .send({ username: 'alice', address: VALID_ADDRESS });
 
       expect(res.headers).toHaveProperty('ratelimit-limit');
@@ -158,7 +131,7 @@ describe('Rate Limiting — express-rate-limit', () => {
 
     it('includes X-RateLimit-* legacy headers', async () => {
       const res = await request(app)
-        .get('/federation')
+        .get('/api/v1/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.headers).toHaveProperty('x-ratelimit-limit');
@@ -174,13 +147,13 @@ describe('Rate Limiting — express-rate-limit', () => {
       // Send 100 requests (should all succeed or get normal responses)
       for (let i = 0; i < 100; i++) {
         await request(app)
-          .get('/federation')
+          .get('/api/v1/federation')
           .query({ q: 'client*localhost' });
       }
 
       // The 101st request should be rate limited
       const res = await request(app)
-        .get('/federation')
+        .get('/api/v1/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(429);
@@ -198,12 +171,12 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       for (let i = 0; i < 100; i++) {
         await request(app)
-          .post('/register')
+          .post('/api/v1/register')
           .send(payload);
       }
 
       const res = await request(app)
-        .post('/register')
+        .post('/api/v1/register')
         .send(payload);
 
       expect(res.status).toBe(429);
@@ -219,12 +192,12 @@ describe('Rate Limiting — express-rate-limit', () => {
     it('includes Retry-After header on 429 responses', async () => {
       for (let i = 0; i < 100; i++) {
         await request(app)
-          .get('/federation')
+          .get('/api/v1/federation')
           .query({ q: 'client*localhost' });
       }
 
       const res = await request(app)
-        .get('/federation')
+        .get('/api/v1/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(429);
@@ -243,7 +216,7 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       // /federation should now be rate limited too
       const res = await request(app)
-        .get('/federation')
+        .get('/api/v1/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(429);
@@ -256,7 +229,7 @@ describe('Rate Limiting — express-rate-limit', () => {
     it('fresh app instance has a full budget', async () => {
       // The beforeEach resetModules gives us a fresh app
       const res = await request(app)
-        .get('/federation')
+        .get('/api/v1/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(200);
