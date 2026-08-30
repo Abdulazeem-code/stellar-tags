@@ -15,7 +15,7 @@ jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: 
 jest.mock('../src/db-pool-monitor', () => ({ schedulePoolMonitoring: jest.fn(() => ({ stop: jest.fn() })) }));
 jest.mock('../middleware/correlation', () => ({ correlationId: (req, res, next) => next() }));
 jest.mock('../middleware/idempotency', () => ({ idempotencyMiddleware: () => (req, res, next) => next() }));
-jest.mock('sqlite3', () => ({}));
+jest.mock('pg', () => ({}));
 jest.mock('../src/multisigner-verifier', () => ({}));
 jest.mock('../src/db', () => ({}));
 jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }) }));

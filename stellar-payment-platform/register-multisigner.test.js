@@ -42,43 +42,12 @@ jest.mock('./prismaClient', () => ({
   isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
 
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call({ lastID: 1, changes: 1 }, null);
-      }),
-      get: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call(this, null, undefined);
-      }),
-      all: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call(this, null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    on: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   })),
-}));
-
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn(function (...args) {
-          const fn = args.find((a) => typeof a === 'function');
-          if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-        }),
-        serialize: jest.fn((fn) => fn && fn()),
-        close: jest.fn((cb) => cb && cb()),
-      };
-      if (cb) cb(null);
-      return db;
-    }),
-  }),
 }));
 
 const request = require('supertest');
@@ -130,10 +99,6 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
       signerCount: 1,
       errorMessage: null,
     });
-
-    // Mock pool
-    const genericPool = require('generic-pool');
-    mockPool = await genericPool.createPool().acquire();
   });
 
   describe('Validation Tests', () => {
@@ -316,10 +281,10 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
   });
 
   describe('Account Lookup and Conflict Detection', () => {
-    it('should reject duplicate address registration', async () => {
+    it('should reject registration once the address has 5 usernames', async () => {
       const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
-      
-      prisma.user.findFirst.mockResolvedValue({ username: 'existing' });
+
+      prisma.user.count.mockResolvedValue(5);
 
       const response = await request(app)
         .post('/register')
@@ -330,7 +295,24 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         });
 
       expect(response.status).toBe(409);
-      expect(response.body.error.message).toContain('Address already registered');
+      expect(response.body.error.message).toMatch(/maximum of 5/);
+    });
+
+    it('should register an additional username as an alias for an existing address', async () => {
+      const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
+
+      prisma.user.count.mockResolvedValue(2);
+
+      const response = await request(app)
+        .post('/register')
+        .send({
+          username: 'newuser',
+          address: accountId,
+          signature: accountId,
+        });
+
+      expect(response.status).toBe(201);
+      expect(response.body).toMatchObject({ ok: true, is_primary: false });
     });
 
     it('should handle account not found error', async () => {
