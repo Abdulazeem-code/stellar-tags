@@ -3,7 +3,7 @@ const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { poolGet, poolRun, poolAll } = require('../../db');
+const { poolGet, poolRun, poolAll, etagCache } = require('../../db');
 const { logger } = require('../../logger');
 const { lookupCached, invalidateFederationCache } = require('../../cache');
 const {
@@ -295,7 +295,7 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   }
 }));
 
-router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
+router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
   if (address) {
@@ -381,7 +381,7 @@ const totalPages = Math.ceil(totalCount / limit);
   }
 }));
 
-router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
+router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);
   if (invalidCursor) {
