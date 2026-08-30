@@ -8,6 +8,7 @@ const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { shouldFallbackToLocalRegistry } = require('../../utils');
+const { sendWebhook, markWebhookSuccess, markWebhookFailure } = require('../../webhookWorker');
 
 const router = express.Router();
 
@@ -318,6 +319,59 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     if (err.statusCode) return next(err);
     logger.error('[webhooks] DELETE /webhooks/:id failed:', err.message);
     const generic = new Error('Failed to delete webhook');
+    generic.statusCode = 500;
+    return next(generic);
+  }
+}));
+
+router.post('/webhooks/:id/test', asyncHandler(async (req, res, next) => {
+  try {
+    if (!req.is('application/json')) {
+      return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
+    }
+
+    const user = await authenticateWebhookCall(req);
+    const id = typeof req.params?.id === 'string' ? req.params.id.trim() : '';
+
+    if (!id) {
+      return res.status(400).json({ error: 'Webhook id is required in URL path.' });
+    }
+
+    let webhook;
+    try {
+      webhook = await prisma.webhook.findFirst({ where: { id, username: user.username } });
+    } catch (error) {
+      if (!shouldFallbackToLocalRegistry(error)) throw error;
+      webhook = await poolGet(
+        'SELECT id, url, secret FROM webhooks WHERE id = ? AND username = ? LIMIT 1',
+        [id, user.username],
+      );
+    }
+
+    if (!webhook) {
+      return res.status(404).json({ error: 'Webhook not found.' });
+    }
+
+    const payload = {
+      event: 'webhook.test',
+      event_id: `test-${uuidv4()}`,
+      timestamp: new Date().toISOString(),
+      data: { message: 'This is a test delivery triggered from the webhook dashboard.' },
+    };
+    const now = new Date();
+
+    try {
+      await sendWebhook(webhook.url, payload, webhook.secret);
+      await markWebhookSuccess(prisma, poolRun, webhook.id, now);
+      return res.status(200).json({ ok: true, delivered: true });
+    } catch {
+      await markWebhookFailure(prisma, poolRun, webhook.id, now);
+      return res.status(502).json({ ok: false, delivered: false, error: 'Webhook endpoint did not respond successfully.' });
+    }
+  } catch (err) {
+    if (err.statusCode) return next(err);
+    logger.error('[webhooks] POST /webhooks/:id/test failed:', err.message);
+    const generic = new Error('Failed to send test webhook delivery');
     generic.statusCode = 500;
     return next(generic);
   }

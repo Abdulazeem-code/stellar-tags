@@ -283,6 +283,8 @@ module.exports = {
   dispatchPaymentWebhooks,
   scheduleWebhookRetryJob,
   sendWebhook,
+  markWebhookSuccess,
+  markWebhookFailure,
   computeSignature,
   WEBHOOK_TIMEOUT_MS,
 };
