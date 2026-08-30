@@ -1,0 +1,23 @@
+﻿  console.log
+    Ôùç injected env (1) from .env // tip: Ôîÿ suppress logs { quiet: true }
+
+      at _log (node_modules/dotenv/lib/main.js:131:11)
+
+  console.log
+    Ôùç injected env (0) from .env // tip: Ôîü auth for agents [www.vestauth.com]
+
+      at _log (node_modules/dotenv/lib/main.js:131:11)
+
+  console.warn
+    QUERY RES BODY: {}
+
+    [0m [90m 184 |[39m       [33m.[39m[36mget[39m([32m`/api/v1/lookup?address=${user1.address}`[39m)[33m;[39m
+     [90m 185 |[39m
+    [31m[1m>[22m[39m[90m 186 |[39m     console[33m.[39mwarn([32m'QUERY RES BODY:'[39m[33m,[39m queryRes[33m.[39mbody)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 187 |[39m     expect(queryRes[33m.[39mstatus)[33m.[39mtoBe([35m200[39m)[33m;[39m
+     [90m 188 |[39m     expect(queryRes[33m.[39mbody)[33m.[39mtoMatchObject({
+     [90m 189 |[39m       username[33m:[39m user1[33m.[39mfederationTag[33m,[39m[0m
+
+      at Object.warn (integration.test.js:186:13)
+

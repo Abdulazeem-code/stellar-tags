@@ -11,6 +11,10 @@ jest.mock('@stellar/stellar-sdk', () => ({
   }
 }));
 
+jest.mock('redis', () => ({
+  createClient: jest.fn(() => null),
+}));
+
 // Mock Prisma so it doesn't try to connect to a real database and crash
 jest.mock('../prismaClient', () => ({
   prisma: {
@@ -27,6 +31,7 @@ jest.mock('../prismaClient', () => ({
   }
 }));
 
+process.env.NODE_ENV = 'test';
 const { app } = require('../server');
 
 describe('Prometheus Metrics Endpoint', () => {
@@ -54,6 +59,17 @@ describe('Prometheus Metrics Endpoint', () => {
       const metricsText = response.text;
       // Check for default Node.js metrics with our prefix
       expect(metricsText).toMatch(/stellar_tags_nodejs_|stellar_tags_process_/);
+    });
+
+    test('should contain Redis and database connection gauges', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_redis_connections_active');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_open');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_busy');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_idle');
+      expect(metricsText).toContain('stellar_tags_db_pool_queries_waiting');
     });
 
     test('should contain custom request counter metric', async () => {
