@@ -32,9 +32,7 @@ const { validateSchema } = require('./src/middleware/validateSchema');
 const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
 const { ApiError, errorBody } = require('./src/errors');
 const { requireJson } = require('./src/middleware/requireJson');
-const { bodySizeLimit } = require('./src/middleware/bodyLimit');
-const { apiVersion } = require('./src/middleware/apiVersion');
-const { deprecationMiddleware } = require('./src/middleware/deprecation');
+const { graphqlMiddleware } = require('./src/graphql');
 const {
   registerBodySchema,
   federationQuerySchema,
@@ -232,6 +230,11 @@ app.use(limiter);
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
+  // GraphQL variables are intentionally nested; REST endpoints retain the
+  // existing flat-parameter restriction.
+  if (req.path === '/graphql' || req.originalUrl?.startsWith('/graphql/')) {
+    return next();
+  }
   const sources = [req.query, req.body];
   for (const source of sources) {
     if (source && typeof source === 'object') {
@@ -976,6 +979,7 @@ app.use('/api', v1Router);
 app.use('/', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+app.use('/graphql', graphqlMiddleware);
 
 // API key management endpoints (rotation, invalidation, listing)
 app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
