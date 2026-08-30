@@ -7,9 +7,12 @@ const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { createSignatureRateLimiter } = require('../../middleware/signatureRateLimit');
 const { shouldFallbackToLocalRegistry } = require('../../utils');
 
 const router = express.Router();
+
+const signatureRateLimiter = createSignatureRateLimiter();
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
@@ -267,7 +270,7 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
   }
 }));
 
-router.post('/webhooks', asyncHandler(async (req, res, next) => {
+router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json')) {
       return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
