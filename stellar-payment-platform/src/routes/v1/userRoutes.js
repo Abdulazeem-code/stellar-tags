@@ -5,6 +5,7 @@ const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
+const { transferAccount } = require('../../services/registrationService');
 
 const router = express.Router();
 
@@ -160,6 +161,33 @@ router.post('/register', async (req, res, next) => {
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
+router.post('/users/:username/transfer', async (req, res, next) => {
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
+  }
+
+  const { username } = req.params;
+  const { oldAddress, newAddress, oldSignature, newSignature } = req.body;
+
+  try {
+    const normalizedUsername = typeof username === 'string' ? username.toLowerCase().trim() : '';
+    const updatedUser = await transferAccount(
+      normalizedUsername,
+      oldAddress,
+      newAddress,
+      oldSignature,
+      newSignature
+    );
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Account transferred successfully',
+      username: updatedUser.username,
+      new_address: updatedUser.address,
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    return res.status(status).json({ error: error.message || 'Transfer failed' });
   }
 });
 
