@@ -1,7 +1,7 @@
 const { StrKey } = require('@stellar/stellar-sdk');
-const { prisma } = require('../../../prismaClient');
-const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { logger } = require('../../logger');
+const { prisma } = require('../../prismaClient');
+const { verifyMultiSignerThreshold } = require('../multisigner-verifier');
+const { logger } = require('../logger');
 
 async function transferAccount(username, oldAddress, newAddress, oldSignature, newSignature) {
   if (!username) {
