@@ -85,7 +85,7 @@ describe('payment intent metadata', () => {
 
     const app = express();
     app.use(express.json());
-    app.use('/v1', paymentRoutes);
+    app.use('/v1', paymentRoutes(null));
 
     const response = await request(app)
       .post('/v1/payments/bulk')
