@@ -157,6 +157,69 @@ describe('gracefulShutdown', () => {
 
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
+
+  test('disconnects Redis after Prisma when redis client is provided', async () => {
+    const mockRedis = { quit: jest.fn().mockResolvedValue(undefined) };
+    mockServer.close.mockImplementation((cb) => cb());
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM', mockRedis);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockPrisma.$disconnect).toHaveBeenCalledTimes(1);
+    expect(mockRedis.quit).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
+  test('Redis disconnected after Prisma — correct order', async () => {
+    const callOrder = [];
+    const mockRedis = {
+      quit: jest.fn().mockImplementation(() => {
+        callOrder.push('redis.quit');
+        return Promise.resolve();
+      }),
+    };
+    mockServer.close.mockImplementation((cb) => {
+      callOrder.push('server.close');
+      cb();
+    });
+    mockPrisma.$disconnect.mockImplementation(() => {
+      callOrder.push('prisma.$disconnect');
+      return Promise.resolve();
+    });
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM', mockRedis);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callOrder).toEqual(['server.close', 'prisma.$disconnect', 'redis.quit']);
+  });
+
+  test('skips Redis disconnect when no redis client is provided', async () => {
+    mockServer.close.mockImplementation((cb) => cb());
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockPrisma.$disconnect).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
+  test('logs Redis error but still exits 0 if redis.quit() rejects', async () => {
+    const mockRedis = { quit: jest.fn().mockRejectedValue(new Error('Redis gone')) };
+    mockServer.close.mockImplementation((cb) => cb());
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM', mockRedis);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockRedis.quit).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
 });
 
 describe('rejectNestedObjects middleware', () => {
@@ -944,7 +1007,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1001'],
     ['P1008'],
   ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
-    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
+    prisma.user.count.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app)
       .post('/api/v1/register')
