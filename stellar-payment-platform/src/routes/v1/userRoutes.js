@@ -161,6 +161,9 @@ router.post('/register', async (req, res, next) => {
     const registrationError = new Error(`Registration verification failed: ${error.message}`);
     registrationError.statusCode = 500;
     return next(registrationError);
+  }
+});
+
 router.post('/users/:username/transfer', async (req, res, next) => {
   if (!req.is('application/json')) {
     return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
