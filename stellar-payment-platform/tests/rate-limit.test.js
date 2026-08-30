@@ -71,8 +71,13 @@ jest.mock('../src/multisigner-verifier', () => ({
 jest.mock('pg', () => ({
   Pool: jest.fn().mockImplementation(() => ({
     query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-    on: jest.fn(),
+    connect: jest.fn().mockResolvedValue({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      release: jest.fn(),
+    }),
     end: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
+    options: { max: 10 },
   })),
 }));
 
