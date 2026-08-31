@@ -1,5 +1,4 @@
-name: Soroban Contract CI
-
+name: Soroban Contract CI 
 on:
   push:
     branches: [main]
@@ -16,19 +15,15 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./payment_router
-
       - name: Run contract tests
-        run: cargo test --verbose
-
+        run: cargo test --verbose --target x86_64-unknown-linux-gnu
       - name: Build contract to WASM
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: cargo build --target waqm32-unknown-unknown --release
