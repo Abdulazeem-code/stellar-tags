@@ -35,9 +35,7 @@ const {
 } = require('../../schemas');
 const { registerUser } = require('../../services/registrationService');
 const { lookupUser, listUsers } = require('../../services/userService');
-  lookupQuerySchema,
-  usersQuerySchema,
-} = require('../../schemas');
+
 
 const router = express.Router();
 
