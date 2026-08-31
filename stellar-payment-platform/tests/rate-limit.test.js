@@ -231,6 +231,33 @@ describe('Rate Limiting — express-rate-limit', () => {
     });
   });
 
+  // ── Strict auth/login rate limit ─────────────────────────────────────────
+
+  describe('strict auth rate limit', () => {
+    it('applies a stricter limit on /auth endpoints than the global limiter', async () => {
+      // The auth limiter allows only 20 requests per window, so the 21st
+      // request should be rejected even though the global limit is 100.
+      for (let i = 0; i < 20; i++) {
+        await request(app)
+          .post('/auth/verify-email')
+          .send({ email: `user${i}@example.com` });
+      }
+
+      const res = await request(app)
+        .post('/auth/verify-email')
+        .send({ email: 'overflow@example.com' });
+
+      expect(res.status).toBe(429);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests, please try again later.',
+        },
+      });
+    });
+  });
+
   // ── Reset between test modules ───────────────────────────────────────────
 
   describe('rate limiter resets with new app instance', () => {
