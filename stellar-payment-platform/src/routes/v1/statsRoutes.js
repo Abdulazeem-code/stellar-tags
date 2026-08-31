@@ -2,7 +2,7 @@
 
 const express = require('express');
 const { prisma } = require('../../../prismaClient');
-const { poolGet } = require('../../db');
+const { poolGet, etagCache } = require('../../db');
 const { logger } = require('../../logger');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { getCachedStats } = require('../../cache/statsCache');

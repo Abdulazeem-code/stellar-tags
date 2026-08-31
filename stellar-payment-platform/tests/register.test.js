@@ -12,6 +12,7 @@ jest.mock('../prismaClient', () => ({
     user: {
       findUnique: jest.fn().mockResolvedValue(null),
       findFirst: jest.fn().mockResolvedValue(null),
+      count: jest.fn().mockResolvedValue(0),
       create: jest.fn().mockResolvedValue({
         username: 'alice123',
         address: 'GABC123',

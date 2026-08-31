@@ -7,8 +7,10 @@ const { asyncHandler } = require('../../middleware/asyncHandler');
 const { paymentIntentSchema, bulkPaymentSchema } = require('../../schemas/paymentSchema');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { logger } = require('../../logger');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
 
 // POST /payments/bulk
 
@@ -66,4 +68,5 @@ router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSch
   }
 }));
 
-module.exports = router;
+  return router;
+};

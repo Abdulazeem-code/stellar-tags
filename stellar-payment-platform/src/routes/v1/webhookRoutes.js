@@ -7,21 +7,18 @@ const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { shouldFallbackToLocalRegistry } = require('../../utils');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
+
+  // ── Idempotency protection for mutating webhook routes (POST /webhooks and
+  // DELETE /webhooks/:id). Duplicate requests within 24h return the cached
+  // 2xx response. Read-only GET /webhooks is ignored. ────────────────────────
+  router.use(idempotencyMiddleware(redisClient));
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
-};
 
 const verifyFreighterSignedMessage = ({
   message,
@@ -86,7 +83,7 @@ const authenticateWebhookCall = async (req) => {
 
   const normalizedUsername = normalizeNameTag(rawUsername).toLowerCase();
 
-  let userRecord = null;
+  let userRecord;
   try {
     userRecord = await prisma.user.findUnique({
       where: { username: normalizedUsername },
@@ -95,7 +92,7 @@ const authenticateWebhookCall = async (req) => {
   } catch (err) {
     if (!shouldFallbackToLocalRegistry(err)) throw err;
     const localRow = await poolGet(
-      'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+      'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
       [normalizedUsername],
     );
     userRecord = localRow
@@ -166,6 +163,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
 
     const user = await authenticateWebhookCall(req);
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const events = normalizeWebhookEvents(req.body?.events);
 
     if (!isValidWebhookUrl(rawUrl)) {
       return res.status(400).json({ error: 'Invalid webhook URL. Must be http or https.' });
@@ -183,6 +181,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
           username: user.username,
           url: rawUrl,
           secret,
+          events,
           createdAt: now,
         },
       });
@@ -200,11 +199,11 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
 
       await poolRun(
-        `INSERT INTO webhooks (id, username, url, secret, created_at, last_sent_at, failing_since)
-         VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
-        [id, user.username, rawUrl, secret, now.toISOString()],
+        `INSERT INTO webhooks (id, username, url, secret, events, created_at, last_sent_at, failing_since)
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)`,
+        [id, user.username, rawUrl, secret, JSON.stringify(events), now.toISOString()],
       );
-      webhook = { id, username: user.username, url: rawUrl, createdAt: now.toISOString() };
+      webhook = { id, username: user.username, url: rawUrl, events, createdAt: now.toISOString() };
     }
 
     return res.status(201).json({
@@ -213,6 +212,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
         id: webhook.id,
         username: webhook.username,
         url: webhook.url,
+        events: Array.isArray(webhook.events) ? webhook.events : normalizeWebhookEvents(webhook.events),
         secret,
         created_at: (webhook.createdAt instanceof Date
           ? webhook.createdAt
@@ -259,14 +259,15 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
       const rows = await poolAll(
-        `SELECT id, username, url, created_at, last_sent_at, failing_since
-         FROM webhooks WHERE username = ? ORDER BY created_at DESC`,
+        `SELECT id, username, url, events, created_at, last_sent_at, failing_since
+         FROM webhooks WHERE username = $1 ORDER BY created_at DESC`,
         [user.username],
       );
       webhooks = rows.map((r) => ({
         id: r.id,
         username: r.username,
         url: r.url,
+        events: Array.isArray(r.events) ? r.events : (typeof r.events === 'string' ? JSON.parse(r.events || '[]') : ['*']),
         createdAt: r.created_at,
         lastSentAt: r.last_sent_at,
         failingSince: r.failing_since,
@@ -278,6 +279,7 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
       webhooks: webhooks.map((w) => ({
         id: w.id,
         url: w.url,
+        events: Array.isArray(w.events) ? w.events : normalizeWebhookEvents(w.events),
         created_at: (w.createdAt instanceof Date ? w.createdAt : new Date(w.createdAt)).toISOString(),
         last_sent_at: w.lastSentAt
           ? (w.lastSentAt instanceof Date ? w.lastSentAt : new Date(w.lastSentAt)).toISOString()
@@ -330,7 +332,7 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
       const result = await poolRun(
-        'DELETE FROM webhooks WHERE id = ? AND username = ?',
+        'DELETE FROM webhooks WHERE id = $1 AND username = $2',
         [id, user.username],
       );
       deletedCount = result?.changes || 0;
@@ -350,11 +352,12 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   }
 }));
 
-router.all('/webhooks', (req, res) => {
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
-  }
-  res.status(404).end();
-});
+  router.all('/webhooks', (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method Not Allowed' });
+    }
+    res.status(404).end();
+  });
 
-module.exports = router;
+  return router;
+};
