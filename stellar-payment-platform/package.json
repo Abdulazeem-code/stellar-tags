@@ -24,6 +24,9 @@
   "jest": {
     "testEnvironment": "node"
   },
+  "prisma": {
+    "seed": "node scripts/seed.js"
+  },
   "dependencies": {
     "@faker-js/faker": "^10.5.0",
     "@prisma/client": "^6.19.3",

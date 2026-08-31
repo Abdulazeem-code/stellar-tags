@@ -2,13 +2,13 @@ const express = require('express');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { prisma } = require('../../../prismaClient');
-const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
-const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
+const { poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
-const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { shouldFallbackToLocalRegistry } = require('../../utils');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
+const { authenticateUsernameOwner } = require('../../services/ownershipService');
+const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -20,118 +20,13 @@ module.exports = (redisClient) => {
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
-const verifyFreighterSignedMessage = ({
-  message,
-  signature,
-  signerAddress,
-  publicKey,
-}) => {
-  const claimedSigner = signerAddress || publicKey;
-
-  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error('Invalid signer address format.');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const keypair = Keypair.fromPublicKey(claimedSigner);
-
-  let signatureBuffer;
-  if (Buffer.isBuffer(signature)) {
-    signatureBuffer = signature;
-  } else if (typeof signature === 'string') {
-    signatureBuffer = Buffer.from(signature, 'base64');
-  } else {
-    throw new Error('Invalid message signature format.');
-  }
-
-  const prefix = Buffer.from('Stellar Signed Message:\n', 'utf8');
-  const messageBytes = Buffer.from(message, 'utf8');
-  const payload = Buffer.concat([prefix, messageBytes]);
-  const messageHash = crypto.createHash('sha256').update(payload).digest();
-
-  if (!keypair.verify(messageHash, signatureBuffer)) {
-    const error = new Error('Signature verification failed.');
-    error.statusCode = 401;
-    throw error;
-  }
-
-  if (claimedSigner !== publicKey) {
-    const error = new Error('Signer address does not match the registered account.');
-    error.statusCode = 401;
-    throw error;
-  }
-
-  return claimedSigner;
-};
-
-const authenticateWebhookCall = async (req) => {
-  const rawUsername = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
-  const signature = typeof req.body?.signature === 'string' ? req.body.signature.trim() : '';
-  const signerAddress = typeof req.body?.signerAddress === 'string' ? req.body.signerAddress.trim() : undefined;
-
-  if (!rawUsername) {
-    const error = new Error('Missing required field: username.');
-    error.statusCode = 400;
-    throw error;
-  }
-  if (!signature) {
-    const error = new Error('Missing required field: signature.');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const normalizedUsername = normalizeNameTag(rawUsername).toLowerCase();
-
-  let userRecord;
-  try {
-    userRecord = await prisma.user.findUnique({
-      where: { username: normalizedUsername },
-      select: { username: true, address: true },
-    });
-  } catch (err) {
-    if (!shouldFallbackToLocalRegistry(err)) throw err;
-    const localRow = await poolGet(
-      'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
-      [normalizedUsername],
-    );
-    userRecord = localRow
-      ? { username: localRow.username, address: localRow.address }
-      : null;
-  }
-
-  if (!userRecord) {
-    const error = new Error('Username not registered.');
-    error.statusCode = 404;
-    throw error;
-  }
-
-  const operation =
-    typeof req.body?.operation === 'string' ? req.body.operation : 'webhook';
-  const message = `${operation}:${normalizedUsername}`;
-
-  if (StrKey.isValidEd25519PublicKey(signature) && !signerAddress) {
-    const verificationResult = await verifyMultiSignerThreshold(
-      userRecord.address,
-      [signature],
-      { operationType: 'management' },
-    );
-    if (!verificationResult.success) {
-      const error = new Error(verificationResult.errorMessage || 'Signature verification failed');
-      error.statusCode = 401;
-      throw error;
-    }
-  } else {
-    verifyFreighterSignedMessage({
-      message,
-      signature,
-      signerAddress,
-      publicKey: userRecord.address,
-    });
-  }
-
-  return userRecord;
-};
+const authenticateWebhookCall = (req) =>
+  authenticateUsernameOwner({
+    username: req.body?.username,
+    signature: req.body?.signature,
+    signerAddress: req.body?.signerAddress,
+    operation: typeof req.body?.operation === 'string' ? req.body.operation : 'webhook',
+  });
 
 const isValidWebhookUrl = (url) => {
   if (typeof url !== 'string' || url.length > 2048) return false;
@@ -205,6 +100,13 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
       );
       webhook = { id, username: user.username, url: rawUrl, events, createdAt: now.toISOString() };
     }
+
+    await recordActivity(prisma, {
+      username: user.username,
+      action: ACTIVITY_ACTIONS.WEBHOOK_CREATED,
+      metadata: { webhook_id: webhook.id, url: rawUrl, events },
+      req,
+    });
 
     return res.status(201).json({
       ok: true,
@@ -341,6 +243,13 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     if (deletedCount === 0) {
       return res.status(404).json({ error: 'Webhook not found.' });
     }
+
+    await recordActivity(prisma, {
+      username: user.username,
+      action: ACTIVITY_ACTIONS.WEBHOOK_DELETED,
+      metadata: { webhook_id: id },
+      req,
+    });
 
     return res.status(200).json({ ok: true, deleted: true });
   } catch (err) {

@@ -3,7 +3,7 @@ const express = require('express');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 const cors = require('cors');
-const helmet = require('helmet');
+const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
@@ -44,6 +44,10 @@ const {
   usersQuerySchema,
 } = require('./src/schemas');
 const Sentry = require('@sentry/node');
+const {
+  ACTIVITY_ACTIONS,
+  recordActivity,
+} = require('./src/services/activityService');
 const {
   lookupCached,
   federationNameKey,
@@ -103,7 +107,8 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
-app.use(helmet());
+app.disable('x-powered-by');
+app.use(securityMiddleware);
 
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
@@ -790,6 +795,13 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       await registerLocalUser({ username: normalizedUsername, address, isPrimary });
     }
 
+    await recordActivity(prisma, {
+      username: normalizedUsername,
+      action: ACTIVITY_ACTIONS.USER_REGISTERED,
+      metadata: { address, is_primary: isPrimary, ...(memoType && { memo_type: memoType }) },
+      req,
+    });
+
     return res.status(201).json({
       ok: true,
       username: normalizedUsername,
@@ -1054,10 +1066,26 @@ app.use('/api/v2', v2Router);
 // Explicit v1 mount, then /api (no version) and the legacy unversioned root
 // both resolve to v1 so existing clients keep working unchanged.
 app.use('/api/v1', v1Router);
+// #492 — Strict rate limiter for auth/login endpoints. These are prime
+// brute-force targets, so they get a much tighter budget than the global
+// limiter. Uses the same Redis-backed store so the limit is shared across
+// all distributed nodes.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: true,
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  keyGenerator: (req) => req.ip || (req.connection && req.connection.remoteAddress) || '',
+});
+
 app.use('/api', v1Router);
 app.use('/', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
-app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+app.use('/auth', authLimiter, require('./src/routes/v1/authRoutes')(redisClient));
 
 // API key management endpoints (rotation, invalidation, listing)
 app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
@@ -1125,81 +1153,7 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-
-/**
- * @openapi
- * /health:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /health
- *     responses:
- *       200:
- *         description: Success
- */
-app.get('/health', async (_req, res) => {
-  const checks = { database: null, redis: null };
-  let allOk = true;
-  const errors = [];
-
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    checks.database = 'up';
-  } catch (err) {
-    checks.database = 'down';
-    allOk = false;
-    errors.push('Database unavailable');
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Database health check failed`);
-  }
-
-  if (redisClient) {
-    try {
-      await redisClient.ping();
-      checks.redis = 'up';
-    } catch (err) {
-      checks.redis = 'down';
-      allOk = false;
-      errors.push('Redis unavailable');
-      logger.error(err, `[Correlation ID: ${req.correlationId}] Redis health check failed`);
-    }
-  } else {
-    checks.redis = 'not configured';
-  }
-
-  if (allOk) {
-    res.json({ status: 'ok', ...checks });
-  } else {
-    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
-  }
-});
-
-
-/**
- * @openapi
- * /health:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /health
- *     responses:
- *       200:
- *         description: Success
- */
-app.get('/health', async (req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok', database: 'connected' });
-  } catch (err) {
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Database unavailable`);
-    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
-
-  if (!allOk) {
-    response.message = errors.join(', ');
-    return res.status(503).json(response);
-  }
-
-  return res.status(200).json(response);
-});
+app.use(require('./src/routes/v1/healthRoutes')(redisClient));
 
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
 // they reach our own JSON error handler below.
@@ -1249,19 +1203,44 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
 
 
 if (require.main === module) {
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    logger.info(`Server successfully initialized on port ${PORT}`);
-  });
+  const { checkMigrations, enforceMigrationPolicy } = require('./src/migrate-check');
 
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+  const startServer = () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      logger.info(`Server successfully initialized on port ${PORT}`);
+    });
+
+    server.on('error', (e) => {
+      if (e.code === 'EADDRINUSE') {
+        logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+        process.exit(1);
+      }
+    });
+
+    process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+    process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+  };
+
+  // Verify the database is not out of sync with the Prisma migrations before
+  // binding a port, so schema drift surfaces as a clear startup error instead
+  // of a cryptic failure on the first query. In strict mode this exits
+  // (non-zero) when migrations are pending; in permissive mode it warns and
+  // continues. The server only boots once the result is known.
+  checkMigrations()
+    .then((result) => {
+      const { shouldExit } = enforceMigrationPolicy(result);
+      if (shouldExit) {
+        logger.error('[migrate-check] Aborting startup: database migrations are not applied.');
+        process.exit(1);
+      }
+      startServer();
+    })
+    .catch((err) => {
+      // Unexpected failure running the check itself — refuse to start deceptively
+      // healthy when we couldn't validate schema parity.
+      logger.error(err, '[migrate-check] Failed to verify migration status at startup.');
       process.exit(1);
-    }
-  });
-
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+    });
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
