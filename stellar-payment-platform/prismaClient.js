@@ -39,10 +39,39 @@ try {
         e.code = 'P2025';
         throw e;
       },
+    },
+    webhookDLQ: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      create: async () => ({}),
+      delete: async () => ({}),
+      update: async () => ({}),
+    },
+    auditLog: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      findFirst: async () => null,
+      create: async (args) => args.data || {},
+      count: async () => 0,
+    },
+    payment: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      count: async () => 0,
+    },
+    webhook: {
       findUnique: async () => null,
       findFirst: async () => null,
       findMany: async () => [],
       create: async () => ({}),
+      update: async () => ({}),
+      delete: async () => ({}),
+      count: async () => 0,
+    },
+    paymentIntent: {
+      create: async (args) => args.data || {},
+      findMany: async () => [],
+      findUnique: async () => null,
       count: async () => 0,
     },
     $transaction: async (queries) => Promise.all(queries),
