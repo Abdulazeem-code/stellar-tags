@@ -9,6 +9,7 @@ const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
 const MAX_WEBHOOK_ATTEMPTS = 5;
 const WEBHOOK_BACKOFF_DELAY_MS = 1_000;
 const WEBHOOK_WORKER_CONCURRENCY = 5;
+const MAX_RETRY_BACKLOG_DAYS = 3;
 
 const WEBHOOK_JOB_OPTIONS = Object.freeze({
   attempts: MAX_WEBHOOK_ATTEMPTS,
@@ -76,6 +77,43 @@ const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
   }
 };
 
+const getWebhooksExhaustedRetries = async (prisma, poolAllFn) => {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - MAX_RETRY_BACKLOG_DAYS);
+
+  try {
+    return await prisma.webhook.findMany({
+      where: {
+        failingSince: { not: null, lt: cutoff },
+      },
+      select: {
+        id: true,
+        username: true,
+        url: true,
+        secret: true,
+        failingSince: true,
+      },
+    });
+  } catch (error) {
+    if (!shouldFallbackToLocalRegistry(error) || typeof poolAllFn !== 'function') {
+      throw error;
+    }
+    const rows = await poolAllFn(
+      `SELECT id, username, url, secret, failing_since
+       FROM webhooks
+       WHERE failing_since IS NOT NULL AND failing_since < $1`,
+      [cutoff.toISOString()],
+    );
+    return (rows || []).map((row) => ({
+      id: row.id,
+      username: row.username,
+      url: row.url,
+      secret: row.secret,
+      failingSince: row.failing_since ? new Date(row.failing_since) : null,
+    }));
+  }
+};
+
 const sendWebhook = async (url, payload, secret) => {
   const rawBody = JSON.stringify(payload);
   const signature = computeSignature(secret, rawBody);
@@ -114,7 +152,7 @@ const markWebhookSuccess = async (prisma, poolRunFn, webhookId, now) => {
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     await poolRunFn(
-      'UPDATE webhooks SET last_sent_at = ?, failing_since = NULL WHERE id = ?',
+      'UPDATE webhooks SET last_sent_at = $1, failing_since = NULL WHERE id = $2',
       [now.toISOString(), webhookId],
     );
   }
@@ -137,8 +175,8 @@ const markWebhookFailure = async (prisma, poolRunFn, webhookId, now) => {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     await poolRunFn(
       `UPDATE webhooks
-       SET last_sent_at = ?, failing_since = COALESCE(failing_since, ?)
-       WHERE id = ?`,
+       SET last_sent_at = $1, failing_since = COALESCE(failing_since, $2)
+       WHERE id = $3`,
       [now.toISOString(), now.toISOString(), webhookId],
     );
   }
@@ -345,7 +383,7 @@ const moveToDLQ = async (prisma, poolRunFn, webhook) => {
       `INSERT INTO webhook_dlq
          (id, webhook_id, webhook_url, webhook_secret, username,
           event_type, event_payload, failure_reason, delivery_attempts, moved_at, replayed)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, FALSE)`,
       [
         `dlq-${webhook.id}-${crypto.randomBytes(8).toString('hex')}`,
         webhook.id,
@@ -396,17 +434,17 @@ const listDLQEntries = async (prisma, poolAllFn, opts = {}) => {
     let countRow;
     if (username) {
       rows = await poolAllFn(
-        `SELECT * FROM webhook_dlq WHERE username = ?
-         ORDER BY moved_at DESC LIMIT ? OFFSET ?`,
+        `SELECT * FROM webhook_dlq WHERE username = $1
+         ORDER BY moved_at DESC LIMIT $2 OFFSET $3`,
         [username, limit, offset],
       );
       countRow = await poolAllFn(
-        'SELECT COUNT(*) AS total FROM webhook_dlq WHERE username = ?',
+        'SELECT COUNT(*) AS total FROM webhook_dlq WHERE username = $1',
         [username],
       );
     } else {
       rows = await poolAllFn(
-        `SELECT * FROM webhook_dlq ORDER BY moved_at DESC LIMIT ? OFFSET ?`,
+        `SELECT * FROM webhook_dlq ORDER BY moved_at DESC LIMIT $1 OFFSET $2`,
         [limit, offset],
       );
       countRow = await poolAllFn(
@@ -437,7 +475,7 @@ const replayFromDLQ = async (prisma, poolRunFn, dqlId) => {
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
     const rows = await poolRunFn(
-      'SELECT * FROM webhook_dlq WHERE id = ? LIMIT 1',
+      'SELECT * FROM webhook_dlq WHERE id = $1 LIMIT 1',
       [dqlId],
     );
     entry = rows?.[0] || null;
@@ -466,7 +504,7 @@ const replayFromDLQ = async (prisma, poolRunFn, dqlId) => {
     } catch (err) {
       if (!shouldFallbackToLocalRegistry(err)) throw err;
       await poolRunFn(
-        'UPDATE webhook_dlq SET replayed = 1, replayed_at = ? WHERE id = ?',
+        'UPDATE webhook_dlq SET replayed = TRUE, replayed_at = $1 WHERE id = $2',
         [now.toISOString(), dqlId],
       );
     }
@@ -483,7 +521,7 @@ const replayFromDLQ = async (prisma, poolRunFn, dqlId) => {
         logger.error(`[webhook-worker] Failed to update DLQ attempt count for ${dqlId}: ${dbErr.message}`);
       } else {
         await poolRunFn(
-          'UPDATE webhook_dlq SET delivery_attempts = delivery_attempts + 1 WHERE id = ?',
+          'UPDATE webhook_dlq SET delivery_attempts = delivery_attempts + 1 WHERE id = $1',
           [dqlId],
         );
       }
@@ -506,6 +544,8 @@ module.exports = {
   MAX_WEBHOOK_ATTEMPTS,
   WEBHOOK_BACKOFF_DELAY_MS,
   WEBHOOK_JOB_OPTIONS,
+  MAX_RETRY_BACKLOG_DAYS,
+  getWebhooksExhaustedRetries,
   moveToDLQ,
   listDLQEntries,
   replayFromDLQ,
