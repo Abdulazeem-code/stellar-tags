@@ -33,6 +33,13 @@ try {
       create: async () => ({}),
       count: async () => 0,
     },
+    admin: {
+      update: async () => {
+        const e = new Error('P2025: mock - record not found');
+        e.code = 'P2025';
+        throw e;
+      },
+    },
     webhookDLQ: {
       findMany: async () => [],
       findUnique: async () => null,

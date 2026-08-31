@@ -14,6 +14,14 @@ generator client {
   previewFeatures = ["metrics"]
 }
 
+// Granular admin dashboard roles. SuperAdmin has full access; Viewer is
+// read-only; Support can view and assist but cannot mutate data.
+enum AdminRole {
+  SuperAdmin
+  Viewer
+  Support
+}
+
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
 // to its Stellar address. Maps to the legacy "username_registry" table so the
 // data shape is preserved across the SQLite -> PostgreSQL migration.
@@ -63,6 +71,21 @@ model Webhook {
   @@index([username])
   @@index([lastSentAt])
   @@map("webhooks")
+}
+
+// Platform operators for the admin dashboard. Authenticated via API key;
+// authorization is enforced by RBAC middleware using `role`.
+model Admin {
+  id        String    @id @default(uuid())
+  email     String    @unique
+  apiKey    String    @unique @map("api_key")
+  role      AdminRole @default(Viewer)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  @@index([apiKey])
+  @@index([role])
+  @@map("admins")
 }
 
 // Dead-letter queue: holds webhook delivery attempts that have permanently
@@ -151,4 +174,3 @@ model AuditLog {
   @@index([action])
   @@map("audit_logs")
 }
-

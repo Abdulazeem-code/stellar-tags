@@ -4,6 +4,8 @@ const express = require('express');
 const { invalidateFederationCache } = require('../../federationCache');
 const { invalidateStatsCache } = require('../../cache/statsCache');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { requireRole, ROLES } = require('../../middleware/rbac');
+const { ApiError } = require('../../errors');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
@@ -15,7 +17,7 @@ const {
   cursorPaginatedResponse,
   keysetWhereDesc
 } = require('../../pagination');
-const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
+
 
 // PAGE_SIZE for the admin export cursor-based pagination
 const EXPORT_PAGE_SIZE = 500;
@@ -34,19 +36,14 @@ module.exports = (redisClient) => {
     return require('../../../prismaClient').prisma;
   };
 
-  const adminAuth = (req, res, next) => {
-    const apiKey = req.headers['x-api-key'] || req.query.api_key;
-    if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
-    }
-    next();
-  };
+  // Authenticate + authorize. Support/Viewer cannot mutate.
+  const adminRbac = requireRole();
 
   // ── GET /admin/export ──────────────────────────────────────────────────────
   // Streams all payment records as CSV (default) or NDJSON.
   // Supports optional startDate / endDate query params for filtering.
   // Paginates internally using cursor-based pages so memory stays bounded.
-  router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
+  router.get('/admin/export', adminRbac, asyncHandler(async (req, res, next) => {
     const { format = 'csv', startDate, endDate } = req.query;
 
     // Validate date range when provided
@@ -128,36 +125,85 @@ module.exports = (redisClient) => {
     }
   }));
 
-  router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
-    const { address } = req.body;
-
-    if (!address || typeof address !== 'string') {
-      return res.status(400).json({ error: 'Missing or invalid address' });
-    }
-
-    try {
-      const updatedUser = await prisma.user.update({
-        where: { address },
-        data: { flaggedAt: new Date() },
-      });
-
-      await invalidateFederationCache(redisClient, updatedUser.address, updatedUser.username);
-      await invalidateStatsCache(redisClient);
-
+  router.get(
+    '/admin/me',
+    adminRbac,
+    asyncHandler(async (req, res) => {
       return res.status(200).json({
-        message: 'Address successfully blocked',
-        username: updatedUser.username,
-        address: updatedUser.address,
-        flaggedAt: updatedUser.flaggedAt,
+        id: req.admin.id,
+        email: req.admin.email,
+        role: req.admin.role,
       });
-    } catch (error) {
-      if (error.code === 'P2025') {
-        return res.status(404).json({ error: 'Address not found' });
+    }),
+  );
+
+  router.post(
+    '/admin/block',
+    adminRbac,
+    asyncHandler(async (req, res, next) => {
+      const prisma = getPrisma();
+      const { address } = req.body;
+
+      if (!address || typeof address !== 'string') {
+        return res.status(400).json({ error: 'Missing or invalid address' });
       }
-      return next(error);
-    }
-  }));
+
+      try {
+        const updatedUser = await prisma.user.update({
+          where: { address },
+          data: { flaggedAt: new Date() },
+        });
+
+        await invalidateFederationCache(redisClient, updatedUser.address, updatedUser.username);
+        await invalidateStatsCache(redisClient);
+
+        return res.status(200).json({
+          message: 'Address successfully blocked',
+          username: updatedUser.username,
+          address: updatedUser.address,
+          flaggedAt: updatedUser.flaggedAt,
+        });
+      } catch (error) {
+        if (error.code === 'P2025') {
+          return res.status(404).json({ error: 'Address not found' });
+        }
+        return next(error);
+      }
+    }),
+  );
+
+  router.put(
+    '/admin/admins/:id/role',
+    requireRole({ roles: [ROLES.SUPER_ADMIN], permission: 'write' }),
+    asyncHandler(async (req, res, next) => {
+      const prisma = getPrisma();
+      const { role } = req.body || {};
+      const { normalizeRole } = require('../../middleware/rbac');
+      const nextRole = normalizeRole(role);
+      if (!nextRole) {
+        return next(new ApiError('INVALID_INPUT', 'Invalid role'));
+      }
+      if (!prisma.admin || typeof prisma.admin.update !== 'function') {
+        return next(new ApiError('SERVICE_UNAVAILABLE', 'Admin store is not available'));
+      }
+      try {
+        const updated = await prisma.admin.update({
+          where: { id: req.params.id },
+          data: { role: nextRole },
+        });
+        return res.status(200).json({
+          id: updated.id,
+          email: updated.email,
+          role: updated.role,
+        });
+      } catch (error) {
+        if (error.code === 'P2025') {
+          return next(new ApiError('NOT_FOUND', 'Admin not found'));
+        }
+        return next(error);
+      }
+    }),
+  );
 
   // ── Dead Letter Queue (DLQ) ────────────────────────────────────────────
 
@@ -301,7 +347,6 @@ module.exports = (redisClient) => {
     } else {
       // Offset pagination
       const { page: parsedPage, limit, skip } = parsePagination(req.query);
-      
       const [totalCount, users] = await prisma.$transaction([
         prisma.user.count({ where }),
         prisma.user.findMany({
@@ -317,7 +362,6 @@ module.exports = (redisClient) => {
           }
         })
       ]);
-      
       return res.status(200).json(paginatedResponse(users, totalCount, { page: parsedPage, limit }));
     }
   }));
