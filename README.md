@@ -379,6 +379,21 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
 
 Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
 
+### `GET /admin/stats/routing`
+Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
+- **Query Parameters:**
+  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
+  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
+  - `groupBy` (optional) – `'day'` (default), `'week'`, or `'month'`.
+  - `interval` (optional) – Alias for `groupBy`.
+  - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
+- **Status Codes:**
+  - `200 OK`: Statistics retrieved successfully.
+  - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, or invalid `groupBy`.
+  - `401 Unauthorized`: Missing or invalid API key.
+
 ### `GET /admin/audit-logs`
 Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
 - **Query Parameters:**
