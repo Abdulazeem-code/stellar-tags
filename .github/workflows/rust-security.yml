@@ -1,11 +1,9 @@
 name: Rust Security Checks
-
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-
 jobs:
   security:
     name: Static security analysis
@@ -14,34 +12,28 @@ jobs:
       run:
         working-directory: ./payment_router
     env:
-      RSTFLAGS: "-D warnings"
+      RUSTFLAGS: "-D warnings"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-
       - name: Verify formatting
         run: |
           cargo fmt --all -- --check
-
       - name: Run clippy (deny warnings)
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
-
       - name: Install and run cargo-dylint
         run: |
           cargo install cargo-dylint --force
           cargo dylint --all-targets --all-features -- -D warnings
-
       - name: Install and run cargo-audit
         run: |
           cargo install cargo-audit --force
           cargo audit
-
       - name: Run tests (release)
         run: |
           cargo test --all --release
