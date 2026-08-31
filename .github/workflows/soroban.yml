@@ -27,3 +27,39 @@ jobs:
         run: cargo test --all-features -- --ignored
       - name: Build contract to WASM
         run: cargo build --all-features --target wasm32-unknown-unknown --release
+
+  coverage:
+    name: Coverage Report (cargo tarpaulin)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Generate coverage report
+        run: >
+          cargo tarpaulin
+          --features testutils
+          --out Xml
+          --out Html
+          --output-dir coverage
+          --verbose
+
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarpaulin-coverage-report
+          path: payment_router/coverage/

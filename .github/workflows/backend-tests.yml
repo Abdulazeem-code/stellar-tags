@@ -29,3 +29,10 @@ jobs:
       - name: Run backend unit tests
         working-directory: stellar-payment-platform
         run: npm test
+
+      - name: Run memory leak detection tests (#511)
+        working-directory: stellar-payment-platform
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        env:
+          MEMORY_TEST_REQUESTS: '200'
+          MEMORY_LEAK_THRESHOLD_MB: '50'

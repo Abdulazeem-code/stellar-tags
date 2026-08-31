@@ -25,10 +25,16 @@ jobs:
 
 
       - name: Install Backend Dependencies
-        run: npm ci
+        run: npm install
 
       - name: Run Backend Tests
         run: NODE_ENV=test npm test
+
+      - name: Run Memory Leak Detection Tests (#511)
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        env:
+          MEMORY_TEST_REQUESTS: '200'
+          MEMORY_LEAK_THRESHOLD_MB: '50'
 
   frontend-checks:
     name: Frontend Vercel Build Check
