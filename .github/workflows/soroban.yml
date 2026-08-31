@@ -27,7 +27,7 @@ jobs:
           workspaces: ./payment_router
 
       - name: Run contract tests
-        run: cargo test --verbose
+        run: cargo test --all-features --verbose
 
       - name: Build contract to WASM
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: cargo build --all-features --target wasm32-unknown-unknown --release
