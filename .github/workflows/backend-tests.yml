@@ -1,5 +1,4 @@
 name: Backend Unit Tests
-
 on:
   pull_request:
     branches:
@@ -20,7 +19,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: ${ {{ matrix.node-version }} }
 
       - name: Install backend dependencies
         working-directory: stellar-payment-platform
@@ -29,3 +28,5 @@ jobs:
       - name: Run backend unit tests
         working-directory: stellar-payment-platform
         run: npm test
+        env:
+          NODE_ENV: test
