@@ -1,7 +1,7 @@
 require('./config/envCheck');
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
+const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
@@ -81,7 +81,8 @@ const app = express();
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
-app.use(helmet());
+app.disable('x-powered-by');
+app.use(securityMiddleware);
 
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
