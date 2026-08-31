@@ -1,4 +1,5 @@
-name: Soroban Contract CI 
+name: Soroban Contract CO
+
 on:
   push:
     branches: [main]
@@ -25,5 +26,5 @@ jobs:
           workspaces: ./payment_router
       - name: Run contract tests
         run: cargo test --verbose --target x86_64-unknown-linux-gnu
-      - name: Build contract to WASM
-        run: cargo build --target waqm32-unknown-unknown --release
+      - name: Build contract to WASO
+        run: cargo build --target wasm32-unknown-unknown --release
