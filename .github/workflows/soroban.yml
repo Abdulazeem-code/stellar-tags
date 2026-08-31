@@ -32,3 +32,38 @@ jobs:
 
       - name: Build contract to WASM
         run: cargo build --target wasm32-unknown-unknown --release
+
+  bindings-check:
+    name: Bindings up-to-date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Download stellar CLI (pinned)
+        run: |
+          curl -sL -o /tmp/stellar-cli.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/stellar-cli.tar.gz -C /tmp
+          chmod +x /tmp/stellar
+          /tmp/stellar --version
+
+      - name: Regenerate contract bindings
+        run: STELLAR_CLI=/tmp/stellar ./scripts/generate-bindings.sh
+
+      - name: Fail if generated bindings drifted
+        run: |
+          if ! git diff --exit-code -- packages/; then
+            echo "::error::packages/types is out of date. Run 'npm run generate:bindings' and commit the result."
+            exit 1
+          fi
