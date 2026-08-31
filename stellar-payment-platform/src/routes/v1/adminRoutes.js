@@ -1,9 +1,28 @@
 'use strict';
 
+/**
+ * src/routes/v1/adminRoutes.js
+ *
+ * Admin-only endpoints.  All routes require the ADMIN_API_KEY header or
+ * query parameter.
+ *
+ * Routes
+ *  POST /admin/block          – flag (soft-block) an address
+ *  GET  /admin/export         – stream transaction records as CSV or JSON
+ *  GET  /admin/stats/routing  – fetch historical payment routing statistics
+ */
 const express = require('express');
 const { invalidateFederationCache } = require('../../federationCache');
 const { invalidateStatsCache } = require('../../cache/statsCache');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { validateSchema } = require('../../middleware/validateSchema');
+const {
+  adminBlockBodySchema,
+  adminExportQuerySchema,
+  adminRoutingStatsQuerySchema,
+} = require('../../schemas');
+const { streamAdminExport } = require('../../utils/exporter');
+const { getRoutingStats } = require('../../services/statsService');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
@@ -21,6 +40,7 @@ const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
 const EXPORT_PAGE_SIZE = 500;
 
 module.exports = (redisClient) => {
+
   const router = express.Router();
 
   // ── Intercept mutating admin requests for audit logging ───────────────────
@@ -251,6 +271,42 @@ module.exports = (redisClient) => {
       } catch (error) {
         return next(error);
       }
+    }),
+  );
+
+  // ── GET /admin/stats/routing ─────────────────────────────────────────────
+
+  /**
+   * Returns historical payment routing aggregation statistics (volume, fees, counts)
+   * grouped by day, week, or month with optional date-range and asset filtering.
+   *
+   * Query parameters:
+   *  - startDate (optional) YYYY-MM-DD inclusive lower bound on createdAt
+   *  - endDate   (optional) YYYY-MM-DD inclusive upper bound on createdAt
+   *  - groupBy   (optional) 'day' (default) | 'week' | 'month'
+   *  - interval  (optional) alias for groupBy
+   *  - assetCode (optional) filter by asset code
+   */
+  router.get(
+    '/admin/stats/routing',
+    adminAuth,
+    validateSchema({ query: adminRoutingStatsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { startDate, endDate, groupBy, interval, assetCode } = req.query;
+      const prisma = getPrisma();
+
+      const stats = await getRoutingStats({
+        prisma,
+        startDate,
+        endDate,
+        groupBy: interval || groupBy || 'day',
+        assetCode,
+      });
+
+      return res.status(200).json({
+        success: true,
+        ...stats,
+      });
     }),
   );
 

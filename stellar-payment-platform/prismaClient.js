@@ -50,7 +50,11 @@ try {
     payment: {
       findMany: async () => [],
       findUnique: async () => null,
+      findFirst: async () => null,
+      create: async () => ({}),
       count: async () => 0,
+      aggregate: async () => ({ _sum: { amount: 0, fee: 0 }, _count: { id: 0 } }),
+      groupBy: async () => [],
     },
     webhook: {
       findUnique: async () => null,

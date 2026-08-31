@@ -182,6 +182,7 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
 - `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
 - `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
+- `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). `warn` (default) logs a clear warning and continues; `strict` logs an error and exits non-zero before the server binds a port; `off` skips the check. Set to `strict` where you want deploys to fail fast on schema drift instead of failing on the first query.
 
 For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
 
@@ -260,7 +261,7 @@ internals are never leaked; the real error goes to the log under
 `reference_id`. A message passed deliberately to `ApiError` is sent as written.
 
 `GET /health` is exempt: it reports component status (`{ status, database,
-redis }`) rather than an API error.
+redis, horizon }`) rather than an API error.
 
 ## Request validation
 
@@ -336,9 +337,18 @@ several usernames, the primary one is returned.
   - `500 Internal Server Error`: Database lookup failed.
 
 ### `GET /health`
-A simple health check endpoint.
-- **Returns:** `{ status: 'ok' }`
-- **Status Codes:** `200 OK`.
+Aggregates the status of every external dependency: PostgreSQL (a `SELECT 1`
+through Prisma), Redis (`PING`) and Stellar Horizon (an HTTP request to
+`HORIZON_BASE`). The three probes run in parallel.
+- **Returns:** `{ status, timestamp, database, redis, horizon }`, where each
+  dependency is `up`, `down`, or `not configured` (Redis, when `REDIS_URL` is
+  unset). A `DOWN` response also carries a `message` naming the failures.
+- **Status Codes:**
+  - `200 OK`: Every configured dependency responded.
+  - `503 Service Unavailable`: At least one dependency is down.
+
+`HEALTH_HORIZON_TIMEOUT_MS` (default 3000) bounds the Horizon probe so a
+hanging Horizon cannot hold the response open.
 
 ### `GET /transactions/export`
 Streams the account's payment history as a CSV download.
@@ -378,6 +388,21 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
   - `401 Unauthorized`: Missing or invalid API key.
 
 Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
+
+### `GET /admin/stats/routing`
+Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
+- **Query Parameters:**
+  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
+  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
+  - `groupBy` (optional) – `'day'` (default), `'week'`, or `'month'`.
+  - `interval` (optional) – Alias for `groupBy`.
+  - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
+- **Status Codes:**
+  - `200 OK`: Statistics retrieved successfully.
+  - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, or invalid `groupBy`.
+  - `401 Unauthorized`: Missing or invalid API key.
 
 ### `GET /admin/audit-logs`
 Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).

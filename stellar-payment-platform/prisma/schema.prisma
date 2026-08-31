@@ -65,6 +65,24 @@ model Webhook {
   @@map("webhooks")
 }
 
+// Payment records for routing, statistics, and auditing.
+model Payment {
+  id              String   @id @default(uuid())
+  createdAt       DateTime @default(now()) @map("created_at")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  fee             Float    @default(0)
+  assetCode       String?  @map("asset_code")
+  transactionHash String?  @map("transaction_hash")
+  status          String   @default("completed")
+
+  @@index([createdAt])
+  @@index([fromAddress])
+  @@index([toAddress])
+  @@map("payments")
+}
+
 // Dead-letter queue: holds webhook delivery attempts that have permanently
 // failed (exhausted all retries).  Admin endpoints can list and manually
 // replay individual entries so no critical event is lost.
@@ -151,4 +169,3 @@ model AuditLog {
   @@index([action])
   @@map("audit_logs")
 }
-
