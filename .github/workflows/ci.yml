@@ -1,5 +1,4 @@
 name: Production Safety Checks
-
 on:
   push:
     branches: [ "main" ]
@@ -15,10 +14,10 @@ jobs:
         working-directory: ./stellar-payment-platform
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -39,17 +38,17 @@ jobs:
         working-directory: ./payment-dashboard
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
-      
+        uses: actions/checkout@v4
+
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./payment-dashboard/package-lock.json
-          
+
       - name: Install Frontend Dependencies
         run: npm install --legacy-peer-deps
-        
+
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build
