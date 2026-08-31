@@ -20,8 +20,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: $();
-        - name: Install backend dependencies
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install backend dependencies
         working-directory: stellar-payment-platform
         run: npm install --legacy-peer-deps
 
