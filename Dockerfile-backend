@@ -1,21 +1,84 @@
-# ---- Builder: install all dependencies and generate the Prisma client ----
-FROM node:22-alpine AS builder
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder
+#   - installs the FULL dependency tree (dev deps included) once,
+#   - generates the Prisma client,
+#   - prunes down to production-only dependencies, and
+#   - removes engine binaries that are only needed at *generate* time.
+# Nothing heavyweight from this stage except the slimmed node_modules and the
+# app source is ever copied into the runtime image.
+# ---------------------------------------------------------------------------
+FROM node:lts-alpine AS builder
 WORKDIR /app
+ENV NPM_CONFIG_AUDIT=false \
+	NPM_CONFIG_FUND=false \
+	NPM_CONFIG_FETCH_RETRIES=5 \
+	NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=20000 \
+	NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=120000 \
+	NPM_CONFIG_FETCH_TIMEOUT=600000
 
 COPY stellar-payment-platform/package*.json ./
 COPY stellar-payment-platform/prisma ./prisma
-RUN npm ci
+
+# Shared BuildKit cache mount: the npm download cache speeds up rebuilds
+# without ever being baked into an image layer.
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
+	npm ci --no-audit --no-fund
 
 COPY stellar-payment-platform/ .
 RUN npx prisma generate
 
-# ---- Runtime: only production dependencies and built app ----
-FROM node:22-alpine
+# Slim the tree IN THE BUILDER so the runtime stage never sees the weight:
+#  1. npm prune drops devDependencies (jest, supertest, tsx, ...) here, not in
+#     a later layer of the final image (copy-then-prune keeps the fat layer).
+#  2. Prisma ships redundant engine payloads that are unused in library-engine
+#     mode with this schema (provider postgresql, generator prisma-client-js):
+#     - the WASM engine blobs in @prisma/client/runtime (driver-adapter mode),
+#     - the query engine bundled inside the `prisma` CLI package (the CLI uses
+#       the schema engine for `migrate deploy`).
+#     Kept deliberately: node_modules/.prisma/client/libquery_engine-* (the
+#     engine the app actually queries through) and node_modules/@prisma/engines/*
+#     (`prisma migrate deploy` re-downloads the query engine at startup if it
+#     is missing, which would slow every deploy and require egress).
+RUN npm prune --omit=dev \
+	&& rm -f node_modules/.prisma/client/query_engine_bg.wasm \
+		node_modules/@prisma/client/runtime/*wasm-base64* \
+		node_modules/prisma/libquery_engine-*
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime — slim alpine image containing only what the API needs.
+# ---------------------------------------------------------------------------
+FROM node:lts-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-COPY --from=builder /app /app
-RUN npm prune --omit=dev
+# Run as the unprivileged `node` user that ships with the base image
+# (smaller attack surface). /app stays writable for the logs/data dirs the
+# app creates at runtime.
+RUN mkdir -p /app/logs /app/data \
+	&& chown node:node /app /app/logs /app/data
+
+# Production node_modules only (pruned + slimmed in the builder), plus the
+# runtime application files. Tests, docs, logs and build artifacts never
+# enter this stage.
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/prisma ./prisma
+COPY --from=builder --chown=node:node /app/package.json ./package.json
+COPY --from=builder --chown=node:node \
+	/app/server.js /app/horizonListener.js /app/prismaClient.js \
+	/app/mount-versioning.js /app/startup.sh ./
+COPY --from=builder --chown=node:node /app/src ./src
+COPY --from=builder --chown=node:node /app/middleware ./middleware
+COPY --from=builder --chown=node:node /app/config ./config
+
+USER node
+RUN chmod +x startup.sh
+
+# curl is intentionally NOT installed; busybox wget ships with alpine and
+# keeps the image slim.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+	CMD wget -qO- http://127.0.0.1:${PORT:-5000}/health || exit 1
 
 EXPOSE 5000
-CMD ["node", "server.js"]
+CMD ["./startup.sh"]

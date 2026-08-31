@@ -1,16 +1,30 @@
 const express = require('express');
+
 const userRoutes = require('./userRoutes');
-const federationRoutes = require('./federationRoutes');
 const receiptRoutes = require('./receiptRoutes');
+const contractRoutes = require('./contractRoutes');
+const webhookRoutes = require('./webhookRoutes');
 const statsRoutes = require('./statsRoutes');
 const historyRoutes = require('./historyRoutes');
+const exportRoutes = require('./exportRoutes');
+const paymentRoutes = require('./paymentRoutes');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
 
-router.use('/', userRoutes);
-router.use('/', federationRoutes);
-router.use('/', receiptRoutes);
-router.use('/', historyRoutes);
-router.use('/', statsRoutes);
+  const federationRoutes = require('./federationRoutes')(redisClient);
+  const adminRoutes = require('./adminRoutes')(redisClient);
 
-module.exports = router;
+  router.use('/', userRoutes);
+  router.use('/', federationRoutes);
+  router.use('/', receiptRoutes);
+  router.use('/', contractRoutes);
+  router.use('/', historyRoutes);
+  router.use('/', exportRoutes);
+  router.use('/', webhookRoutes(redisClient));
+  router.use('/', paymentRoutes(redisClient));
+  router.use('/', statsRoutes(redisClient));
+  router.use('/', adminRoutes);
+
+  return router;
+};

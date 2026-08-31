@@ -1,33 +1,32 @@
 const express = require('express');
 const xss = require('xss');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { ApiError } = require('../../errors');
+const { requireJson } = require('../../middleware/requireJson');
+const { verifyEmailBodySchema, verifyEmailConfirmBodySchema } = require('../../schemas');
+const { asyncHandler } = require('../../middleware/asyncHandler');
+const { signToken } = require('../../utils/jwt');
 
 module.exports = (redisClient) => {
   const router = express.Router();
   const { logger } = require('../../logger');
 
-  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const makeKey = (email) => `email_verification:${email.toLowerCase()}`;
+
+  // Redis holds the OTPs, so an unconfigured client is reported before the
+  // payload is inspected.
+  const requireRedis = (req, res, next) => {
+    if (!redisClient) {
+      return next(new ApiError('SERVICE_UNAVAILABLE', 'Redis is not configured'));
+    }
+    return next();
+  };
 
   // POST /auth/verify-email
   // Body: { email }
-  router.post('/verify-email', async (req, res, next) => {
+  router.post('/verify-email', requireRedis, requireJson, validateSchema({ body: verifyEmailBodySchema }), asyncHandler(async (req, res, next) => {
     try {
-      if (!redisClient) {
-        const err = new Error('Redis is not configured');
-        err.statusCode = 503;
-        return next(err);
-      }
-
-      if (!req.is('application/json')) {
-        return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
-      }
-
-      const rawEmail = typeof req.body.email === 'string' ? req.body.email.trim() : '';
-      const safeEmail = xss(rawEmail);
-
-      if (!safeEmail || !EMAIL_RE.test(safeEmail)) {
-        return res.status(400).json({ error: 'Invalid email address' });
-      }
+      const safeEmail = xss(req.body.email);
 
       // Generate 6-digit OTP
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
@@ -44,49 +43,42 @@ module.exports = (redisClient) => {
     } catch (err) {
       return next(err);
     }
-  });
+  }));
 
   // POST /auth/verify-email/confirm
   // Body: { email, code }
-  router.post('/verify-email/confirm', async (req, res, next) => {
+  router.post('/verify-email/confirm', requireRedis, requireJson, validateSchema({ body: verifyEmailConfirmBodySchema }), asyncHandler(async (req, res, next) => {
     try {
-      if (!redisClient) {
-        const err = new Error('Redis is not configured');
-        err.statusCode = 503;
-        return next(err);
-      }
-
-      if (!req.is('application/json')) {
-        return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
-      }
-
-      const rawEmail = typeof req.body.email === 'string' ? req.body.email.trim() : '';
-      const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
-      const safeEmail = xss(rawEmail);
-
-      if (!safeEmail || !EMAIL_RE.test(safeEmail) || !/^[0-9]{6}$/.test(code)) {
-        return res.status(400).json({ error: 'Invalid email or code' });
-      }
+      const safeEmail = xss(req.body.email);
+      const { code } = req.body;
 
       const key = makeKey(safeEmail);
       const stored = await redisClient.get(key);
 
       if (!stored) {
-        return res.status(404).json({ error: 'Verification code not found or expired' });
+        return next(new ApiError('NOT_FOUND', 'Verification code not found or expired'));
       }
 
       if (stored !== code) {
-        return res.status(400).json({ error: 'Invalid verification code' });
+        return next(new ApiError('INVALID_INPUT', 'Invalid verification code'));
       }
 
       // On success, remove key
       await redisClient.del(key);
 
-      return res.json({ ok: true, verified: true });
+      // Issue a signed RS256 JWT so the caller can authenticate subsequent requests.
+      let token = null;
+      try {
+        token = signToken({ sub: safeEmail, email: safeEmail });
+      } catch {
+        // JWT keys not configured — return verification result without a token.
+      }
+
+      return res.json({ ok: true, verified: true, ...(token && { token }) });
     } catch (err) {
       return next(err);
     }
-  });
+  }));
 
   return router;
 };

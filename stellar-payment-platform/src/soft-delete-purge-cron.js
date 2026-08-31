@@ -1,10 +1,5 @@
 const cron = require('node-cron');
-const pino = require('pino');
-
-const logger = pino({
-  name: 'soft-delete-purge',
-  level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'test' ? 'silent' : 'info'),
-});
+const { logger } = require('./logger');
 
 /** Days after soft-delete before a user row is permanently removed. */
 const SOFT_DELETE_RETENTION_DAYS = 30;
@@ -36,16 +31,16 @@ async function runSoftDeletePurge(prisma) {
  */
 function scheduleSoftDeletePurgeJob(prisma) {
   cron.schedule('0 0 * * *', async () => {
-    logger.info('Starting soft-delete purge…');
+    logger.info('[soft-delete-purge] Starting soft-delete purge…');
     try {
       const purged = await runSoftDeletePurge(prisma);
-      logger.info({ purged }, 'Soft-delete purge complete');
+      logger.info('[soft-delete-purge] Soft-delete purge complete', { purged });
     } catch (err) {
-      logger.error({ err: err.message }, 'Soft-delete purge failed');
+      logger.error('[soft-delete-purge] Soft-delete purge failed', { err: err.message });
     }
   });
 
-  logger.info('Daily soft-delete purge job scheduled (midnight)');
+  logger.info('[soft-delete-purge] Daily soft-delete purge job scheduled (midnight)');
 }
 
 module.exports = {

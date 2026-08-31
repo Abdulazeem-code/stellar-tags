@@ -31,6 +31,9 @@ jest.mock('../prismaClient', () => ({
   }
 }));
 
+// /health probes Horizon over HTTP; keep it off the network.
+global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+
 process.env.NODE_ENV = 'test';
 const { app } = require('../server');
 
@@ -59,6 +62,17 @@ describe('Prometheus Metrics Endpoint', () => {
       const metricsText = response.text;
       // Check for default Node.js metrics with our prefix
       expect(metricsText).toMatch(/stellar_tags_nodejs_|stellar_tags_process_/);
+    });
+
+    test('should contain Redis and database connection gauges', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_redis_connections_active');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_open');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_busy');
+      expect(metricsText).toContain('stellar_tags_db_pool_connections_idle');
+      expect(metricsText).toContain('stellar_tags_db_pool_queries_waiting');
     });
 
     test('should contain custom request counter metric', async () => {
@@ -126,6 +140,60 @@ describe('Prometheus Metrics Endpoint', () => {
       
       // Should record the 404 request
       expect(metricsText).toContain('status_code="404"');
+    });
+
+    test('should expose the configured latency buckets (10ms, 50ms, 100ms, 500ms, 1s, 5s)', async () => {
+      await request(app).get('/health');
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      for (const le of ['0.01', '0.05', '0.1', '0.5', '1', '5', '+Inf']) {
+        expect(metricsText).toMatch(
+          new RegExp(`stellar_tags_http_request_duration_seconds_bucket\\{.*le="${le.replace('+', '\\+')}"`),
+        );
+      }
+    });
+
+    test('should record the normalized route including the API version mount', async () => {
+      await request(app).get('/api/v1/users?limit=5');
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      // The route label is the matched pattern with its mount prefix, never
+      // the raw query string.
+      expect(metricsText).toMatch(/route="\/api\/v1\/users"/);
+      expect(metricsText).not.toMatch(/limit=5/);
+    });
+
+    test('should collapse unmatched routes to a bounded "unknown" label', async () => {
+      // A random path must not create a per-path label (cardinality guard).
+      await request(app).get('/definitely-not-a-real-route-42');
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('status_code="404"');
+      expect(metricsText).toMatch(/route="unknown"/);
+      expect(metricsText).not.toContain('definitely-not-a-real-route-42');
+    });
+
+    test('should record latency for every request in the histogram', async () => {
+      await request(app).get('/health');
+      await request(app).post('/federation').send({});
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      // Both the sum (with a real duration value) and the count must be present
+      // for the duration histogram after requests are made.
+      expect(metricsText).toMatch(
+        /stellar_tags_http_request_duration_seconds_count\{.*method="GET".*\} [1-9]\d*/,
+      );
+      expect(metricsText).toMatch(
+        /stellar_tags_http_request_duration_seconds_count\{.*method="POST".*\} [1-9]\d*/,
+      );
     });
 
     test('should handle different HTTP methods in metrics', async () => {
