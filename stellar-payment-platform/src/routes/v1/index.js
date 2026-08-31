@@ -21,10 +21,10 @@ module.exports = (redisClient) => {
   router.use('/', contractRoutes);
   router.use('/', historyRoutes);
   router.use('/', exportRoutes);
-  router.use('/', statsRoutes(redisClient));
-  router.use('/', adminRoutes);
   router.use('/', webhookRoutes(redisClient));
   router.use('/', paymentRoutes(redisClient));
+  router.use('/', statsRoutes(redisClient));
+  router.use('/', adminRoutes);
 
   return router;
 };

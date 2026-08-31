@@ -65,6 +65,46 @@ model Webhook {
   @@map("webhooks")
 }
 
+// Payment records for routing, statistics, and auditing.
+model Payment {
+  id              String   @id @default(uuid())
+  createdAt       DateTime @default(now()) @map("created_at")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  fee             Float    @default(0)
+  assetCode       String?  @map("asset_code")
+  transactionHash String?  @map("transaction_hash")
+  status          String   @default("completed")
+
+  @@index([createdAt])
+  @@index([fromAddress])
+  @@index([toAddress])
+  @@map("payments")
+}
+
+// Dead-letter queue: holds webhook delivery attempts that have permanently
+// failed (exhausted all retries).  Admin endpoints can list and manually
+// replay individual entries so no critical event is lost.
+model WebhookDLQ {
+  id              String    @id @default(uuid())
+  webhookId       String    @map("webhook_id")
+  webhookUrl      String    @map("webhook_url")
+  webhookSecret   String    @map("webhook_secret")
+  username        String
+  eventType       String    @map("event_type")
+  eventPayload    String    @map("event_payload")
+  failureReason   String    @map("failure_reason")
+  deliveryAttempts Int      @default(0) @map("delivery_attempts")
+  movedAt         DateTime  @default(now()) @map("moved_at")
+  replayed        Boolean   @default(false)
+  replayedAt      DateTime? @map("replayed_at")
+
+  @@index([username])
+  @@index([webhookId])
+  @@index([movedAt])
+  @@map("webhook_dlq")
+}
 // API keys for backend consumers. Only the SHA-256 hash of the secret is
 // stored; the raw key is shown once at creation time.
 model ApiKey {
@@ -129,4 +169,3 @@ model AuditLog {
   @@index([action])
   @@map("audit_logs")
 }
-
