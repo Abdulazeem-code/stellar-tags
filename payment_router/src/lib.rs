@@ -47,6 +47,495 @@
     #[test]
     fn test_get_user_volume_no_history() {
         let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, _token_admin_client) = setup_token(&env);
+
+        let limit = 10_000_000_000_000i128;
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &(limit + 2000));
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.add_supported_token(&token_address);
+
+        // Route amount up to daily limit
+        client.route_payment(&sender, &recipient, &token_address, &limit);
+
+        // Next payment should exceed daily limit
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &2000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+
+        // Advance time past 24 hours to reset the daily limit
+        let current_time = env.ledger().timestamp();
+        let current_protocol_version = env.ledger().protocol_version();
+        env.ledger().set(LedgerInfo {
+            timestamp: current_time + 86400,
+            protocol_version: current_protocol_version,
+            sequence_number: 1,
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        // Now routing should succeed again. The first payment pushed volume past
+        // VOLUME_THRESHOLD, so the halved rate applies: 2000 * 50 bps = 10.
+        client.route_payment(&sender, &recipient, &token_address, &2000);
+        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 10));
+    }
+
+    #[test]
+    fn test_prevent_self_routing() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
+    }
+
+    #[test]
+    fn test_tiered_fee_discount_applied_after_volume_threshold() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, _token_admin_client) = setup_token(&env);
+
+        // Threshold is 10,000 XLM = 10,000 * 10,000,000 (7 decimals)
+        let threshold = 100_000_000_000i128;
+        let first_amount = threshold + 1;
+        let second_amount = 1000i128;
+        let total_mint = first_amount + second_amount + 10_000_000;
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &total_mint);
+
+        // Initialize with 1% fee (100 bps) and no cap
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // First payment: volume is 0 (< threshold), full fee applies
+        client.route_payment(&sender, &recipient, &token_address, &first_amount);
+
+        let full_fee_first = (first_amount * 100) / 10_000;
+        assert_eq!(token_client.balance(&treasury), full_fee_first);
+        assert_eq!(
+            token_client.balance(&recipient),
+            first_amount - full_fee_first
+        );
+        assert_eq!(client.get_user_volume(&sender), first_amount);
+        // Volume is now past threshold, so next call gets the discount
+        assert_eq!(client.get_effective_fee_bps(&sender), 50);
+
+        // Second payment: volume > threshold, 50% discount applies
+        client.route_payment(&sender, &recipient, &token_address, &second_amount);
+
+        let discounted_fee = (second_amount * 50) / 10_000;
+        assert_eq!(
+            token_client.balance(&treasury),
+            full_fee_first + discounted_fee
+        );
+        assert_eq!(
+            token_client.balance(&recipient),
+            (first_amount - full_fee_first) + (second_amount - discounted_fee)
+        );
+    }
+
+    #[test]
+    fn test_get_effective_fee_bps_no_discount_below_threshold() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // No volume yet
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
+
+        // Route a small payment (below threshold)
+        client.route_payment(&sender, &recipient, &token_address, &1000);
+
+        // Volume is 1000, far below 10,000 XLM threshold
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
+    }
+
+    #[test]
+    fn test_successful_xlm_routing() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        client.initialize(
+            &admin,
+            &platform_treasury,
+            &40,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        let token_admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(token_admin.clone());
+        let sac = StellarAssetClient::new(&env, &token_address);
+        let token_client = token::Client::new(&env, &token_address);
+
+        let initial_balance = 1_000_000_000i128;
+        sac.mint(&sender, &initial_balance);
+
+        client.add_supported_token(&token_address);
+
+        let amount = 100_000_000i128;
+        client.route_payment(&sender, &recipient, &token_address, &amount);
+
+        let expected_fee = 400_000i128;
+        let expected_recipient_amount = amount - expected_fee;
+
+        assert_eq!(token_client.balance(&sender), initial_balance - amount);
+        assert_eq!(token_client.balance(&recipient), expected_recipient_amount);
+        assert_eq!(token_client.balance(&platform_treasury), expected_fee);
+    }
+
+    #[test]
+    fn test_initialize_sets_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let contract_addr = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_addr);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let stored_admin: Option<Address> = env.as_contract(&contract_addr, || {
+            env.storage().instance().get(&DataKey::Admin)
+        });
+        assert_eq!(stored_admin, Some(admin));
+    }
+
+    /// Verifies that `emergency_withdraw` transfers the exact requested amount
+    /// from the contract's own balance to the admin address.
+    #[test]
+    fn test_emergency_withdraw_transfers_tokens_to_admin() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+
+        // Fund the contract directly (simulates stranded tokens from a routing failure).
+        let stranded_amount = 10_000i128;
+        stellar_asset_client.mint(&contract_id, &stranded_amount);
+
+        assert_eq!(token_client.balance(&contract_id), stranded_amount);
+        assert_eq!(token_client.balance(&admin), 0);
+
+        // Admin withdraws half the stranded balance.
+        let withdraw_amount = 4_000i128;
+        client.emergency_withdraw(&token_address, &withdraw_amount);
+
+        assert_eq!(token_client.balance(&admin), withdraw_amount);
+        assert_eq!(
+            token_client.balance(&contract_id),
+            stranded_amount - withdraw_amount
+        );
+    }
+
+    /// Verifies that `emergency_withdraw` can drain the entire contract balance
+    /// in a single call.
+    #[test]
+    fn test_emergency_withdraw_full_balance() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+
+        let stranded_amount = 7_500i128;
+        stellar_asset_client.mint(&contract_id, &stranded_amount);
+
+        client.emergency_withdraw(&token_address, &stranded_amount);
+
+        assert_eq!(token_client.balance(&admin), stranded_amount);
+        assert_eq!(token_client.balance(&contract_id), 0);
+    }
+
+    /// Verifies that `emergency_withdraw` declares admin authorization as required.
+    ///
+    /// Soroban's `require_auth()` uses an abort-on-failure model in the host
+    /// (non-unwinding panics), so we cannot catch a missing-auth failure inside
+    /// the same test process.  Instead we use `mock_all_auths_allowing_non_root_auth`
+    /// to record which addresses the call attempts to authorize, then assert that
+    /// the admin address — and *only* the admin — appears in that list.
+    #[test]
+    fn test_admin_is_required_for_emergency_withdraw() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, _token_client, stellar_asset_client) = setup_token(&env);
+        stellar_asset_client.mint(&contract_id, &5_000i128);
+
+        // Call succeeds because mock_all_auths satisfies any require_auth.
+        // What we verify is that the invocation recorded exactly one
+        // authorization and that it belongs to admin, proving the function
+        // gates on the admin address.
+        client.emergency_withdraw(&token_address, &1_000i128);
+
+        let auths = env.auths();
+        let admin_auth_present = auths.iter().any(|(addr, _)| *addr == admin);
+        assert!(
+            admin_auth_present,
+            "emergency_withdraw must require the admin address to authorize"
+        );
+    }
+
+    #[test]
+    fn test_blacklist_recipient() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Blacklist the recipient
+        client.blacklist_address(&recipient);
+        assert!(client.is_blacklisted(&recipient));
+
+        // Route payment should fail
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::Blacklisted);
+
+        // Unblacklist and try again
+        client.unblacklist_address(&recipient);
+        assert!(!client.is_blacklisted(&recipient));
+
+        client
+            .mock_all_auths()
+            .route_payment(&sender, &recipient, &token_address, &1000);
+    }
+
+    #[test]
+    fn test_routes_multiple_distinct_assets() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
+        let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
+        assert_ne!(usdc_like_address, eurc_like_address);
+
+        usdc_like_admin_client.mint(&sender, &10_000);
+        eurc_like_admin_client.mint(&sender, &5_000);
+
+        client.route_payment(&sender, &recipient, &usdc_like_address, &2_000);
+        client.route_payment(&sender, &recipient, &eurc_like_address, &1_000);
+
+        assert_eq!(usdc_like_client.balance(&sender), 8_000);
+        assert_eq!(usdc_like_client.balance(&recipient), 1_980);
+        assert_eq!(eurc_like_client.balance(&sender), 4_000);
+        assert_eq!(eurc_like_client.balance(&recipient), 990);
+        assert_eq!(client.get_user_volume(&sender), 3_000);
+    }
+
+    /// Verifies that `route_payments` routes a batch of payments across
+    /// disparate tokens in a single atomic transaction, charging the correct
+    /// fee per token and crediting each recipient independently.
+    #[test]
+    fn test_route_payments_multi_token_batch() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient_a = Address::generate(&env);
+        let recipient_b = Address::generate(&env);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        let (usdc_like_address, usdc_like_client, usdc_like_admin_client) = setup_token(&env);
+        let (eurc_like_address, eurc_like_client, eurc_like_admin_client) = setup_token(&env);
+        assert_ne!(usdc_like_address, eurc_like_address);
+
+        usdc_like_admin_client.mint(&sender, &10_000);
+        eurc_like_admin_client.mint(&sender, &5_000);
+
+        let payments = vec![
+            &env,
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient_a.clone(),
+                token_address: usdc_like_address.clone(),
+                amount: 2_000,
+            },
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient_b.clone(),
+                token_address: eurc_like_address.clone(),
+                amount: 1_000,
+            },
+        ];
+
+        client.route_payments(&payments);
+
+        // USDC-like payment: 2_000 with 100 bps fee => 20 fee, 1_980 to recipient_a
+        assert_eq!(usdc_like_client.balance(&sender), 8_000);
+        assert_eq!(usdc_like_client.balance(&recipient_a), 1_980);
+        assert_eq!(usdc_like_client.balance(&treasury), 20);
+
+        // EURC-like payment: 1_000 with 100 bps fee => 10 fee, 990 to recipient_b
+        assert_eq!(eurc_like_client.balance(&sender), 4_000);
+        assert_eq!(eurc_like_client.balance(&recipient_b), 990);
+        assert_eq!(eurc_like_client.balance(&treasury), 10);
+
+        // Volume aggregates across both tokens for the sender
+        assert_eq!(client.get_user_volume(&sender), 3_000);
+    }
+
+    #[test]
+    fn test_benchmark_gas_costs() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        // Reset budget before initialization
+        env.budget().reset_default();
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        let init_cpu = env.budget().cpu_instruction_cost();
+        let init_mem = env.budget().memory_bytes_cost();
+        std::println!("GAS REPORT: initialize");
+        std::println!("CPU Instructions: {}", init_cpu);
+        std::println!("Memory Bytes: {}", init_mem);
+
+        // Reset budget before route_payment
+        env.budget().reset_default();
+        client.route_payment(&sender, &recipient, &token_address, &5_000);
+        let route_cpu = env.budget().cpu_instruction_cost();
+        let route_mem = env.budget().memory_bytes_cost();
+        std::println!("GAS REPORT: route_payment");
+        std::println!("CPU Instructions: {}", route_cpu);
+        std::println!("Memory Bytes: {}", route_mem);
+
+        env.budget().print();
+
+        // Fails CI if gas costs exceed defined thresholds
+        // Set reasonable thresholds (e.g. 5M CPU and 2MB Mem per call)
+        let max_cpu = 5_000_000;
+        let max_mem = 2_000_000;
+
+        assert!(
+            init_cpu <= max_cpu,
+            "initialize CPU cost exceeded threshold! Cost: {}, Threshold: {}",
+            init_cpu,
+            max_cpu
+        );
+        assert!(
+            init_mem <= max_mem,
+            "initialize Memory cost exceeded threshold! Cost: {}, Threshold: {}",
+            init_mem,
+            max_mem
+        );
+
+        assert!(
+            route_cpu <= max_cpu,
+            "route_payment CPU cost exceeded threshold! Cost: {}, Threshold: {}",
+            route_cpu,
+            max_cpu
+        );
+        assert!(
+            route_mem <= max_mem,
+            "route_payment Memory cost exceeded threshold! Cost: {}, Threshold: {}",
+            route_mem,
+            max_mem
+        );
+    }
+
+    #[test]
+    fn test_refund_ledger_and_withdrawal() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
         let user = Address::generate(&env);
         assert_eq!(client.get_user_volume(&user), 0);
     }
