@@ -736,8 +736,6 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
 
 app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
-app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
-  const { address = '', search = '' } = req.query;
 
 // Request versioning: URI (/api/v1, /api/v2) first, then Accept-Version /
 // API-Version header, defaulting to v1. Routers below then decide routing.
