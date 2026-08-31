@@ -261,7 +261,7 @@ internals are never leaked; the real error goes to the log under
 `reference_id`. A message passed deliberately to `ApiError` is sent as written.
 
 `GET /health` is exempt: it reports component status (`{ status, database,
-redis }`) rather than an API error.
+redis, horizon }`) rather than an API error.
 
 ## Request validation
 
@@ -337,9 +337,18 @@ several usernames, the primary one is returned.
   - `500 Internal Server Error`: Database lookup failed.
 
 ### `GET /health`
-A simple health check endpoint.
-- **Returns:** `{ status: 'ok' }`
-- **Status Codes:** `200 OK`.
+Aggregates the status of every external dependency: PostgreSQL (a `SELECT 1`
+through Prisma), Redis (`PING`) and Stellar Horizon (an HTTP request to
+`HORIZON_BASE`). The three probes run in parallel.
+- **Returns:** `{ status, timestamp, database, redis, horizon }`, where each
+  dependency is `up`, `down`, or `not configured` (Redis, when `REDIS_URL` is
+  unset). A `DOWN` response also carries a `message` naming the failures.
+- **Status Codes:**
+  - `200 OK`: Every configured dependency responded.
+  - `503 Service Unavailable`: At least one dependency is down.
+
+`HEALTH_HORIZON_TIMEOUT_MS` (default 3000) bounds the Horizon probe so a
+hanging Horizon cannot hold the response open.
 
 ### `GET /transactions/export`
 Streams the account's payment history as a CSV download.

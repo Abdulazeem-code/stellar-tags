@@ -44,6 +44,9 @@ jest.mock('../src/routes/v1/authRoutes', () => () => {
   return express.Router();
 });
 
+// /health probes Horizon over HTTP; keep it off the network.
+global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+
 const { app } = require('../server');
 
 describe('Helmet Security Headers', () => {
