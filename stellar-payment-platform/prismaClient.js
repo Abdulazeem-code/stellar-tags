@@ -33,6 +33,13 @@ try {
       create: async () => ({}),
       count: async () => 0,
     },
+    webhookDLQ: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      create: async () => ({}),
+      delete: async () => ({}),
+      update: async () => ({}),
+    },
     auditLog: {
       findMany: async () => [],
       findUnique: async () => null,
