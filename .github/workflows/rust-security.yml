@@ -14,10 +14,10 @@ jobs:
       run:
         working-directory: ./payment_router
     env:
-      RUSTFLAGS: "-D warnings"
+      RSTFLAGS: "-D warnings"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -34,12 +34,12 @@ jobs:
 
       - name: Install and run cargo-dylint
         run: |
-          cargo install cargo-dylint --force || true
+          cargo install cargo-dylint --force
           cargo dylint --all-targets --all-features -- -D warnings
 
       - name: Install and run cargo-audit
         run: |
-          cargo install cargo-audit --force || true
+          cargo install cargo-audit --force
           cargo audit
 
       - name: Run tests (release)
