@@ -144,6 +144,16 @@ const accountPaymentsQuerySchema = z
   })
   .loose();
 
+/** GET /users/:username/activity query. Dates are only shape-checked here;
+ * the handler parses them so it can report which bound was unparseable. */
+const activityQuerySchema = z
+  .object({
+    ...paginationFields,
+    startDate: z.string().trim().min(1).max(64).optional(),
+    endDate: z.string().trim().min(1).max(64).optional(),
+  })
+  .loose();
+
 /** POST /auth/verify-email and /auth/verify-email/confirm */
 const verifyEmailBodySchema = z
   .object({
@@ -315,6 +325,7 @@ module.exports = {
   federationQuerySchema,
   lookupQuerySchema,
   usersQuerySchema,
+  activityQuerySchema,
   accountPaymentsQuerySchema,
   verifyEmailBodySchema,
   verifyEmailConfirmBodySchema,

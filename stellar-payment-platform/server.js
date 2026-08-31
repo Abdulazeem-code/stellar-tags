@@ -43,6 +43,10 @@ const {
 } = require('./src/schemas');
 const Sentry = require('@sentry/node');
 const {
+  ACTIVITY_ACTIONS,
+  recordActivity,
+} = require('./src/services/activityService');
+const {
   lookupCached,
   federationNameKey,
   federationIdKey,
@@ -732,6 +736,13 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
 
       await registerLocalUser({ username: normalizedUsername, address, isPrimary });
     }
+
+    await recordActivity(prisma, {
+      username: normalizedUsername,
+      action: ACTIVITY_ACTIONS.USER_REGISTERED,
+      metadata: { address, is_primary: isPrimary, ...(memoType && { memo_type: memoType }) },
+      req,
+    });
 
     return res.status(201).json({
       ok: true,
