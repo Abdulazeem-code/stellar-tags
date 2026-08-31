@@ -182,6 +182,7 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
 - `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
 - `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
+- `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). `warn` (default) logs a clear warning and continues; `strict` logs an error and exits non-zero before the server binds a port; `off` skips the check. Set to `strict` where you want deploys to fail fast on schema drift instead of failing on the first query.
 
 For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
 
@@ -237,7 +238,7 @@ when the failure is field-level. `correlation_id` is on every error;
 | `FORBIDDEN` | 403 | Reserved name, blocked address |
 | `NOT_FOUND` | 404 | No such tag, address, or route |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
-| `CONFLICT` | 409 | Username or address already registered |
+| `CONFLICT` | 409 | Username already taken, or an address is at its 5-username limit |
 | `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
 | `VALIDATION_FAILED` | 422 | Body failed its schema |
@@ -252,7 +253,7 @@ turns an error into a response:
 ```js
 const { ApiError } = require('./src/errors');
 
-return next(new ApiError('CONFLICT', 'Address already registered'));
+return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
 ```
 
 A `5xx` from an unexpected throw always reports the generic message so
@@ -260,7 +261,7 @@ internals are never leaked; the real error goes to the log under
 `reference_id`. A message passed deliberately to `ApiError` is sent as written.
 
 `GET /health` is exempt: it reports component status (`{ status, database,
-redis }`) rather than an API error.
+redis, horizon }`) rather than an API error.
 
 ## Request validation
 
@@ -310,19 +311,23 @@ Resolves a given username tag to a Stellar address.
   - `500 Internal Server Error`: Database lookup failed.
 
 ### `POST /register`
-Registers a new username and associates it with a Stellar address.
+Registers a new username and associates it with a Stellar address. An address
+may hold up to 5 usernames (aliases), e.g. `payments*domain` and
+`support*domain` for one business account. The first username registered for an
+address is its primary; reverse (`type=id`) federation lookups resolve to it.
 - **Body Parameters (JSON):** 
   - `username` (string) - The desired username.
   - `address` (string) - The user's Stellar address.
-- **Returns:** A JSON object with registration details `{ ok: true, username, address }`.
+- **Returns:** A JSON object with registration details `{ ok: true, username, address, is_primary }`.
 - **Status Codes:**
   - `200 OK`: Registration successful.
   - `400 Bad Request`: Missing `username` or `address`.
-  - `409 Conflict`: Address or username already registered.
+  - `409 Conflict`: Username already taken, or the address already has the maximum of 5 usernames.
   - `500 Internal Server Error`: Database lookup or insertion failed.
 
 ### `GET /lookup`
-Resolves a given Stellar address to its registered username.
+Resolves a given Stellar address to its registered username. When an address has
+several usernames, the primary one is returned.
 - **Query Parameter:** `address` (string) - The Stellar address to lookup.
 - **Returns:** A JSON object with `username` and `address`.
 - **Status Codes:**
@@ -332,9 +337,18 @@ Resolves a given Stellar address to its registered username.
   - `500 Internal Server Error`: Database lookup failed.
 
 ### `GET /health`
-A simple health check endpoint.
-- **Returns:** `{ status: 'ok' }`
-- **Status Codes:** `200 OK`.
+Aggregates the status of every external dependency: PostgreSQL (a `SELECT 1`
+through Prisma), Redis (`PING`) and Stellar Horizon (an HTTP request to
+`HORIZON_BASE`). The three probes run in parallel.
+- **Returns:** `{ status, timestamp, database, redis, horizon }`, where each
+  dependency is `up`, `down`, or `not configured` (Redis, when `REDIS_URL` is
+  unset). A `DOWN` response also carries a `message` naming the failures.
+- **Status Codes:**
+  - `200 OK`: Every configured dependency responded.
+  - `503 Service Unavailable`: At least one dependency is down.
+
+`HEALTH_HORIZON_TIMEOUT_MS` (default 3000) bounds the Horizon probe so a
+hanging Horizon cannot hold the response open.
 
 ### `GET /transactions/export`
 Streams the account's payment history as a CSV download.
@@ -375,6 +389,21 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
 
 Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
 
+### `GET /admin/stats/routing`
+Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
+- **Query Parameters:**
+  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
+  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
+  - `groupBy` (optional) – `'day'` (default), `'week'`, or `'month'`.
+  - `interval` (optional) – Alias for `groupBy`.
+  - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
+- **Status Codes:**
+  - `200 OK`: Statistics retrieved successfully.
+  - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, or invalid `groupBy`.
+  - `401 Unauthorized`: Missing or invalid API key.
+
 ### `GET /admin/audit-logs`
 Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
 - **Query Parameters:**
@@ -399,7 +428,7 @@ rate limiter so a scraper on a fixed interval is never throttled.
 | `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
 | `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
 | `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
-| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code` |
+| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code`; buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s |
 | `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
 | `db_pool_connections_busy` | gauge | Connections executing a query |
 | `db_pool_connections_idle` | gauge | Connections open but unused |
@@ -443,7 +472,7 @@ The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts
 ./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
 
 # Upgrade an existing contract to newly compiled WASM
-./scripts/deploy_contract.sh upgrade --contract-id CDNQ7... --network testnet --source S...
+./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S...
 
 # Compile and optimize WASM only
 ./scripts/deploy_contract.sh build
