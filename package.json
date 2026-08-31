@@ -6,7 +6,10 @@
     "start": "npm --prefix stellar-payment-platform start",
     "lint": "eslint .",
     "prepare": "husky",
-    "load:test": "artillery run artillery.yml"
+    "load:test": "artillery run artillery.yml",
+    "contract:build": "node scripts/deploy.js build",
+    "contract:deploy": "node scripts/deploy.js deploy",
+    "contract:upgrade": "node scripts/deploy.js upgrade"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
