@@ -1,5 +1,4 @@
-name: Soroban Contract CI
-
+name: Soroban Contract CI 
 on:
   push:
     branches: [main]
@@ -15,7 +14,7 @@ jobs:
         working-directory: ./payment_router
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
