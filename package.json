@@ -7,7 +7,10 @@
     "lint": "eslint .",
     "prepare": "husky",
     "load:test": "artillery run artillery.yml",
-    "generate:bindings": "bash scripts/generate-bindings.sh"
+    "generate:bindings": "bash scripts/generate-bindings.sh",
+    "contract:build": "node scripts/deploy.js build",
+    "contract:deploy": "node scripts/deploy.js deploy",
+    "contract:upgrade": "node scripts/deploy.js upgrade"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

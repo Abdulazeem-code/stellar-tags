@@ -17,9 +17,16 @@ generator client {
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
 // to its Stellar address. Maps to the legacy "username_registry" table so the
 // data shape is preserved across the SQLite -> PostgreSQL migration.
+//
+// #613 — an address may carry several usernames (aliases), e.g.
+// "payments*domain" and "support*domain" for one business account. `address`
+// is therefore no longer unique; `isPrimary` marks the one username that
+// reverse (type=id) federation lookups resolve to. The first username
+// registered for an address is its primary.
 model User {
   username  String    @id
-  address   String    @unique
+  address   String
+  isPrimary Boolean   @default(false) @map("is_primary")
   memoType  String?   @map("memo_type")
   memo      String?
   createdAt DateTime  @default(now()) @map("created_at")
@@ -28,6 +35,13 @@ model User {
   webhooks  Webhook[] // <-- add this line
 
   @@index([username])
+  // Reverse federation lookups (type=id) and /lookup?address= filter by
+  // address, which is no longer backed by a unique index.
+  @@index([address])
+  // Serves the keyset (cursor) pagination seeks used by the /users and
+  // /lookup list endpoints: (created_at DESC, username DESC) walks this
+  // index backwards, so page depth no longer affects query cost.
+  @@index([createdAt, username])
   @@map("username_registry")
 }
 
@@ -40,6 +54,7 @@ model Webhook {
   user         User      @relation(fields: [username], references: [username], onDelete: Cascade)
   url          String
   secret       String // HMAC-SHA256 signing secret for payload verification
+  events       String[]  @default(["*"]) // Optional event filter; "*" preserves the legacy all-events behavior.
   createdAt    DateTime  @default(now()) @map("created_at")
   lastSentAt   DateTime? @map("last_sent_at")
   failingSince DateTime? @map("failing_since")
@@ -48,4 +63,109 @@ model Webhook {
   @@index([username])
   @@index([lastSentAt])
   @@map("webhooks")
+}
+
+// Payment records for routing, statistics, and auditing.
+model Payment {
+  id              String   @id @default(uuid())
+  createdAt       DateTime @default(now()) @map("created_at")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  fee             Float    @default(0)
+  assetCode       String?  @map("asset_code")
+  transactionHash String?  @map("transaction_hash")
+  status          String   @default("completed")
+
+  @@index([createdAt])
+  @@index([fromAddress])
+  @@index([toAddress])
+  @@map("payments")
+}
+
+// Dead-letter queue: holds webhook delivery attempts that have permanently
+// failed (exhausted all retries).  Admin endpoints can list and manually
+// replay individual entries so no critical event is lost.
+model WebhookDLQ {
+  id              String    @id @default(uuid())
+  webhookId       String    @map("webhook_id")
+  webhookUrl      String    @map("webhook_url")
+  webhookSecret   String    @map("webhook_secret")
+  username        String
+  eventType       String    @map("event_type")
+  eventPayload    String    @map("event_payload")
+  failureReason   String    @map("failure_reason")
+  deliveryAttempts Int      @default(0) @map("delivery_attempts")
+  movedAt         DateTime  @default(now()) @map("moved_at")
+  replayed        Boolean   @default(false)
+  replayedAt      DateTime? @map("replayed_at")
+
+  @@index([username])
+  @@index([webhookId])
+  @@index([movedAt])
+  @@map("webhook_dlq")
+}
+// API keys for backend consumers. Only the SHA-256 hash of the secret is
+// stored; the raw key is shown once at creation time.
+model ApiKey {
+  id          String    @id @default(uuid())
+  name        String
+  ownerId     String    @map("owner_id")
+  keyHash     String    @unique @map("key_hash")
+  keyPrefix   String    @map("key_prefix")
+  scopes      String[]  @default(["read", "write"])
+  expiresAt   DateTime? @map("expires_at")
+  revokedAt   DateTime? @map("revoked_at")
+  revokedBy   String?   @map("revoked_by")
+  lastUsedAt  DateTime? @map("last_used_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([ownerId])
+  @@index([keyHash])
+  @@map("api_keys")
+}
+
+// PaymentIntent model for storing requested payment registrations. These are
+// created via the bulk registration endpoint and persisted atomically using
+// `prisma.$transaction`.
+model PaymentIntent {
+  id         String   @id @default(uuid())
+  externalId String?  @map("external_id")
+  from       String
+  to         String
+  amount     String
+  asset      String?
+  memoType   String?  @map("memo_type")
+  memo       String?
+  metadata   Json?
+  status     String   @default("pending")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([to])
+  @@index([from])
+  // Composite index for dashboard-style list queries that filter by status
+  // and sort/filter by date (e.g. "pending intents created since X"), so
+  // those WHERE ... ORDER BY combinations use an index scan instead of a
+  // full table scan.
+  @@index([status, createdAt])
+  @@map("payment_intents")
+}
+
+// AuditLog model for tracking all mutating admin actions and security events.
+model AuditLog {
+  id         String   @id @default(uuid())
+  action     String
+  method     String
+  path       String
+  userId     String?  @map("user_id")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  statusCode Int?     @map("status_code")
+  payload    String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@index([userId])
+  @@index([action])
+  @@map("audit_logs")
 }

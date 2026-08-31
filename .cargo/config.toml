@@ -1,0 +1,2 @@
+[build]
+rustflags = ["-Dwarnings", "-Wclippy::all", "-Wclippy::pedantic", "-Wclippy::nursery"]
