@@ -93,6 +93,9 @@ jest.mock('@sentry/node', () => ({
   setupExpressErrorHandler: jest.fn(() => (req, res, next) => next()),
 }));
 
+// /health probes Horizon over HTTP; keep it off the network.
+global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+
 // ── Test Suite ───────────────────────────────────────────────────────────────
 
 const VALID_ADDRESS = 'GBCDEFGHIJKLMNOPQRSTUVWXYZ';
