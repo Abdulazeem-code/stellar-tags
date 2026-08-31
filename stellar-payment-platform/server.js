@@ -32,6 +32,9 @@ const { validateSchema } = require('./src/middleware/validateSchema');
 const { buildErrorHandler, notFoundHandler } = require('./src/middleware/errorHandler');
 const { ApiError, errorBody } = require('./src/errors');
 const { requireJson } = require('./src/middleware/requireJson');
+const { bodySizeLimit } = require('./src/middleware/bodyLimit');
+const { apiVersion } = require('./src/middleware/apiVersion');
+const { deprecationMiddleware } = require('./src/middleware/deprecation');
 const {
   registerBodySchema,
   federationQuerySchema,
@@ -58,6 +61,8 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  MAX_USERNAMES_PER_ADDRESS,
+  PRIMARY_USERNAME_ORDER,
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require('./src/utils');
@@ -147,6 +152,7 @@ if (redisClient) {
 setMetricsSources({ prisma, redisClient });
 
 const v1Router = require('./src/routes/v1')(redisClient);
+const v2Router = require('./src/routes/v2')(redisClient);
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -200,11 +206,29 @@ const limiter = rateLimit({
   },
 });
 
+// Per-IP limiter specifically for sensitive, unauthenticated endpoints.
+// Keys strictly by client IP so brute-force/spam from a single source is
+// blocked regardless of how many account ids are rotated in the payload.
+const ipLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: true,
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  keyGenerator: (req) => req.ip || (req.connection && req.connection.remoteAddress) || '',
+});
+
 app.use(cors(corsOptions));
-app.use(express.json());
+
+// #588 — Per-route request body size limits. A single JSON parser enforces a
+// cap that depends on the endpoint type (auth 1kb / standard 10kb / bulk 100kb)
+// instead of the previous uniform 10kb, and answers oversized payloads with 413.
+app.use(bodySizeLimit);
 
 app.use(limiter);
-app.use(express.json({ limit: '10kb' }));
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
@@ -274,13 +298,13 @@ const etagCache = (req, res, next) => {
 
 const getLocalUserByAddress = async (address) =>
   poolGet(
-    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
+    'SELECT username, address FROM username_registry WHERE address = $1 LIMIT 1',
     [address],
   );
 
 const getLocalUserByUsername = async (username) =>
   poolGet(
-    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+    'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
     [username],
   );
 
@@ -322,17 +346,17 @@ const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
   const rows = await poolAll(
     `SELECT username, address, created_at
      FROM username_registry
-     ${LIKE_FILTER}
+     WHERE username ILIKE $1 OR address ILIKE $1
      ORDER BY created_at DESC
-     LIMIT ? OFFSET ?`,
-    [searchPattern, searchPattern, limit, skip],
+     LIMIT $2 OFFSET $3`,
+    [searchPattern, limit, skip],
   );
 
   const countRow = await poolGet(
-    `SELECT COUNT(*) AS totalCount
+    `SELECT COUNT(*) AS "totalCount"
      FROM username_registry
-     ${LIKE_FILTER}`,
-    [searchPattern, searchPattern],
+     WHERE username ILIKE $1 OR address ILIKE $1`,
+    [searchPattern],
   );
 
   const totalCount = Number(countRow?.totalCount || 0);
@@ -347,14 +371,9 @@ const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
   );
 };
 
-const registerLocalUser = async ({ username, address }) => {
-  const existingByAddress = await getLocalUserByAddress(address);
-  if (existingByAddress) {
-    const conflictError = new Error('Address already registered');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
+const registerLocalUser = async ({ username, address, isPrimary = false }) => {
+  // #613 — several usernames may share an address, so an existing address is
+  // no longer a conflict; only a duplicate username is.
   const existingByUsername = await getLocalUserByUsername(username);
   if (existingByUsername) {
     const conflictError = new Error('Username is already taken. Please choose another.');
@@ -364,7 +383,7 @@ const registerLocalUser = async ({ username, address }) => {
 
   await poolRun(
     `INSERT INTO username_registry (username, address, created_at)
-     VALUES (?, ?, ?)`,
+     VALUES ($1, $2, $3)`,
     [username, address, new Date().toISOString()],
   );
 };
@@ -381,16 +400,19 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
-app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+app.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
   const { q: queryValue, type } = req.query;
 
   try {
     if (type === 'id') {
       const cacheKey = federationIdKey(queryValue);
       const cached = await federationLookupCached(cacheKey, async () => {
+        // #613 — an address can have several usernames; a reverse lookup
+        // resolves to the primary one.
         const row = await prisma.user.findFirst({
           where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
           select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
+          orderBy: PRIMARY_USERNAME_ORDER,
         });
 
         if (!row) return null;
@@ -562,7 +584,7 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   // registerBodySchema has already guaranteed that username is a trimmed
   // 3-20 character alphanumeric string and address is a non-empty trimmed
   // string, so those shape checks are not repeated here.
@@ -611,9 +633,13 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   }
 
   try {
-    let existing = null;
+    // #613 — an address may carry several usernames (aliases). Registration
+    // adds another while the address is under the cap; the first username
+    // registered for an address becomes its primary. Reverse (type=id)
+    // federation lookups resolve to that primary.
+    let usernameCount = 0;
     try {
-      existing = await prisma.user.findFirst({
+      usernameCount = await prisma.user.count({
         where: { address, deletedAt: null },
       });
     } catch (error) {
@@ -621,14 +647,20 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         throw error;
       }
 
-      existing = await getLocalUserByAddress(address);
+      // Degraded path: the exact alias count is unavailable, so fall back to
+      // a presence check. The 5-username cap is enforced best-effort here.
+      usernameCount = (await getLocalUserByAddress(address)) ? 1 : 0;
     }
 
-    if (existing) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+    if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
+      return next(
+        new ApiError(
+          'CONFLICT',
+          `This address already has the maximum of ${MAX_USERNAMES_PER_ADDRESS} federation usernames.`,
+        ),
+      );
     }
+    const isPrimary = usernameCount === 0;
 
     let verificationResult = null;
     if (signature) {
@@ -686,6 +718,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         data: {
           username: normalizedUsername,
           address,
+          isPrimary,
           ...(memoType && { memoType, memo }),
         },
       });
@@ -696,13 +729,14 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         throw error;
       }
 
-      await registerLocalUser({ username: normalizedUsername, address });
+      await registerLocalUser({ username: normalizedUsername, address, isPrimary });
     }
 
     return res.status(201).json({
       ok: true,
       username: normalizedUsername,
       address,
+      is_primary: isPrimary,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
       ...(verificationResult && {
         verification: {
@@ -716,7 +750,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+    if (error.code === '23505' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
@@ -750,9 +784,11 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
       const result = await lookupCached(address, async () => {
         let row;
         try {
+          // #613 — an address can have several usernames; return the primary.
           row = await prisma.user.findFirst({
             where: { address, deletedAt: null },
             select: { username: true },
+            orderBy: PRIMARY_USERNAME_ORDER,
           });
         } catch (error) {
           if (!shouldFallbackToLocalRegistry(error)) {
@@ -923,11 +959,43 @@ app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, 
     return next(dbError);
   }
 });
-// Mount v1 router for both legacy paths and explicit API versioning
-app.use('/', v1Router);
+// Request versioning: URI (/api/v1, /api/v2) first, then Accept-Version /
+// API-Version header, defaulting to v1. Routers below then decide routing.
+app.use(apiVersion);
+
+// RFC 8594 deprecation headers: attaches Deprecation/Sunset/Link to endpoints
+// listed in src/config/deprecations.js and logs a server-side warning.
+app.use(deprecationMiddleware());
+
+// v2 first so an explicit /api/v2 request wins over the unversioned fallback.
+app.use('/api/v2', v2Router);
+// Explicit v1 mount, then /api (no version) and the legacy unversioned root
+// both resolve to v1 so existing clients keep working unchanged.
 app.use('/api/v1', v1Router);
+app.use('/api', v1Router);
+app.use('/', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
 app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+
+// API key management endpoints (rotation, invalidation, listing)
+app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
+
+// #497 — Expose RSA public key as a JWKS document so external services can
+// verify RS256-signed tokens without sharing a secret.
+app.get('/.well-known/jwks.json', (_req, res) => {
+  try {
+    const { getJwks } = require('./src/utils/jwt');
+    const jwks = getJwks();
+    res.setHeader('Content-Type', 'application/json');
+    // Cache for 1 hour — key rotations are infrequent and consumers should
+    // re-fetch on verification failure anyway.
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.json(jwks);
+  } catch (err) {
+    logger.warn({ err }, 'JWKS endpoint: JWT_PUBLIC_KEY is not configured');
+    return res.status(503).json({ error: 'JWKS not available: public key not configured.' });
+  }
+});
 
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -939,49 +1007,47 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', async (_req, res) => {
+app.get('/health', async (req, res) => {
   const checks = { database: null, redis: null };
   let allOk = true;
   const errors = [];
 
   try {
     await prisma.$queryRaw`SELECT 1`;
-    checks.database = 'ok';
-  } catch {
-    checks.database = 'error';
+    checks.database = 'up';
+  } catch (err) {
+    checks.database = 'down';
     allOk = false;
     errors.push('Database unavailable');
+    logger.error(err, `[Correlation ID: ${req.correlationId}] Database health check failed`);
   }
 
   if (redisClient) {
     try {
       await redisClient.ping();
-      checks.redis = 'ok';
-    } catch {
-      checks.redis = 'error';
+      checks.redis = 'up';
+    } catch (err) {
+      checks.redis = 'down';
       allOk = false;
       errors.push('Redis unavailable');
+      logger.error(err, `[Correlation ID: ${req.correlationId}] Redis health check failed`);
     }
   } else {
     checks.redis = 'not configured';
   }
 
-  if (allOk) {
-    res.json({ status: 'ok', ...checks });
-  } else {
-    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
-  }
-});
+  const response = {
+    status: allOk ? 'UP' : 'DOWN',
+    timestamp: new Date().toISOString(),
+    ...checks,
+  };
 
-app.get('/health', async (req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok', database: 'connected' });
-  } catch (err) {
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Database unavailable`);
-    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
-
+  if (!allOk) {
+    response.message = errors.join(', ');
+    return res.status(503).json(response);
   }
+
+  return res.status(200).json(response);
 });
 
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
@@ -997,7 +1063,7 @@ app.use(buildErrorHandler(isPrismaConnectionError));
 const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
 let isShuttingDown = false;
 
-const gracefulShutdown = (server, prismaClient, signal) => {
+const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
@@ -1019,6 +1085,13 @@ const gracefulShutdown = (server, prismaClient, signal) => {
     } catch (err) {
       logger.error(err, 'Error disconnecting Prisma during shutdown:');
     }
+    if (redis) {
+      try {
+        await redis.quit();
+      } catch (err) {
+        logger.error(err, 'Error disconnecting Redis during shutdown:');
+      }
+    }
     process.exit(0);
   });
 };
@@ -1036,8 +1109,8 @@ if (require.main === module) {
     }
   });
 
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
+  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };

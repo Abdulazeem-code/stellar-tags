@@ -1,6 +1,34 @@
 'use strict';
 
 const { z } = require('zod');
+const xss = require('xss');
+
+/**
+ * Zod transform that strips HTML/JS tags from a string using the `xss`
+ * library. Apply this after `.trim()` on every free-text field that could be
+ * stored and later rendered in a browser context. Fields whose content is
+ * structurally constrained (Stellar addresses, numeric codes, enums) do not
+ * need this because their shape already prohibits injection payloads.
+ *
+ * Usage:
+ *   z.string().trim().transform(sanitizeString)
+ *   // or via the helper:
+ *   sanitized(z.string().trim().optional())
+ */
+const sanitizeString = (value) => {
+  if (value === undefined || value === null) return value;
+  return xss(value, { whiteList: {}, stripIgnoreTag: true, stripIgnoreTagBody: ['script', 'style'] });
+};
+
+/**
+ * Wraps a Zod string schema with XSS sanitization as its final transform.
+ * The schema must already be a ZodString (or ZodOptional<ZodString>) — add
+ * .trim() and any other refinements before passing it in.
+ *
+ * @param {import('zod').ZodType} schema
+ * @returns {import('zod').ZodType}
+ */
+const sanitized = (schema) => schema.transform(sanitizeString);
 
 // Query values arrive as strings. Page and limit clamp rather than reject, so
 // `?limit=1000` keeps returning the maximum page size instead of erroring.
@@ -56,8 +84,10 @@ const registerBodySchema = z
     // Memo and signature fields are only shape-checked here. validateMemo owns
     // the cross-field pairing and per-type format rules (and their 400
     // responses), and an empty signature legitimately means "unsigned".
-    memo_type: z.string().trim().optional(),
-    memo: z.string().trim().optional(),
+    // Free-text fields are sanitized against XSS payloads before reaching the
+    // handler layer.
+    memo_type: sanitized(z.string().trim().optional()),
+    memo: sanitized(z.string().trim().optional()),
     signature: z.string().trim().optional(),
     signerAddress: z.string().trim().optional(),
   })
@@ -175,7 +205,77 @@ const adminExportQuerySchema = z
     { error: 'startDate must be on or before endDate', path: ['startDate'] },
   );
 
+/** POST /auth/api-keys - generate a new API key */
+const createApiKeyBodySchema = z
+  .object({
+    name: sanitized(
+      z
+        .string({ error: 'name is required' })
+        .trim()
+        .min(1, 'name cannot be empty')
+        .max(100, 'name must be 100 characters or less'),
+    ),
+    owner_id: sanitized(
+      z
+        .string({ error: 'owner_id is required' })
+        .trim()
+        .min(1, 'owner_id cannot be empty')
+        .max(256, 'owner_id must be 256 characters or less'),
+    ),
+    scopes: z
+      .string()
+      .trim()
+      .optional()
+      .default('read,write')
+      .refine(
+        (val) => val.split(',').every((s) => ['read', 'write', 'admin'].includes(s.trim())),
+        { error: 'scopes must be a comma-separated list of: read, write, admin' },
+      ),
+    expires_in_hours: z
+      .number({ error: 'expires_in_hours must be a number' })
+      .int()
+      .min(1, 'expires_in_hours must be at least 1')
+      .max(8760, 'expires_in_hours must be at most 8760 (1 year)')
+      .optional(),
+  })
+  .loose();
+
+/** POST /auth/api-keys/:id/revoke - revoke an API key */
+const revokeApiKeyBodySchema = z
+  .object({
+    revoked_by: sanitized(
+      z
+        .string({ error: 'revoked_by is required' })
+        .trim()
+        .min(1, 'revoked_by cannot be empty')
+        .max(256, 'revoked_by must be 256 characters or less'),
+    ),
+  })
+  .loose();
+
+/** POST /auth/api-keys/:id/rotate - rotate an API key */
+const rotateApiKeyBodySchema = z
+  .object({
+    name: sanitized(
+      z
+        .string()
+        .trim()
+        .min(1, 'name cannot be empty')
+        .max(100, 'name must be 100 characters or less'),
+    ).optional(),
+    grace_period_hours: z
+      .number({ error: 'grace_period_hours must be a number' })
+      .int()
+      .min(0, 'grace_period_hours must be at least 0')
+      .max(24, 'grace_period_hours must be at most 24')
+      .default(1)
+      .optional(),
+  })
+  .loose();
+
 module.exports = {
+  sanitizeString,
+  sanitized,
   registerBodySchema,
   federationQuerySchema,
   lookupQuerySchema,
@@ -186,4 +286,7 @@ module.exports = {
   adminBlockBodySchema,
   exportQuerySchema,
   adminExportQuerySchema,
+  createApiKeyBodySchema,
+  revokeApiKeyBodySchema,
+  rotateApiKeyBodySchema,
 };
