@@ -29,7 +29,7 @@ describe('GET /federation', () => {
   // 'client' is seeded in USER_DATABASE inside server.js
   it('returns 200 with stellar address for a known user', async () => {
     const res = await request(app)
-      .get('/federation')
+      .get('/api/v1/federation')
       .query({ q: 'client*localhost' });
 
     expect(res.statusCode).toBe(200);
@@ -39,7 +39,7 @@ describe('GET /federation', () => {
 
   it('returns 404 for an unknown user', async () => {
     const res = await request(app)
-      .get('/federation')
+      .get('/api/v1/federation')
       .query({ q: 'nonexistentuser*localhost' });
 
     expect(res.statusCode).toBe(404);

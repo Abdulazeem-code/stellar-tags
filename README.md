@@ -237,7 +237,7 @@ when the failure is field-level. `correlation_id` is on every error;
 | `FORBIDDEN` | 403 | Reserved name, blocked address |
 | `NOT_FOUND` | 404 | No such tag, address, or route |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
-| `CONFLICT` | 409 | Username or address already registered |
+| `CONFLICT` | 409 | Username already taken, or an address is at its 5-username limit |
 | `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
 | `VALIDATION_FAILED` | 422 | Body failed its schema |
@@ -252,7 +252,7 @@ turns an error into a response:
 ```js
 const { ApiError } = require('./src/errors');
 
-return next(new ApiError('CONFLICT', 'Address already registered'));
+return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
 ```
 
 A `5xx` from an unexpected throw always reports the generic message so
@@ -310,19 +310,23 @@ Resolves a given username tag to a Stellar address.
   - `500 Internal Server Error`: Database lookup failed.
 
 ### `POST /register`
-Registers a new username and associates it with a Stellar address.
+Registers a new username and associates it with a Stellar address. An address
+may hold up to 5 usernames (aliases), e.g. `payments*domain` and
+`support*domain` for one business account. The first username registered for an
+address is its primary; reverse (`type=id`) federation lookups resolve to it.
 - **Body Parameters (JSON):** 
   - `username` (string) - The desired username.
   - `address` (string) - The user's Stellar address.
-- **Returns:** A JSON object with registration details `{ ok: true, username, address }`.
+- **Returns:** A JSON object with registration details `{ ok: true, username, address, is_primary }`.
 - **Status Codes:**
   - `200 OK`: Registration successful.
   - `400 Bad Request`: Missing `username` or `address`.
-  - `409 Conflict`: Address or username already registered.
+  - `409 Conflict`: Username already taken, or the address already has the maximum of 5 usernames.
   - `500 Internal Server Error`: Database lookup or insertion failed.
 
 ### `GET /lookup`
-Resolves a given Stellar address to its registered username.
+Resolves a given Stellar address to its registered username. When an address has
+several usernames, the primary one is returned.
 - **Query Parameter:** `address` (string) - The Stellar address to lookup.
 - **Returns:** A JSON object with `username` and `address`.
 - **Status Codes:**
@@ -375,7 +379,35 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
 
 Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
 
+### `GET /admin/stats/routing`
+Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
+- **Query Parameters:**
+  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
+  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
+  - `groupBy` (optional) – `'day'` (default), `'week'`, or `'month'`.
+  - `interval` (optional) – Alias for `groupBy`.
+  - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
+- **Status Codes:**
+  - `200 OK`: Statistics retrieved successfully.
+  - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, or invalid `groupBy`.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+### `GET /admin/audit-logs`
+Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
+- **Query Parameters:**
+  - `limit` (optional) – Maximum number of records to return (1-100, default 50).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
+- **Status Codes:**
+  - `200 OK`: Audit logs retrieved successfully.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
+
 ### `GET /metrics`
+
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
 rate limiter so a scraper on a fixed interval is never throttled.
 - **Returns:** all metrics below, prefixed `stellar_tags_`.
@@ -386,7 +418,7 @@ rate limiter so a scraper on a fixed interval is never throttled.
 | `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
 | `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
 | `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
-| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code` |
+| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code`; buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s |
 | `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
 | `db_pool_connections_busy` | gauge | Connections executing a query |
 | `db_pool_connections_idle` | gauge | Connections open but unused |
@@ -407,6 +439,42 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
 
+## Smart Contract Deployment & Upgrades
+
+The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts/deploy_contract.sh`) to automate WASM compilation, optimization, network deployment, contract initialization, and contract upgrades.
+
+### CLI Usage
+
+```bash
+# Display help and available options
+./scripts/deploy_contract.sh --help
+
+# Deploy contract to testnet (compiles, optimizes, deploys, and updates .env configs)
+./scripts/deploy_contract.sh deploy --network testnet
+
+# Dry-run deployment (simulates workflow without on-chain transactions)
+./scripts/deploy_contract.sh deploy --network testnet --dry-run
+
+# Deploy with custom admin and funding source
+./scripts/deploy_contract.sh deploy --network testnet --source S... --admin G... --treasury G...
+
+# Deploy to mainnet
+./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
+
+# Upgrade an existing contract to newly compiled WASM
+./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S...
+
+# Compile and optimize WASM only
+./scripts/deploy_contract.sh build
+```
+
+### Automation & Config Updates
+
+Upon successful deployment, the tool automatically updates the contract address across:
+- `stellar-payment-platform/.env` (`PAYMENT_ROUTER_CONTRACT_ID`, `CONTRACT_ID`)
+- `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
+- `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
+
 ## Architecture notes
 
 - The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.
@@ -416,3 +484,4 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 ## License
 
 See [LICENSE](LICENSE).
+
