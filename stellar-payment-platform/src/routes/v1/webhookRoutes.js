@@ -1,23 +1,23 @@
-const express = require('express');
-const crypto = require('crypto');
-const { v4: uuidv4 } = require('uuid');
-const { prisma } = require('../../../prismaClient');
-const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
-const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { logger } = require('../../logger');
-const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const express = require("express");
+const crypto = require("crypto");
+const { v4: uuidv4 } = require("uuid");
+const { prisma } = require("../../../prismaClient");
+const { normalizeNameTag, poolGet, poolRun, poolAll } = require("../../db");
+const { verifyMultiSignerThreshold } = require("../../multisigner-verifier");
+const { logger } = require("../../logger");
+const { Keypair, StrKey } = require("@stellar/stellar-sdk");
 
 const router = express.Router();
 
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
+const DEFAULT_FEDERATION_DOMAIN = "localhost";
 
 const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
+  const code = typeof error?.code === "string" ? error.code : "";
+  const message = typeof error?.message === "string" ? error.message : "";
 
   return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
+    code.startsWith("P10") ||
+    ["P2021", "P2023", "P2028", "P2001"].includes(code) ||
     /DATABASE_URL|connect|relation|table|timeout/i.test(message)
   );
 };
@@ -31,7 +31,7 @@ const verifyFreighterSignedMessage = ({
   const claimedSigner = signerAddress || publicKey;
 
   if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error('Invalid signer address format.');
+    const error = new Error("Invalid signer address format.");
     error.statusCode = 400;
     throw error;
   }
@@ -41,25 +41,27 @@ const verifyFreighterSignedMessage = ({
   let signatureBuffer;
   if (Buffer.isBuffer(signature)) {
     signatureBuffer = signature;
-  } else if (typeof signature === 'string') {
-    signatureBuffer = Buffer.from(signature, 'base64');
+  } else if (typeof signature === "string") {
+    signatureBuffer = Buffer.from(signature, "base64");
   } else {
-    throw new Error('Invalid message signature format.');
+    throw new Error("Invalid message signature format.");
   }
 
-  const prefix = Buffer.from('Stellar Signed Message:\n', 'utf8');
-  const messageBytes = Buffer.from(message, 'utf8');
+  const prefix = Buffer.from("Stellar Signed Message:\n", "utf8");
+  const messageBytes = Buffer.from(message, "utf8");
   const payload = Buffer.concat([prefix, messageBytes]);
-  const messageHash = crypto.createHash('sha256').update(payload).digest();
+  const messageHash = crypto.createHash("sha256").update(payload).digest();
 
   if (!keypair.verify(messageHash, signatureBuffer)) {
-    const error = new Error('Signature verification failed.');
+    const error = new Error("Signature verification failed.");
     error.statusCode = 401;
     throw error;
   }
 
   if (claimedSigner !== publicKey) {
-    const error = new Error('Signer address does not match the registered account.');
+    const error = new Error(
+      "Signer address does not match the registered account.",
+    );
     error.statusCode = 401;
     throw error;
   }
@@ -68,17 +70,22 @@ const verifyFreighterSignedMessage = ({
 };
 
 const authenticateWebhookCall = async (req) => {
-  const rawUsername = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
-  const signature = typeof req.body?.signature === 'string' ? req.body.signature.trim() : '';
-  const signerAddress = typeof req.body?.signerAddress === 'string' ? req.body.signerAddress.trim() : undefined;
+  const rawUsername =
+    typeof req.body?.username === "string" ? req.body.username.trim() : "";
+  const signature =
+    typeof req.body?.signature === "string" ? req.body.signature.trim() : "";
+  const signerAddress =
+    typeof req.body?.signerAddress === "string"
+      ? req.body.signerAddress.trim()
+      : undefined;
 
   if (!rawUsername) {
-    const error = new Error('Missing required field: username.');
+    const error = new Error("Missing required field: username.");
     error.statusCode = 400;
     throw error;
   }
   if (!signature) {
-    const error = new Error('Missing required field: signature.');
+    const error = new Error("Missing required field: signature.");
     error.statusCode = 400;
     throw error;
   }
@@ -87,14 +94,14 @@ const authenticateWebhookCall = async (req) => {
 
   let userRecord = null;
   try {
-    userRecord = await prisma.user.findUnique({
-      where: { username: normalizedUsername },
+    userRecord = await prisma.user.findFirst({
+      where: { username: normalizedUsername, deletedAt: null },
       select: { username: true, address: true },
     });
   } catch (err) {
     if (!shouldFallbackToLocalRegistry(err)) throw err;
     const localRow = await poolGet(
-      'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+      "SELECT username, address FROM username_registry WHERE deleted_at IS NULL AND username = ? LIMIT 1",
       [normalizedUsername],
     );
     userRecord = localRow
@@ -103,23 +110,25 @@ const authenticateWebhookCall = async (req) => {
   }
 
   if (!userRecord) {
-    const error = new Error('Username not registered.');
+    const error = new Error("Username not registered.");
     error.statusCode = 404;
     throw error;
   }
 
   const operation =
-    typeof req.body?.operation === 'string' ? req.body.operation : 'webhook';
+    typeof req.body?.operation === "string" ? req.body.operation : "webhook";
   const message = `${operation}:${normalizedUsername}`;
 
   if (StrKey.isValidEd25519PublicKey(signature) && !signerAddress) {
     const verificationResult = await verifyMultiSignerThreshold(
       userRecord.address,
       [signature],
-      { operationType: 'management' },
+      { operationType: "management" },
     );
     if (!verificationResult.success) {
-      const error = new Error(verificationResult.errorMessage || 'Signature verification failed');
+      const error = new Error(
+        verificationResult.errorMessage || "Signature verification failed",
+      );
       error.statusCode = 401;
       throw error;
     }
@@ -136,29 +145,35 @@ const authenticateWebhookCall = async (req) => {
 };
 
 const isValidWebhookUrl = (url) => {
-  if (typeof url !== 'string' || url.length > 2048) return false;
+  if (typeof url !== "string" || url.length > 2048) return false;
   try {
     const u = new URL(url);
-    return u.protocol === 'http:' || u.protocol === 'https:';
+    return u.protocol === "http:" || u.protocol === "https:";
   } catch {
     return false;
   }
 };
 
-router.post('/webhooks', async (req, res, next) => {
+router.post("/webhooks", async (req, res, next) => {
   try {
-    if (!req.is('application/json')) {
-      return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
+    if (!req.is("application/json")) {
+      return res
+        .status(415)
+        .json({
+          error: "Unsupported Media Type. Please send application/json",
+        });
     }
 
     const user = await authenticateWebhookCall(req);
-    const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const rawUrl = typeof req.body?.url === "string" ? req.body.url.trim() : "";
 
     if (!isValidWebhookUrl(rawUrl)) {
-      return res.status(400).json({ error: 'Invalid webhook URL. Must be http or https.' });
+      return res
+        .status(400)
+        .json({ error: "Invalid webhook URL. Must be http or https." });
     }
 
-    const secret = crypto.randomBytes(32).toString('hex');
+    const secret = crypto.randomBytes(32).toString("hex");
     const id = uuidv4();
     const now = new Date();
 
@@ -175,12 +190,14 @@ router.post('/webhooks', async (req, res, next) => {
       });
     } catch (error) {
       if (
-        error?.code === 'P2002' &&
+        error?.code === "P2002" &&
         Array.isArray(error.meta?.target) &&
-        error.meta.target.includes('username') &&
-        error.meta.target.includes('url')
+        error.meta.target.includes("username") &&
+        error.meta.target.includes("url")
       ) {
-        const conflictError = new Error('A webhook with this URL is already registered for the user.');
+        const conflictError = new Error(
+          "A webhook with this URL is already registered for the user.",
+        );
         conflictError.statusCode = 409;
         return next(conflictError);
       }
@@ -191,7 +208,12 @@ router.post('/webhooks', async (req, res, next) => {
          VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
         [id, user.username, rawUrl, secret, now.toISOString()],
       );
-      webhook = { id, username: user.username, url: rawUrl, createdAt: now.toISOString() };
+      webhook = {
+        id,
+        username: user.username,
+        url: rawUrl,
+        createdAt: now.toISOString(),
+      };
     }
 
     return res.status(201).json({
@@ -206,21 +228,25 @@ router.post('/webhooks', async (req, res, next) => {
           : new Date(webhook.createdAt)
         ).toISOString(),
       },
-      note: 'Save the secret securely — it will only be returned once. Signatures for webhook payloads are computed with HMAC-SHA256 using this secret.',
+      note: "Save the secret securely — it will only be returned once. Signatures for webhook payloads are computed with HMAC-SHA256 using this secret.",
     });
   } catch (err) {
     if (err.statusCode) return next(err);
-    logger.error('[webhooks] POST /webhooks failed:', err.message);
-    const generic = new Error('Failed to register webhook');
+    logger.error("[webhooks] POST /webhooks failed:", err.message);
+    const generic = new Error("Failed to register webhook");
     generic.statusCode = 500;
     return next(generic);
   }
 });
 
-router.get('/webhooks', async (req, res, next) => {
+router.get("/webhooks", async (req, res, next) => {
   try {
-    if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
-      return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
+    if (!req.is("application/json") && Object.keys(req.body || {}).length > 0) {
+      return res
+        .status(415)
+        .json({
+          error: "Unsupported Media Type. Please send application/json",
+        });
     }
 
     const user = await authenticateWebhookCall(req);
@@ -229,7 +255,7 @@ router.get('/webhooks', async (req, res, next) => {
     try {
       webhooks = await prisma.webhook.findMany({
         where: { username: user.username },
-        orderBy: { createdAt: 'desc' },
+        orderBy: { createdAt: "desc" },
       });
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
@@ -253,35 +279,50 @@ router.get('/webhooks', async (req, res, next) => {
       webhooks: webhooks.map((w) => ({
         id: w.id,
         url: w.url,
-        created_at: (w.createdAt instanceof Date ? w.createdAt : new Date(w.createdAt)).toISOString(),
+        created_at: (w.createdAt instanceof Date
+          ? w.createdAt
+          : new Date(w.createdAt)
+        ).toISOString(),
         last_sent_at: w.lastSentAt
-          ? (w.lastSentAt instanceof Date ? w.lastSentAt : new Date(w.lastSentAt)).toISOString()
+          ? (w.lastSentAt instanceof Date
+              ? w.lastSentAt
+              : new Date(w.lastSentAt)
+            ).toISOString()
           : null,
         failing_since: w.failingSince
-          ? (w.failingSince instanceof Date ? w.failingSince : new Date(w.failingSince)).toISOString()
+          ? (w.failingSince instanceof Date
+              ? w.failingSince
+              : new Date(w.failingSince)
+            ).toISOString()
           : null,
       })),
     });
   } catch (err) {
     if (err.statusCode) return next(err);
-    logger.error('[webhooks] GET /webhooks failed:', err.message);
-    const generic = new Error('Failed to list webhooks');
+    logger.error("[webhooks] GET /webhooks failed:", err.message);
+    const generic = new Error("Failed to list webhooks");
     generic.statusCode = 500;
     return next(generic);
   }
 });
 
-router.delete('/webhooks/:id', async (req, res, next) => {
+router.delete("/webhooks/:id", async (req, res, next) => {
   try {
-    if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
-      return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
+    if (!req.is("application/json") && Object.keys(req.body || {}).length > 0) {
+      return res
+        .status(415)
+        .json({
+          error: "Unsupported Media Type. Please send application/json",
+        });
     }
 
     const user = await authenticateWebhookCall(req);
-    const id = typeof req.params?.id === 'string' ? req.params.id.trim() : '';
+    const id = typeof req.params?.id === "string" ? req.params.id.trim() : "";
 
     if (!id) {
-      return res.status(400).json({ error: 'Webhook id is required in URL path.' });
+      return res
+        .status(400)
+        .json({ error: "Webhook id is required in URL path." });
     }
 
     let deletedCount = 0;
@@ -293,29 +334,29 @@ router.delete('/webhooks/:id', async (req, res, next) => {
     } catch (error) {
       if (!shouldFallbackToLocalRegistry(error)) throw error;
       const result = await poolRun(
-        'DELETE FROM webhooks WHERE id = ? AND username = ?',
+        "DELETE FROM webhooks WHERE id = ? AND username = ?",
         [id, user.username],
       );
       deletedCount = result?.changes || 0;
     }
 
     if (deletedCount === 0) {
-      return res.status(404).json({ error: 'Webhook not found.' });
+      return res.status(404).json({ error: "Webhook not found." });
     }
 
     return res.status(200).json({ ok: true, deleted: true });
   } catch (err) {
     if (err.statusCode) return next(err);
-    logger.error('[webhooks] DELETE /webhooks/:id failed:', err.message);
-    const generic = new Error('Failed to delete webhook');
+    logger.error("[webhooks] DELETE /webhooks/:id failed:", err.message);
+    const generic = new Error("Failed to delete webhook");
     generic.statusCode = 500;
     return next(generic);
   }
 });
 
-router.all('/webhooks', (req, res) => {
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+router.all("/webhooks", (req, res) => {
+  if (req.method !== "GET" && req.method !== "POST") {
+    return res.status(405).json({ error: "Method Not Allowed" });
   }
   res.status(404).end();
 });
