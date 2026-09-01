@@ -1,6 +1,7 @@
 const express = require('express');
 const { prisma } = require('../../../prismaClient');
 const { normalizeNameTag, etagCache, USER_DATABASE } = require('../../db');
+const { PRIMARY_USERNAME_ORDER } = require('../../utils');
 const {
   federationNameKey,
   federationIdKey,
@@ -33,9 +34,12 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
       if (type === 'id') {
         const cacheKey = federationIdKey(queryValue);
         const cached = await federationLookupCached(cacheKey, async () => {
+          // #613 — an address can have several usernames; a reverse lookup
+          // resolves to the primary one.
           const row = await prisma.user.findFirst({
             where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
             select: { username: true, address: true, memoType: true, memo: true },
+            orderBy: PRIMARY_USERNAME_ORDER,
           });
 
           if (!row) return null;
