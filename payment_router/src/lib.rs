@@ -319,9 +319,7 @@ impl PaymentRouter {
             .get(&DataKey::TimelockNonce)
             .unwrap_or(0u64);
         let next = current + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::TimelockNonce, &next);
+        env.storage().instance().set(&DataKey::TimelockNonce, &next);
         next
     }
 
@@ -509,9 +507,7 @@ impl PaymentRouter {
             .set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Frozen, &false);
-        env.storage()
-            .instance()
-            .set(&DataKey::TimelockNonce, &0u64);
+        env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -548,7 +544,10 @@ impl PaymentRouter {
         let nonce = Self::next_nonce(&env);
         let queued_at = env.ledger().timestamp();
 
-        let entry = TimelockEntry { queued_at, action: action.clone() };
+        let entry = TimelockEntry {
+            queued_at,
+            action: action.clone(),
+        };
 
         let key = DataKey::TimelockEntry(nonce);
         env.storage().persistent().set(&key, &entry);
@@ -626,17 +625,13 @@ impl PaymentRouter {
                 env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
             }
             ActionType::SetFeeBps(new_fee_bps) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::FeeBps, &new_fee_bps);
+                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
             }
             ActionType::SetGovernance(gov) => {
                 env.storage().instance().set(&DataKey::Governance, &gov);
             }
             ActionType::SetMinLimit(min_limit) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::MinLimit, &min_limit);
+                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
             }
             ActionType::TransferAdmin(new_admin) => {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -651,10 +646,8 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "action_executed"), admin),
-            nonce,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
 
         log!(&env, "Timelock action executed for nonce {}", nonce);
         Ok(())
@@ -678,10 +671,8 @@ impl PaymentRouter {
 
         env.storage().persistent().remove(&key);
 
-        env.events().publish(
-            (Symbol::new(&env, "action_cancelled"), admin),
-            nonce,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "action_cancelled"), admin), nonce);
 
         log!(&env, "Timelock action cancelled for nonce {}", nonce);
         Ok(())
