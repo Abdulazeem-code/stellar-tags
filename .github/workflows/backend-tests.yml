@@ -11,16 +11,18 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [20]
+        node-version: [22]
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: $(( matrix.node-version ))
+          cache: 'npm'
+          cache-dependency-path: stellar-payment-platform/package-lock.json
 
       - name: Install backend dependencies
         working-directory: stellar-payment-platform
@@ -31,7 +33,7 @@ jobs:
 
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
