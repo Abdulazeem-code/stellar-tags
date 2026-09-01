@@ -9,6 +9,7 @@ const {
   verifyEmailBodySchema,
   verifyEmailConfirmBodySchema,
   adminBlockBodySchema,
+  adminRoutingStatsQuerySchema,
 } = require('../src/schemas');
 
 const messagesFor = (schema, input) => {
@@ -164,5 +165,30 @@ describe('request schemas', () => {
       );
       expect(adminBlockBodySchema.safeParse({ address: 'GABC' }).success).toBe(true);
     });
+
+    test('validates adminRoutingStatsQuerySchema', () => {
+      expect(adminRoutingStatsQuerySchema.safeParse({}).success).toBe(true);
+      expect(adminRoutingStatsQuerySchema.parse({})).toMatchObject({ groupBy: 'day' });
+      expect(
+        adminRoutingStatsQuerySchema.safeParse({
+          startDate: '2026-01-01',
+          endDate: '2026-01-31',
+          groupBy: 'week',
+          assetCode: 'XLM',
+        }).success,
+      ).toBe(true);
+
+      expect(
+        messagesFor(adminRoutingStatsQuerySchema, { startDate: 'bad' }),
+      ).toContain('startDate: startDate must be YYYY-MM-DD');
+
+      expect(
+        messagesFor(adminRoutingStatsQuerySchema, {
+          startDate: '2026-02-01',
+          endDate: '2026-01-01',
+        }),
+      ).toContain('startDate: startDate must be on or before endDate');
+    });
   });
 });
+
