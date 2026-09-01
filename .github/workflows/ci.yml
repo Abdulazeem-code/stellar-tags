@@ -1,8 +1,7 @@
 name: Production Safety Checks
 
-on:
-  push:
-    branches: [ "main" ]
+n: push:
+  braches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
@@ -13,6 +12,22 @@ jobs:
     defaults:
       run:
         working-directory: ./stellar-payment-platform
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTRESE_PASSWORD: postgres
+          POSTRESE_DB: stellar_payment_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pgisready -U postgres
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_payment_test
     steps:
       - name: Checkout Code
         uses: actions/checkout@v5
@@ -27,11 +42,14 @@ jobs:
       - name: Install Backend Dependencies
         run: npm install --legacy-peer-deps
 
+      - name: Run Database Migrations
+        run: npm run migrate
+
       - name: Run Backend Tests
         run: NODE_ENV=test npm test
 
       - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
