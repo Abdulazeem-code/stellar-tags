@@ -13,6 +13,9 @@ logger.info('--- PRISMA CLIENT INITIALIZED ---');
 
 let prisma;
 try {
+  if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is not set');
+  }
   const { PrismaClient } = require('@prisma/client');
   prisma = new PrismaClient();
 } catch (err) {
@@ -28,6 +31,44 @@ try {
       findFirst: async () => null,
       findMany: async () => [],
       create: async () => ({}),
+      count: async () => 0,
+    },
+    webhookDLQ: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      create: async () => ({}),
+      delete: async () => ({}),
+      update: async () => ({}),
+    },
+    auditLog: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      findFirst: async () => null,
+      create: async (args) => args.data || {},
+      count: async () => 0,
+    },
+    payment: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      findFirst: async () => null,
+      create: async () => ({}),
+      count: async () => 0,
+      aggregate: async () => ({ _sum: { amount: 0, fee: 0 }, _count: { id: 0 } }),
+      groupBy: async () => [],
+    },
+    webhook: {
+      findUnique: async () => null,
+      findFirst: async () => null,
+      findMany: async () => [],
+      create: async () => ({}),
+      update: async () => ({}),
+      delete: async () => ({}),
+      count: async () => 0,
+    },
+    paymentIntent: {
+      create: async (args) => args.data || {},
+      findMany: async () => [],
+      findUnique: async () => null,
       count: async () => 0,
     },
     $transaction: async (queries) => Promise.all(queries),

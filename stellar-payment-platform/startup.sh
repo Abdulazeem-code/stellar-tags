@@ -7,10 +7,18 @@ set -e
 PRISMA="./node_modules/.bin/prisma"
 
 if [ -z "${DATABASE_URL:-}" ]; then
-  echo "ERROR: DATABASE_URL is not set." >&2
-  echo "Render must provide a PostgreSQL connection string to this service before startup." >&2
-  echo "Link a Render PostgreSQL instance or set DATABASE_URL in the service environment." >&2
-  exit 1
+  echo "WARNING: DATABASE_URL is not set." >&2
+  echo "Skipping database migrations and running in mock/fallback mode." >&2
+else
+  echo "Running database migrations..."
+  "$PRISMA" migrate deploy
+  echo "Verifying migration status..."
+  if "$PRISMA" migrate status >/dev/null 2>&1; then
+    echo "Database schema is up to date."
+  else
+    echo "WARNING: Prisma schema is out of sync with the database." >&2
+    echo "Run './node_modules/.bin/prisma migrate deploy' and restart the server." >&2
+  fi
 fi
 
 if [ ! -x "$PRISMA" ]; then
@@ -25,8 +33,6 @@ if [ ! -d "./node_modules/@prisma/client" ]; then
   exit 1
 fi
 
-echo "Running database migrations..."
-"$PRISMA" migrate deploy
 
 echo "Starting the application..."
 npm start

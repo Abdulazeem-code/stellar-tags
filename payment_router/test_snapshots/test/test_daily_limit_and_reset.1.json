@@ -74,6 +74,12 @@
                     "hi": 0,
                     "lo": 50
                   }
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 1000000000000000
+                  }
                 }
               ]
             }
@@ -82,6 +88,7 @@
         }
       ]
     ],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
@@ -204,7 +211,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 20
+                        "lo": 10
                       }
                     }
                   ]
@@ -227,7 +234,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 1980
+                        "lo": 1990
                       }
                     }
                   ]
@@ -242,7 +249,7 @@
     []
   ],
   "ledger": {
-    "protocol_version": 21,
+    "protocol_version": 20,
     "sequence_number": 1,
     "timestamp": 86400,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -310,6 +317,51 @@
             "ext": "v0"
           },
           15
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "UserSpending"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "UserSpending"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "bytes": "0000000000015180000000000000000000000000000007d0"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
         ]
       ],
       [
@@ -429,6 +481,45 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Frozen"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "MaxAmount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 1000000000000000
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Paused"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "PlatformTreasury"
                             }
                           ]
@@ -441,35 +532,12 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "UserSpending"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                              "symbol": "TimelockNonce"
                             }
                           ]
                         },
                         "val": {
-                          "map": [
-                            {
-                              "key": {
-                                "symbol": "accumulated_amount"
-                              },
-                              "val": {
-                                "i128": {
-                                  "hi": 0,
-                                  "lo": 2000
-                                }
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "last_reset_time"
-                              },
-                              "val": {
-                                "u64": 86400
-                              }
-                            }
-                          ]
+                          "u64": 0
                         }
                       }
                     ]
@@ -658,7 +726,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 70
+                          "lo": 60
                         }
                       }
                     },
@@ -804,7 +872,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000001930
+                          "lo": 10000000001940
                         }
                       }
                     },
@@ -1215,6 +1283,12 @@
                     "hi": 0,
                     "lo": 50
                   }
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 1000000000000000
+                  }
                 }
               ]
             }
@@ -1259,6 +1333,53 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
+                "symbol": "add_supported_token"
+              }
+            ],
+            "data": {
+              "address": "CDS3FDGQ4JA2V3F26Y4BMWWJEC5TT26RJBN7KIQKUMVO2MAOCMDTSZ7A"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "add_supported_token"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
+              },
+              {
                 "symbol": "route_payment"
               }
             ],
@@ -1280,6 +1401,32 @@
                   }
                 }
               ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "payment_initiated"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 10000000000000
+              }
             }
           }
         }
@@ -1535,7 +1682,36 @@
               }
             ],
             "data": {
-              "string": "Platform fee routed to treasury"
+              "string": "Remaining balance routed to recipient"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "routed"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 10000000000000
+              }
             }
           }
         }
@@ -1555,7 +1731,7 @@
               }
             ],
             "data": {
-              "string": "Remaining balance routed to recipient"
+              "string": "Platform fee routed to treasury"
             }
           }
         }
@@ -1624,6 +1800,32 @@
         }
       },
       "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "payment_initiated"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 2000
+              }
+            }
+          }
+        }
+      },
+      "failed_call": true
     },
     {
       "event": {
@@ -1772,6 +1974,32 @@
       "event": {
         "ext": "v0",
         "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "payment_initiated"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 2000
+              }
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
         "type_": "diagnostic",
         "body": {
           "v0": {
@@ -1849,7 +2077,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 20
+                    "lo": 10
                   }
                 }
               ]
@@ -1883,7 +2111,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 20
+                "lo": 10
               }
             }
           }
@@ -1941,7 +2169,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1980
+                    "lo": 1990
                   }
                 }
               ]
@@ -1975,7 +2203,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1980
+                "lo": 1990
               }
             }
           }
@@ -2017,7 +2245,36 @@
               }
             ],
             "data": {
-              "string": "Platform fee routed to treasury"
+              "string": "Remaining balance routed to recipient"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "routed"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 2000
+              }
             }
           }
         }
@@ -2037,7 +2294,7 @@
               }
             ],
             "data": {
-              "string": "Remaining balance routed to recipient"
+              "string": "Platform fee routed to treasury"
             }
           }
         }
@@ -2109,7 +2366,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 10000000001930
+                "lo": 10000000001940
               }
             }
           }

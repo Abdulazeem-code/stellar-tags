@@ -4,6 +4,8 @@ const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
 const { verifyEmailBodySchema, verifyEmailConfirmBodySchema } = require('../../schemas');
+const { asyncHandler } = require('../../middleware/asyncHandler');
+const { signToken } = require('../../utils/jwt');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -22,7 +24,7 @@ module.exports = (redisClient) => {
 
   // POST /auth/verify-email
   // Body: { email }
-  router.post('/verify-email', requireRedis, requireJson, validateSchema({ body: verifyEmailBodySchema }), async (req, res, next) => {
+  router.post('/verify-email', requireRedis, requireJson, validateSchema({ body: verifyEmailBodySchema }), asyncHandler(async (req, res, next) => {
     try {
       const safeEmail = xss(req.body.email);
 
@@ -41,11 +43,11 @@ module.exports = (redisClient) => {
     } catch (err) {
       return next(err);
     }
-  });
+  }));
 
   // POST /auth/verify-email/confirm
   // Body: { email, code }
-  router.post('/verify-email/confirm', requireRedis, requireJson, validateSchema({ body: verifyEmailConfirmBodySchema }), async (req, res, next) => {
+  router.post('/verify-email/confirm', requireRedis, requireJson, validateSchema({ body: verifyEmailConfirmBodySchema }), asyncHandler(async (req, res, next) => {
     try {
       const safeEmail = xss(req.body.email);
       const { code } = req.body;
@@ -64,11 +66,19 @@ module.exports = (redisClient) => {
       // On success, remove key
       await redisClient.del(key);
 
-      return res.json({ ok: true, verified: true });
+      // Issue a signed RS256 JWT so the caller can authenticate subsequent requests.
+      let token = null;
+      try {
+        token = signToken({ sub: safeEmail, email: safeEmail });
+      } catch {
+        // JWT keys not configured — return verification result without a token.
+      }
+
+      return res.json({ ok: true, verified: true, ...(token && { token }) });
     } catch (err) {
       return next(err);
     }
-  });
+  }));
 
   return router;
 };
