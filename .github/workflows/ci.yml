@@ -1,32 +1,30 @@
 name: Production Safety Checks
 
-on:
+  on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-
-env:
+  env:
   DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb
-
-jobs:
-  backend-checks:
-    name: Backend Build & Test
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: testuser
-          POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: testdb
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+  jobs:
+    backend-checks:
+      name: Backend Build & Test
+      runs-on: ubuntu-latest
+      services:
+        postgres:
+          image: postgres:16
+          env:
+            POSTGRES_USER: testuser
+            POSTGRES_PASSWORD: testpass
+            POSTGRES_DB: testdb
+          ports:
+            - 5432:5432
+          options: >-
+            --health-cmd pgisready -U testuser -d testdb
+            --health-interval 10s
+            --health-timeout 5s
+            --health-retries 5
     defaults:
       run:
         working-directory: ./stellar-payment-platform
@@ -44,11 +42,14 @@ jobs:
       - name: Install Backend Dependencies
         run: npm install
       
+      - name: Run Database Migrations
+        run: npm run migrate --if-present
+      
       - name: Run Backend Tests
         run: NODE_ENV=test npm test
       
       - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPatternPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
