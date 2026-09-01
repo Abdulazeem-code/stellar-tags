@@ -1,5 +1,6 @@
 name: Production Safety Checks
 
+name: Backend Unit Tests
 on:
   push:
     branches: [ "main" ]
@@ -15,24 +16,23 @@ jobs:
         working-directory: ./stellar-payment-platform
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
 
-
       - name: Install Backend Dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       - name: Run Backend Tests
         run: NODE_ENV=test npm test
 
       - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
@@ -45,10 +45,10 @@ jobs:
         working-directory: ./payment-dashboard
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
