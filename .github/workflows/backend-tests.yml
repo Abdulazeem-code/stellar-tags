@@ -13,12 +13,12 @@ jobs:
         image: postgres:16
         env:
           POSTGRESE_USER: testuser
-          POSTRESE_PASSWORD: testpass
+          POSTGRESE_PASSWORD: testpass
           POSTGRESE_DB: testdb
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pgisready
+          --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -35,7 +35,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: ${ { matrix.node-version }}
+          node-version: $${ matrix.node-version }}
 
       - name: Install backend dependencies
         working-directory: stellar-payment-platform
@@ -46,7 +46,7 @@ jobs:
 
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPatternPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
