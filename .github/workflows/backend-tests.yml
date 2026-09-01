@@ -1,24 +1,20 @@
 name: Backend Unit Tests
-
-on:
-  pull_request:
-    branches:
-      - main
-
-jobs:
+		
+			
+objects:
   backend-tests:
     runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:16
         env:
-          POSTGRESE_USER: testuser
-          POSTGRESE_PASSWORD: testpass
-          POSTGRESE_DB: testdb
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
         ports:
           - 5432:5432
-        options: >-
-          --health-cmd pg_isready
+        options: >
+          --health-cmd pgisready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -35,7 +31,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: $${ matrix.node-version }}
+          node-version: ${#{ matrix.node-version }}
 
       - name: Install backend dependencies
         working-directory: stellar-payment-platform
@@ -46,7 +42,7 @@ jobs:
 
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPatternPattern memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
