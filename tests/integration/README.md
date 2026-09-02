@@ -10,7 +10,7 @@ observe the resulting network state.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  docker-compose.test.yml                                    │
+│  docker compose --profile integration                       │
 │                                                             │
 │  stellar-standalone (stellar/quickstart)                    │
 │    ├── Horizon REST API  ──►  http://localhost:8000         │
@@ -36,7 +36,7 @@ smart contracts out of the box.
 
 ```bash
 # 1. Start the standalone Stellar network
-docker compose -f docker-compose.test.yml up -d stellar-standalone
+docker compose --profile integration up -d stellar-standalone
 
 # 2. Wait for Horizon to be ready (healthcheck handles this automatically)
 
