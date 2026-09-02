@@ -17,17 +17,17 @@ jest.mock("./src/db-pool-monitor", () => ({
   schedulePoolMonitoring: jest.fn(() => ({ close: jest.fn() })),
 }));
 
-jest.mock("bad-words", () => ({
-  __esModule: true,
-  default: jest.fn().mockImplementation(() => ({
+jest.mock("bad-words", () =>
+  jest.fn().mockImplementation(() => ({
     isProfane: jest.fn(() => false),
   })),
-}));
+);
 
 jest.mock("./src/db", () => ({
   poolGet: jest.fn(),
   poolRun: jest.fn(),
   poolAll: jest.fn(),
+  etagCache: jest.fn((req, res, next) => next()),
 }));
 
 jest.mock("./prismaClient", () => ({
