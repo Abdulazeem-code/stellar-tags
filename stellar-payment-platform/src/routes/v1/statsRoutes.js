@@ -23,7 +23,7 @@ module.exports = (redisClient) => {
  *       200:
  *         description: Success
  */
-router.get('/stats', asyncHandler(async (req, res, next) => {
+  router.get('/stats', etagCache, asyncHandler(async (req, res, next) => {
     try {
       const stats = await getCachedStats(redisClient, () => fetchAdminStats(prisma, poolGet));
       return res.status(200).json(stats);

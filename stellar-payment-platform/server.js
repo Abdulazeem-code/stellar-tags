@@ -1,9 +1,9 @@
 require('./config/envCheck');
 const express = require('express');
-const swaggerJsdoc = require('swagger-jsdoc');
-const swaggerUi = require('swagger-ui-express');
 const pinoHttp = require('pino-http');
 const cors = require('cors');
+const swaggerJsdoc = require('swagger-jsdoc');
+const swaggerUi = require('swagger-ui-express');
 const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
@@ -451,7 +451,7 @@ app.get('/metrics', async (req, res) => {
  *       200:
  *         description: Success
  */
-app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
+app.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
   const { q: queryValue, type } = req.query;
 
   try {
@@ -647,7 +647,7 @@ const verifyFreighterRegistrationSignature = ({
  *       200:
  *         description: Success
  */
-app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   // registerBodySchema has already guaranteed that username is a trimmed
   // 3-20 character alphanumeric string and address is a non-empty trimmed
   // string, so those shape checks are not repeated here.

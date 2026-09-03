@@ -53,7 +53,7 @@ module.exports = (redisClient) => {
   router.use(idempotencyMiddleware(redisClient));
 
   const getPrisma = () => {
-    return require('../../../prismaClient').prisma;
+    return require('../../../prismaClient');
   };
 
   const adminAuth = (req, res, next) => {
@@ -113,7 +113,7 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Cache-Control', 'no-store');
 
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     let skip = 0;
     let headerWritten = false;
 
@@ -175,7 +175,7 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
  *         description: Success
  */
 router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+    const { prisma, withTransaction } = getPrisma();
     const { address } = req.body;
 
     if (!address || typeof address !== 'string') {
@@ -237,7 +237,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     '/admin/dlq',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const username =
         typeof req.query.username === 'string'
           ? req.query.username.trim()
@@ -298,7 +298,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     '/admin/dlq/:id/replay',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const id =
         typeof req.params?.id === 'string' ? req.params.id.trim() : '';
 
@@ -340,7 +340,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
 
       const stats = await getRoutingStats({
         prisma,
@@ -359,7 +359,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
 
   // ── GET /admin/users/blocked ─────────────────────────────────────────────
   router.get('/admin/users/blocked', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     const { search, cursor, page } = req.query;
 
     const where = {
@@ -449,7 +449,7 @@ router.get(
     '/admin/audit-logs',
     adminAuth,
     asyncHandler(async (req, res) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
       const logs = await prisma.auditLog.findMany({
         take: limit,

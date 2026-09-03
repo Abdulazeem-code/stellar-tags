@@ -14,7 +14,11 @@ module.exports = (redisClient) => {
   
   router.use(idempotencyMiddleware(redisClient));
 
-// POST /payments/bulk
+  // ── Idempotency protection for payment intent creation (POST /payments/bulk).
+  // Duplicate submissions within 24h return the originally created intents. ──
+  router.use(idempotencyMiddleware(redisClient));
+
+  // POST /payments/bulk
 
 /**
  * @openapi
@@ -27,7 +31,7 @@ module.exports = (redisClient) => {
  *       200:
  *         description: Success
  */
-router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSchema }), asyncHandler(async (req, res, next) => {
+  router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSchema }), asyncHandler(async (req, res, next) => {
   const intents = req.body;
 
   // Additional per-item validation that requires runtime logic

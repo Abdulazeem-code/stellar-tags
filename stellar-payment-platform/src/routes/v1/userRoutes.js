@@ -1,7 +1,7 @@
 const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
-const { prisma } = require('../../../prismaClient');
+const { prisma, withTransaction } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { poolGet, poolRun, poolAll, etagCache } = require('../../db');
 const { logger } = require('../../logger');
@@ -232,8 +232,6 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
         ...(memoType && { memoType, memo }),
       },
     });
-    // Invalidate any stale federation cache entries for this username/address
-    invalidateFederationCache(normalizedUsername, address);
 
     await recordActivity(prisma, {
       username: normalizedUsername,
@@ -356,13 +354,15 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
       return next(notFoundError);
     }
 
-    await prisma.user.update({
-      where: { username },
-      data: { deletedAt: new Date() },
+    await withTransaction(async (tx) => {
+      await tx.user.update({
+        where: { username },
+        data: { deletedAt: new Date() },
+      });
+
+      // Invalidate any stale federation cache entries
+      invalidateFederationCache(username, existing.address);
     });
-    
-    // Invalidate any stale federation cache entries
-    invalidateFederationCache(username, existing.address);
 
     await recordActivity(prisma, {
       username,
@@ -525,7 +525,7 @@ const totalPages = Math.ceil(totalCount / limit);
  *       200:
  *         description: Success
  */
-router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
+router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);
   if (invalidCursor) {

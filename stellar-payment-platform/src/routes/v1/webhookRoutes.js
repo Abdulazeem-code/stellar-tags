@@ -18,18 +18,7 @@ module.exports = (redisClient) => {
   // 2xx response. Read-only GET /webhooks is ignored. ────────────────────────
   router.use(idempotencyMiddleware(redisClient));
 
-const normalizeWebhookEvents = (events) => {
-  if (Array.isArray(events)) return events;
-  if (typeof events === 'string') {
-    try {
-      const parsed = JSON.parse(events || '[]');
-      return Array.isArray(parsed) ? parsed : ['*'];
-    } catch {
-      return ['*'];
-    }
-  }
-  return ['*'];
-};
+
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
@@ -51,6 +40,136 @@ const isValidWebhookUrl = (url) => {
   }
 };
 
+const normalizeWebhookEvents = (input) => {
+  if (input === undefined || input === null) return ['*'];
+  const raw = Array.isArray(input) ? input : [input];
+  const events = raw
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => value.trim())
+    .filter((value, index, arr) => arr.indexOf(value) === index);
+
+  if (events.length === 0) return ['*'];
+  if (events.includes('*')) return ['*'];
+
+  return events;
+};
+const getWebhookSecret = (req) => {
+  const headerValue = req.get ? req.get('X-Webhook-Secret') || req.get('X-Stellar-Tags-Secret') : '';
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const secret = typeof body.secret === 'string' ? body.secret : (typeof body.webhookSecret === 'string' ? body.webhookSecret : headerValue);
+  return typeof secret === 'string' && secret.trim() ? secret.trim() : '';
+};
+
+const getPayloadForVerification = (body) => {
+  if (body && typeof body === 'object' && !Array.isArray(body) && Object.prototype.hasOwnProperty.call(body, 'payload')) {
+   return body.payload;
+  }
+
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+   const { secret, webhookSecret, signature, ...rest } = body;
+   if (Object.keys(rest).length > 0) {
+     return rest;
+   }
+  }
+
+  return body;
+};
+
+const normalizeSignature = (value) => {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/^sha256=/i, '');
+};
+
+const getSigningPayloadBuffer = (payload) => {
+  if (Buffer.isBuffer(payload)) return payload;
+  if (typeof payload === 'string') return Buffer.from(payload, 'utf8');
+  if (payload === undefined || payload === null) {
+   throw new Error('Missing required field: payload.');
+  }
+  return Buffer.from(JSON.stringify(payload), 'utf8');
+};
+
+router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
+  try {
+   const secret = getWebhookSecret(req);
+   if (!secret) {
+     return res.status(400).json({
+       ok: false,
+       error: {
+         code: 'MISSING_WEBHOOK_SECRET',
+         message: 'Missing required webhook secret. Provide secret or webhookSecret in the request body or X-Webhook-Secret header.',
+       },
+     });
+   }
+
+   const signatureHeader = normalizeSignature(
+     req.get ? (req.get('X-Webhook-Signature') || req.get('X-Stellar-Tags-Signature') || req.body?.signature) : (req.body?.signature || '')
+   );
+   if (!signatureHeader) {
+     return res.status(400).json({
+       ok: false,
+       error: {
+         code: 'MISSING_SIGNATURE',
+         message: 'Missing required X-Webhook-Signature header.',
+       },
+     });
+   }
+
+   const payload = getPayloadForVerification(req.body);
+   const rawPayload = getSigningPayloadBuffer(payload);
+   const expectedSignature = crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
+
+   const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+   const receivedBuffer = Buffer.from(signatureHeader, 'hex');
+
+   if (expectedBuffer.length !== receivedBuffer.length) {
+     return res.status(401).json({
+       ok: false,
+       valid: false,
+       error: {
+         code: 'INVALID_WEBHOOK_SIGNATURE',
+         message: 'The provided signature does not match the webhook secret and payload.',
+       },
+       expectedSignature,
+       receivedSignature: signatureHeader,
+     });
+   }
+
+   let valid;
+   try {
+     valid = crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+   } catch (error) {
+     valid = false;
+   }
+
+   if (!valid) {
+     return res.status(401).json({
+       ok: false,
+       valid: false,
+       error: {
+         code: 'INVALID_WEBHOOK_SIGNATURE',
+         message: 'The provided signature does not match the webhook secret and payload.',
+       },
+       expectedSignature,
+       receivedSignature: signatureHeader,
+     });
+   }
+
+   return res.status(200).json({
+     ok: true,
+     valid: true,
+     message: 'Webhook signature verification succeeded.',
+     expectedSignature,
+     receivedSignature: signatureHeader,
+   });
+  } catch (err) {
+   if (err.statusCode) return next(err);
+   logger.error('[webhooks] POST /webhooks/verify-test failed:', err.message);
+   const error = new Error(err.message || 'Failed to verify webhook signature');
+   error.statusCode = 400;
+   return next(error);
+  }
+}));
 
 /**
  * @openapi
