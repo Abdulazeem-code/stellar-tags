@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # Deploys the payment_router Soroban contract to the local standalone
-# Stellar network started by docker-compose.test.yml.
+# Stellar network started by docker-compose.yml's integration profile.
 #
 # Prerequisites:
 #   - Docker running with the standalone network up:
-#       docker compose -f docker-compose.test.yml up -d stellar-standalone
+#       docker compose --profile integration up -d stellar-standalone
 #   - The `soroban` CLI installed (https://soroban.stellar.org/docs/reference/cli)
 #   - Rust toolchain with the `wasm32-unknown-unknown` target:
 #       rustup target add wasm32-unknown-unknown
