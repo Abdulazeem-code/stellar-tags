@@ -100,6 +100,7 @@ describe('E2E: Webhooks Flow', () => {
         url: 'https://example.com/webhook',
       });
 
+    if (res.status !== 201) console.log("Webhook Create Error Response:", res.status, res.body);
     expect(res.status).toBe(201);
     expect(res.body.ok).toBe(true);
     expect(res.body.webhook.url).toBe('https://example.com/webhook');

@@ -44,8 +44,10 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
 
           if (!row) return null;
 
+          const domain = process.env.DOMAIN || 'localhost';
+          const stellar_address = row.username.includes('*') ? row.username : `${row.username}*${domain}`;
           const response = {
-            stellar_address: row.username,
+            stellar_address,
             account_id: row.address,
           };
           if (row.memoType) {
@@ -70,7 +72,7 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
         const cached = await federationLookupCached(cacheKey, async () => {
           const row = await prisma.user.findFirst({
             where: { username: queryName, deletedAt: null },
-            select: { address: true, memoType: true, memo: true },
+            select: { username: true, address: true, memoType: true, memo: true },
           });
 
           const address = row?.address || USER_DATABASE[queryName];
@@ -100,6 +102,7 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
         );
       }
     } catch (error) {
+      console.log("FEDERATION LOOKUP ERROR:", error);
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);

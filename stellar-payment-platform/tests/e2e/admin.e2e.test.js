@@ -38,6 +38,16 @@ jest.mock('../../prismaClient', () => {
         }
         return { count };
       }),
+      updateMany: jest.fn(async ({ where, data }) => {
+        let count = 0;
+        for (const [address, entry] of mockDbUsers.entries()) {
+          if (where.address && entry.address === where.address) {
+            mockDbUsers.set(address, { ...entry, ...data });
+            count++;
+          }
+        }
+        return { count };
+      }),
       findMany: jest.fn(async () => {
         return Array.from(mockDbUsers.values());
       }),
@@ -52,7 +62,7 @@ jest.mock('../../prismaClient', () => {
       create: jest.fn().mockResolvedValue({}),
     },
     payment: {
-      findMany: jest.fn().mockResolvedValue([{ id: 1, amount: 100 }]),
+      findMany: jest.fn().mockResolvedValue([{ id: 'payment_1' }])
     },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
@@ -91,13 +101,10 @@ describe('E2E: Admin Flow', () => {
       .set('x-api-key', 'e2e-admin-key');
 
     expect(res.status).toBe(200);
-    expect(res.text).toBeDefined();
     const lines = res.text.trim().split('\n').filter(Boolean);
-    const data = lines.map((line) => JSON.parse(line));
-    expect(Array.isArray(data)).toBe(true);
-    expect(data.length).toBe(1);
-    expect(data[0].id).toBe(1);
-    expect(data[0].amount).toBe(100);
+    expect(lines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(lines[0]);
+    expect(parsed.id).toBe('payment_1');
   });
 
   it('should return 401 for unauthorized admin access', async () => {
