@@ -359,7 +359,7 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
         where: { username },
         data: { deletedAt: new Date() },
       });
-      
+
       // Invalidate any stale federation cache entries
       invalidateFederationCache(username, existing.address);
     });
@@ -513,6 +513,18 @@ const totalPages = Math.ceil(totalCount / limit);
   }
 }));
 
+
+/**
+ * @openapi
+ * /users:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /users
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);

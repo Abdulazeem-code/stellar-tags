@@ -439,6 +439,18 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
+
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
   const { q: queryValue, type } = req.query;
 
@@ -622,6 +634,18 @@ const verifyFreighterRegistrationSignature = ({
  * - Fetches account signers and thresholds from Horizon
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
+ */
+
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /register
+ *     responses:
+ *       200:
+ *         description: Success
  */
 app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   // registerBodySchema has already guaranteed that username is a trimmed
