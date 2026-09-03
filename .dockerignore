@@ -9,7 +9,7 @@ payment_router
 *.db
 
 # Backend test files & artifacts — never needed inside an image
-# (CI runs tests on the runner; docker-compose.test.yml builds from the
+# (CI runs tests on the runner; the api-test service builds from the
 # stellar-payment-platform context, which has its own .dockerignore)
 stellar-payment-platform/tests
 stellar-payment-platform/*.test.js

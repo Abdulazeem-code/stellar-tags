@@ -102,6 +102,18 @@ const writeChunk = async (res, chunk) => {
  * with its cursor, converted, and flushed as they arrive, so neither the full
  * result set nor the full CSV is ever held in memory.
  */
+
+/**
+ * @openapi
+ * /transactions/export:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /transactions/export
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get(
   '/transactions/export',
   validateSchema({ query: exportQuerySchema }),

@@ -26,7 +26,7 @@ jobs:
 
 
       - name: Install Backend Dependencies
-        run: npm ci
+        run: npm install
 
       # Run the full suite with coverage so the thresholds in package.json
       # fail the build whenever coverage regresses below the floor.
