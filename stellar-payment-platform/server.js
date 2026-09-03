@@ -1,5 +1,6 @@
 require('./config/envCheck');
 const express = require('express');
+const pinoHttp = require('pino-http');
 const cors = require('cors');
 const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
