@@ -1,5 +1,6 @@
 require('./config/envCheck');
 const express = require('express');
+const pinoHttp = require('pino-http');
 const cors = require('cors');
 const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
@@ -18,8 +19,7 @@ const timeout = require('connect-timeout');
 const compression = require('compression');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
-const { logger } = require('./src/logger');
-const pinoHttp = require('pino-http');
+const { logger, httpLogger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const {
