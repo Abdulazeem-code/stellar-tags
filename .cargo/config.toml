@@ -1,0 +1,35 @@
+# Lint policy for the Soroban contract. `-Dwarnings` keeps the build honest;
+# the allows below cover lints that the contract cannot satisfy or that do not
+# apply to it, rather than leaving CI red.
+#
+# clippy::nursery is deliberately absent: those lints are unstable by clippy's
+# own definition and are not meant to gate CI.
+[build]
+rustflags = [
+  "-Dwarnings",
+  "-Wclippy::all",
+  "-Wclippy::pedantic",
+
+  # `#[contractimpl]` requires entrypoints to take Env and Address by value,
+  # and generates code that reads parameters an empty body ignores.
+  "-Aclippy::needless_pass_by_value",
+  "-Aclippy::used_underscore_binding",
+
+  # Contract results are consumed through the generated client, and their
+  # failure modes are enumerated once in the Error enum rather than repeated
+  # in an # Errors section on every entrypoint.
+  "-Aclippy::must_use_candidate",
+  "-Aclippy::missing_errors_doc",
+
+  # Doc comments name Stellar and Soroban identifiers that are not Rust items.
+  "-Aclippy::doc_markdown",
+
+  # Style-only lints over the test module.
+  "-Aclippy::too_many_lines",
+  "-Aclippy::similar_names",
+  "-Aclippy::single_match_else",
+  "-Aclippy::unreadable_literal",
+  "-Aclippy::uninlined_format_args",
+  "-Aclippy::map_unwrap_or",
+  "-Aclippy::ignore_without_reason",
+]

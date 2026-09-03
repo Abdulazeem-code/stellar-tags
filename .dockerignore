@@ -5,4 +5,20 @@
 payment_router
 *.md
 .env
+**/.env
 *.db
+
+# Backend test files & artifacts — never needed inside an image
+# (CI runs tests on the runner; the api-test service builds from the
+# stellar-payment-platform context, which has its own .dockerignore)
+stellar-payment-platform/tests
+stellar-payment-platform/*.test.js
+stellar-payment-platform/test_*.txt
+stellar-payment-platform/test_output.txt
+stellar-payment-platform/data
+stellar-payment-platform/artillery.yml
+
+# Root-level files not referenced by any image build
+docs
+tmp_server.js
+artillery.yml
