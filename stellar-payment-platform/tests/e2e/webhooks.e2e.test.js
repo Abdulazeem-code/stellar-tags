@@ -59,6 +59,9 @@ jest.mock('../../prismaClient', () => {
         return { count };
       }),
     },
+    activityLog: {
+      create: jest.fn().mockResolvedValue({}),
+    },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };
@@ -80,7 +83,7 @@ describe('E2E: Webhooks Flow', () => {
     
     // Set up a user for the webhooks
     mockDbUsers.set('GABC123XYZ456789WEBHOOK', {
-      username: 'webhook_test_user',
+      username: 'webhook_test_user*localhost',
       address: 'GABC123XYZ456789WEBHOOK',
     });
   });

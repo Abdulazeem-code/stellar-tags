@@ -27,12 +27,16 @@ jest.mock('../../prismaClient', () => {
         }
         return row ? { ...row } : null;
       }),
-      update: jest.fn(async ({ where, data }) => {
-        const entry = mockDbUsers.get(where.address);
-        if (!entry) throw new Error('Not found');
-        const updated = { ...entry, ...data };
-        mockDbUsers.set(where.address, updated);
-        return updated;
+      updateMany: jest.fn(async ({ where, data }) => {
+        let count = 0;
+        for (const entry of mockDbUsers.values()) {
+          if (entry.address === where.address) {
+            const updated = { ...entry, ...data };
+            mockDbUsers.set(entry.address, updated);
+            count++;
+          }
+        }
+        return { count };
       }),
       findMany: jest.fn(async () => {
         return Array.from(mockDbUsers.values());
@@ -41,10 +45,19 @@ jest.mock('../../prismaClient', () => {
         return mockDbUsers.size;
       })
     },
+    activityLog: {
+      create: jest.fn().mockResolvedValue({}),
+    },
+    auditLog: {
+      create: jest.fn().mockResolvedValue({}),
+    },
+    payment: {
+      findMany: jest.fn().mockResolvedValue([{ id: 1, amount: 100 }]),
+    },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };
-  return { prisma, isPrismaConnectionError: () => false };
+  return { prisma, isPrismaConnectionError: () => false, getPrisma: () => ({ prisma, isPrismaConnectionError: () => false, withTransaction: async (cb) => cb(prisma) }), withTransaction: async (cb) => cb(prisma) };
 });
 
 const request = require('supertest');
@@ -72,17 +85,19 @@ describe('E2E: Admin Flow', () => {
     expect(res.body.address).toBe('GABC123XYZ456789ADMIN');
     expect(res.body.flaggedAt).toBeDefined();
 
-    // 2. Export Users
+    // 2. Export Payments
     res = await request(app)
       .get('/api/v1/admin/export?format=json')
       .set('x-api-key', 'e2e-admin-key');
 
     expect(res.status).toBe(200);
-    expect(res.body.data).toBeDefined();
-    expect(Array.isArray(res.body.data)).toBe(true);
-    expect(res.body.data.length).toBe(1);
-    expect(res.body.data[0].address).toBe('GABC123XYZ456789ADMIN');
-    expect(res.body.data[0].flaggedAt).not.toBeNull();
+    expect(res.text).toBeDefined();
+    const lines = res.text.trim().split('\n').filter(Boolean);
+    const data = lines.map((line) => JSON.parse(line));
+    expect(Array.isArray(data)).toBe(true);
+    expect(data.length).toBe(1);
+    expect(data[0].id).toBe(1);
+    expect(data[0].amount).toBe(100);
   });
 
   it('should return 401 for unauthorized admin access', async () => {

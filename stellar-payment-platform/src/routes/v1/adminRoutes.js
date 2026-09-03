@@ -237,7 +237,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     '/admin/dlq',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const username =
         typeof req.query.username === 'string'
           ? req.query.username.trim()
@@ -298,7 +298,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     '/admin/dlq/:id/replay',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const id =
         typeof req.params?.id === 'string' ? req.params.id.trim() : '';
 
@@ -340,7 +340,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
 
       const stats = await getRoutingStats({
         prisma,
@@ -359,7 +359,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
 
   // ── GET /admin/users/blocked ─────────────────────────────────────────────
   router.get('/admin/users/blocked', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     const { search, cursor, page } = req.query;
 
     const where = {

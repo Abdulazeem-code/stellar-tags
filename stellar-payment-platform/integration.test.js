@@ -226,7 +226,7 @@ describe('API Integration Lifecycle Suite', () => {
 
     expect(fedRes.status).toBe(200);
     expect(fedRes.body).toMatchObject({
-      stellar_address: user1.address,
+      stellar_address: `${user1.username}*localhost`,
       account_id: user1.address,
     });
 

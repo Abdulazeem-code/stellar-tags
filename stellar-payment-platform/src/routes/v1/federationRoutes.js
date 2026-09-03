@@ -45,7 +45,7 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
           if (!row) return null;
 
           const response = {
-            stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
+            stellar_address: row.username,
             account_id: row.address,
           };
           if (row.memoType) {
@@ -77,7 +77,7 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
           if (!address) return null;
 
           const response = {
-            stellar_address: address,
+            stellar_address: queryName,
             account_id: address,
           };
           if (row?.memoType) {
