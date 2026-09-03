@@ -144,6 +144,16 @@ const accountPaymentsQuerySchema = z
   })
   .loose();
 
+/** GET /users/:username/activity query. Dates are only shape-checked here;
+ * the handler parses them so it can report which bound was unparseable. */
+const activityQuerySchema = z
+  .object({
+    ...paginationFields,
+    startDate: z.string().trim().min(1).max(64).optional(),
+    endDate: z.string().trim().min(1).max(64).optional(),
+  })
+  .loose();
+
 /** POST /auth/verify-email and /auth/verify-email/confirm */
 const verifyEmailBodySchema = z
   .object({
@@ -205,6 +215,41 @@ const adminExportQuerySchema = z
     { error: 'startDate must be on or before endDate', path: ['startDate'] },
   );
 
+/**
+ * GET /admin/stats/routing query.
+ *
+ * - `startDate` optional ISO date string (YYYY-MM-DD), inclusive lower bound
+ * - `endDate`   optional ISO date string (YYYY-MM-DD), inclusive upper bound
+ * - `groupBy`   optional grouping interval ('day' | 'week' | 'month'), defaults to 'day'
+ * - `interval`  optional alias for groupBy ('day' | 'week' | 'month')
+ * - `assetCode` optional Stellar asset code filter
+ */
+const adminRoutingStatsQuerySchema = z
+  .object({
+    startDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD')
+      .optional(),
+    endDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD')
+      .optional(),
+    groupBy: z.enum(['day', 'week', 'month']).optional().default('day'),
+    interval: z.enum(['day', 'week', 'month']).optional(),
+    assetCode: z.string().trim().optional(),
+  })
+  .loose()
+  .refine(
+    (value) => {
+      if (value.startDate && value.endDate) {
+        return new Date(value.startDate) <= new Date(value.endDate);
+      }
+      return true;
+    },
+    { error: 'startDate must be on or before endDate', path: ['startDate'] },
+  );
 /** POST /auth/api-keys - generate a new API key */
 const createApiKeyBodySchema = z
   .object({
@@ -280,13 +325,16 @@ module.exports = {
   federationQuerySchema,
   lookupQuerySchema,
   usersQuerySchema,
+  activityQuerySchema,
   accountPaymentsQuerySchema,
   verifyEmailBodySchema,
   verifyEmailConfirmBodySchema,
   adminBlockBodySchema,
   exportQuerySchema,
   adminExportQuerySchema,
+  adminRoutingStatsQuerySchema,
   createApiKeyBodySchema,
   revokeApiKeyBodySchema,
   rotateApiKeyBodySchema,
 };
+

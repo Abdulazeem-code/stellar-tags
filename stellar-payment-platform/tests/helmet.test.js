@@ -29,7 +29,7 @@ jest.mock('pg', () => ({
 }));
 jest.mock('../src/multisigner-verifier', () => ({}));
 jest.mock('../src/db', () => ({}));
-jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }) }));
+jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }), httpLogger: (req, res, next) => next() }));
 jest.mock('../src/metrics', () => ({ metricsMiddleware: (req, res, next) => next(), getMetrics: jest.fn(), getContentType: jest.fn(), setMetricsSources: jest.fn() }));
 jest.mock('@sentry/node', () => ({ init: jest.fn(), setupExpressErrorHandler: jest.fn() }));
 jest.mock('../src/cache', () => ({}));
@@ -44,6 +44,9 @@ jest.mock('../src/routes/v1/authRoutes', () => () => {
   return express.Router();
 });
 
+// /health probes Horizon over HTTP; keep it off the network.
+global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+
 const { app } = require('../server');
 
 describe('Helmet Security Headers', () => {
@@ -55,5 +58,21 @@ describe('Helmet Security Headers', () => {
   it('should set security headers (e.g., X-Content-Type-Options)', async () => {
     const response = await request(app).get('/health');
     expect(response.header).toHaveProperty('x-content-type-options', 'nosniff');
+  });
+
+  it('should deny all framing via X-Frame-Options', async () => {
+    const response = await request(app).get('/health');
+    expect(response.header).toHaveProperty('x-frame-options', 'DENY');
+  });
+
+  it('should enforce strict Content-Security-Policy with frame-ancestors none', async () => {
+    const response = await request(app).get('/health');
+    expect(response.header).toHaveProperty('content-security-policy');
+    const csp = response.header['content-security-policy'];
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("style-src 'self'");
+    expect(csp).toContain("object-src 'none'");
   });
 });
