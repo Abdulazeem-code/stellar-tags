@@ -80,7 +80,7 @@ describe('E2E: Webhooks Flow', () => {
     
     // Set up a user for the webhooks
     mockDbUsers.set('GABC123XYZ456789WEBHOOK', {
-      username: 'webhook_test_user',
+      username: 'webhook_test_user*localhost',
       address: 'GABC123XYZ456789WEBHOOK',
     });
   });
@@ -97,6 +97,7 @@ describe('E2E: Webhooks Flow', () => {
         url: 'https://example.com/webhook',
       });
 
+    if (res.status !== 201) console.log("Webhook Create Error Response:", res.status, res.body);
     expect(res.status).toBe(201);
     expect(res.body.ok).toBe(true);
     expect(res.body.webhook.url).toBe('https://example.com/webhook');

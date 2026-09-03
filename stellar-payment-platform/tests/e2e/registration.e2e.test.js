@@ -62,6 +62,13 @@ jest.mock('../../prismaClient', () => {
         mockDb.set(data.address, row);
         return row;
       }),
+      count: jest.fn(async ({ where }) => {
+        let count = 0;
+        for (const entry of mockDb.values()) {
+          if (where.address && entry.address === where.address) count++;
+        }
+        return count;
+      }),
     },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
@@ -91,7 +98,7 @@ describe('E2E: Registration Flow', () => {
   it('should successfully register a new user and handle duplicate registration gracefully', async () => {
     // 1. Successful Registration
     const validUser = {
-      username: 'e2e_register_test',
+      username: 'e2eregistertest',
       address: 'GABC123XYZ456789REGISTRATION',
     };
 
