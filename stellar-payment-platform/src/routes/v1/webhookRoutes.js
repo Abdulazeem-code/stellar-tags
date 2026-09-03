@@ -18,6 +18,8 @@ module.exports = (redisClient) => {
   // 2xx response. Read-only GET /webhooks is ignored. ────────────────────────
   router.use(idempotencyMiddleware(redisClient));
 
+
+
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 
 const authenticateWebhookCall = (req) =>
@@ -169,6 +171,17 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
   }
 }));
 
+/**
+ * @openapi
+ * /webhooks:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /webhooks
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.post('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json')) {
@@ -251,6 +264,18 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
   }
 }));
 
+
+/**
+ * @openapi
+ * /webhooks:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /webhooks
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
@@ -307,6 +332,18 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
   }
 }));
 
+
+/**
+ * @openapi
+ * /webhooks/:id:
+ *   delete:
+ *     tags:
+ *       - v1
+ *     description: DELETE /webhooks/:id
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
@@ -355,6 +392,33 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     return next(generic);
   }
 }));
+
+  router.post('/webhooks/verify-test', (req, res) => {
+    const { secret, payload } = req.body;
+    const signature = req.headers['x-webhook-signature'];
+
+    if (!secret || !payload) {
+      return res.status(400).json({ error: 'Missing secret or payload' });
+    }
+
+    const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+
+    if (signature === expectedSignature) {
+      return res.status(200).json({
+        ok: true,
+        valid: true,
+        message: 'Signature verification succeeded',
+        expectedSignature,
+      });
+    } else {
+      return res.status(401).json({
+        ok: false,
+        valid: false,
+        error: { code: 'INVALID_WEBHOOK_SIGNATURE' },
+        receivedSignature: signature,
+      });
+    }
+  });
 
   router.all('/webhooks', (req, res) => {
     if (req.method !== 'GET' && req.method !== 'POST') {

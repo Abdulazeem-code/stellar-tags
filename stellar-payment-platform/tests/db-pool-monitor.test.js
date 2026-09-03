@@ -11,6 +11,7 @@ const mockLogger = {
 // Mock the logger before the module is loaded
 jest.mock('../src/logger', () => ({
   logger: mockLogger,
+  httpLogger: (req, res, next) => next(),
 }));
 
 describe('DB Pool Monitor', () => {

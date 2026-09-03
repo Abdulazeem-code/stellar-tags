@@ -48,6 +48,7 @@ jest.mock('../src/logger', () => ({
     error: jest.fn(),
     debug: jest.fn(),
   },
+  httpLogger: (req, res, next) => next(),
 }));
 
 const { __mockServer, __mockCallFn, __mockTransactionCall } = require('@stellar/stellar-sdk');

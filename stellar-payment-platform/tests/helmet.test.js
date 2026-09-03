@@ -29,7 +29,7 @@ jest.mock('pg', () => ({
 }));
 jest.mock('../src/multisigner-verifier', () => ({}));
 jest.mock('../src/db', () => ({}));
-jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }) }));
+jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }), httpLogger: (req, res, next) => next() }));
 jest.mock('../src/metrics', () => ({ metricsMiddleware: (req, res, next) => next(), getMetrics: jest.fn(), getContentType: jest.fn(), setMetricsSources: jest.fn() }));
 jest.mock('@sentry/node', () => ({ init: jest.fn(), setupExpressErrorHandler: jest.fn() }));
 jest.mock('../src/cache', () => ({}));

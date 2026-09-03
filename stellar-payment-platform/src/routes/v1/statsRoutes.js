@@ -11,6 +11,18 @@ const { fetchAdminStats } = require('../../services/statsService');
 module.exports = (redisClient) => {
   const router = express.Router();
 
+  
+/**
+ * @openapi
+ * /stats:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /stats
+ *     responses:
+ *       200:
+ *         description: Success
+ */
   router.get('/stats', etagCache, asyncHandler(async (req, res, next) => {
     try {
       const stats = await getCachedStats(redisClient, () => fetchAdminStats(prisma, poolGet));
