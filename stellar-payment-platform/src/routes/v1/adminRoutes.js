@@ -1,25 +1,60 @@
 'use strict';
 
+/**
+ * src/routes/v1/adminRoutes.js
+ *
+ * Admin-only endpoints.  All routes require the ADMIN_API_KEY header or
+ * query parameter.
+ *
+ * Routes
+ *  POST /admin/block          – flag (soft-block) an address
+ *  GET  /admin/export         – stream transaction records as CSV or JSON
+ *  GET  /admin/stats/routing  – fetch historical payment routing statistics
+ */
 const express = require('express');
 const { invalidateFederationCache } = require('../../federationCache');
 const { invalidateStatsCache } = require('../../cache/statsCache');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { validateSchema } = require('../../middleware/validateSchema');
+const {
+  adminBlockBodySchema,
+  adminExportQuerySchema,
+  adminRoutingStatsQuerySchema,
+} = require('../../schemas');
+const { streamAdminExport } = require('../../utils/exporter');
+const { getRoutingStats } = require('../../services/statsService');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
+const {
+  parsePagination,
+  paginatedResponse,
+  parseCursorQuery,
+  paginateByKeyset,
+  cursorPaginatedResponse,
+  keysetWhereDesc
+} = require('../../pagination');
+const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
+const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
+const { PRIMARY_USERNAME_ORDER } = require('../../utils');
 
 // PAGE_SIZE for the admin export cursor-based pagination
 const EXPORT_PAGE_SIZE = 500;
 
 module.exports = (redisClient) => {
+
   const router = express.Router();
 
   // ── Intercept mutating admin requests for audit logging ───────────────────
   router.use(auditLogMiddleware);
 
+  // ── Idempotency protection for all mutating admin routes (POST/PUT/DELETE).
+  // GET endpoints (export, audit-logs) are ignored by the middleware. ────────
+  router.use(idempotencyMiddleware(redisClient));
+
   const getPrisma = () => {
     return require('../../../prismaClient').prisma;
   };
-
 
   const adminAuth = (req, res, next) => {
     const apiKey = req.headers['x-api-key'] || req.query.api_key;
@@ -124,25 +159,245 @@ module.exports = (redisClient) => {
     }
 
     try {
-      const updatedUser = await prisma.user.update({
-        where: { address },
-        data: { flaggedAt: new Date() },
+      // #613 dropped the unique index on address, so a single `update` keyed on
+      // it no longer resolves. An address can now carry several usernames and
+      // blocking it has to flag every one of them.
+      const flaggedAt = new Date();
+      const { count } = await prisma.user.updateMany({
+        where: { address, deletedAt: null },
+        data: { flaggedAt },
       });
 
-      await invalidateFederationCache(redisClient, updatedUser.address, updatedUser.username);
+      if (count === 0) {
+        return res.status(404).json({ error: 'Address not found' });
+      }
+
+      const blocked = await prisma.user.findMany({
+        where: { address, deletedAt: null },
+        orderBy: PRIMARY_USERNAME_ORDER,
+        select: { username: true },
+      });
+      const usernames = blocked.map((user) => user.username);
+
+      for (const username of usernames) {
+        await invalidateFederationCache(redisClient, address, username);
+        await recordActivity(prisma, {
+          username,
+          action: ACTIVITY_ACTIONS.USER_BLOCKED,
+          metadata: { address },
+          req,
+        });
+      }
       await invalidateStatsCache(redisClient);
 
       return res.status(200).json({
         message: 'Address successfully blocked',
-        username: updatedUser.username,
-        address: updatedUser.address,
-        flaggedAt: updatedUser.flaggedAt,
+        username: usernames[0],
+        usernames,
+        address,
+        flaggedAt,
       });
     } catch (error) {
-      if (error.code === 'P2025') {
-        return res.status(404).json({ error: 'Address not found' });
-      }
       return next(error);
+    }
+  }));
+
+  // ── Dead Letter Queue (DLQ) ────────────────────────────────────────────
+
+  /**
+   * GET /admin/dlq
+   * List dead-letter-queue entries.  Supports optional `?username=` filter,
+   * `?limit=` (default 50, max 200), and `?offset=` (default 0).
+   */
+  router.get(
+    '/admin/dlq',
+    adminAuth,
+    asyncHandler(async (req, res, next) => {
+      const prisma = getPrisma();
+      const username =
+        typeof req.query.username === 'string'
+          ? req.query.username.trim()
+          : undefined;
+      const limit = Math.min(
+        Math.max(parseInt(req.query.limit, 10) || 50, 1),
+        200,
+      );
+      const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+      try {
+        const { entries, total } = await listDLQEntries(
+          prisma,
+          async (sql, params) => {
+            // Fallback path not used in normal operation; provide empty impl
+            return [];
+          },
+          { username, limit, offset },
+        );
+
+        return res.status(200).json({
+          ok: true,
+          total,
+          limit,
+          offset,
+          entries: entries.map((e) => ({
+            id: e.id,
+            webhook_id: e.webhookId,
+            webhook_url: e.webhookUrl,
+            username: e.username,
+            event_type: e.eventType,
+            failure_reason: e.failureReason,
+            delivery_attempts: e.deliveryAttempts,
+            moved_at: (e.movedAt instanceof Date
+              ? e.movedAt
+              : new Date(e.movedAt)
+            ).toISOString(),
+            replayed: e.replayed,
+            replayed_at: e.replayedAt
+              ? (e.replayedAt instanceof Date
+                  ? e.replayedAt
+                  : new Date(e.replayedAt)
+                ).toISOString()
+              : null,
+          })),
+        });
+      } catch (error) {
+        return next(error);
+      }
+    }),
+  );
+
+  /**
+   * POST /admin/dlq/:id/replay
+   * Manually replay a dead-letter-queue entry — retries delivery once.
+   */
+  router.post(
+    '/admin/dlq/:id/replay',
+    adminAuth,
+    asyncHandler(async (req, res, next) => {
+      const prisma = getPrisma();
+      const id =
+        typeof req.params?.id === 'string' ? req.params.id.trim() : '';
+
+      if (!id) {
+        return res.status(400).json({ error: 'DLQ entry id is required in URL path.' });
+      }
+
+      try {
+        const result = await replayFromDLQ(prisma, async (sql, params) => [], id);
+
+        if (!result.ok) {
+          const status = result.error === 'DLQ entry not found' ? 404 : 409;
+          return res.status(status).json({ error: result.error });
+        }
+
+        return res.status(200).json({ ok: true, replayed: true });
+      } catch (error) {
+        return next(error);
+      }
+    }),
+  );
+
+  // ── GET /admin/stats/routing ─────────────────────────────────────────────
+
+  /**
+   * Returns historical payment routing aggregation statistics (volume, fees, counts)
+   * grouped by day, week, or month with optional date-range and asset filtering.
+   *
+   * Query parameters:
+   *  - startDate (optional) YYYY-MM-DD inclusive lower bound on createdAt
+   *  - endDate   (optional) YYYY-MM-DD inclusive upper bound on createdAt
+   *  - groupBy   (optional) 'day' (default) | 'week' | 'month'
+   *  - interval  (optional) alias for groupBy
+   *  - assetCode (optional) filter by asset code
+   */
+  router.get(
+    '/admin/stats/routing',
+    adminAuth,
+    validateSchema({ query: adminRoutingStatsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { startDate, endDate, groupBy, interval, assetCode } = req.query;
+      const prisma = getPrisma();
+
+      const stats = await getRoutingStats({
+        prisma,
+        startDate,
+        endDate,
+        groupBy: interval || groupBy || 'day',
+        assetCode,
+      });
+
+      return res.status(200).json({
+        success: true,
+        ...stats,
+      });
+    }),
+  );
+
+  // ── GET /admin/users/blocked ─────────────────────────────────────────────
+  router.get('/admin/users/blocked', adminAuth, asyncHandler(async (req, res, next) => {
+    const prisma = getPrisma();
+    const { search, cursor, page } = req.query;
+
+    const where = {
+      flaggedAt: { not: null }
+    };
+
+    if (search) {
+      where.OR = [
+        { username: { contains: search } },
+        { address: { contains: search } }
+      ];
+    }
+
+    if (cursor !== undefined || (page === undefined && cursor === undefined)) {
+      // Keyset (cursor) pagination
+      const { limit, cursor: parsedCursor, invalid } = parseCursorQuery(req.query);
+      if (invalid) {
+        return res.status(400).json({ error: 'Invalid cursor' });
+      }
+
+      if (parsedCursor) {
+        where.AND = [keysetWhereDesc(parsedCursor)];
+      }
+
+      const users = await prisma.user.findMany({
+        where,
+        take: limit + 1,
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        select: {
+          username: true,
+          address: true,
+          flaggedAt: true,
+          createdAt: true
+        }
+      });
+
+      const { rows, hasMore, nextCursor } = paginateByKeyset(users, limit);
+      return res.status(200).json(cursorPaginatedResponse(rows, { limit, nextCursor, hasMore }));
+    } else {
+      // Offset pagination
+      const { page: parsedPage, limit, skip } = parsePagination(req.query);
+      
+      const [totalCount, users] = await prisma.$transaction([
+        prisma.user.count({ where }),
+        prisma.user.findMany({
+          where,
+          skip,
+          take: limit,
+          orderBy: { createdAt: 'desc' },
+          select: {
+            username: true,
+            address: true,
+            flaggedAt: true,
+            createdAt: true
+          }
+        })
+      ]);
+      
+      return res.status(200).json(paginatedResponse(users, totalCount, { page: parsedPage, limit }));
     }
   }));
 
@@ -175,4 +430,3 @@ module.exports = (redisClient) => {
 
   return router;
 };
-

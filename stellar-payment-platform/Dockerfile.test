@@ -3,10 +3,14 @@ FROM node:20-alpine
 WORKDIR /app
 
 COPY package*.json ./
+# Before npm ci: the postinstall hook runs `prisma generate`, which fails
+# unless the schema is already present.
+COPY prisma ./prisma
 RUN npm ci --omit=dev
 
 COPY . .
 
-EXPOSE 5000
+# Matches PORT in the api-test service and its healthcheck.
+EXPOSE 5001
 
 CMD ["node", "server.js"]

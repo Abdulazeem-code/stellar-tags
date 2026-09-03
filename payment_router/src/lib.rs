@@ -1422,7 +1422,7 @@ mod test {
 
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, _)| {
-            if topics.len() < 1 {
+            if topics.is_empty() {
                 return false;
             }
             let raw = topics.get(0).unwrap();
@@ -1444,7 +1444,7 @@ mod test {
 
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, _)| {
-            if topics.len() < 1 {
+            if topics.is_empty() {
                 return false;
             }
             let raw = topics.get(0).unwrap();
@@ -1478,6 +1478,17 @@ mod test {
         // Update via set_fee_config
         client.set_fee_config(&300, &10000);
         assert_eq!(client.get_fee(), 300);
+    }
+
+    #[test]
+    fn test_version_reports_contract_version() {
+        let (_env, client, _) = setup_env();
+
+        // #269 — the version view is callable without initialization and
+        // returns the compiled-in contract version so a UI can check
+        // compatibility before interacting with the contract.
+        assert_eq!(client.version(), PaymentRouter::VERSION);
+        assert_eq!(client.version(), 1);
     }
 
     #[test]
