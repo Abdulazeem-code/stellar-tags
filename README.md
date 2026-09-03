@@ -64,6 +64,47 @@ The following diagram maps exactly how data flows between the user, Render, and 
 
 > These steps are split by module so you can run only what you need.
 
+### Docker Compose profiles
+
+Every service in `docker-compose.yml` belongs to a profile, so
+`docker compose up` on its own starts nothing and you always say which stack
+you want:
+
+| Command | Starts |
+| --- | --- |
+| `docker compose --profile dev up` | backend, postgres, redis |
+| `docker compose --profile full up` | the same, plus the built frontend on :3000 |
+| `docker compose --profile test up` | the API under test on :5001 and its own database |
+| `docker compose --profile integration up` | a local standalone Stellar network on :8000 |
+
+`dev` is the everyday one. `full` adds the frontend, which is the slowest
+thing in the file to build and is not needed for backend work.
+
+The dev and test stacks use separate databases on separate host ports (5432
+and 5433), so you can run both at once:
+
+```bash
+docker compose --profile dev --profile test up -d
+```
+
+`COMPOSE_PROFILES` works too, if you would rather not repeat the flag:
+
+```bash
+export COMPOSE_PROFILES=dev
+docker compose up -d
+```
+
+Stop a stack with the same profile you started it with, otherwise Compose
+will not know which services it is meant to remove:
+
+```bash
+docker compose --profile dev down
+```
+
+The `integration` profile pulls `stellar/quickstart`, a multi-gigabyte image
+used only by the Soroban contract tests in `tests/integration/`. It is kept
+out of `test` so the API tests do not drag it in.
+
 ### Frontend dashboard
 
 ```bash
@@ -111,7 +152,14 @@ For a typical local install that becomes, for example:
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/stellar_tags?schema=public"
 ```
 
-The quickest way to get a local database is Docker:
+The quickest way to get a local database is the dev profile, which also
+brings up Redis:
+
+```bash
+docker compose --profile dev up -d postgres redis
+```
+
+Or a single container, if you want nothing else:
 
 ```bash
 docker run --name stellar-postgres -e POSTGRES_PASSWORD=postgres \
