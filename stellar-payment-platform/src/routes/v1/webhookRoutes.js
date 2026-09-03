@@ -86,17 +86,19 @@ const authenticateWebhookCall = async (req) => {
 
   const normalizedUsername = normalizeNameTag(rawUsername).toLowerCase();
 
+  const dbUsername = normalizedUsername.split('*')[0];
+
   let userRecord = null;
   try {
     userRecord = await prisma.user.findUnique({
-      where: { username: normalizedUsername },
+      where: { username: dbUsername },
       select: { username: true, address: true },
     });
   } catch (err) {
     if (!shouldFallbackToLocalRegistry(err)) throw err;
     const localRow = await poolGet(
       'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
-      [normalizedUsername],
+      [dbUsername],
     );
     userRecord = localRow
       ? { username: localRow.username, address: localRow.address }

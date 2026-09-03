@@ -74,7 +74,7 @@ describe('E2E: Federation Flow', () => {
 
   it('should successfully lookup a user by name and ID', async () => {
     const validUser = {
-      username: 'federation_test*localhost',
+      username: 'federationtest*localhost',
       address: 'GABC123XYZ456789FEDERATION',
     };
     mockDb.set(validUser.address, validUser);

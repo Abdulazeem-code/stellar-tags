@@ -14,6 +14,7 @@ module.exports = (redisClient) => {
   router.use('/', userRoutes);
   router.use('/', federationRoutes);
   router.use('/', receiptRoutes);
+  router.use('/', webhookRoutes);
   router.use('/', historyRoutes);
   router.use('/', exportRoutes);
   router.use('/', statsRoutes(redisClient));

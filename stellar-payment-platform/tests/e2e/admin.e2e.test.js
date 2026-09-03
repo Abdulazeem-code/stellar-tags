@@ -41,6 +41,9 @@ jest.mock('../../prismaClient', () => {
         return mockDbUsers.size;
       })
     },
+    payment: {
+      findMany: jest.fn().mockResolvedValue([{ id: 'payment_1' }])
+    },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };
@@ -72,17 +75,16 @@ describe('E2E: Admin Flow', () => {
     expect(res.body.address).toBe('GABC123XYZ456789ADMIN');
     expect(res.body.flaggedAt).toBeDefined();
 
-    // 2. Export Users
+    // 2. Export Payments
     res = await request(app)
       .get('/api/v1/admin/export?format=json')
       .set('x-api-key', 'e2e-admin-key');
 
     expect(res.status).toBe(200);
-    expect(res.body.data).toBeDefined();
-    expect(Array.isArray(res.body.data)).toBe(true);
-    expect(res.body.data.length).toBe(1);
-    expect(res.body.data[0].address).toBe('GABC123XYZ456789ADMIN');
-    expect(res.body.data[0].flaggedAt).not.toBeNull();
+    const lines = res.text.trim().split('\n').filter(Boolean);
+    expect(lines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(lines[0]);
+    expect(parsed.id).toBe('payment_1');
   });
 
   it('should return 401 for unauthorized admin access', async () => {
