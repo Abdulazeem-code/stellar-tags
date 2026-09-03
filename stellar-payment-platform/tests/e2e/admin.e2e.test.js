@@ -27,12 +27,16 @@ jest.mock('../../prismaClient', () => {
         }
         return row ? { ...row } : null;
       }),
-      update: jest.fn(async ({ where, data }) => {
-        const entry = mockDbUsers.get(where.address);
-        if (!entry) throw new Error('Not found');
-        const updated = { ...entry, ...data };
-        mockDbUsers.set(where.address, updated);
-        return updated;
+      updateMany: jest.fn(async ({ where, data }) => {
+        let count = 0;
+        for (const entry of mockDbUsers.values()) {
+          if (entry.address === where.address) {
+            const updated = { ...entry, ...data };
+            mockDbUsers.set(entry.address, updated);
+            count++;
+          }
+        }
+        return { count };
       }),
       updateMany: jest.fn(async ({ where, data }) => {
         let count = 0;
@@ -51,13 +55,19 @@ jest.mock('../../prismaClient', () => {
         return mockDbUsers.size;
       })
     },
+    activityLog: {
+      create: jest.fn().mockResolvedValue({}),
+    },
+    auditLog: {
+      create: jest.fn().mockResolvedValue({}),
+    },
     payment: {
       findMany: jest.fn().mockResolvedValue([{ id: 'payment_1' }])
     },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };
-  return { prisma, isPrismaConnectionError: () => false };
+  return { prisma, isPrismaConnectionError: () => false, getPrisma: () => ({ prisma, isPrismaConnectionError: () => false, withTransaction: async (cb) => cb(prisma) }), withTransaction: async (cb) => cb(prisma) };
 });
 
 const request = require('supertest');

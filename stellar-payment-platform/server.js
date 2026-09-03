@@ -2,6 +2,8 @@ require('./config/envCheck');
 const express = require('express');
 const pinoHttp = require('pino-http');
 const cors = require('cors');
+const swaggerJsdoc = require('swagger-jsdoc');
+const swaggerUi = require('swagger-ui-express');
 const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
@@ -80,6 +82,26 @@ if (process.env.SENTRY_DSN) {
 }
 
 const app = express();
+
+const swaggerOptions = {
+  definition: {
+    openapi: '3.0.0',
+    info: {
+      title: 'Stellar Tags API',
+      version: '1.0.0',
+      description: 'API for Stellar Tags',
+    },
+    servers: [
+      {
+        url: 'http://localhost:5000',
+      },
+    ],
+  },
+  apis: ['./server.js', './src/routes/v1/*.js'],
+};
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
@@ -394,6 +416,18 @@ const registerLocalUser = async ({ username, address, isPrimary = false }) => {
 };
 
 // Expose /metrics endpoint for Prometheus to scrape
+
+/**
+ * @openapi
+ * /metrics:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /metrics
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/metrics', async (req, res) => {
   try {
     res.set('Content-Type', getContentType());
@@ -788,6 +822,18 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
 
 app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
+
+/**
+ * @openapi
+ * /lookup:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /lookup
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
@@ -898,6 +944,18 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
   }
 });
 
+
+/**
+ * @openapi
+ * /users:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /users
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);
@@ -1010,6 +1068,18 @@ app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
 
 // #497 — Expose RSA public key as a JWKS document so external services can
 // verify RS256-signed tokens without sharing a secret.
+
+/**
+ * @openapi
+ * /.well-known/jwks.json:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /.well-known/jwks.json
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/.well-known/jwks.json', (_req, res) => {
   try {
     const { getJwks } = require('./src/utils/jwt');
@@ -1025,12 +1095,36 @@ app.get('/.well-known/jwks.json', (_req, res) => {
   }
 });
 
+
+/**
+ * @openapi
+ * /.well-known/stellar.toml:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /.well-known/stellar.toml
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
   res.send(`FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`);
 });
 
+
+/**
+ * @openapi
+ * /api/v1/time:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /api/v1/time
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });

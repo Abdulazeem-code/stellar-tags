@@ -15,7 +15,19 @@ const { asyncHandler } = require('../../middleware/asyncHandler');
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
 
     try {

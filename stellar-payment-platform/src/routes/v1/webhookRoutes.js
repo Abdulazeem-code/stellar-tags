@@ -169,6 +169,18 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
   }
 }));
 
+
+/**
+ * @openapi
+ * /webhooks:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /webhooks
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.post('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json')) {
@@ -251,6 +263,18 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
   }
 }));
 
+
+/**
+ * @openapi
+ * /webhooks:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /webhooks
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
@@ -307,6 +331,18 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
   }
 }));
 
+
+/**
+ * @openapi
+ * /webhooks/:id:
+ *   delete:
+ *     tags:
+ *       - v1
+ *     description: DELETE /webhooks/:id
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {

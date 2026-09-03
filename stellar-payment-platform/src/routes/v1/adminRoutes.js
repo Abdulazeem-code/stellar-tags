@@ -53,7 +53,7 @@ module.exports = (redisClient) => {
   router.use(idempotencyMiddleware(redisClient));
 
   const getPrisma = () => {
-    return require('../../../prismaClient').prisma;
+    return require('../../../prismaClient');
   };
 
   const adminAuth = (req, res, next) => {
@@ -68,7 +68,19 @@ module.exports = (redisClient) => {
   // Streams all payment records as CSV (default) or NDJSON.
   // Supports optional startDate / endDate query params for filtering.
   // Paginates internally using cursor-based pages so memory stays bounded.
-  router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /admin/export:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/export
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     const { format = 'csv', startDate, endDate } = req.query;
 
     // Validate date range when provided
@@ -101,7 +113,7 @@ module.exports = (redisClient) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Cache-Control', 'no-store');
 
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     let skip = 0;
     let headerWritten = false;
 
@@ -150,8 +162,20 @@ module.exports = (redisClient) => {
     }
   }));
 
-  router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+  
+/**
+ * @openapi
+ * /admin/block:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /admin/block
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma, withTransaction } = getPrisma();
     const { address } = req.body;
 
     if (!address || typeof address !== 'string') {
@@ -213,7 +237,7 @@ module.exports = (redisClient) => {
     '/admin/dlq',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const username =
         typeof req.query.username === 'string'
           ? req.query.username.trim()
@@ -274,7 +298,7 @@ module.exports = (redisClient) => {
     '/admin/dlq/:id/replay',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const id =
         typeof req.params?.id === 'string' ? req.params.id.trim() : '';
 
@@ -316,7 +340,7 @@ module.exports = (redisClient) => {
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
 
       const stats = await getRoutingStats({
         prisma,
@@ -335,7 +359,7 @@ module.exports = (redisClient) => {
 
   // ── GET /admin/users/blocked ─────────────────────────────────────────────
   router.get('/admin/users/blocked', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     const { search, cursor, page } = req.query;
 
     const where = {
@@ -409,11 +433,23 @@ module.exports = (redisClient) => {
    * Query parameters:
    *  - limit (optional) integer between 1 and 100, default 50
    */
-  router.get(
+  
+/**
+ * @openapi
+ * /admin/audit-logs:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/audit-logs
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get(
     '/admin/audit-logs',
     adminAuth,
     asyncHandler(async (req, res) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
       const logs = await prisma.auditLog.findMany({
         take: limit,

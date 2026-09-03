@@ -71,10 +71,21 @@ try {
       findUnique: async () => null,
       count: async () => 0,
     },
-    $transaction: async (queries) => Promise.all(queries),
+    $transaction: async (arg) => {
+      if (typeof arg === 'function') {
+        return arg(prisma);
+      }
+      return Promise.all(arg);
+    },
     $queryRaw: async () => [],
   };
 }
+
+const withTransaction = async (callback) => {
+  return await prisma.$transaction(async (tx) => {
+    return await callback(tx);
+  });
+};
 
 /**
  * Returns true when the error (or its direct Error.cause) is a Prisma
@@ -89,4 +100,4 @@ function isPrismaConnectionError(error) {
   return causeCode.startsWith('P10');
 }
 
-module.exports = { prisma, isPrismaConnectionError };
+module.exports = { prisma, isPrismaConnectionError, withTransaction };

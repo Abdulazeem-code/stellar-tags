@@ -70,6 +70,9 @@ jest.mock('../../prismaClient', () => {
         return count;
       }),
     },
+    activityLog: {
+      create: jest.fn().mockResolvedValue({}),
+    },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };

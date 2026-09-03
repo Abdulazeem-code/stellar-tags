@@ -1,7 +1,7 @@
 const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
-const { prisma } = require('../../../prismaClient');
+const { prisma, withTransaction } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { poolGet, poolRun, poolAll, etagCache } = require('../../db');
 const { logger } = require('../../logger');
@@ -126,6 +126,18 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
+
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /register
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
@@ -220,8 +232,6 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
         ...(memoType && { memoType, memo }),
       },
     });
-    // Invalidate any stale federation cache entries for this username/address
-    invalidateFederationCache(normalizedUsername, address);
 
     await recordActivity(prisma, {
       username: normalizedUsername,
@@ -310,6 +320,18 @@ router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWE
 
 // #18 — Soft-delete endpoint. Sets deleted_at to now() instead of running a
 // hard DELETE so the row is preserved for historical auditing.
+
+/**
+ * @openapi
+ * /register/:username:
+ *   delete:
+ *     tags:
+ *       - v1
+ *     description: DELETE /register/:username
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   const username = normalizeNameTag(
     typeof req.params.username === 'string' ? req.params.username.trim() : '',
@@ -332,13 +354,15 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
       return next(notFoundError);
     }
 
-    await prisma.user.update({
-      where: { username },
-      data: { deletedAt: new Date() },
+    await withTransaction(async (tx) => {
+      await tx.user.update({
+        where: { username },
+        data: { deletedAt: new Date() },
+      });
+      
+      // Invalidate any stale federation cache entries
+      invalidateFederationCache(username, existing.address);
     });
-    
-    // Invalidate any stale federation cache entries
-    invalidateFederationCache(username, existing.address);
 
     await recordActivity(prisma, {
       username,
