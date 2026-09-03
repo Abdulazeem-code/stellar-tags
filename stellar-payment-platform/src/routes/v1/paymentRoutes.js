@@ -11,6 +11,8 @@ const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 
 module.exports = (redisClient) => {
   const router = express.Router();
+  
+  router.use(idempotencyMiddleware(redisClient));
 
 // POST /payments/bulk
 
