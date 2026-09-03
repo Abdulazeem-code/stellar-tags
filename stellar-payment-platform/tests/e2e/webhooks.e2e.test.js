@@ -80,7 +80,7 @@ describe('E2E: Webhooks Flow', () => {
     
     // Set up a user for the webhooks
     mockDbUsers.set('GABC123XYZ456789WEBHOOK', {
-      username: 'webhook_test_user',
+      username: 'webhook_test_user*localhost',
       address: 'GABC123XYZ456789WEBHOOK',
     });
   });

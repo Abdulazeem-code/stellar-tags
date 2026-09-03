@@ -62,6 +62,13 @@ jest.mock('../../prismaClient', () => {
         mockDb.set(data.address, row);
         return row;
       }),
+      count: jest.fn(async ({ where }) => {
+        let count = 0;
+        for (const entry of mockDb.values()) {
+          if (where.address && entry.address === where.address) count++;
+        }
+        return count;
+      }),
     },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
