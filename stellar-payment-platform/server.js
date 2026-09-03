@@ -2,6 +2,8 @@ require('./config/envCheck');
 const express = require('express');
 const pinoHttp = require('pino-http');
 const cors = require('cors');
+const swaggerJsdoc = require('swagger-jsdoc');
+const swaggerUi = require('swagger-ui-express');
 const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
