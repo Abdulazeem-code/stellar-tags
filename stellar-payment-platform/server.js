@@ -1,3 +1,4 @@
+require('./src/utils/tracing');
 require('./config/envCheck');
 const express = require('express');
 const pinoHttp = require('pino-http');

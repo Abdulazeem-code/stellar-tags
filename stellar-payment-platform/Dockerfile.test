@@ -6,7 +6,7 @@ COPY package*.json ./
 # Before npm ci: the postinstall hook runs `prisma generate`, which fails
 # unless the schema is already present.
 COPY prisma ./prisma
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 COPY . .
 
