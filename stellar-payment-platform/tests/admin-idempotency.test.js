@@ -3,11 +3,12 @@
 const express = require('express');
 const request = require('supertest');
 
-const mockUserUpdate = jest.fn();
+const mockUserUpdateMany = jest.fn();
+const mockUserFindMany = jest.fn();
 
 jest.mock('../prismaClient', () => ({
   prisma: {
-    user: { update: mockUserUpdate },
+    user: { updateMany: mockUserUpdateMany, findMany: mockUserFindMany },
   },
   isPrismaConnectionError: () => false,
 }));
@@ -21,11 +22,8 @@ const buildAdminRouter = require('../src/routes/v1/adminRoutes');
 describe('admin block idempotency', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockUserUpdate.mockResolvedValue({
-      address: 'GABC',
-      username: 'alice*stellar',
-      flaggedAt: new Date(),
-    });
+    mockUserUpdateMany.mockResolvedValue({ count: 1 });
+    mockUserFindMany.mockResolvedValue([{ username: 'alice*stellar' }]);
   });
 
   const buildApp = () => {
@@ -54,7 +52,7 @@ describe('admin block idempotency', () => {
     expect(second.status).toBe(200);
     expect(second.headers['x-idempotent-replay']).toBe('true');
     // Handler must only run once; the duplicate is served from cache.
-    expect(mockUserUpdate).toHaveBeenCalledTimes(1);
+    expect(mockUserUpdateMany).toHaveBeenCalledTimes(1);
   });
 
   test('distinct keys run the handler again', async () => {
@@ -71,7 +69,7 @@ describe('admin block idempotency', () => {
       .set(IDEMPOTENCY_HEADER, 'block-key-b')
       .send({ address: 'GABC' });
 
-    expect(mockUserUpdate).toHaveBeenCalledTimes(2);
+    expect(mockUserUpdateMany).toHaveBeenCalledTimes(2);
   });
 
   test('ignores idempotency key on read-only admin GET endpoints', async () => {

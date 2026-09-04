@@ -14,7 +14,19 @@ const { resolveFederationId, resolveFederationName } = require('../../services/f
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
+
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
 
     try {
@@ -53,6 +65,7 @@ module.exports = (redisClient) => {
         );
       }
     } catch (error) {
+      console.log("FEDERATION LOOKUP ERROR:", error);
       if (error.statusCode === 403) {
         return next(error);
       }

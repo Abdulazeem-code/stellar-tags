@@ -35,6 +35,8 @@ const {
   keysetWhereDesc
 } = require('../../pagination');
 const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
+const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
+const { PRIMARY_USERNAME_ORDER } = require('../../utils');
 
 // PAGE_SIZE for the admin export cursor-based pagination
 const EXPORT_PAGE_SIZE = 500;
@@ -51,7 +53,7 @@ module.exports = (redisClient) => {
   router.use(idempotencyMiddleware(redisClient));
 
   const getPrisma = () => {
-    return require('../../../prismaClient').prisma;
+    return require('../../../prismaClient');
   };
 
   const adminAuth = (req, res, next) => {
@@ -66,7 +68,19 @@ module.exports = (redisClient) => {
   // Streams all payment records as CSV (default) or NDJSON.
   // Supports optional startDate / endDate query params for filtering.
   // Paginates internally using cursor-based pages so memory stays bounded.
-  router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /admin/export:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/export
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     const { format = 'csv', startDate, endDate } = req.query;
 
     // Validate date range when provided
@@ -99,7 +113,7 @@ module.exports = (redisClient) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Cache-Control', 'no-store');
 
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     let skip = 0;
     let headerWritten = false;
 
@@ -148,8 +162,20 @@ module.exports = (redisClient) => {
     }
   }));
 
-  router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+  
+/**
+ * @openapi
+ * /admin/block:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /admin/block
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma, withTransaction } = getPrisma();
     const { address } = req.body;
 
     if (!address || typeof address !== 'string') {
@@ -157,24 +183,45 @@ module.exports = (redisClient) => {
     }
 
     try {
-      const updatedUser = await prisma.user.update({
-        where: { address },
-        data: { flaggedAt: new Date() },
+      // #613 dropped the unique index on address, so a single `update` keyed on
+      // it no longer resolves. An address can now carry several usernames and
+      // blocking it has to flag every one of them.
+      const flaggedAt = new Date();
+      const { count } = await prisma.user.updateMany({
+        where: { address, deletedAt: null },
+        data: { flaggedAt },
       });
 
-      await invalidateFederationCache(redisClient, updatedUser.address, updatedUser.username);
+      if (count === 0) {
+        return res.status(404).json({ error: 'Address not found' });
+      }
+
+      const blocked = await prisma.user.findMany({
+        where: { address, deletedAt: null },
+        orderBy: PRIMARY_USERNAME_ORDER,
+        select: { username: true },
+      });
+      const usernames = blocked.map((user) => user.username);
+
+      for (const username of usernames) {
+        await invalidateFederationCache(redisClient, address, username);
+        await recordActivity(prisma, {
+          username,
+          action: ACTIVITY_ACTIONS.USER_BLOCKED,
+          metadata: { address },
+          req,
+        });
+      }
       await invalidateStatsCache(redisClient);
 
       return res.status(200).json({
         message: 'Address successfully blocked',
-        username: updatedUser.username,
-        address: updatedUser.address,
-        flaggedAt: updatedUser.flaggedAt,
+        username: usernames[0],
+        usernames,
+        address,
+        flaggedAt,
       });
     } catch (error) {
-      if (error.code === 'P2025') {
-        return res.status(404).json({ error: 'Address not found' });
-      }
       return next(error);
     }
   }));
@@ -190,7 +237,7 @@ module.exports = (redisClient) => {
     '/admin/dlq',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const username =
         typeof req.query.username === 'string'
           ? req.query.username.trim()
@@ -251,7 +298,7 @@ module.exports = (redisClient) => {
     '/admin/dlq/:id/replay',
     adminAuth,
     asyncHandler(async (req, res, next) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const id =
         typeof req.params?.id === 'string' ? req.params.id.trim() : '';
 
@@ -293,7 +340,7 @@ module.exports = (redisClient) => {
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
 
       const stats = await getRoutingStats({
         prisma,
@@ -312,7 +359,7 @@ module.exports = (redisClient) => {
 
   // ── GET /admin/users/blocked ─────────────────────────────────────────────
   router.get('/admin/users/blocked', adminAuth, asyncHandler(async (req, res, next) => {
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     const { search, cursor, page } = req.query;
 
     const where = {
@@ -386,11 +433,23 @@ module.exports = (redisClient) => {
    * Query parameters:
    *  - limit (optional) integer between 1 and 100, default 50
    */
-  router.get(
+  
+/**
+ * @openapi
+ * /admin/audit-logs:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/audit-logs
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get(
     '/admin/audit-logs',
     adminAuth,
     asyncHandler(async (req, res) => {
-      const prisma = getPrisma();
+      const { prisma } = getPrisma();
       const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
       const logs = await prisma.auditLog.findMany({
         take: limit,

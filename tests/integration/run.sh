@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # End-to-end integration test for the payment_router Soroban contract
-# against a local standalone Stellar network (docker-compose.test.yml).
+# against a local standalone Stellar network (the integration profile in
+# docker-compose.yml).
 #
 # Verifies:
 #   1. The contract can be deployed to the local network.
@@ -10,7 +11,7 @@
 #      fee and crediting the recipient, as observed through local Horizon.
 #
 # Prerequisites:
-#   - docker compose -f docker-compose.test.yml up -d stellar-standalone
+#   - docker compose --profile integration up -d stellar-standalone
 #   - soroban CLI installed
 #   - rustup target add wasm32-unknown-unknown
 #

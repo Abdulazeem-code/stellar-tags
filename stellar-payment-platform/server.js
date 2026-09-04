@@ -1,6 +1,10 @@
+require('./src/utils/tracing');
 require('./config/envCheck');
 const express = require('express');
+const pinoHttp = require('pino-http');
 const cors = require('cors');
+const swaggerJsdoc = require('swagger-jsdoc');
+const swaggerUi = require('swagger-ui-express');
 const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
@@ -17,8 +21,9 @@ const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
 const { poolGet, poolRun, poolAll } = require('./src/db');
-const { logger } = require('./src/logger');
-const pinoHttp = require('pino-http');
+const { logger, httpLogger } = require('./src/logger');
+const xss = require('xss');
+const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const {
   metricsMiddleware,
   getMetrics,
@@ -34,8 +39,10 @@ const { apiVersion } = require('./src/middleware/apiVersion');
 const { deprecationMiddleware } = require('./src/middleware/deprecation');
 const Sentry = require('@sentry/node');
 const {
+
   validateMemo,
 } = require('./src/utils');
+const { getCachedApprovedOrigins } = require('./src/originCache');
 
 dotenv.config();
 
@@ -46,6 +53,26 @@ if (process.env.SENTRY_DSN) {
 }
 
 const app = express();
+
+const swaggerOptions = {
+  definition: {
+    openapi: '3.0.0',
+    info: {
+      title: 'Stellar Tags API',
+      version: '1.0.0',
+      description: 'API for Stellar Tags',
+    },
+    servers: [
+      {
+        url: 'http://localhost:5000',
+      },
+    ],
+  },
+  apis: ['./server.js', './src/routes/v1/*.js'],
+};
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
@@ -81,9 +108,19 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 const corsOptions = {
-  origin: (origin, callback) => {
+  origin: async (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
+    }
+    try {
+      const approvedOrigins = await getCachedApprovedOrigins(redisClient, () =>
+        prisma.approvedOrigin.findMany({ select: { origin: true } }).then((rows) => rows.map((row) => row.origin))
+      );
+      if (approvedOrigins && approvedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+    } catch (err) {
+      logger.error(err, 'Failed to validate CORS origin against approved origins');
     }
     return callback(new Error('Not allowed by CORS'));
   },
@@ -350,6 +387,18 @@ const registerLocalUser = async ({ username, address, isPrimary = false }) => {
 };
 
 // Expose /metrics endpoint for Prometheus to scrape
+
+/**
+ * @openapi
+ * /metrics:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /metrics
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/metrics', async (req, res) => {
   try {
     res.set('Content-Type', getContentType());
@@ -361,6 +410,18 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
+
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
   const { q: queryValue, type } = req.query;
 
@@ -545,6 +606,18 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
+
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /register
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   // registerBodySchema has already guaranteed that username is a trimmed
   // 3-20 character alphanumeric string and address is a non-empty trimmed
@@ -693,6 +766,13 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
       await registerLocalUser({ username: normalizedUsername, address, isPrimary });
     }
 
+    await recordActivity(prisma, {
+      username: normalizedUsername,
+      action: ACTIVITY_ACTIONS.USER_REGISTERED,
+      metadata: { address, is_primary: isPrimary, ...(memoType && { memo_type: memoType }) },
+      req,
+    });
+
     return res.status(201).json({
       ok: true,
       username: normalizedUsername,
@@ -777,6 +857,18 @@ app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
 
 // #497 — Expose RSA public key as a JWKS document so external services can
 // verify RS256-signed tokens without sharing a secret.
+
+/**
+ * @openapi
+ * /.well-known/jwks.json:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /.well-known/jwks.json
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/.well-known/jwks.json', (_req, res) => {
   try {
     const { getJwks } = require('./src/utils/jwt');
@@ -792,12 +884,36 @@ app.get('/.well-known/jwks.json', (_req, res) => {
   }
 });
 
+
+/**
+ * @openapi
+ * /.well-known/stellar.toml:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /.well-known/stellar.toml
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
   res.send(`FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`);
 });
 
+
+/**
+ * @openapi
+ * /api/v1/time:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /api/v1/time
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });

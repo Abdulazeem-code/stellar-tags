@@ -64,6 +64,47 @@ The following diagram maps exactly how data flows between the user, Render, and 
 
 > These steps are split by module so you can run only what you need.
 
+### Docker Compose profiles
+
+Every service in `docker-compose.yml` belongs to a profile, so
+`docker compose up` on its own starts nothing and you always say which stack
+you want:
+
+| Command | Starts |
+| --- | --- |
+| `docker compose --profile dev up` | backend, postgres, redis |
+| `docker compose --profile full up` | the same, plus the built frontend on :3000 |
+| `docker compose --profile test up` | the API under test on :5001 and its own database |
+| `docker compose --profile integration up` | a local standalone Stellar network on :8000 |
+
+`dev` is the everyday one. `full` adds the frontend, which is the slowest
+thing in the file to build and is not needed for backend work.
+
+The dev and test stacks use separate databases on separate host ports (5432
+and 5433), so you can run both at once:
+
+```bash
+docker compose --profile dev --profile test up -d
+```
+
+`COMPOSE_PROFILES` works too, if you would rather not repeat the flag:
+
+```bash
+export COMPOSE_PROFILES=dev
+docker compose up -d
+```
+
+Stop a stack with the same profile you started it with, otherwise Compose
+will not know which services it is meant to remove:
+
+```bash
+docker compose --profile dev down
+```
+
+The `integration` profile pulls `stellar/quickstart`, a multi-gigabyte image
+used only by the Soroban contract tests in `tests/integration/`. It is kept
+out of `test` so the API tests do not drag it in.
+
 ### Frontend dashboard
 
 ```bash
@@ -89,7 +130,10 @@ cp .env.example .env
 # 2. Apply the schema to your database
 npm run prisma:migrate
 
-# 3. Start the server
+# 3. Fill the database with test data
+npm run db:seed
+
+# 4. Start the server
 npm run dev
 ```
 
@@ -108,7 +152,14 @@ For a typical local install that becomes, for example:
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/stellar_tags?schema=public"
 ```
 
-The quickest way to get a local database is Docker:
+The quickest way to get a local database is the dev profile, which also
+brings up Redis:
+
+```bash
+docker compose --profile dev up -d postgres redis
+```
+
+Or a single container, if you want nothing else:
 
 ```bash
 docker run --name stellar-postgres -e POSTGRES_PASSWORD=postgres \
@@ -123,9 +174,36 @@ Useful Prisma commands (run from `stellar-payment-platform/`):
 | `npm run prisma:deploy` | Apply existing migrations (CI / production) |
 | `npm run prisma:generate` | Regenerate the Prisma Client after schema changes |
 | `npm run prisma:studio` | Open Prisma Studio to browse the data |
+| `npm run db:seed` | Populate the database with test data (see below) |
 
 > `.env` is gitignored — never commit real credentials. Each contributor keeps
 > their own local `DATABASE_URL`.
+
+#### Seed data
+
+`npm run db:seed` populates an empty database with 50 users, 10 webhooks,
+20 payment intents and 2 API keys, so the API has something to answer with
+before you have registered anything by hand. `prisma migrate reset` runs it
+automatically.
+
+The data covers the cases the endpoints branch on: usernames with every memo
+type, several addresses carrying aliases alongside their primary username,
+flagged and soft-deleted users, webhooks that are healthy, never delivered,
+and failing on both sides of the retry cutoff, and payment intents in each
+status.
+
+Re-running is safe. Every record is upserted on its natural key and the
+identities are derived from a fixed seed, so a second run updates the same
+rows rather than adding a set. Pass `--reset` to delete the seeded rows first:
+
+```bash
+npm run db:seed -- --reset
+```
+
+Both API keys are printed on each run, since only their hashes are stored.
+Use the active one as `X-Api-Key`; the revoked one is there to exercise the
+rejection path. The script refuses to run against a non-local `DATABASE_URL`
+unless `SEED_ALLOW_REMOTE=1` is set.
 
 ### Render deployment
 
@@ -335,6 +413,42 @@ several usernames, the primary one is returned.
   - `400 Bad Request`: Missing `address` parameter.
   - `404 Not Found`: Username not found for this address.
   - `500 Internal Server Error`: Database lookup failed.
+
+### `GET /users/:username/activity`
+Returns the caller's own activity trail: registrations, transfers,
+unregistrations, webhook creation and deletion, and blocks applied to their
+address.
+
+Ownership is proven the same way the webhook endpoints prove it. Sign the
+message `activity:<username>` with the account key and send the base64
+signature:
+
+```bash
+curl "http://localhost:5000/users/ada*localhost/activity?limit=20" \
+  -H "X-Stellar-Signature: <base64 signature>" \
+  -H "X-Stellar-Signer: <G... public key>"
+```
+
+The signature may also be sent in the request body as `signature` /
+`signerAddress`, matching `GET /webhooks`.
+
+- **Query Parameters:**
+  - `page` (optional) - 1-based page number, default 1.
+  - `limit` (optional) - rows per page, default 10, capped at 100.
+  - `startDate` / `endDate` (optional) - inclusive bounds on `created_at`.
+- **Returns:** `{ data, meta: { total, page, limit, totalPages } }`, newest
+  first. Each row carries `id`, `action`, `metadata`, `ip_address` and
+  `created_at`.
+- **Status Codes:**
+  - `200 OK`: Trail returned.
+  - `400 Bad Request`: Missing signature, or an unparseable/inverted date range.
+  - `401 Unauthorized`: The signature does not belong to the account behind the
+    username.
+  - `404 Not Found`: Username not registered.
+
+Actions are namespaced: `user.registered`, `user.unregistered`,
+`user.transferred`, `user.blocked`, `webhook.created`, `webhook.deleted`. Rows
+are removed with the user, so a purge does not leave a trail behind.
 
 ### `GET /health`
 Aggregates the status of every external dependency: PostgreSQL (a `SELECT 1`

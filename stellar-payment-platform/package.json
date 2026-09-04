@@ -22,14 +22,24 @@
     "contract:upgrade": "node ../scripts/deploy.js upgrade"
   },
   "jest": {
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "setupFiles": ["./jest.setup.js"]
+  },
+  "prisma": {
+    "seed": "node scripts/seed.js"
   },
   "dependencies": {
     "@faker-js/faker": "^10.5.0",
+    "@opentelemetry/api": "^1.8.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.47.1",
+    "@opentelemetry/exporter-zipkin": "^1.25.0",
+    "@opentelemetry/sdk-node": "^0.52.1",
     "@prisma/client": "^6.19.3",
+    "@prisma/instrumentation": "^6.19.3",
     "@sentry/node": "^10.68.0",
     "@stellar/stellar-sdk": "^16.0.1",
     "bad-words": "^3.0.4",
+    "bullmq": "^5.58.5",
     "compression": "^1.8.1",
     "connect-timeout": "^1.9.1",
     "cors": "^2.8.5",
@@ -37,8 +47,9 @@
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.3.0",
-    "json2csv": "5.0.7",
-    "jsonwebtoken": "9.0.2",
+    "ioredis": "^5.7.0",
+    "json2csv": "^5.0.7",
+    "jsonwebtoken": "^9.0.2",
     "node-cache": "^5.1.2",
     "node-cron": "4.5.0",
     "opossum": "^10.0.0",
@@ -53,7 +64,9 @@
     "redis": "^4.7.0",
     "uuid": "^9.0.1",
     "xss": "^1.0.15",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.0"
   },
   "devDependencies": {
     "@babel/core": "^7.23.0",
