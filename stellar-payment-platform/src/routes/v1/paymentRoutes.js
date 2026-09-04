@@ -7,11 +7,31 @@ const { asyncHandler } = require('../../middleware/asyncHandler');
 const { paymentIntentSchema, bulkPaymentSchema } = require('../../schemas/paymentSchema');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { logger } = require('../../logger');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 
-const router = express.Router();
+module.exports = (redisClient) => {
+  const router = express.Router();
+  
+  router.use(idempotencyMiddleware(redisClient));
 
-// POST /payments/bulk
-router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSchema }), asyncHandler(async (req, res, next) => {
+  // ── Idempotency protection for payment intent creation (POST /payments/bulk).
+  // Duplicate submissions within 24h return the originally created intents. ──
+  router.use(idempotencyMiddleware(redisClient));
+
+  // POST /payments/bulk
+
+/**
+ * @openapi
+ * /payments/bulk:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /payments/bulk
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+  router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSchema }), asyncHandler(async (req, res, next) => {
   const intents = req.body;
 
   // Additional per-item validation that requires runtime logic
@@ -54,4 +74,5 @@ router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSch
   }
 }));
 
-module.exports = router;
+  return router;
+};

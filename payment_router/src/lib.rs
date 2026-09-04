@@ -82,19 +82,33 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
 // it directly continue to compile.  All runtime code now uses the packed
 // BytesN<24> representation stored under DataKey::UserSpending.
 
+/// A user's rolling 24-hour spending record.
+///
+/// Retained purely so existing test snapshots that reference this type by
+/// name keep compiling. Live contract state is stored as a packed
+/// `BytesN<24>` (see `pack_spending` / `unpack_spending`); this struct is not
+/// read from or written to storage at runtime.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserSpending {
+    /// Unix timestamp (seconds) at which the 24-hour window last reset.
     pub last_reset_time: u64,
+    /// Total amount routed by the user since `last_reset_time`.
     pub accumulated_amount: i128,
 }
 
+/// A single transfer instruction for use with [`PaymentRouter::route_payments`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Payment {
+    /// Address the funds are debited from. Must authorize the call.
     pub sender: Address,
+    /// Address the funds (minus the platform fee) are credited to.
     pub recipient: Address,
+    /// Contract ID of the token (or Stellar Asset Contract) being transferred.
     pub token_address: Address,
+    /// Amount to route, denominated in the token's smallest unit. Must be
+    /// positive and within the contract's configured min/max bounds.
     pub amount: i128,
 }
 
@@ -146,20 +160,34 @@ pub struct TimelockEntry {
     pub action: ActionType,
 }
 
+/// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// The current admin address.
     Admin,
+    /// Governance contract address; if set, it takes over fee-authority from the admin.
     Governance,
+    /// Address that receives collected platform fees.
     PlatformTreasury,
+    /// Platform fee rate, in basis points (1/100th of a percent).
     FeeBps,
+    /// Upper bound on the fee taken from a single payment.
     FeeCap,
+    /// Minimum amount accepted by `route_payment` / `route_payments`, if set.
     MinLimit,
+    /// Whether routing is currently paused.
     Paused,
+    /// Maximum amount accepted by a single payment.
     MaxAmount,
+    /// Cumulative lifetime amount routed by a given sender.
     UserVolume(Address),
+    /// Packed 24-hour spending window for a given sender.
     UserSpending(Address),
+    /// Whether a given recipient address is blacklisted.
     Blacklist(Address),
+    /// Internal refund balance for a (user, token) pair, credited when a
+    /// direct transfer to the recipient fails.
     RefundBalance(Address, Address),
     /// Monotonically-increasing nonce counter used to generate unique IDs for
     /// timelock entries.  Stored as `u64` in instance storage.
@@ -188,7 +216,9 @@ pub enum Error {
     AlreadyInitialized = 4,
     /// An admin-configured value (treasury, fee, admin) was read before `initialize`.
     NotInitialized = 5,
+    /// The contract is currently paused; routing calls are rejected until unpaused.
     Paused = 6,
+    /// A fee configuration value (basis points or cap) is out of the allowed range.
     InvalidFeeRate = 7,
     /// Sender and recipient addresses are the same (self-routing not allowed).
     InvalidRecipient = 8,
@@ -208,6 +238,9 @@ pub enum Error {
     ContractFrozen = 14,
 }
 
+/// Soroban contract that routes token payments between addresses while
+/// collecting a configurable platform fee, enforcing per-user daily spending
+/// limits, and supporting an admin-managed blacklist and pause switch.
 #[contract]
 pub struct PaymentRouter;
 
@@ -319,9 +352,7 @@ impl PaymentRouter {
             .get(&DataKey::TimelockNonce)
             .unwrap_or(0u64);
         let next = current + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::TimelockNonce, &next);
+        env.storage().instance().set(&DataKey::TimelockNonce, &next);
         next
     }
 
@@ -485,6 +516,22 @@ impl PaymentRouter {
 
     /// One-time setup: records the admin and the initial fee configuration
     /// in instance storage. Must be called before `route_payment`.
+    ///
+    /// # Parameters
+    /// - `admin`: Address granted admin rights over the contract; must
+    ///   authorize this call.
+    /// - `platform_treasury`: Address that receives collected platform fees.
+    /// - `fee_bps`: Platform fee rate, in basis points.
+    /// - `fee_cap`: Maximum fee (in the token's smallest unit) taken from a
+    ///   single payment.
+    /// - `max_amount`: Maximum amount accepted by a single payment.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::AlreadyInitialized)` if the
+    /// contract already has an admin set.
+    ///
+    /// # Panics
+    /// Panics if `admin` does not authorize the call.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -509,9 +556,7 @@ impl PaymentRouter {
             .set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Frozen, &false);
-        env.storage()
-            .instance()
-            .set(&DataKey::TimelockNonce, &0u64);
+        env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -548,7 +593,10 @@ impl PaymentRouter {
         let nonce = Self::next_nonce(&env);
         let queued_at = env.ledger().timestamp();
 
-        let entry = TimelockEntry { queued_at, action: action.clone() };
+        let entry = TimelockEntry {
+            queued_at,
+            action: action.clone(),
+        };
 
         let key = DataKey::TimelockEntry(nonce);
         env.storage().persistent().set(&key, &entry);
@@ -626,17 +674,13 @@ impl PaymentRouter {
                 env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
             }
             ActionType::SetFeeBps(new_fee_bps) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::FeeBps, &new_fee_bps);
+                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
             }
             ActionType::SetGovernance(gov) => {
                 env.storage().instance().set(&DataKey::Governance, &gov);
             }
             ActionType::SetMinLimit(min_limit) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::MinLimit, &min_limit);
+                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
             }
             ActionType::TransferAdmin(new_admin) => {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -651,10 +695,8 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "action_executed"), admin),
-            nonce,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
 
         log!(&env, "Timelock action executed for nonce {}", nonce);
         Ok(())
@@ -678,10 +720,8 @@ impl PaymentRouter {
 
         env.storage().persistent().remove(&key);
 
-        env.events().publish(
-            (Symbol::new(&env, "action_cancelled"), admin),
-            nonce,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "action_cancelled"), admin), nonce);
 
         log!(&env, "Timelock action cancelled for nonce {}", nonce);
         Ok(())
@@ -762,6 +802,18 @@ impl PaymentRouter {
 
     /// Updates the treasury address that receives the platform fee.
     ///
+    /// Updates the treasury address that receives the platform fee. Admin-only.
+    ///
+    /// # Parameters
+    /// - `new_treasury`: Address to receive platform fees going forward.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetPlatformTreasury(…))`
     /// and execute after 24 hours.  This direct path is retained for tooling
     /// compatibility only.
@@ -782,6 +834,17 @@ impl PaymentRouter {
     /// Updates the fee basis points and fee cap.
     /// Requires governance authority if a governance address is set; otherwise admin-only.
     ///
+    /// # Parameters
+    /// - `fee_bps`: New platform fee rate, in basis points.
+    /// - `fee_cap`: New maximum fee taken from a single payment.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the caller does not authorize the call.
+    ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
     pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
         Self::require_fee_authority(&env)?;
@@ -797,6 +860,16 @@ impl PaymentRouter {
 
     /// Alias for `set_fee_config_legacy`. Admin-only.
     ///
+    /// # Parameters
+    /// - `fee_bps`: New platform fee rate, in basis points.
+    /// - `fee_cap`: New maximum fee taken from a single payment.
+    ///
+    /// # Returns
+    /// See `set_fee_config_legacy`.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
     pub fn set_fee_config(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
         Self::set_fee_config_legacy(env, fee_bps, fee_cap)
@@ -804,6 +877,16 @@ impl PaymentRouter {
 
     /// Updates the fee basis points.
     /// Requires governance authority if a governance address is set; otherwise admin-only.
+    ///
+    /// # Parameters
+    /// - `new_fee_bps`: New platform fee rate, in basis points.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the caller does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeBps(…))`.
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
@@ -834,6 +917,17 @@ impl PaymentRouter {
 
     /// Sets the minimum allowed routing amount. Admin-only.
     ///
+    /// # Parameters
+    /// - `min_limit`: Smallest `amount` that `route_payment` /
+    ///   `route_payments` will accept going forward.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
     pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
@@ -848,11 +942,30 @@ impl PaymentRouter {
     }
 
     /// Returns the current protocol fee percentage in basis points.
+    ///
+    /// # Returns
+    /// The configured `fee_bps`, or `0` if the contract has not been
+    /// initialized.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn get_fee(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
     /// Pauses or unpauses the payment router. Admin-only.
+    ///
+    /// # Parameters
+    /// - `paused`: `true` to reject `route_payment` / `route_payments`
+    ///   calls, `false` to allow them again.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    ///
     /// This is NOT timelocked — operational pausing must remain instant.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
@@ -870,11 +983,26 @@ impl PaymentRouter {
     }
 
     /// Alias for `set_pause`. Admin-only.
+    ///
+    /// # Parameters
+    /// - `paused`: `true` to reject routing calls, `false` to allow them.
+    ///
+    /// # Returns
+    /// See `set_pause`.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         Self::set_pause(env, paused)
     }
 
     /// Returns whether the contract is currently paused.
+    ///
+    /// # Returns
+    /// `true` if paused, `false` if unpaused or not yet initialized.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -883,6 +1011,16 @@ impl PaymentRouter {
     }
 
     /// Returns the cumulative amount a given sender has routed through the contract.
+    ///
+    /// # Parameters
+    /// - `user`: Sender address to look up.
+    ///
+    /// # Returns
+    /// The lifetime routed volume for `user`, or `0` if they have never
+    /// routed a payment.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn get_user_volume(env: Env, user: Address) -> i128 {
         env.storage()
             .persistent()
@@ -891,6 +1029,17 @@ impl PaymentRouter {
     }
 
     /// Adds an address to the blacklist. Admin-only.
+    ///
+    /// # Parameters
+    /// - `address`: Address to blacklist; subsequent payments to it as a
+    ///   recipient will be rejected.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
     pub fn blacklist_address(env: Env, address: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -908,6 +1057,16 @@ impl PaymentRouter {
     }
 
     /// Removes an address from the blacklist. Admin-only.
+    ///
+    /// # Parameters
+    /// - `address`: Address to remove from the blacklist.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
     pub fn unblacklist_address(env: Env, address: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -920,6 +1079,15 @@ impl PaymentRouter {
     }
 
     /// Returns whether an address is blacklisted.
+    ///
+    /// # Parameters
+    /// - `address`: Address to check.
+    ///
+    /// # Returns
+    /// `true` if `address` is blacklisted, `false` otherwise.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn is_blacklisted(env: Env, address: Address) -> bool {
         env.storage()
             .persistent()
@@ -929,6 +1097,16 @@ impl PaymentRouter {
 
     /// Returns the effective fee_bps for a sender after applying any
     /// volume-based tiered discount.
+    ///
+    /// # Parameters
+    /// - `sender`: Address whose discounted fee rate to compute.
+    ///
+    /// # Returns
+    /// The configured `fee_bps`, halved if `sender`'s lifetime volume
+    /// exceeds the tiered-discount threshold, or `0` if not initialized.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let user_volume = Self::get_user_volume(env.clone(), sender);
@@ -940,6 +1118,15 @@ impl PaymentRouter {
     }
 
     /// Set a new admin. Gated by the current admin if one exists.
+    ///
+    /// # Parameters
+    /// - `new_admin`: Address to install as the new admin.
+    ///
+    /// # Returns
+    /// Always `Ok(())`.
+    ///
+    /// # Panics
+    /// Panics if an admin is already set and it does not authorize the call.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         if let Some(admin) = env
             .storage()
@@ -956,7 +1143,17 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Transfers admin rights to a new address.
+    /// Transfers admin rights to a new address. Requires the current admin's authorization.
+    ///
+    /// # Parameters
+    /// - `new_admin`: Address to become the new admin.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::TransferAdmin(…))`.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
@@ -971,6 +1168,18 @@ impl PaymentRouter {
     }
 
     /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to recover.
+    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -983,11 +1192,41 @@ impl PaymentRouter {
     }
 
     /// Records a token as supported (no-op; routing accepts any token contract ID).
+    ///
+    /// # Parameters
+    /// - `_token`: Ignored; present for API compatibility.
+    ///
+    /// # Returns
+    /// Always `Ok(())`.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
         Ok(())
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// # Parameters
+    /// - `sender`: Address the funds are debited from; must authorize the call.
+    /// - `recipient`: Address to receive the funds (minus the platform fee).
+    /// - `token_address`: Contract ID of the token being transferred.
+    /// - `amount`: Amount to route, in the token's smallest unit. Must be
+    ///   positive and within the configured min/max and daily-limit bounds.
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Returns `Err(Error::Paused)` if routing is
+    /// paused, `Err(Error::NotInitialized)` if the contract has no admin
+    /// set, `Err(Error::InvalidRecipient)` if `sender == recipient`,
+    /// `Err(Error::Blacklisted)` if `recipient` is blacklisted,
+    /// `Err(Error::LimitExceeded)` if `amount` is outside the configured
+    /// bounds or exceeds the sender's remaining daily limit, or
+    /// `Err(Error::InsufficientBalance)` if `sender`'s token balance is
+    /// below `amount`.
+    ///
+    /// # Panics
+    /// Panics if `sender` does not authorize the call, or if the underlying
+    /// token transfer to `platform_treasury` fails.
     pub fn route_payment(
         env: Env,
         sender: Address,
@@ -1018,6 +1257,20 @@ impl PaymentRouter {
 
     /// Routes multiple payments in a single transaction. If any payment fails,
     /// the entire batch is reverted atomically.
+    ///
+    /// # Parameters
+    /// - `payments`: Batch of transfer instructions to apply in order. See
+    ///   [`Payment`] for per-item constraints.
+    ///
+    /// # Returns
+    /// `Ok(())` if every payment in the batch succeeds. Returns the first
+    /// error encountered (see `route_payment` for the possible `Err`
+    /// variants and their causes) if any payment fails; the Soroban host
+    /// reverts all storage and balance changes from the batch in that case.
+    ///
+    /// # Panics
+    /// Panics if any payment's `sender` does not authorize the call, or if
+    /// a token transfer to `platform_treasury` fails.
     pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
@@ -1045,11 +1298,39 @@ impl PaymentRouter {
     }
 
     /// Returns the available internal refund balance for a user and token.
+    ///
+    /// # Parameters
+    /// - `user`: Address whose refund balance to look up.
+    /// - `token`: Contract ID of the token.
+    ///
+    /// # Returns
+    /// The refundable balance for `(user, token)`, or `0` if none is held.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn get_refund_balance(env: Env, user: Address, token: Address) -> i128 {
         Self::get_refund_balance_internal(&env, &user, &token)
     }
 
     /// Withdraws a specific amount from the user's internal refund balance.
+    ///
+    /// A refund balance accrues when a `route_payment` / `route_payments`
+    /// transfer to the recipient fails (e.g. missing trustline) and the
+    /// funds are held by the contract on the sender's behalf instead.
+    ///
+    /// # Parameters
+    /// - `user`: Address withdrawing funds; must authorize the call.
+    /// - `token`: Contract ID of the token to withdraw.
+    /// - `amount`: Amount to withdraw. Must be positive and not exceed the
+    ///   current refund balance.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NoRefundAvailable)` if `amount`
+    /// is zero, negative, or greater than the available balance.
+    ///
+    /// # Panics
+    /// Panics if `user` does not authorize the call, or if the underlying
+    /// token transfer fails.
     pub fn withdraw_refund(
         env: Env,
         user: Address,
@@ -1094,6 +1375,18 @@ impl PaymentRouter {
     }
 
     /// Claims and withdraws the entire available refund balance for a user and token.
+    ///
+    /// # Parameters
+    /// - `user`: Address withdrawing funds; must authorize the call.
+    /// - `token`: Contract ID of the token to withdraw.
+    ///
+    /// # Returns
+    /// `Ok(amount)` with the amount withdrawn, or
+    /// `Err(Error::NoRefundAvailable)` if the refund balance is zero.
+    ///
+    /// # Panics
+    /// Panics if `user` does not authorize the call, or if the underlying
+    /// token transfer fails.
     pub fn claim_all_refunds(env: Env, user: Address, token: Address) -> Result<i128, Error> {
         user.require_auth();
 
@@ -1107,6 +1400,18 @@ impl PaymentRouter {
     }
 
     /// Admin-only emergency withdrawal of tokens held by this contract.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to withdraw.
+    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -1118,7 +1423,19 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Replaces this contract's WASM with a previously uploaded version.
+    /// Replaces this contract's WASM with a previously uploaded version. Admin-only.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
+    ///   network, to install as this contract's new executable.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call, or if
+    /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
@@ -1130,6 +1447,12 @@ impl PaymentRouter {
     }
 
     /// Returns the contract version.
+    ///
+    /// # Returns
+    /// The contract's version number, currently `1`.
+    ///
+    /// # Panics
+    /// Does not panic.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
     }
@@ -1431,7 +1754,7 @@ mod test {
 
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, _)| {
-            if topics.len() < 1 {
+            if topics.is_empty() {
                 return false;
             }
             let raw = topics.get(0).unwrap();
@@ -1453,7 +1776,7 @@ mod test {
 
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, _)| {
-            if topics.len() < 1 {
+            if topics.is_empty() {
                 return false;
             }
             let raw = topics.get(0).unwrap();

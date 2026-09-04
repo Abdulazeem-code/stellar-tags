@@ -1,7 +1,11 @@
+require('./src/utils/tracing');
 require('./config/envCheck');
 const express = require('express');
+const pinoHttp = require('pino-http');
 const cors = require('cors');
-const helmet = require('helmet');
+const swaggerJsdoc = require('swagger-jsdoc');
+const swaggerUi = require('swagger-ui-express');
+const { securityMiddleware } = require('./src/middleware/security');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
@@ -18,8 +22,7 @@ const timeout = require('connect-timeout');
 const compression = require('compression');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
-const { logger } = require('./src/logger');
-const pinoHttp = require('pino-http');
+const { logger, httpLogger } = require('./src/logger');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const {
@@ -42,6 +45,10 @@ const {
   usersQuerySchema,
 } = require('./src/schemas');
 const Sentry = require('@sentry/node');
+const {
+  ACTIVITY_ACTIONS,
+  recordActivity,
+} = require('./src/services/activityService');
 const {
   lookupCached,
   federationNameKey,
@@ -66,6 +73,7 @@ const {
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require('./src/utils');
+const { getCachedApprovedOrigins } = require('./src/originCache');
 
 dotenv.config();
 
@@ -77,11 +85,32 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
+const swaggerOptions = {
+  definition: {
+    openapi: '3.0.0',
+    info: {
+      title: 'Stellar Tags API',
+      version: '1.0.0',
+      description: 'API for Stellar Tags',
+    },
+    servers: [
+      {
+        url: 'http://localhost:5000',
+      },
+    ],
+  },
+  apis: ['./server.js', './src/routes/v1/*.js'],
+};
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
-app.use(helmet());
+app.disable('x-powered-by');
+app.use(securityMiddleware);
 
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
@@ -110,9 +139,19 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 const corsOptions = {
-  origin: (origin, callback) => {
+  origin: async (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
+    }
+    try {
+      const approvedOrigins = await getCachedApprovedOrigins(redisClient, () =>
+        prisma.approvedOrigin.findMany({ select: { origin: true } }).then((rows) => rows.map((row) => row.origin))
+      );
+      if (approvedOrigins && approvedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+    } catch (err) {
+      logger.error(err, 'Failed to validate CORS origin against approved origins');
     }
     return callback(new Error('Not allowed by CORS'));
   },
@@ -298,13 +337,13 @@ const etagCache = (req, res, next) => {
 
 const getLocalUserByAddress = async (address) =>
   poolGet(
-    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
+    'SELECT username, address FROM username_registry WHERE address = $1 LIMIT 1',
     [address],
   );
 
 const getLocalUserByUsername = async (username) =>
   poolGet(
-    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+    'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
     [username],
   );
 
@@ -346,17 +385,17 @@ const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
   const rows = await poolAll(
     `SELECT username, address, created_at
      FROM username_registry
-     ${LIKE_FILTER}
+     WHERE username ILIKE $1 OR address ILIKE $1
      ORDER BY created_at DESC
-     LIMIT ? OFFSET ?`,
-    [searchPattern, searchPattern, limit, skip],
+     LIMIT $2 OFFSET $3`,
+    [searchPattern, limit, skip],
   );
 
   const countRow = await poolGet(
-    `SELECT COUNT(*) AS totalCount
+    `SELECT COUNT(*) AS "totalCount"
      FROM username_registry
-     ${LIKE_FILTER}`,
-    [searchPattern, searchPattern],
+     WHERE username ILIKE $1 OR address ILIKE $1`,
+    [searchPattern],
   );
 
   const totalCount = Number(countRow?.totalCount || 0);
@@ -382,13 +421,25 @@ const registerLocalUser = async ({ username, address, isPrimary = false }) => {
   }
 
   await poolRun(
-    `INSERT INTO username_registry (username, address, is_primary, created_at)
-     VALUES (?, ?, ?, ?)`,
-    [username, address, isPrimary, new Date().toISOString()],
+    `INSERT INTO username_registry (username, address, created_at)
+     VALUES ($1, $2, $3)`,
+    [username, address, new Date().toISOString()],
   );
 };
 
 // Expose /metrics endpoint for Prometheus to scrape
+
+/**
+ * @openapi
+ * /metrics:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /metrics
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/metrics', async (req, res) => {
   try {
     res.set('Content-Type', getContentType());
@@ -400,6 +451,18 @@ app.get('/metrics', async (req, res) => {
   }
 });
 
+
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), async (req, res, next) => {
   const { q: queryValue, type } = req.query;
 
@@ -584,6 +647,18 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
+
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /register
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   // registerBodySchema has already guaranteed that username is a trimmed
   // 3-20 character alphanumeric string and address is a non-empty trimmed
@@ -732,6 +807,13 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
       await registerLocalUser({ username: normalizedUsername, address, isPrimary });
     }
 
+    await recordActivity(prisma, {
+      username: normalizedUsername,
+      action: ACTIVITY_ACTIONS.USER_REGISTERED,
+      metadata: { address, is_primary: isPrimary, ...(memoType && { memo_type: memoType }) },
+      req,
+    });
+
     return res.status(201).json({
       ok: true,
       username: normalizedUsername,
@@ -750,7 +832,7 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === '23505' || (error.message && error.message.includes('UNIQUE'))) {
+    if (error.code === '23505' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
@@ -776,6 +858,18 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
 
 app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
+
+/**
+ * @openapi
+ * /lookup:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /lookup
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
@@ -886,6 +980,18 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
   }
 });
 
+
+/**
+ * @openapi
+ * /users:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /users
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);
@@ -972,16 +1078,44 @@ app.use('/api/v2', v2Router);
 // Explicit v1 mount, then /api (no version) and the legacy unversioned root
 // both resolve to v1 so existing clients keep working unchanged.
 app.use('/api/v1', v1Router);
+// #492 — Strict rate limiter for auth/login endpoints. These are prime
+// brute-force targets, so they get a much tighter budget than the global
+// limiter. Uses the same Redis-backed store so the limit is shared across
+// all distributed nodes.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: true,
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  keyGenerator: (req) => req.ip || (req.connection && req.connection.remoteAddress) || '',
+});
+
 app.use('/api', v1Router);
 app.use('/', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
-app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+app.use('/auth', authLimiter, require('./src/routes/v1/authRoutes')(redisClient));
 
 // API key management endpoints (rotation, invalidation, listing)
 app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));
 
 // #497 — Expose RSA public key as a JWKS document so external services can
 // verify RS256-signed tokens without sharing a secret.
+
+/**
+ * @openapi
+ * /.well-known/jwks.json:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /.well-known/jwks.json
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/.well-known/jwks.json', (_req, res) => {
   try {
     const { getJwks } = require('./src/utils/jwt');
@@ -997,58 +1131,41 @@ app.get('/.well-known/jwks.json', (_req, res) => {
   }
 });
 
+
+/**
+ * @openapi
+ * /.well-known/stellar.toml:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /.well-known/stellar.toml
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/.well-known/stellar.toml', (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader('Content-Type', 'text/plain');
   res.send(`FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`);
 });
 
+
+/**
+ * @openapi
+ * /api/v1/time:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /api/v1/time
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', async (req, res) => {
-  const checks = { database: null, redis: null };
-  let allOk = true;
-  const errors = [];
-
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    checks.database = 'up';
-  } catch (err) {
-    checks.database = 'down';
-    allOk = false;
-    errors.push('Database unavailable');
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Database health check failed`);
-  }
-
-  if (redisClient) {
-    try {
-      await redisClient.ping();
-      checks.redis = 'up';
-    } catch (err) {
-      checks.redis = 'down';
-      allOk = false;
-      errors.push('Redis unavailable');
-      logger.error(err, `[Correlation ID: ${req.correlationId}] Redis health check failed`);
-    }
-  } else {
-    checks.redis = 'not configured';
-  }
-
-  const response = {
-    status: allOk ? 'UP' : 'DOWN',
-    timestamp: new Date().toISOString(),
-    ...checks,
-  };
-
-  if (!allOk) {
-    response.message = errors.join(', ');
-    return res.status(503).json(response);
-  }
-
-  return res.status(200).json(response);
-});
+app.use(require('./src/routes/v1/healthRoutes')(redisClient));
 
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
 // they reach our own JSON error handler below.
@@ -1098,19 +1215,44 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
 
 
 if (require.main === module) {
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    logger.info(`Server successfully initialized on port ${PORT}`);
-  });
+  const { checkMigrations, enforceMigrationPolicy } = require('./src/migrate-check');
 
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+  const startServer = () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      logger.info(`Server successfully initialized on port ${PORT}`);
+    });
+
+    server.on('error', (e) => {
+      if (e.code === 'EADDRINUSE') {
+        logger.error(e, `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`);
+        process.exit(1);
+      }
+    });
+
+    process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+    process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+  };
+
+  // Verify the database is not out of sync with the Prisma migrations before
+  // binding a port, so schema drift surfaces as a clear startup error instead
+  // of a cryptic failure on the first query. In strict mode this exits
+  // (non-zero) when migrations are pending; in permissive mode it warns and
+  // continues. The server only boots once the result is known.
+  checkMigrations()
+    .then((result) => {
+      const { shouldExit } = enforceMigrationPolicy(result);
+      if (shouldExit) {
+        logger.error('[migrate-check] Aborting startup: database migrations are not applied.');
+        process.exit(1);
+      }
+      startServer();
+    })
+    .catch((err) => {
+      // Unexpected failure running the check itself — refuse to start deceptively
+      // healthy when we couldn't validate schema parity.
+      logger.error(err, '[migrate-check] Failed to verify migration status at startup.');
       process.exit(1);
-    }
-  });
-
-  process.on('SIGTERM', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
-  process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig, redisClient));
+    });
 }
 
 module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
