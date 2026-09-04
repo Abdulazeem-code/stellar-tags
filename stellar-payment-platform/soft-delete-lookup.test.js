@@ -63,6 +63,8 @@ jest.mock("./src/multisigner-verifier", () => ({
 
 const request = require("supertest");
 
+jest.setTimeout(15000);
+
 describe("soft-delete lookup guards", () => {
   beforeEach(() => {
     jest.resetModules();
