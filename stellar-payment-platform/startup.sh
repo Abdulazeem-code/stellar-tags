@@ -12,6 +12,13 @@ if [ -z "${DATABASE_URL:-}" ]; then
 else
   echo "Running database migrations..."
   "$PRISMA" migrate deploy
+  echo "Verifying migration status..."
+  if "$PRISMA" migrate status >/dev/null 2>&1; then
+    echo "Database schema is up to date."
+  else
+    echo "WARNING: Prisma schema is out of sync with the database." >&2
+    echo "Run './node_modules/.bin/prisma migrate deploy' and restart the server." >&2
+  fi
 fi
 
 if [ ! -x "$PRISMA" ]; then

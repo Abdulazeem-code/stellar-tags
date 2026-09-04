@@ -10,14 +10,18 @@
 //   HORIZON_NETWORK=public npm run listener  (mainnet)
 // ---------------------------------------------------------------------------
 
-const { Horizon } = require('@stellar/stellar-sdk');
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
 const { poolGet, poolRun } = require('./src/db');
 const {
   dispatchPaymentWebhooks,
-  scheduleWebhookRetryJob,
+  startWebhookWorker,
+  closeWebhookQueue,
 } = require('./src/webhookWorker');
+const {
+  horizon,
+  createBreaker,
+} = require('./src/services/stellarService');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -30,14 +34,21 @@ const HORIZON_URLS = {
 };
 
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000; // Re-check for new accounts every 60s
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
 // ---------------------------------------------------------------------------
-// Horizon Server Instance
+// Horizon Health-Check Circuit Breaker
 // ---------------------------------------------------------------------------
-const horizon = new Horizon.Server(HORIZON_URL);
+// Wraps a lightweight Horizon query so we can detect outages fast and avoid
+// opening new streams (or polling the DB) while Horizon is unreachable.
+const healthCheckBreaker = createBreaker(
+  () => horizon.ledgers().latest().call(),
+  { timeout: 5000, volumeThreshold: 3 },
+);
 
-// Track active streams so we can clean up on shutdown
+// ---------------------------------------------------------------------------
+// Stream Management
+// ---------------------------------------------------------------------------
 const activeStreams = new Map();
 
 // ---------------------------------------------------------------------------
@@ -70,7 +81,8 @@ const formatPayment = (payment, trackedAccount) => {
 
 /**
  * Open a payment SSE stream for a single Stellar account.
- * Returns the stream close function.
+ * On error the stream is removed from the active map so the next sync cycle
+ * can attempt to reconnect it (instead of staying stuck on a dead stream).
  */
 const watchAccount = (accountId) => {
   if (activeStreams.has(accountId)) {
@@ -105,6 +117,12 @@ const watchAccount = (accountId) => {
           `[${timestamp()}] ⚠️  Stream error for ${accountId}:`,
           error?.message || error,
         );
+        // Remove the dead stream so syncWatchedAccounts can re-open it on the
+        // next poll cycle instead of leaving a stale entry in the map.
+        activeStreams.delete(accountId);
+        logger.info(
+          `[${timestamp()}] 🔄 Removed dead stream for ${accountId}; will reconnect on next sync`,
+        );
       },
     });
 
@@ -116,6 +134,17 @@ const watchAccount = (accountId) => {
  * streams for any that aren't already being watched.
  */
 const syncWatchedAccounts = async () => {
+  // Fast-fail when Horizon is known to be down — don't waste resources
+  // opening streams that will immediately error.
+  try {
+    await healthCheckBreaker.fire();
+  } catch {
+    logger.warn(
+      `[${timestamp()}] ⏸️  Horizon health check failed; skipping stream sync`,
+    );
+    return;
+  }
+
   try {
     const rows = await prisma.user.findMany({
       distinct: ['address'],
@@ -158,6 +187,7 @@ const shutdown = async () => {
     logger.info(`  Closed stream for ${address}`);
   }
   activeStreams.clear();
+  await closeWebhookQueue();
   await prisma.$disconnect();
   process.exit(0);
 };
@@ -179,12 +209,8 @@ const main = async () => {
   // Initial sync
   await syncWatchedAccounts();
 
-  // Schedule webhook retry / liveness pings
-  try {
-    scheduleWebhookRetryJob({ prisma, poolAllFn: require('./src/db').poolAll, poolRunFn: poolRun });
-  } catch (err) {
-    logger.error('Failed to schedule webhook retry job:', err.message);
-  }
+  // Start the durable Redis-backed webhook delivery worker.
+  startWebhookWorker({ prisma, poolRunFn: poolRun });
 
   // Periodically check for newly registered accounts
   setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
