@@ -10,6 +10,7 @@
     "test:memory": "node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory --globals '{\"gc\":true}'",
     "test:integration": "TEST_API_URL=http://localhost:5001 jest --forceExit --testPathPattern=integration",
     "test:load": "artillery run artillery.yml",
+    "test:load:webhooks": "node scripts/run-webhook-load-test.js",
     "listener": "node horizonListener.js",
     "db:seed": "node scripts/seed.js",
     "prisma:generate": "prisma generate",

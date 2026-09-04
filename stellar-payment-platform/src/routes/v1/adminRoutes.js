@@ -464,5 +464,41 @@ router.get(
     }),
   );
 
+  // ── GET /admin/webhooks/health ───────────────────────────────────────────
+  // Aggregates webhook delivery health so ops can spot broken merchant
+  // integrations: total/healthy/failing counts, a rolling 24h success rate,
+  // and the URLs that have been failing for more than 24h.
+  router.get('/admin/webhooks/health', adminAuth, asyncHandler(async (req, res) => {
+    const prisma = getPrisma();
+    const username = typeof req.query.username === 'string' ? req.query.username.trim() : '';
+    const where = username ? { username } : {};
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const [total, failing, activeLast24h, failingLast24h, failingOver24h] = await Promise.all([
+      prisma.webhook.count({ where }),
+      prisma.webhook.count({ where: { ...where, failingSince: { not: null } } }),
+      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo } } }),
+      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo }, failingSince: { not: null } } }),
+      prisma.webhook.findMany({
+        where: { ...where, failingSince: { lte: dayAgo } },
+        select: { id: true, username: true, url: true, failingSince: true },
+        orderBy: { failingSince: 'asc' },
+      }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      summary: {
+        total,
+        healthy: total - failing,
+        failing,
+        successRate24h: activeLast24h
+          ? Number((((activeLast24h - failingLast24h) / activeLast24h) * 100).toFixed(2))
+          : null,
+      },
+      failingOver24h,
+    });
+  }));
+
   return router;
 };
