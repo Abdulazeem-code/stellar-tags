@@ -20,7 +20,6 @@ const Filter = require('bad-words');
 const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
-const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger, httpLogger } = require('./src/logger');
 const xss = require('xss');
@@ -38,40 +37,10 @@ const { requireJson } = require('./src/middleware/requireJson');
 const { bodySizeLimit } = require('./src/middleware/bodyLimit');
 const { apiVersion } = require('./src/middleware/apiVersion');
 const { deprecationMiddleware } = require('./src/middleware/deprecation');
-const {
-  registerBodySchema,
-  federationQuerySchema,
-  lookupQuerySchema,
-  usersQuerySchema,
-} = require('./src/schemas');
 const Sentry = require('@sentry/node');
 const {
-  ACTIVITY_ACTIONS,
-  recordActivity,
-} = require('./src/services/activityService');
-const {
-  lookupCached,
-  federationNameKey,
-  federationIdKey,
-  federationLookupCached,
-  invalidateFederationCache,
-} = require('./src/cache');
-const {
-  paginatedResponse,
-  parsePagination,
-  parseCursorQuery,
-  keysetWhereDesc,
-  paginateByKeyset,
-  cursorPaginatedResponse,
-} = require('./src/pagination');
-const {
-  normalizeNameTag,
+
   validateMemo,
-  RESERVED_NAMES,
-  MAX_USERNAMES_PER_ADDRESS,
-  PRIMARY_USERNAME_ORDER,
-  USER_DATABASE,
-  shouldFallbackToLocalRegistry,
 } = require('./src/utils');
 const { getCachedApprovedOrigins } = require('./src/originCache');
 
@@ -300,16 +269,6 @@ app.use(compression({ threshold: 1024 }));
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
-
-const RESERVED_USERNAMES = [
-  'admin',
-  'root',
-  'stellar',
-  'system',
-  'superuser',
-  'administrator',
-  'support',
-];
 
 // ---------------------------------------------------------------------------
 // #51 — ETag Caching Middleware for Federation Endpoint
@@ -859,212 +818,6 @@ app.post('/register', ipLimiter, idempotencyMiddleware(redisClient), requireJson
 app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
 
-/**
- * @openapi
- * /lookup:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /lookup
- *     responses:
- *       200:
- *         description: Success
- */
-app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res, next) => {
-  const { address = '', search = '' } = req.query;
-
-  if (address) {
-    try {
-      const result = await lookupCached(address, async () => {
-        let row;
-        try {
-          // #613 — an address can have several usernames; return the primary.
-          row = await prisma.user.findFirst({
-            where: { address, deletedAt: null },
-            select: { username: true },
-            orderBy: PRIMARY_USERNAME_ORDER,
-          });
-        } catch (error) {
-          if (!shouldFallbackToLocalRegistry(error)) {
-            throw error;
-          }
-          row = await getLocalUserByAddress(address);
-        }
-        return row ? { username: row.username, address } : null;
-      });
-
-      if (!result) {
-        const notFoundError = new Error('Username not found for this address');
-        notFoundError.statusCode = 404;
-        return next(notFoundError);
-      }
-
-      return res.json(result);
-    } catch (err) {
-      logger.error(err, "🚨 ACTUAL PRISMA ERROR:");
-
-      const dbError = new Error('Database lookup failed', { cause: err });
-      dbError.statusCode = 500;
-      return next(dbError);
-    }
-  }
-
-  const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
-  const { page, limit, skip } = parsePagination(req.query);
-  if (invalidCursor) {
-    return next(new ApiError('INVALID_INPUT', 'Invalid cursor parameter'));
-  }
-
-  const where = {
-    deletedAt: null,
-    OR: [
-      { username: { contains: search, mode: 'insensitive' } },
-      { address: { contains: search, mode: 'insensitive' } },
-    ],
-  };
-
-  try {
-    let response = null;
-    try {
-      if (cursor) {
-        // Keyset mode: seek straight past the cursor row instead of skipping
-        // every preceding row, so deep pages cost the same as page one.
-        const candidates = await prisma.user.findMany({
-          where: { AND: [where, keysetWhereDesc(cursor)] },
-          orderBy: [{ createdAt: 'desc' }, { username: 'desc' }],
-          take: cursorLimit + 1,
-        });
-        const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-        response = cursorPaginatedResponse(
-          rows.map((user) => ({
-            username: user.username,
-            address: user.address,
-            created_at: user.createdAt.toISOString(),
-          })),
-          { limit: cursorLimit, nextCursor, hasMore },
-        );
-      } else {
-        const [totalCount, rows] = await prisma.$transaction([
-          prisma.user.count({ where }),
-          prisma.user.findMany({
-            where,
-            orderBy: [{ createdAt: 'desc' }, { username: 'desc' }],
-            skip,
-            take: limit,
-          }),
-        ]);
-
-        response = paginatedResponse(
-          rows.map((user) => ({
-            username: user.username,
-            address: user.address,
-            created_at: user.createdAt.toISOString(),
-          })),
-          totalCount,
-          { page, limit },
-        );
-      }
-    } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) {
-        throw error;
-      }
-
-      response = await listLocalUsers(search, page, limit, cursor);
-    }
-
-    return res.json(response);
-  } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
-  }
-});
-
-
-/**
- * @openapi
- * /users:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /users
- *     responses:
- *       200:
- *         description: Success
- */
-app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
-  const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
-  const { page, limit, skip } = parsePagination(req.query);
-  if (invalidCursor) {
-    return next(new ApiError('INVALID_INPUT', 'Invalid cursor parameter'));
-  }
-  const search = req.query.search ?? null;
-
-  const where = search
-    ? {
-        deletedAt: null,
-        OR: [
-          { username: { contains: search, mode: 'insensitive' } },
-          { address: { contains: search, mode: 'insensitive' } },
-        ],
-      }
-    : { deletedAt: null };
-
-  try {
-    if (cursor) {
-      // Keyset mode: seek straight past the cursor row instead of skipping
-      // every preceding row, so deep pages cost the same as page one.
-      const candidates = await prisma.user.findMany({
-        where: { AND: [where, keysetWhereDesc(cursor)] },
-        orderBy: [{ createdAt: 'desc' }, { username: 'desc' }],
-        take: cursorLimit + 1,
-      });
-      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-      }));
-      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
-    }
-
-    const [totalCount, rows] = await prisma.$transaction([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: [{ createdAt: 'desc' }, { username: 'desc' }],
-        skip,
-        take: limit,
-      }),
-    ]);
-
-    const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-    }));
-
-    res.json({
-      data,
-      meta: {
-        total: totalCount,
-        totalCount,
-        page,
-        currentPage: page,
-        limit,
-        totalPages,
-      },
-      totalCount,
-      totalPages,
-      currentPage: page,
-    });
-  } catch (error) {
-    const dbError = new Error('Database error', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
-  }
-});
 // Request versioning: URI (/api/v1, /api/v2) first, then Accept-Version /
 // API-Version header, defaulting to v1. Routers below then decide routing.
 app.use(apiVersion);

@@ -37,10 +37,14 @@ const {
 } = require('../../services/activityService');
 const {
   registerBodySchema,
+  federationQuerySchema,
   lookupQuerySchema,
   usersQuerySchema,
   activityQuerySchema,
 } = require('../../schemas');
+const { registerUser } = require('../../services/registrationService');
+const { lookupUser, listUsers } = require('../../services/userService');
+
 
 const router = express.Router();
 
@@ -139,57 +143,6 @@ const registerLocalUser = async ({ username, address }) => {
  *         description: Success
  */
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
-  const safeUsername = xss(req.body.username);
-  const username = normalizeNameTag(safeUsername);
-  const { address, memo_type: memoType, memo, signature = '', signerAddress = '' } = req.body;
-
-  if (address.toUpperCase().startsWith('S')) {
-    return next(
-      new ApiError(
-        'INVALID_INPUT',
-        'Never share your Secret Key. Please register using your Public Key (starts with G).',
-      ),
-    );
-  }
-
-  if (!username || !address) {
-    return next(new ApiError('INVALID_INPUT', 'Missing required fields: username and address are both required.'));
-  }
-
-  const BLOCKED_EXCHANGES = [
-    "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
-    "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
-    "GBV4ZDEPNQ2FKSPKGJP2YKDAIZWQ2XKRQD4V4ACH3TCTXTGLWEBDU3OS"
-  ];
-
-  if (BLOCKED_EXCHANGES.includes(address) && !memo) {
-    return next(new ApiError('INVALID_INPUT', "Cannot map federation addresses directly to custodial exchange master wallets."));
-  }
-
-  const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-  if (usernameLocalPart.length < 3) {
-    return next(new ApiError('INVALID_INPUT', "Username must be at least 3 characters long."));
-  }
-
-  if (!StrKey.isValidEd25519PublicKey(address)) {
-    const error = new Error('Invalid Stellar Public Key format.');
-    error.statusCode = 400;
-    return next(error);
-  }
-
-  const memoError = validateMemo(memoType, memo);
-  if (memoError) {
-    return next(new ApiError('INVALID_INPUT', memoError));
-  }
-
-
-
-  const normalizedUsername = username.toLowerCase();
-
-  if (RESERVED_NAMES.includes(normalizedUsername)) {
-    return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
-  }
-
   try {
     // #613 — an address may carry several usernames (aliases). Registration
     // adds another while the address is under the cap; the first username
@@ -257,6 +210,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       }),
       ...(memoType && { memo_type: memoType, memo }),
     });
+
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
@@ -427,6 +381,17 @@ router.get(
   }),
 );
 
+/**
+ * @openapi
+ * /lookup:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /lookup
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
@@ -465,55 +430,25 @@ router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), a
   const where = buildUserSearchWhere(search);
 
   try {
-    if (cursor) {
-      // Keyset mode: seek straight past the cursor row instead of skipping
-      // every preceding row, so deep pages cost the same as page one.
-      const candidates = await prisma.user.findMany({
-        where: { AND: [where, keysetWhereDesc(cursor)] },
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        take: cursorLimit + 1,
-      });
-      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt.toISOString(),
-      }));
-      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
-    }
-
-    const [totalCount, rows] = await prisma.$transaction([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        skip,
-        take: limit,
-      }),
-    ]);
-
-const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
-    }));
-
-    return res.json({ data, totalCount, totalPages, currentPage: page });
+    const result = await lookupUser(req.query.address, req.query.search, req.query);
+    return res.json(result);
   } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
 
+/**
+ * @openapi
+ * /users:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /users
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 /**
  * @openapi
  * /users:
@@ -535,64 +470,10 @@ router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asy
   const where = search ? buildUserSearchWhere(search) : { deletedAt: null };
 
   try {
-    if (cursor) {
-      // Keyset mode: seek straight past the cursor row instead of skipping
-      // every preceding row, so deep pages cost the same as page one.
-      const candidates = await prisma.user.findMany({
-        where: { AND: [where, keysetWhereDesc(cursor)] },
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        take: cursorLimit + 1,
-      });
-      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-      }));
-      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
-    }
-
-    const [totalCount, rows] = await prisma.$transaction([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        skip,
-        take: limit,
-      }),
-    ]);
-
-const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-    }));
-
-    res.json({
-      data,
-      meta: {
-        total: totalCount,
-        totalCount,
-        page,
-        currentPage: page,
-        limit,
-        totalPages,
-      },
-      totalCount,
-      totalPages,
-      currentPage: page,
-    });
+    const result = await listUsers(req.query);
+    return res.json(result);
   } catch (error) {
-    const dbError = new Error('Database error', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
