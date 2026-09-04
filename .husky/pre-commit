@@ -1,1 +1,9 @@
 npx lint-staged
+
+if git diff --cached --name-only --diff-filter=ACM | grep -q '\.prisma$'; then
+  echo "Prisma schema changed — running prisma validate..."
+  npm --prefix stellar-payment-platform run prisma:validate || {
+    echo "Prisma schema is invalid. Fix the errors above before committing."
+    exit 1
+  }
+fi
