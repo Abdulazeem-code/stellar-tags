@@ -11,7 +11,7 @@ datasource db {
 
 generator client {
   provider        = "prisma-client-js"
-  previewFeatures = ["metrics"]
+  previewFeatures = ["metrics", "tracing"]
 }
 
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
@@ -66,6 +66,17 @@ model Webhook {
   @@map("webhooks")
 }
 
+// Approved merchant frontend origins allowed to call the API. CORS
+// validation (see server.js) checks incoming Origin headers against this
+// table, with results cached in Redis so most requests avoid a DB round trip.
+model ApprovedOrigin {
+  id        String   @id @default(uuid())
+  origin    String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("approved_origins")
+}
+
 // Payment records for routing, statistics, and auditing.
 model Payment {
   id              String   @id @default(uuid())
@@ -106,6 +117,7 @@ model WebhookDLQ {
   @@index([movedAt])
   @@map("webhook_dlq")
 }
+
 // API keys for backend consumers. Only the SHA-256 hash of the secret is
 // stored; the raw key is shown once at creation time.
 model ApiKey {

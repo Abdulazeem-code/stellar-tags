@@ -1,3 +1,4 @@
+require("./src/utils/tracing");
 require("./config/envCheck");
 const express = require("express");
 const pinoHttp = require("pino-http");
@@ -75,6 +76,7 @@ const {
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require("./src/utils");
+const { getCachedApprovedOrigins } = require("./src/originCache");
 
 dotenv.config();
 
@@ -139,9 +141,24 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 const corsOptions = {
-  origin: (origin, callback) => {
+  origin: async (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
+    }
+    try {
+      const approvedOrigins = await getCachedApprovedOrigins(redisClient, () =>
+        prisma.approvedOrigin
+          .findMany({ select: { origin: true } })
+          .then((rows) => rows.map((row) => row.origin)),
+      );
+      if (approvedOrigins && approvedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+    } catch (err) {
+      logger.error(
+        err,
+        "Failed to validate CORS origin against approved origins",
+      );
     }
     return callback(new Error("Not allowed by CORS"));
   },
