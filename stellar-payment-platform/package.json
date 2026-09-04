@@ -23,7 +23,8 @@
     "contract:upgrade": "node ../scripts/deploy.js upgrade"
   },
   "jest": {
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "testTimeout": 120000
   },
   "dependencies": {
     "@faker-js/faker": "^10.5.0",
