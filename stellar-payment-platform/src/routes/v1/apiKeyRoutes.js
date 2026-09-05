@@ -55,7 +55,19 @@ module.exports = (redisClient) => {
 
   // POST /auth/api-keys
   // Generate a new API key
-  router.post('/', requireAuth, requireJson, validateSchema({ body: createApiKeyBodySchema }), asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/', requireAuth, requireJson, validateSchema({ body: createApiKeyBodySchema }), asyncHandler(async (req, res, next) => {
     try {
       const { name, owner_id, scopes: scopesStr, expires_in_hours } = req.body;
 
@@ -102,7 +114,19 @@ module.exports = (redisClient) => {
 
   // GET /auth/api-keys
   // List API keys for an owner
-  router.get('/', requireAuth, asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/', requireAuth, asyncHandler(async (req, res, next) => {
     try {
       const ownerId = req.query.owner_id;
       if (!ownerId) {
@@ -134,7 +158,19 @@ module.exports = (redisClient) => {
 
   // POST /auth/api-keys/:id/revoke
   // Revoke a specific API key
-  router.post('/:id/revoke', requireAuth, requireJson, validateSchema({ body: revokeApiKeyBodySchema }), asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /:id/revoke:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /:id/revoke
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/:id/revoke', requireAuth, requireJson, validateSchema({ body: revokeApiKeyBodySchema }), asyncHandler(async (req, res, next) => {
     try {
       const { id } = req.params;
       const { revoked_by } = req.body;
@@ -175,7 +211,19 @@ module.exports = (redisClient) => {
 
   // POST /auth/api-keys/:id/rotate
   // Rotate an API key: generate new key, revoke old one with grace period
-  router.post('/:id/rotate', requireAuth, requireJson, validateSchema({ body: rotateApiKeyBodySchema }), asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /:id/rotate:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /:id/rotate
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/:id/rotate', requireAuth, requireJson, validateSchema({ body: rotateApiKeyBodySchema }), asyncHandler(async (req, res, next) => {
     try {
       const { id } = req.params;
       const { name, grace_period_hours = 1 } = req.body;

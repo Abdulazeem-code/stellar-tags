@@ -32,6 +32,13 @@ try {
       create: async () => ({}),
       count: async () => 0,
     },
+    webhookDLQ: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      create: async () => ({}),
+      delete: async () => ({}),
+      update: async () => ({}),
+    },
     auditLog: {
       findMany: async () => [],
       findUnique: async () => null,
@@ -42,7 +49,11 @@ try {
     payment: {
       findMany: async () => [],
       findUnique: async () => null,
+      findFirst: async () => null,
+      create: async () => ({}),
       count: async () => 0,
+      aggregate: async () => ({ _sum: { amount: 0, fee: 0 }, _count: { id: 0 } }),
+      groupBy: async () => [],
     },
     webhook: {
       findUnique: async () => null,
@@ -59,10 +70,21 @@ try {
       findUnique: async () => null,
       count: async () => 0,
     },
-    $transaction: async (queries) => Promise.all(queries),
+    $transaction: async (arg) => {
+      if (typeof arg === 'function') {
+        return arg(prisma);
+      }
+      return Promise.all(arg);
+    },
     $queryRaw: async () => [],
   };
 }
+
+const withTransaction = async (callback) => {
+  return await prisma.$transaction(async (tx) => {
+    return await callback(tx);
+  });
+};
 
 /**
  * Returns true when the error (or its direct Error.cause) is a Prisma
@@ -77,4 +99,4 @@ function isPrismaConnectionError(error) {
   return causeCode.startsWith('P10');
 }
 
-module.exports = { prisma, isPrismaConnectionError };
+module.exports = { prisma, isPrismaConnectionError, withTransaction };

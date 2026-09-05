@@ -9,7 +9,7 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: parseInt(process.env.DB_POOL_MAX, 10) || 10,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  connectionTimeoutMillis: 10000,
 });
 
 pool.on('error', (err) => {
@@ -17,36 +17,44 @@ pool.on('error', (err) => {
 });
 
 (async () => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS username_registry (
-        username TEXT PRIMARY KEY,
-        address TEXT NOT NULL UNIQUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS webhooks (
-        id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        url TEXT NOT NULL,
-        secret TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        last_sent_at TIMESTAMPTZ,
-        failing_since TIMESTAMPTZ,
-        UNIQUE(username, url),
-        FOREIGN KEY (username) REFERENCES username_registry(username) ON DELETE CASCADE
-      )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS webhooks_username_idx ON webhooks(username)`).catch(() => {});
-    await pool.query(`CREATE INDEX IF NOT EXISTS webhooks_last_sent_at_idx ON webhooks(last_sent_at)`).catch(() => {});
-    logger.info(`PostgreSQL pool initialised — max ${pool.options.max} connections`);
-  } catch (err) {
-    if (process.env.NODE_ENV === 'test') {
-      logger.warn('PostgreSQL schema init skipped in test environment');
-    } else {
-      logger.error(err, 'Failed to initialise PostgreSQL schema:');
-      process.exit(1);
+  let retries = 5;
+  while (retries > 0) {
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS username_registry (
+          username TEXT PRIMARY KEY,
+          address TEXT NOT NULL UNIQUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS webhooks (
+          id TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          url TEXT NOT NULL,
+          secret TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          last_sent_at TIMESTAMPTZ,
+          failing_since TIMESTAMPTZ,
+          UNIQUE(username, url),
+          FOREIGN KEY (username) REFERENCES username_registry(username) ON DELETE CASCADE
+        )
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS webhooks_username_idx ON webhooks(username)`).catch(() => {});
+      await pool.query(`CREATE INDEX IF NOT EXISTS webhooks_last_sent_at_idx ON webhooks(last_sent_at)`).catch(() => {});
+      logger.info(`PostgreSQL pool initialised — max ${pool.options.max} connections`);
+      return;
+    } catch (err) {
+      if (process.env.NODE_ENV === 'test') {
+        logger.warn('PostgreSQL schema init skipped in test environment');
+        return;
+      }
+      retries -= 1;
+      logger.error(err, `Failed to initialise PostgreSQL schema. Retries left: ${retries}`);
+      if (retries === 0) {
+        process.exit(1);
+      }
+      await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
 })();
