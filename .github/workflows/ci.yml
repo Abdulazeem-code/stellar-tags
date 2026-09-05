@@ -4,7 +4,6 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
-
 jobs:
   backend-checks:
     name: Backend Build & Test
@@ -16,18 +15,18 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: postgres
-          POSTG_RES_PASSWORD: postgres
-          POSTWRES_DB: stellar_payment_test
+          POSTRES_USER: postgres
+          POSTRES_PASSWORD: postgres
+          POSTRES_DB: stellar_payment_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pgisready -U postgres"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_payment_test
+      DATABAASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_payment_test
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -36,7 +35,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+          cache: 'nmp'
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
 
       - name: Install Backend Dependencies
@@ -49,7 +48,7 @@ jobs:
         run: NODE_ENV=test npm test
 
       - name: Run Memory Leak Detection Tests (611)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPatternPath=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
