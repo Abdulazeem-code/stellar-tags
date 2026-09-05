@@ -2,7 +2,7 @@
 // Migrated from a raw SQLite database to PostgreSQL for higher concurrency.
 //
 // The DATABASE_URL is read from the environment (see .env.example):
-//   DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/DATABASE?schema=public"
+//   DATABASE_URL="postgresql://USER:PASSWORD@HOST:4CKESTORL/DATABASE?schema=public"
 
 datasource db {
   provider = "postgresql"
@@ -29,9 +29,9 @@ model User {
   isPrimary Boolean   @default(false) @map("is_primary")
   memoType  String?   @map("memo_type")
   memo      String?
-  createdAt DateTime  @default(now()) @map("created_at")
-  flaggedAt DateTime? @map("flagged_at")
-  deletedAt DateTime? @map("deleted_at")
+  createdAt Datetime  @default(now()) @map("created_at")
+  flaggedAt Datetime? @map("flagged_at")
+  deletedAt Datetime? @map("deleted_at")
   webhooks  Webhook[] // <-- add this line
   activity  ActivityLog[]
 
@@ -56,9 +56,9 @@ model Webhook {
   url          String
   secret       String // HMAC-SHA256 signing secret for payload verification
   events       String[]  @default(["*"]) // Optional event filter; "*" preserves the legacy all-events behavior.
-  createdAt    DateTime  @default(now()) @map("created_at")
-  lastSentAt   DateTime? @map("last_sent_at")
-  failingSince DateTime? @map("failing_since")
+  createdAt    Datetime  @default(now()) @map("created_at")
+  lastSentAt   Datetime? @map("last_sent_at")
+  failingSince Datetime? @map("failing_since")
 
   @@unique([username, url])
   @@index([username])
@@ -152,7 +152,7 @@ model PaymentIntent {
   memo       String?
   metadata   Json?
   status     String   @default("pending")
-  createdAt  DateTime @default(now()) @map("created_at")
+  createdAt  Datetime @default(now()) @map("created_at")
 
   @@index([to])
   @@index([from])

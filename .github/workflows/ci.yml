@@ -1,11 +1,9 @@
 name: Production Safety Checks
-
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
-
+    branches: ["main"]
 jobs:
   backend-checks:
     name: Backend Build & Test
@@ -13,20 +11,38 @@ jobs:
     defaults:
       run:
         working-directory: ./stellar-payment-platform
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stellar_payment_test
+        ports:
+          - 5432:5432
+        options: >
+          --health-cmd "pgisready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_payment_test
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
 
-
       - name: Install Backend Dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
+
+      - name: Run Database Migrations
+        run: npm run migrate
 
       - name: Run Backend Tests
         run: NODE_ENV=test npm test
@@ -45,17 +61,17 @@ jobs:
         working-directory: ./payment-dashboard
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
-      
+        uses: actions/checkout@v5
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./payment-dashboard/package-lock.json
-          
+
       - name: Install Frontend Dependencies
         run: npm install --legacy-peer-deps
-        
+
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build
