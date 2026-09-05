@@ -35,7 +35,7 @@ jest.mock('./prismaClient', () => ({
       create: jest.fn(),
     },
     $transaction: jest.fn(),
-    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
+    $queryRaw: jest.fn().mockResolvedValue([{ '?column?': 1 }]),
   },
   isPrismaConnectionError: (error) => {
     const code = typeof error?.code === 'string' ? error.code : '';
