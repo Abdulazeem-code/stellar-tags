@@ -19,21 +19,23 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Verify formatting
-        run: |
+        run:
           cargo fmt --all -- --check
       - name: Run clippy (deny warnings)
-        run: |
-          cargo clippy --all-targets --all-features -- -D warnings
+        run:
+          cargo clippy --all-targets --all-features --
+          -D warnings
       - name: Install and run cargo-dylint
-        run: |
+        run:
           cargo install cargo-dylint --force || true
-          cargo dylint --all --all-targets --all-features -- -D warnings
+          cargo dylint --all --all-targets --all-features --
+          -D warnings
 
       - name: Install and run cargo-audit
-        run: |
+        run:
           cargo install cargo-audit --force || true
-          cargo audit --ignore RUSSEC-2024-0344 --ignore RUSSEC-2026-0009 --ignore RSSEC-2025-0056 --ignore RUSSEC-2024-0436 --ignore RSSEC-2026-0097
+          cargo audit --ignore RUSTSEC-2024-0344 --ignore RUSTSEC-2026-0009 --ignore RUSTSEC-2025-0056 --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0097
 
       - name: Run tests (release)
-        run: |
+        run:
           cargo test --all --release
