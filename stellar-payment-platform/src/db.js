@@ -66,7 +66,7 @@ const poolGet = async (sql, params = []) => {
 
 const poolRun = async (sql, params = []) => {
   const result = await pool.query(sql, params);
-  return { changes: result.rowCount };
+  return { changes: result.rowCount, lastID: result.rows[0]?.id };
 };
 
 const poolAll = async (sql, params = []) => {

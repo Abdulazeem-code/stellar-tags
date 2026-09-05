@@ -3,12 +3,11 @@ const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma, withTransaction } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { poolGet, poolRun, poolAll, etagCache } = require('../../db');
+const { etagCache } = require('../../db');
 const { logger } = require('../../logger');
 const { transferAccount } = require('../../services/registrationService');
 const { lookupCached, invalidateFederationCache } = require('../../cache');
 const {
-  paginatedResponse,
   parsePagination,
   parseCursorQuery,
   keysetWhereDesc,
@@ -258,7 +257,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
+    if (error.code === '23505' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     

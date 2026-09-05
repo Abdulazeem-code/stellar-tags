@@ -35,7 +35,7 @@ jest.mock('./prismaClient', () => ({
       create: jest.fn(),
     },
     $transaction: jest.fn(),
-    $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
+    $queryRaw: jest.fn().mockResolvedValue([{ '?column?': 1 }]),
   },
   isPrismaConnectionError: (error) => {
     const code = typeof error?.code === 'string' ? error.code : '';
@@ -1016,7 +1016,7 @@ describe('Database disconnection — 503 handling', () => {
     expect(res.body.error.message).toBe('Service Unavailable');
   });
 
-  test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {
+  test('server.js routes with local fallback still return normally for Prisma P10 errors', async () => {
     prisma.user.findFirst.mockRejectedValue(makePrismaError('P1001'));
 
     const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');

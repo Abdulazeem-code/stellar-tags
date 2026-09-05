@@ -124,7 +124,7 @@ jest.mock('./prismaClient', () => {
         for (const entry of mockDb.values()) {
           if (entry.username === data.username) {
             const err = new Error('Unique constraint failed on the fields: (`username`)');
-            err.code = 'SQLITE_CONSTRAINT';
+            err.code = '23505';
             throw err;
           }
         }

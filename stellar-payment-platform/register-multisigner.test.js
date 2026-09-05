@@ -105,6 +105,7 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
       errorMessage: null,
     });
 
+
   });
 
   describe('Validation Tests', () => {
@@ -114,11 +115,10 @@ describe('POST /register - Multi-Signer Threshold Verification', () => {
         .send({
           username: 'testuser',
           address: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
-          signature: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
         });
 
-      expect(response.status).toBe(201);
-      expect(response.body.ok).toBe(true);
+      expect(response.status).toBe(422);
+      expect(response.body).toHaveProperty('error.details');
     });
 
     it('should reject request with invalid public key format', async () => {
