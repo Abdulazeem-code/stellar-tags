@@ -25,7 +25,7 @@ jobs:
       - name: Run contract tests
         run: cargo test --all-features --verbose
       - name: Anomaly Detection
-        run: cargo test --all-features -- --ignored
+        run: cargo test --release --all-features -- --ignored
       - name: Build contract to WASO
         run: cargo build --all-features --target wasm32-unknown-unknown --release
 
