@@ -1,9 +1,9 @@
 name: Production Safety Checks
 
 n: push:
-  braches: [ "main" ]
+  braches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   backend-checks:
@@ -17,12 +17,12 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: postgres
-          POSTRESE_PASSWORD: postgres
-          POSTRESE_DB: stellar_payment_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stellar_payment_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pgisready -U postgres
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -49,7 +49,7 @@ jobs:
         run: NODE_ENV=test npm test
 
       - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
@@ -63,16 +63,16 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v5
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./payment-dashboard/package-lock.json
-          
+
       - name: Install Frontend Dependencies
         run: npm install --legacy-peer-deps
-        
+
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build
