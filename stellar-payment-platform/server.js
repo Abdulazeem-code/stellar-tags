@@ -14,6 +14,7 @@ const { prisma, isPrismaConnectionError } = require('./prismaClient');
 const { scheduleCleanupJob } = require('./src/cleanup-cron');
 const { scheduleSoftDeletePurgeJob } = require('./src/soft-delete-purge-cron');
 const { schedulePoolMonitoring } = require('./src/db-pool-monitor');
+const { scheduleAnomalyMonitor } = require('./src/scripts/anomalyMonitor');
 const { correlationId } = require('./middleware/correlation');
 const { idempotencyMiddleware } = require('./middleware/idempotency');
 const Filter = require('bad-words');
@@ -300,6 +301,7 @@ app.use(compression({ threshold: 1024 }));
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
+scheduleAnomalyMonitor(prisma);
 
 const RESERVED_USERNAMES = [
   'admin',

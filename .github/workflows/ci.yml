@@ -1,5 +1,4 @@
 name: Production Safety Checks
-
 on:
   push:
     branches: [ "main" ]
@@ -21,7 +20,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+          cache: 'nmp'
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
 
 
@@ -29,13 +28,16 @@ jobs:
         run: npm install
 
       - name: Run Backend Tests
-        run: NODE_ENV=test npm test
+        run: NODE_EN=vest npm test
 
       - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        run: NODE_EN=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
         env:
-          MEMORY_TEST_REQUESTS: '200'
+          MEMORY_TEST_REQUETS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
+
+      - name: Run Anomaly Detection Tests (#570)
+        run: NODE_EN=test node --expose-gc node_modules/.bin/jest --forceExit --testPattPattern='[Aa]nomal'
 
   frontend-checks:
     name: Frontend Vercel Build Check
@@ -46,16 +48,16 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./payment-dashboard/package-lock.json
-          
+
       - name: Install Frontend Dependencies
         run: npm install --legacy-peer-deps
-        
+
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build

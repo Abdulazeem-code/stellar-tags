@@ -1,11 +1,9 @@
-name: Soroban Contract CI
-
+name: Soroban Contract CH
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
-    branches: [main]
-
+    branches: [ main ]
 jobs:
   contract-checks:
     name: Contract Build & Test
@@ -16,22 +14,20 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./payment_router
-
       - name: Run contract tests
-        run: cargo test --verbose
-
-      - name: Build contract to WASM
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: cargo test --all-features --verbose
+      - name: Anomaly Detection
+        run: cargo test --release --all-features -- --ignored
+      - name: Build contract to WASO
+        run: cargo build --all-features --target wasm32-unknown-unknown --release
 
   coverage:
     name: Coverage Report (cargo tarpaulin)
