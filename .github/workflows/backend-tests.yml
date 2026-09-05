@@ -20,7 +20,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: $((
           cache: 'npm'
           cache-dependency-path: stellar-payment-platform/package-lock.json
 
@@ -29,7 +29,8 @@ jobs:
         run: npm install --legacy-peer-deps
 
       - name: Run backend unit tests
-        run: npm test --prefix stellar-payment-platform
+        working-directory: stellar-payment-platform
+        run: npm test
 
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
