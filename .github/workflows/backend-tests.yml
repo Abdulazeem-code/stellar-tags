@@ -20,7 +20,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: $(({ matrix.node-version }})
+          node-version: ${{ matrix.node-version }}
           cache: 'npm'
           cache-dependency-path: stellar-payment-platform/package-lock.json
 
@@ -31,7 +31,7 @@ jobs:
       - name: Run backend unit tests
         run: npm test --prefix stellar-payment-platform
 
-      - name: Run memory leak detection tests ($711)
+      - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
         run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
         env:
