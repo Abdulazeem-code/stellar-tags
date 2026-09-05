@@ -15,12 +15,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@5
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@5
+        uses: actions/setup-node@v4
         with:
-          node-version: $ {{ matrix.node-version }}
+          node-version: $+{{ matrix.node-version }}
 
       - name: Install backend dependencies
         working-directory: stellar-payment-platform
@@ -32,11 +32,11 @@ jobs:
 
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
-        run: NODE_ENV=Test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
 
       - name: Run anomaly detection tests (#570)
         working-directory: stellar-payment-platform
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=anomaly
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPattern=anomaly
