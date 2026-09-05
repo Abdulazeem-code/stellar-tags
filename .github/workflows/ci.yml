@@ -1,59 +1,52 @@
 name: Production Safety Checks
-
-  on:
+on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
-  env:
-  DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb
-  jobs:
-    backend-checks:
-      name: Backend Build & Test
-      runs-on: ubuntu-latest
-      services:
-        postgres:
-          image: postgres:16
-          env:
-            POSTGRES_USER: testuser
-            POSTGRES_PASSWORD: testpass
-            POSTGRES_DB: testdb
-          ports:
-            - 5432:5432
-          options: >-
-            --health-cmd pgisready -U testuser -d testdb
-            --health-interval 10s
-            --health-timeout 5s
-            --health-retries 5
+    branches: ["main"]
+jobs:
+  backend-checks:
+    name: Backend Build & Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U testuser -d testdb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb
     defaults:
       run:
         working-directory: ./stellar-payment-platform
     steps:
       - name: Checkout Code
         uses: actions/checkout@v5
-      
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: "22"
+          cache: "npm"
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
-      
       - name: Install Backend Dependencies
         run: npm install
-      
       - name: Run Database Migrations
         run: npm run migrate --if-present
-      
       - name: Run Backend Tests
         run: NODE_ENV=test npm test
-      
       - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPatternPattern=memory
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
         env:
-          MEMORY_TEST_REQUESTS: '200'
-          MEMORY_LEAK_THRESHOLD_MB: '50'
-
+          MEMORY_TEST_REQUESTS: "200"
+          MEMORY_LEAK_THRESHOLD_MB: "50"
   frontend-checks:
     name: Frontend Vercel Build Check
     runs-on: ubuntu-latest
@@ -63,16 +56,14 @@ name: Production Safety Checks
     steps:
       - name: Checkout Code
         uses: actions/checkout@v5
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: "22"
+          cache: "npm"
           cache-dependency-path: ./payment-dashboard/package-lock.json
-          
       - name: Install Frontend Dependencies
         run: npm install --legacy-peer-deps
-        
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build
