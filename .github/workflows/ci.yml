@@ -16,12 +16,12 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: postgres
-          POSTRES_PASSWORD: postgres
-          POSTRES_DB: stellar_payment_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stellar_payment_test
         ports:
           - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
+        options: >
+          --health-cmd "pgisready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -29,10 +29,10 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_payment_test
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
@@ -47,8 +47,8 @@ jobs:
       - name: Run Backend Tests
         run: NODE_ENV=test npm test
 
-      - name: Run Memory Leak Detection Tests (611)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPattern=memory
+      - name: Run Memory Leak Detection Tests (#511)
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
@@ -61,10 +61,10 @@ jobs:
         working-directory: ./payment-dashboard
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
