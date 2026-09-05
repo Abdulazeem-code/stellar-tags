@@ -1,7 +1,8 @@
 name: Production Safety Checks
 
-n: push:
-  braches: ["main"]
+on:
+  push:
+    branches: ["main"]
   pull_request:
     branches: ["main"]
 
