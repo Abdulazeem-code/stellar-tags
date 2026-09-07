@@ -7,6 +7,7 @@ const statsRoutes = require('./statsRoutes');
 const historyRoutes = require('./historyRoutes');
 const exportRoutes = require('./exportRoutes');
 const paymentRoutes = require('./paymentRoutes');
+const contractRoutes = require('./contractRoutes');
 
 module.exports = (redisClient) => {
   const router = express.Router();
