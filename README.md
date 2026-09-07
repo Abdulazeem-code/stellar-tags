@@ -530,6 +530,18 @@ Retrieves recent immutable audit trail records for mutating admin actions (`POST
 
 Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
 
+### `GET /admin/webhooks/health`
+Aggregates webhook delivery health so operators can spot broken merchant integrations.
+- **Query Parameters:**
+  - `username` (optional) – Scope the aggregates to one merchant's webhooks.
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
+- **Returns:** JSON object with `success: true`, a `summary` (`total`, `healthy`, `failing`, `successRate24h`), and `failingOver24h` — the webhooks that have been failing continuously for more than 24 hours.
+- **Status Codes:**
+  - `200 OK`: Health snapshot retrieved successfully.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+A webhook is "failing" while its `failingSince` timestamp is set (cleared on the next successful delivery). `successRate24h` is the share of webhooks with a delivery attempt in the last 24h that are currently healthy; it is `null` when nothing has been active in that window.
+
 ### `GET /metrics`
 
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
