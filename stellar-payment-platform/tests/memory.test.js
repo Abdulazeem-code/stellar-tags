@@ -57,6 +57,9 @@ const REQUEST_COUNT = parseInt(process.env.MEMORY_TEST_REQUESTS ?? '200', 10);
 const THRESHOLD_MB = parseFloat(process.env.MEMORY_LEAK_THRESHOLD_MB ?? '50');
 const THRESHOLD_BYTES = THRESHOLD_MB * 1024 * 1024;
 
+// /health probes Horizon over HTTP; keep it off the network.
+global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**

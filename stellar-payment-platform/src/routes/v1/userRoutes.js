@@ -1,7 +1,7 @@
 const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
-const { prisma } = require('../../../prismaClient');
+const { prisma, withTransaction } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { poolGet, poolRun, poolAll, etagCache } = require('../../db');
 const { logger } = require('../../logger');
@@ -27,10 +27,19 @@ const {
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
+const { authenticateUsernameOwner } = require('../../services/ownershipService');
+const {
+  ACTIVITY_ACTIONS,
+  recordActivity,
+  listActivity,
+  parseDateRange,
+  serializeActivity,
+} = require('../../services/activityService');
 const {
   registerBodySchema,
   lookupQuerySchema,
   usersQuerySchema,
+  activityQuerySchema,
 } = require('../../schemas');
 
 const router = express.Router();
@@ -117,6 +126,18 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
+
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /register
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
@@ -211,8 +232,13 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
         ...(memoType && { memoType, memo }),
       },
     });
-    // Invalidate any stale federation cache entries for this username/address
-    invalidateFederationCache(normalizedUsername, address);
+
+    await recordActivity(prisma, {
+      username: normalizedUsername,
+      action: ACTIVITY_ACTIONS.USER_REGISTERED,
+      metadata: { address, is_primary: isPrimary, ...(memoType && { memo_type: memoType }) },
+      req,
+    });
 
     return res.status(201).json({
       ok: true,
@@ -271,6 +297,13 @@ router.post('/users/:username/transfer', async (req, res, next) => {
       newSignature
     );
 
+    await recordActivity(prisma, {
+      username: updatedUser.username,
+      action: ACTIVITY_ACTIONS.USER_TRANSFERRED,
+      metadata: { from_address: oldAddress, to_address: updatedUser.address },
+      req,
+    });
+
     return res.status(200).json({
       ok: true,
       message: 'Account transferred successfully',
@@ -287,6 +320,18 @@ router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWE
 
 // #18 — Soft-delete endpoint. Sets deleted_at to now() instead of running a
 // hard DELETE so the row is preserved for historical auditing.
+
+/**
+ * @openapi
+ * /register/:username:
+ *   delete:
+ *     tags:
+ *       - v1
+ *     description: DELETE /register/:username
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   const username = normalizeNameTag(
     typeof req.params.username === 'string' ? req.params.username.trim() : '',
@@ -309,13 +354,22 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
       return next(notFoundError);
     }
 
-    await prisma.user.update({
-      where: { username },
-      data: { deletedAt: new Date() },
+    await withTransaction(async (tx) => {
+      await tx.user.update({
+        where: { username },
+        data: { deletedAt: new Date() },
+      });
+
+      // Invalidate any stale federation cache entries
+      invalidateFederationCache(username, existing.address);
     });
-    
-    // Invalidate any stale federation cache entries
-    invalidateFederationCache(username, existing.address);
+
+    await recordActivity(prisma, {
+      username,
+      action: ACTIVITY_ACTIONS.USER_UNREGISTERED,
+      metadata: { address: existing.address },
+      req,
+    });
 
     return res.status(200).json({ ok: true, username, deleted: true });
   } catch (error) {
@@ -325,6 +379,53 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
     return next(dbError);
   }
 }));
+
+// #599 — A user's own activity trail. Ownership is proven the same way the
+// webhook endpoints prove it: a signature over `activity:<username>` made with
+// the account key, passed in the X-Stellar-Signature header (or the body, as
+// the webhook routes accept it).
+router.get(
+  '/users/:username/activity',
+  validateSchema({ query: activityQuerySchema }),
+  asyncHandler(async (req, res, next) => {
+    const username = normalizeNameTag(
+      typeof req.params.username === 'string' ? req.params.username.trim() : '',
+    ).toLowerCase();
+
+    if (!username) {
+      return next(new ApiError('INVALID_INPUT', 'Missing username parameter.'));
+    }
+
+    let owner;
+    try {
+      owner = await authenticateUsernameOwner({
+        username,
+        signature: req.get('X-Stellar-Signature') || req.body?.signature,
+        signerAddress: req.get('X-Stellar-Signer') || req.body?.signerAddress,
+        operation: 'activity',
+      });
+    } catch (error) {
+      return next(error);
+    }
+
+    const { range, error: dateError } = parseDateRange(req.query);
+    if (dateError) {
+      return next(new ApiError('INVALID_INPUT', dateError));
+    }
+
+    const { page, limit } = req.query;
+    const { rows, total } = await listActivity(prisma, {
+      username: owner.username,
+      page,
+      limit,
+      range,
+    });
+
+    return res
+      .status(200)
+      .json(paginatedResponse(rows.map(serializeActivity), total, { page, limit }));
+  }),
+);
 
 router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
   const { address = '', search = '' } = req.query;
@@ -412,6 +513,18 @@ const totalPages = Math.ceil(totalCount / limit);
   }
 }));
 
+
+/**
+ * @openapi
+ * /users:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /users
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);
