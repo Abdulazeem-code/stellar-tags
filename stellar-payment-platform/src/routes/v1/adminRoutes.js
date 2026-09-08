@@ -469,7 +469,7 @@ router.get(
   // integrations: total/healthy/failing counts, a rolling 24h success rate,
   // and the URLs that have been failing for more than 24h.
   router.get('/admin/webhooks/health', adminAuth, asyncHandler(async (req, res) => {
-    const prisma = getPrisma();
+    const { prisma } = getPrisma();
     const username = typeof req.query.username === 'string' ? req.query.username.trim() : '';
     const where = username ? { username } : {};
     const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);

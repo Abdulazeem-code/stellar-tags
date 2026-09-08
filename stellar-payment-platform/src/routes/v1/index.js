@@ -12,11 +12,9 @@ const contractRoutes = require('./contractRoutes');
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  const federationRoutes = require('./federationRoutes')(redisClient);
   const adminRoutes = require('./adminRoutes')(redisClient);
 
   router.use('/', userRoutes);
-  router.use('/', federationRoutes);
   router.use('/', receiptRoutes);
   router.use('/', contractRoutes);
   router.use('/', historyRoutes);
