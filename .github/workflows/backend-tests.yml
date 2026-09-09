@@ -26,8 +26,9 @@ jobs:
         working-directory: stellar-payment-platform
         run: npm install --legacy-peer-deps
 
-      - name: Run backend unit tests
-        run: npm test --prefix stellar-payment-platform
+      # Coverage thresholds live in package.json; failing below them fails the PR.
+      - name: Run backend unit tests (with coverage thresholds)
+        run: npm run test:coverage --prefix stellar-payment-platform
 
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
