@@ -81,15 +81,11 @@ try {
   };
 }
 
-const withTransaction = async (callback) => {
-  return await prisma.$transaction(async (tx) => {
-    return await callback(tx);
-  });
-};
+
 
 /**
  * Returns true when the error (or its direct Error.cause) is a Prisma
- * database-connection error (P10xx codes — connection refused, pool
+ * database-connection error (P10xx codes - connection refused, pool
  * timeout, etc.). Used by the global error handler to return 503
  * instead of 500 when Postgres is unreachable.
  */
@@ -98,6 +94,7 @@ function isPrismaConnectionError(error) {
   if (code.startsWith('P10')) return true;
   const causeCode = typeof error?.cause?.code === 'string' ? error.cause.code : '';
   return causeCode.startsWith('P10');
+
 }
 
 module.exports = { prisma, isPrismaConnectionError, withTransaction };
