@@ -20,10 +20,14 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  RESERVED_USERNAMES,
   MAX_USERNAMES_PER_ADDRESS,
   PRIMARY_USERNAME_ORDER,
   shouldFallbackToLocalRegistry,
 } = require('../../utils');
+const Filter = require('bad-words');
+const profanityFilter = new Filter();
+const { verifyFreighterRegistrationSignature } = require('../../services/signatureService');
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
@@ -37,10 +41,14 @@ const {
 } = require('../../services/activityService');
 const {
   registerBodySchema,
+  federationQuerySchema,
   lookupQuerySchema,
   usersQuerySchema,
   activityQuerySchema,
 } = require('../../schemas');
+const { registerUser } = require('../../services/registrationService');
+const { lookupUser, listUsers } = require('../../services/userService');
+
 
 const router = express.Router();
 
@@ -152,23 +160,10 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     );
   }
 
-  if (!username || !address) {
-    return next(new ApiError('INVALID_INPUT', 'Missing required fields: username and address are both required.'));
-  }
-
-  const BLOCKED_EXCHANGES = [
-    "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
-    "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
-    "GBV4ZDEPNQ2FKSPKGJP2YKDAIZWQ2XKRQD4V4ACH3TCTXTGLWEBDU3OS"
-  ];
-
-  if (BLOCKED_EXCHANGES.includes(address) && !memo) {
-    return next(new ApiError('INVALID_INPUT', "Cannot map federation addresses directly to custodial exchange master wallets."));
-  }
-
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-  if (usernameLocalPart.length < 3) {
-    return next(new ApiError('INVALID_INPUT', "Username must be at least 3 characters long."));
+
+  if (profanityFilter.isProfane(usernameLocalPart)) {
+    return next(new ApiError('INVALID_INPUT', 'Username contains restricted words'));
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -182,9 +177,12 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     return next(new ApiError('INVALID_INPUT', memoError));
   }
 
-
-
   const normalizedUsername = username.toLowerCase();
+  
+  const normalizedLocalPart = normalizedUsername.includes('*') ? normalizedUsername.split('*')[0] : normalizedUsername;
+  if (RESERVED_USERNAMES.includes(normalizedLocalPart)) {
+    return res.status(403).json({ error: "Username is reserved." });
+  }
 
   if (RESERVED_NAMES.includes(normalizedUsername)) {
     return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
@@ -209,18 +207,53 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     const isPrimary = usernameCount === 0;
 
     let verificationResult = null;
-    const signerToVerify = signerAddress || address;
-    if (signerToVerify) {
-      verificationResult = await verifyMultiSignerThreshold(address, [signerToVerify], {
-        operationType: 'management',
-      });
+    if (signature) {
+      const isLegacyPublicKeyFlow =
+        StrKey.isValidEd25519PublicKey(signature) && !signerAddress;
 
-      if (!verificationResult.success) {
-        const verificationError = new Error(
-          verificationResult.errorMessage || 'Signature verification failed'
-        );
-        verificationError.statusCode = 401;
-        throw verificationError;
+      if (isLegacyPublicKeyFlow) {
+        verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+          operationType: 'management',
+        });
+
+        if (!verificationResult.success) {
+          const verificationError = new Error(
+            verificationResult.errorMessage || 'Signature verification failed'
+          );
+          verificationError.statusCode = 401;
+          throw verificationError;
+        }
+      } else {
+        const claimedSigner = verifyFreighterRegistrationSignature({
+          username: req.body.username,
+          address: req.body.address,
+          signature,
+          signerAddress,
+        });
+
+        verificationResult = {
+          success: true,
+          accountId: claimedSigner,
+          operationType: 'message',
+          requiredThreshold: 1,
+          totalWeight: 1,
+          signatureCount: 1,
+          uniqueSignerCount: 1,
+          signatures: [
+            {
+              publicKey: claimedSigner,
+              weight: 1,
+              isValid: true,
+            },
+          ],
+          thresholds: {
+            low_threshold: 1,
+            med_threshold: 1,
+            high_threshold: 1,
+          },
+          signerCount: 1,
+          errorMessage: null,
+        };
       }
     }
 
@@ -257,6 +290,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       }),
       ...(memoType && { memo_type: memoType, memo }),
     });
+
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
@@ -272,10 +306,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       return next(error);
     }
 
-    logger.error('Registration error:', error.message);
-    const registrationError = new Error(`Registration verification failed: ${error.message}`, { cause: error });
-    registrationError.statusCode = 500;
-    return next(registrationError);
+    return next(error);
   }
 }));
 
@@ -427,6 +458,17 @@ router.get(
   }),
 );
 
+/**
+ * @openapi
+ * /lookup:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /lookup
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
@@ -450,7 +492,6 @@ router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), a
 
       return res.json(result);
     } catch (error) {
-      console.warn('USER ROUTES ERROR:', error);
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
@@ -465,55 +506,25 @@ router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), a
   const where = buildUserSearchWhere(search);
 
   try {
-    if (cursor) {
-      // Keyset mode: seek straight past the cursor row instead of skipping
-      // every preceding row, so deep pages cost the same as page one.
-      const candidates = await prisma.user.findMany({
-        where: { AND: [where, keysetWhereDesc(cursor)] },
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        take: cursorLimit + 1,
-      });
-      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt.toISOString(),
-      }));
-      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
-    }
-
-    const [totalCount, rows] = await prisma.$transaction([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        skip,
-        take: limit,
-      }),
-    ]);
-
-const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
-    }));
-
-    return res.json({ data, totalCount, totalPages, currentPage: page });
+    const result = await lookupUser(req.query.address, req.query.search, req.query);
+    return res.json(result);
   } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
 
+/**
+ * @openapi
+ * /users:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /users
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 /**
  * @openapi
  * /users:
@@ -535,64 +546,10 @@ router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asy
   const where = search ? buildUserSearchWhere(search) : { deletedAt: null };
 
   try {
-    if (cursor) {
-      // Keyset mode: seek straight past the cursor row instead of skipping
-      // every preceding row, so deep pages cost the same as page one.
-      const candidates = await prisma.user.findMany({
-        where: { AND: [where, keysetWhereDesc(cursor)] },
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        take: cursorLimit + 1,
-      });
-      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-      }));
-      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
-    }
-
-    const [totalCount, rows] = await prisma.$transaction([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        orderBy: [
-          { createdAt: 'desc' },
-          { username: 'desc' },
-        ],
-        skip,
-        take: limit,
-      }),
-    ]);
-
-const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
-    }));
-
-    res.json({
-      data,
-      meta: {
-        total: totalCount,
-        totalCount,
-        page,
-        currentPage: page,
-        limit,
-        totalPages,
-      },
-      totalCount,
-      totalPages,
-      currentPage: page,
-    });
+    const result = await listUsers(req.query);
+    return res.json(result);
   } catch (error) {
-    const dbError = new Error('Database error', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
