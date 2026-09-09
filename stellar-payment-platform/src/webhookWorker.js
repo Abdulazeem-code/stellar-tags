@@ -538,6 +538,8 @@ module.exports = {
   closeWebhookQueue,
   processWebhookJob,
   sendWebhook,
+  markWebhookSuccess,
+  markWebhookFailure,
   computeSignature,
   WEBHOOK_TIMEOUT_MS,
   WEBHOOK_QUEUE_NAME,
