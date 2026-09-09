@@ -11,6 +11,8 @@ if [ -z "${DATABASE_URL:-}" ]; then
   echo "Skipping database migrations and running in mock/fallback mode." >&2
 else
   echo "Running database migrations..."
+  # Automatically resolve the duplicate soft_deletes migration that failed on Render
+  "$PRISMA" migrate resolve --applied 20260829000000_soft_deletes || true
   "$PRISMA" migrate deploy
   echo "Verifying migration status..."
   if "$PRISMA" migrate status >/dev/null 2>&1; then
