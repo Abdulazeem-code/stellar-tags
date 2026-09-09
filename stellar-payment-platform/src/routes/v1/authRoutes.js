@@ -24,7 +24,19 @@ module.exports = (redisClient) => {
 
   // POST /auth/verify-email
   // Body: { email }
-  router.post('/verify-email', requireRedis, requireJson, validateSchema({ body: verifyEmailBodySchema }), asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /verify-email:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /verify-email
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/verify-email', requireRedis, requireJson, validateSchema({ body: verifyEmailBodySchema }), asyncHandler(async (req, res, next) => {
     try {
       const safeEmail = xss(req.body.email);
 
@@ -47,7 +59,19 @@ module.exports = (redisClient) => {
 
   // POST /auth/verify-email/confirm
   // Body: { email, code }
-  router.post('/verify-email/confirm', requireRedis, requireJson, validateSchema({ body: verifyEmailConfirmBodySchema }), asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /verify-email/confirm:
+ *   post:
+ *     tags:
+ *       - v1
+ *     description: POST /verify-email/confirm
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.post('/verify-email/confirm', requireRedis, requireJson, validateSchema({ body: verifyEmailConfirmBodySchema }), asyncHandler(async (req, res, next) => {
     try {
       const safeEmail = xss(req.body.email);
       const { code } = req.body;

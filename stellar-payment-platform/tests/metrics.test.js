@@ -31,6 +31,9 @@ jest.mock('../prismaClient', () => ({
   }
 }));
 
+// /health probes Horizon over HTTP; keep it off the network.
+global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+
 process.env.NODE_ENV = 'test';
 const { app } = require('../server');
 

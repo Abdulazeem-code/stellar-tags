@@ -11,7 +11,7 @@ datasource db {
 
 generator client {
   provider        = "prisma-client-js"
-  previewFeatures = ["metrics"]
+  previewFeatures = ["metrics", "tracing"]
 }
 
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
@@ -33,6 +33,7 @@ model User {
   flaggedAt DateTime? @map("flagged_at")
   deletedAt DateTime? @map("deleted_at")
   webhooks  Webhook[] // <-- add this line
+  activity  ActivityLog[]
 
   @@index([username])
   // Reverse federation lookups (type=id) and /lookup?address= filter by
@@ -63,6 +64,17 @@ model Webhook {
   @@index([username])
   @@index([lastSentAt])
   @@map("webhooks")
+}
+
+// Approved merchant frontend origins allowed to call the API. CORS
+// validation (see server.js) checks incoming Origin headers against this
+// table, with results cached in Redis so most requests avoid a DB round trip.
+model ApprovedOrigin {
+  id        String   @id @default(uuid())
+  origin    String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("approved_origins")
 }
 
 // Payment records for routing, statistics, and auditing.
@@ -105,6 +117,7 @@ model WebhookDLQ {
   @@index([movedAt])
   @@map("webhook_dlq")
 }
+
 // API keys for backend consumers. Only the SHA-256 hash of the secret is
 // stored; the raw key is shown once at creation time.
 model ApiKey {
@@ -168,4 +181,23 @@ model AuditLog {
   @@index([userId])
   @@index([action])
   @@map("audit_logs")
+}
+
+// #599 — Self-service activity trail. Records the account-affecting events a
+// user can review for their own username through
+// GET /users/:username/activity. Rows go away with the user so a purge does
+// not leave an orphaned trail behind.
+model ActivityLog {
+  id        String   @id @default(uuid())
+  username  String
+  user      User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  action    String
+  metadata  Json?
+  ipAddress String?  @map("ip_address")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Serves the only read path: one user's trail, newest first, optionally
+  // bounded by a date range.
+  @@index([username, createdAt])
+  @@map("activity_logs")
 }

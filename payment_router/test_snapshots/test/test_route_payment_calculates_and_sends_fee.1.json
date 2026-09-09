@@ -112,9 +112,6 @@
                     "hi": 0,
                     "lo": 2000
                   }
-                },
-                {
-                  "bytes": ""
                 }
               ]
             }
@@ -197,9 +194,6 @@
                     "hi": 0,
                     "lo": 8000
                   }
-                },
-                {
-                  "bytes": ""
                 }
               ]
             }
@@ -367,27 +361,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "accumulated_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 10000
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "last_reset_time"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    }
-                  ]
+                  "bytes": "000000000000000000000000000000000000000000002710"
                 }
               }
             },
@@ -513,6 +487,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Frozen"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "MaxAmount"
                             }
                           ]
@@ -546,6 +532,18 @@
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TimelockNonce"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
                         }
                       }
                     ]
@@ -1407,9 +1405,6 @@
                     "hi": 0,
                     "lo": 2000
                   }
-                },
-                {
-                  "bytes": ""
                 }
               ]
             }
@@ -1684,6 +1679,26 @@
       "event": {
         "ext": "v0",
         "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "log"
+              }
+            ],
+            "data": {
+              "string": "Remaining balance routed to recipient"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
         "type_": "contract",
         "body": {
           "v0": {
@@ -1723,26 +1738,6 @@
             ],
             "data": {
               "string": "Platform fee routed to treasury"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "log"
-              }
-            ],
-            "data": {
-              "string": "Remaining balance routed to recipient"
             }
           }
         }
@@ -2012,9 +2007,6 @@
                     "hi": 0,
                     "lo": 8000
                   }
-                },
-                {
-                  "bytes": ""
                 }
               ]
             }
@@ -2289,6 +2281,26 @@
       "event": {
         "ext": "v0",
         "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "log"
+              }
+            ],
+            "data": {
+              "string": "Remaining balance routed to recipient"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
         "type_": "contract",
         "body": {
           "v0": {
@@ -2328,26 +2340,6 @@
             ],
             "data": {
               "string": "Platform fee routed to treasury"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "log"
-              }
-            ],
-            "data": {
-              "string": "Remaining balance routed to recipient"
             }
           }
         }

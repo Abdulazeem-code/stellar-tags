@@ -8,6 +8,7 @@
     "prepare": "husky",
     "load:test": "artillery run artillery.yml",
     "generate:bindings": "bash scripts/generate-bindings.sh",
+    "test:integration": "bash tests/integration/run.sh",
     "contract:build": "node scripts/deploy.js build",
     "contract:deploy": "node scripts/deploy.js deploy",
     "contract:upgrade": "node scripts/deploy.js upgrade"

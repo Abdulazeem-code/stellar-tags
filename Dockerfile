@@ -11,7 +11,7 @@ ENV NPM_CONFIG_AUDIT=false \
 FROM base AS backend
 COPY stellar-payment-platform/package*.json ./
 COPY stellar-payment-platform/prisma ./prisma
-RUN npm ci --no-audit --no-fund
+RUN npm install --no-audit --no-fund
 COPY stellar-payment-platform/ .
 RUN npx prisma generate
 EXPOSE 5000

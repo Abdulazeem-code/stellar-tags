@@ -109,12 +109,12 @@ describe('payment intent metadata', () => {
         update: jest.fn().mockResolvedValue({}),
       },
     };
-    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200 });
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
 
     await dispatchPaymentWebhooks({
       prisma,
       poolGetFn: jest.fn(),
-      poolRunFn: jest.fn(),
+      queue,
       payment: {
         id: 'payment-1',
         type: 'payment',
@@ -127,8 +127,9 @@ describe('payment intent metadata', () => {
       },
     });
 
-    const requestBody = JSON.parse(fetchSpy.mock.calls[0][1].body);
-    expect(requestBody.data.metadata).toEqual(metadata);
+    expect(queue.add).toHaveBeenCalledTimes(1);
+    const queuedJob = queue.add.mock.calls[0][1];
+    expect(queuedJob.payload.data.metadata).toEqual(metadata);
   });
 
   test('delivers payment events only when the merchant subscribed to payment.received', async () => {
@@ -143,12 +144,12 @@ describe('payment intent metadata', () => {
         update: jest.fn().mockResolvedValue({}),
       },
     };
-    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200 });
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-2' }) };
 
     await dispatchPaymentWebhooks({
       prisma,
       poolGetFn: jest.fn(),
-      poolRunFn: jest.fn(),
+      queue,
       payment: {
         id: 'payment-2',
         type: 'payment',
@@ -160,9 +161,9 @@ describe('payment intent metadata', () => {
       },
     });
 
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const requestBody = JSON.parse(fetchSpy.mock.calls[0][1].body);
-    expect(requestBody.event).toBe('payment.received');
+    expect(queue.add).toHaveBeenCalledTimes(1);
+    const queuedJob = queue.add.mock.calls[0][1];
+    expect(queuedJob.payload.event).toBe('payment.received');
   });
 
   test('skips delivery for unsubscribed webhook event types', async () => {
@@ -177,12 +178,12 @@ describe('payment intent metadata', () => {
         update: jest.fn().mockResolvedValue({}),
       },
     };
-    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200 });
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-3' }) };
 
     await dispatchPaymentWebhooks({
       prisma,
       poolGetFn: jest.fn(),
-      poolRunFn: jest.fn(),
+      queue,
       payment: {
         id: 'payment-3',
         type: 'payment',
@@ -194,6 +195,6 @@ describe('payment intent metadata', () => {
       },
     });
 
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
   });
 });

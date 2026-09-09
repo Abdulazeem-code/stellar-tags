@@ -231,6 +231,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Frozen"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "MaxAmount"
                             }
                           ]
@@ -264,6 +276,18 @@
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TimelockNonce"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
                         }
                       }
                     ]
@@ -913,9 +937,6 @@
                     "hi": 0,
                     "lo": 500
                   }
-                },
-                {
-                  "bytes": ""
                 }
               ]
             }
@@ -1093,9 +1114,6 @@
                         "hi": 0,
                         "lo": 500
                       }
-                    },
-                    {
-                      "bytes": ""
                     }
                   ]
                 }
