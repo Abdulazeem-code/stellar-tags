@@ -201,3 +201,19 @@ model ActivityLog {
   @@index([username, createdAt])
   @@map("activity_logs")
 }
+
+// Stores discrepancies found between internal DB state and the Stellar Horizon API.
+model ReconciliationAnomaly {
+  id              String   @id @default(uuid())
+  paymentId       String?  @map("payment_id")
+  transactionHash String?  @map("transaction_hash")
+  discrepancyType String   @map("discrepancy_type") // e.g. "missing_on_chain", "amount_mismatch", "status_mismatch"
+  details         String?
+  resolved        Boolean  @default(false)
+  createdAt       DateTime @default(now()) @map("created_at")
+  resolvedAt      DateTime? @map("resolved_at")
+
+  @@index([createdAt])
+  @@index([resolved])
+  @@map("reconciliation_anomalies")
+}

@@ -14,6 +14,7 @@ const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLi
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
+const { scheduleReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
 const { correlationId } = require("./middleware/correlation");
 const { idempotencyMiddleware } = require("./middleware/idempotency");
@@ -347,6 +348,7 @@ app.use(compression({ threshold: 1024 }));
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
+scheduleReconciliationJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
 const RESERVED_USERNAMES = [
