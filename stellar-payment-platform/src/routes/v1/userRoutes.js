@@ -532,7 +532,7 @@ router.get(
 
         return res.json(result);
       } catch (error) {
-        console.warn("USER ROUTES ERROR:", error);
+        req.log.error({ err: error }, "USER ROUTES ERROR");
         const dbError = new Error("Database lookup failed", { cause: error });
         dbError.statusCode = 500;
         return next(dbError);

@@ -102,7 +102,7 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
         );
       }
     } catch (error) {
-      console.log("FEDERATION LOOKUP ERROR:", error);
+      req.log.error({ err: error }, "FEDERATION LOOKUP ERROR");
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
