@@ -532,7 +532,8 @@ router.get(
 
         return res.json(result);
       } catch (error) {
-        req.log.error({ err: error }, "USER ROUTES ERROR");
+        const { logger } = require('../../logger');
+        (req.log || logger).error({ err: error }, "USER ROUTES ERROR");
         const dbError = new Error("Database lookup failed", { cause: error });
         dbError.statusCode = 500;
         return next(dbError);
