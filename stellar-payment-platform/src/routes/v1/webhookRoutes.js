@@ -8,7 +8,8 @@ const { asyncHandler } = require('../../middleware/asyncHandler');
 const { shouldFallbackToLocalRegistry } = require('../../utils');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { authenticateUsernameOwner } = require('../../services/ownershipService');
-const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
+const { ACTIVITY_ACTIONS, recordActivity } = require("../../services/activityService");
+const { createSignatureRateLimiter } = require('../../middleware/signatureRateLimit');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -17,6 +18,8 @@ module.exports = (redisClient) => {
   // DELETE /webhooks/:id). Duplicate requests within 24h return the cached
   // 2xx response. Read-only GET /webhooks is ignored. ────────────────────────
   router.use(idempotencyMiddleware(redisClient));
+
+  const signatureRateLimiter = createSignatureRateLimiter();
 
 
 
@@ -182,7 +185,7 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
  *       200:
  *         description: Success
  */
-router.post('/webhooks', asyncHandler(async (req, res, next) => {
+router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json')) {
       return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
