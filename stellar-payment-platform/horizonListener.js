@@ -22,6 +22,8 @@ const {
   horizon,
   createBreaker,
 } = require('./src/services/stellarService');
+const { createRedisConnection } = require('./src/config/redis');
+const { publishPaymentUpdate } = require('./src/websocket');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -35,6 +37,27 @@ const HORIZON_URLS = {
 
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
+
+// ---------------------------------------------------------------------------
+// Redis publisher for real-time WebSocket events
+// ---------------------------------------------------------------------------
+// When a payment is detected on-chain we publish a message to the Redis
+// channel `stellar:payment:update`. The API server process subscribes to that
+// channel (via src/websocket/index.js) and broadcasts the event to every
+// browser client currently watching the affected payment intent ID.
+//
+// A dedicated ioredis connection is used for publishing so the BullMQ
+// worker connections (which require maxRetriesPerRequest: null) are unaffected.
+const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
+if (redisPublisher) {
+  redisPublisher.on('error', (err) =>
+    logger.error({ err }, '[listener] Redis publisher error'),
+  );
+} else {
+  logger.warn(
+    '[listener] REDIS_URL not set — real-time WebSocket payment updates are disabled.',
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Horizon Health-Check Circuit Breaker
@@ -80,6 +103,81 @@ const formatPayment = (payment, trackedAccount) => {
 // ---------------------------------------------------------------------------
 
 /**
+ * Resolve any pending PaymentIntent records that match the on-chain payment
+ * and broadcast a real-time status update via Redis → Socket.io.
+ *
+ * A PaymentIntent is considered a match when:
+ *   - its `to` address equals the payment's destination, and
+ *   - its `status` is still "pending".
+ *
+ * On a match we mark the intent as "completed" and publish the event so the
+ * API server can notify subscribed browser clients over the WebSocket channel.
+ *
+ * @param {object} payment         - The Horizon payment operation object.
+ * @param {string} trackedAccount  - The local address that was being watched.
+ */
+const notifyPaymentIntents = async (payment, trackedAccount) => {
+  if (!redisPublisher) return; // Real-time updates not configured
+
+  try {
+    // Find pending intents addressed to this account. There may be several
+    // (e.g. multiple outstanding invoices for the same recipient).
+    const matchingIntents = await prisma.paymentIntent.findMany({
+      where: {
+        to: trackedAccount,
+        status: 'pending',
+      },
+      select: { id: true },
+    });
+
+    if (matchingIntents.length === 0) return;
+
+    // Update all matched intents to "completed" in one atomic batch.
+    await prisma.paymentIntent.updateMany({
+      where: {
+        id: { in: matchingIntents.map((i) => i.id) },
+        status: 'pending', // guard against concurrent updates
+      },
+      data: { status: 'completed' },
+    });
+
+    // Broadcast a real-time update for each resolved intent.
+    const updatePayload = {
+      status: 'completed',
+      transactionHash: payment.transaction_hash,
+      from: payment.from,
+      to: payment.to,
+      amount: payment.amount,
+      asset:
+        payment.asset_type === 'native'
+          ? 'XLM'
+          : `${payment.asset_code}:${payment.asset_issuer}`,
+      detectedAt: new Date().toISOString(),
+    };
+
+    await Promise.all(
+      matchingIntents.map((intent) =>
+        publishPaymentUpdate(redisPublisher, intent.id, updatePayload),
+      ),
+    );
+
+    logger.info(
+      {
+        count: matchingIntents.length,
+        transactionHash: payment.transaction_hash,
+        to: trackedAccount,
+      },
+      '[listener] Published payment:update for matching PaymentIntent(s)',
+    );
+  } catch (err) {
+    logger.error(
+      { err: err.message, transactionHash: payment.transaction_hash },
+      '[listener] Failed to notify PaymentIntent(s) via WebSocket',
+    );
+  }
+};
+
+/**
  * Open a payment SSE stream for a single Stellar account.
  * On error the stream is removed from the active map so the next sync cycle
  * can attempt to reconnect it (instead of staying stuck on a dead stream).
@@ -107,6 +205,14 @@ const watchAccount = (accountId) => {
           }).catch((err) =>
             logger.error(
               `[${timestamp()}] ⚠️  Webhook dispatch failed for tx ${payment.transaction_hash}:`,
+              err?.message || err,
+            ),
+          );
+          // Emit a real-time WebSocket update for any pending PaymentIntent
+          // records addressed to this account.
+          notifyPaymentIntents(payment, accountId).catch((err) =>
+            logger.error(
+              `[${timestamp()}] ⚠️  WebSocket notification failed for tx ${payment.transaction_hash}:`,
               err?.message || err,
             ),
           );
@@ -188,6 +294,13 @@ const shutdown = async () => {
   }
   activeStreams.clear();
   await closeWebhookQueue();
+  if (redisPublisher) {
+    try {
+      await redisPublisher.quit();
+    } catch (err) {
+      logger.error({ err }, '[listener] Error closing Redis publisher during shutdown');
+    }
+  }
   await prisma.$disconnect();
   process.exit(0);
 };

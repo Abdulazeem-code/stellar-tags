@@ -78,6 +78,10 @@ const {
   shouldFallbackToLocalRegistry,
 } = require("./src/utils");
 const { getCachedApprovedOrigins } = require("./src/originCache");
+const {
+  initWebSocket,
+  closeWebSocket,
+} = require("./src/websocket");
 
 dotenv.config();
 
@@ -1383,21 +1387,25 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
-  server.close(async () => {
-    clearTimeout(timer);
-    try {
-      await prismaClient.$disconnect();
-    } catch (err) {
-      logger.error(err, "Error disconnecting Prisma during shutdown:");
-    }
-    if (redis) {
+  // Gracefully close Socket.io before closing the underlying HTTP server so
+  // existing WebSocket connections can finish in-flight before being dropped.
+  closeWebSocket().then(() => {
+    server.close(async () => {
+      clearTimeout(timer);
       try {
-        await redis.quit();
+        await prismaClient.$disconnect();
       } catch (err) {
-        logger.error(err, "Error disconnecting Redis during shutdown:");
+        logger.error(err, "Error disconnecting Prisma during shutdown:");
       }
-    }
-    process.exit(0);
+      if (redis) {
+        try {
+          await redis.quit();
+        } catch (err) {
+          logger.error(err, "Error disconnecting Redis during shutdown:");
+        }
+      }
+      process.exit(0);
+    });
   });
 };
 
@@ -1421,6 +1429,11 @@ if (require.main === module) {
         process.exit(1);
       }
     });
+
+    // Attach Socket.io to the same HTTP server so WebSocket upgrades are
+    // handled on the same port as the REST API. Pass the existing CORS
+    // allow-list so WebSocket handshakes respect the same origin policy.
+    initWebSocket(server, allowedOrigins);
 
     process.on("SIGTERM", (sig) =>
       gracefulShutdown(server, prisma, sig, redisClient),

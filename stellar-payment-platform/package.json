@@ -26,7 +26,11 @@
     "testEnvironment": "node",
     "collectCoverage": false,
     "coverageDirectory": "coverage",
-    "coverageReporters": ["text", "lcov", "json-summary"],
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "json-summary"
+    ],
     "coverageThreshold": {
       "global": {
         "statements": 68,
@@ -35,7 +39,9 @@
         "lines": 68
       }
     },
-    "setupFiles": ["./jest.setup.js"]
+    "setupFiles": [
+      "./jest.setup.js"
+    ]
   },
   "prisma": {
     "seed": "node scripts/seed.js"
@@ -74,11 +80,12 @@
     "qrcode": "^1.5.4",
     "rate-limit-redis": "^4.2.0",
     "redis": "^4.7.0",
+    "socket.io": "4.8.1",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.0",
     "uuid": "^9.0.1",
     "xss": "^1.0.15",
-    "zod": "^4.4.3",
-    "swagger-jsdoc": "^6.2.8",
-    "swagger-ui-express": "^5.0.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "jest": "^29.7.0",
