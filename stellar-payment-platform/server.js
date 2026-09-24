@@ -10,6 +10,7 @@ const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const { RedisStore } = require("rate-limit-redis");
 const { createClient } = require("redis");
+const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
@@ -226,7 +227,7 @@ const limiter = rateLimit({
     : undefined,
   // Return the standard RateLimit-* headers only
   standardHeaders: true,
-  legacyHeaders: true,
+  legacyHeaders: false,
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -293,7 +294,7 @@ const ipLimiter = rateLimit({
       })
     : undefined,
   standardHeaders: true,
-  legacyHeaders: true,
+  legacyHeaders: false,
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -301,6 +302,8 @@ const ipLimiter = rateLimit({
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });
+
+const signatureRateLimiter = createSignatureRateLimiter(redisClient);
 
 app.use(cors(corsOptions));
 
@@ -743,7 +746,7 @@ const verifyFreighterRegistrationSignature = ({
  */
 app.post(
   "/register",
-  ipLimiter,
+  signatureRateLimiter,
   idempotencyMiddleware(redisClient),
   requireJson,
   validateSchema({ body: registerBodySchema }),
@@ -1261,7 +1264,7 @@ const authLimiter = rateLimit({
       })
     : undefined,
   standardHeaders: true,
-  legacyHeaders: true,
+  legacyHeaders: false,
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",

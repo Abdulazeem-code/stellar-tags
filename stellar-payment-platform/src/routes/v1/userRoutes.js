@@ -16,6 +16,7 @@ const {
   cursorPaginatedResponse,
 } = require("../../pagination");
 const { asyncHandler } = require("../../middleware/asyncHandler");
+const { createSignatureRateLimiter } = require("../../middleware/signatureRateLimit");
 const {
   normalizeNameTag,
   validateMemo,
@@ -45,6 +46,8 @@ const {
 } = require("../../schemas");
 
 const router = express.Router();
+
+const signatureRateLimiter = createSignatureRateLimiter();
 
 const buildUserSearchWhere = (search) => {
   if (!search) return {};
@@ -145,6 +148,7 @@ router.post(
   "/register",
   requireJson,
   validateSchema({ body: registerBodySchema }),
+  signatureRateLimiter,
   asyncHandler(async (req, res, next) => {
     const safeUsername = xss(req.body.username);
     const username = normalizeNameTag(safeUsername);
