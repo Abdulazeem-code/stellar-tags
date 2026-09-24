@@ -198,6 +198,8 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    /// Reentrancy guard flag.
+    ReentrancyGuard,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -236,6 +238,8 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
+    /// A reentrant call was detected.
+    ReentrantCall = 15,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -243,6 +247,34 @@ pub enum Error {
 /// limits, and supporting an admin-managed blacklist and pause switch.
 #[contract]
 pub struct PaymentRouter;
+
+struct ReentrancyGuard<'a> {
+    env: &'a Env,
+}
+
+impl<'a> ReentrancyGuard<'a> {
+    fn new(env: &'a Env) -> Result<Self, Error> {
+        let is_locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentrancyGuard)
+            .unwrap_or(false);
+        if is_locked {
+            return Err(Error::ReentrantCall);
+        }
+        env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        Ok(Self { env })
+    }
+}
+
+impl<'a> Drop for ReentrancyGuard<'a> {
+    fn drop(&mut self) {
+        self.env
+            .storage()
+            .instance()
+            .set(&DataKey::ReentrancyGuard, &false);
+    }
+}
 
 #[contractimpl]
 impl PaymentRouter {
@@ -1234,6 +1266,8 @@ impl PaymentRouter {
         token_address: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -1272,6 +1306,8 @@ impl PaymentRouter {
     /// Panics if any payment's `sender` does not authorize the call, or if
     /// a token transfer to `platform_treasury` fails.
     pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -2582,6 +2618,27 @@ mod test {
         // Governance address can now update the fee
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
+    }
+    #[test]
+    fn test_reentrancy_guard_blocks_reentrant_calls() {
+        let (env, client, _contract_id) = setup_env();
+
+        let admin = Address::generate(&client.env);
+        let treasury = Address::generate(&client.env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let sender = Address::generate(&client.env);
+        let recipient = Address::generate(&client.env);
+        let token_address = Address::generate(&client.env);
+
+        // Manually lock the reentrancy guard in instance storage
+        client.env.as_contract(&_contract_id, || {
+            client.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        // Now routing a payment should fail with Error::ReentrantCall
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::ReentrantCall);
     }
 }
 
