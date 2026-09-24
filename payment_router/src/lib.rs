@@ -147,6 +147,8 @@ pub enum ActionType {
     /// Transfer admin rights to a new address.
     TransferAdmin(Address),
     /// Upgrade the contract WASM.
+    /// In Soroban, this native upgrade replaces the code in-place (similar to 
+    /// a proxy pattern), preserving the Contract ID and all storage variables.
     Upgrade(BytesN<32>),
 }
 
@@ -718,6 +720,8 @@ impl PaymentRouter {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
             }
             ActionType::Upgrade(new_wasm_hash) => {
+                // This updates the contract's code in-place while keeping the same Contract ID 
+                // and retaining all persistent/instance storage (Soroban's native proxy pattern).
                 env.deployer().update_current_contract_wasm(new_wasm_hash);
             }
         }
