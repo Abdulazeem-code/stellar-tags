@@ -7,6 +7,8 @@ const RedisStore = require('rate-limit-redis');
 const WINDOW_MS = 60 * 1000;
 const MAX_REQUESTS = Number(process.env.SIGNATURE_RATE_LIMIT_MAX) || 10;
 
+const { errorBody } = require('../errors');
+
 const createSignatureRateLimiter = (redisClient) =>
   rateLimit({
     windowMs: WINDOW_MS,
@@ -20,7 +22,7 @@ const createSignatureRateLimiter = (redisClient) =>
           sendCommand: (...args) => redisClient.sendCommand(args),
         })
       : undefined,
-    message: { error: 'Too many requests, please try again later.' },
+    message: errorBody("RATE_LIMITED", "Too many requests, please try again later."),
   });
 
 module.exports = { createSignatureRateLimiter };

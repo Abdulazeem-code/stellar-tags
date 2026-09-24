@@ -12,3 +12,6 @@ data/*.db-wal
 
 # Rotating log files (#294)
 logs/
+
+# Jest coverage reports
+coverage/

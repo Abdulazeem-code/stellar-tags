@@ -5,6 +5,11 @@ const { ApiError } = require('../src/errors');
 const IDEMPOTENCY_HEADER = 'X-Idempotency-Key';
 const CACHE_EXPIRATION_SECONDS = 24 * 60 * 60; // 24 hours
 
+// Methods that create or mutate server-side state and therefore benefit from
+// idempotency protection against retries/double-clicks. Read-only methods
+// (GET, HEAD, OPTIONS) are never idempotency-protected.
+const MUTATING_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
+
 /**
  * Idempotency Middleware Factory
  * 
@@ -20,8 +25,8 @@ const idempotencyMiddleware = (redisClient) => {
   const memoryCache = new Map();
 
   return async (req, res, next) => {
-    // 1. Only process POST requests (or ones that modify state)
-    if (req.method !== 'POST') {
+    // 1. Only process requests that mutate state
+    if (!MUTATING_METHODS.includes(req.method)) {
       return next();
     }
 
@@ -36,8 +41,9 @@ const idempotencyMiddleware = (redisClient) => {
       return next(new ApiError('INVALID_INPUT', 'Invalid or too long X-Idempotency-Key'));
     }
 
-    // Include the path in the cache key to avoid collisions across different endpoints
-    const cacheKey = `idempotency:${req.path}:${crypto.createHash('sha256').update(key).digest('hex')}`;
+    // Include the method and path in the cache key so identical keys on
+    // different endpoints/methods do not collide.
+    const cacheKey = `idempotency:${req.method}:${req.path}:${crypto.createHash('sha256').update(key).digest('hex')}`;
 
     try {
       // 3. Check for existing cached response
