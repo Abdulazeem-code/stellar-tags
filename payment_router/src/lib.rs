@@ -329,9 +329,7 @@ impl PaymentRouter {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn set_role_internal(env: &Env, role: Role, account: &Address) {
-        env.storage()
-            .instance()
-            .set(&DataKey::Role(role), account);
+        env.storage().instance().set(&DataKey::Role(role), account);
         env.storage()
             .persistent()
             .set(&DataKey::UserRole(account.clone(), role), &true);
@@ -3198,11 +3196,26 @@ mod test {
         assert!(client.has_role(&admin, &Role::ComplianceOfficer));
         assert!(client.has_role(&admin, &Role::FeeManager));
 
-        assert_eq!(client.get_role_member(&Role::SuperAdmin), Some(admin.clone()));
-        assert_eq!(client.get_role_member(&Role::TreasuryManager), Some(admin.clone()));
-        assert_eq!(client.get_role_member(&Role::ComplianceOfficer), Some(admin.clone()));
-        assert_eq!(client.get_role_member(&Role::FeeManager), Some(admin.clone()));
-        assert_eq!(client.get_role_admin(&Role::TreasuryManager), Role::SuperAdmin);
+        assert_eq!(
+            client.get_role_member(&Role::SuperAdmin),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_member(&Role::TreasuryManager),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_member(&Role::ComplianceOfficer),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_member(&Role::FeeManager),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_admin(&Role::TreasuryManager),
+            Role::SuperAdmin
+        );
     }
 
     #[test]
@@ -3219,17 +3232,26 @@ mod test {
         // Assign TreasuryManager
         client.assign_role(&treasurer, &Role::TreasuryManager);
         assert!(client.has_role(&treasurer, &Role::TreasuryManager));
-        assert_eq!(client.get_role_member(&Role::TreasuryManager), Some(treasurer.clone()));
+        assert_eq!(
+            client.get_role_member(&Role::TreasuryManager),
+            Some(treasurer.clone())
+        );
 
         // Assign ComplianceOfficer
         client.assign_role(&compliance, &Role::ComplianceOfficer);
         assert!(client.has_role(&compliance, &Role::ComplianceOfficer));
-        assert_eq!(client.get_role_member(&Role::ComplianceOfficer), Some(compliance.clone()));
+        assert_eq!(
+            client.get_role_member(&Role::ComplianceOfficer),
+            Some(compliance.clone())
+        );
 
         // Assign FeeManager
         client.assign_role(&fee_mgr, &Role::FeeManager);
         assert!(client.has_role(&fee_mgr, &Role::FeeManager));
-        assert_eq!(client.get_role_member(&Role::FeeManager), Some(fee_mgr.clone()));
+        assert_eq!(
+            client.get_role_member(&Role::FeeManager),
+            Some(fee_mgr.clone())
+        );
 
         // Revoke TreasuryManager
         client.revoke_role(&treasurer, &Role::TreasuryManager);
