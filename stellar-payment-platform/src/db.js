@@ -12,9 +12,22 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
+const readPool = process.env.DATABASE_READ_URL ? new Pool({
+  connectionString: process.env.DATABASE_READ_URL,
+  max: parseInt(process.env.DB_READ_POOL_MAX, 10) || parseInt(process.env.DB_POOL_MAX, 10) || 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+}) : pool;
+
 pool.on('error', (err) => {
   logger.error(err, 'Unexpected error on idle PostgreSQL client');
 });
+
+if (readPool !== pool) {
+  readPool.on('error', (err) => {
+    logger.error(err, 'Unexpected error on idle PostgreSQL read client');
+  });
+}
 
 (async () => {
   let retries = 5;
@@ -60,7 +73,7 @@ pool.on('error', (err) => {
 })();
 
 const poolGet = async (sql, params = []) => {
-  const { rows } = await pool.query(sql, params);
+  const { rows } = await readPool.query(sql, params);
   return rows[0] || null;
 };
 
@@ -70,7 +83,7 @@ const poolRun = async (sql, params = []) => {
 };
 
 const poolAll = async (sql, params = []) => {
-  const { rows } = await pool.query(sql, params);
+  const { rows } = await readPool.query(sql, params);
   return rows;
 };
 
