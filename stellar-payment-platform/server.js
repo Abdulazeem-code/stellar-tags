@@ -7,8 +7,7 @@ const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
 const crypto = require("crypto");
-const rateLimit = require("express-rate-limit");
-const { RedisStore } = require("rate-limit-redis");
+const { createTokenBucketLimiter } = require("./src/middleware/tokenBucketLimiter");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
@@ -216,24 +215,10 @@ setMetricsSources({ prisma, redisClient });
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  // Use Redis-backed store when available
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  // Return the standard RateLimit-* headers only
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
-  // Prometheus scrapes /metrics on a fixed interval from a single address, so
-  // counting those scrapes against the shared quota would 429 the scraper.
+const limiter = createTokenBucketLimiter(redisClient, {
+  capacity: 100,
+  refillRate: 100 / (15 * 60), // 100 requests per 15 minutes
+  prefix: 'global-rl:',
   skip: (req) => req.path === "/metrics",
   // Key by authenticated user identifier when present (address/username),
   // otherwise fall back to client IP. This lets registered/identified users
@@ -285,20 +270,10 @@ const limiter = rateLimit({
 // Per-IP limiter specifically for sensitive, unauthenticated endpoints.
 // Keys strictly by client IP so brute-force/spam from a single source is
 // blocked regardless of how many account ids are rotated in the payload.
-const ipLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
+const ipLimiter = createTokenBucketLimiter(redisClient, {
+  capacity: 100,
+  refillRate: 100 / (15 * 60),
+  prefix: 'ip-rl:',
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });

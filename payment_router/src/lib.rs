@@ -263,6 +263,8 @@ impl PaymentRouter {
     const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
     const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
 
+    const MAX_FEE_MULTIPLIER: u32 = 10;
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn require_admin(env: &Env) -> Result<Address, Error> {
@@ -384,11 +386,20 @@ impl PaymentRouter {
             .persistent()
             .get(&DataKey::UserVolume(sender.clone()))
             .unwrap_or(0);
-        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+        let base_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
             fee_bps
         };
+
+        let ledger_base_fee = env.ledger().base_fee();
+        let mut multiplier = ledger_base_fee / 100;
+        if multiplier < 1 {
+            multiplier = 1;
+        } else if multiplier > Self::MAX_FEE_MULTIPLIER {
+            multiplier = Self::MAX_FEE_MULTIPLIER;
+        }
+        let effective_fee_bps = base_fee_bps * (multiplier as i128);
 
         // Check time-based daily spending limits.
         // Storage format: packed BytesN<24> (see pack_spending / unpack_spending).
@@ -1082,11 +1093,21 @@ impl PaymentRouter {
     pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let user_volume = Self::get_user_volume(env.clone(), sender);
-        if user_volume > Self::VOLUME_THRESHOLD {
+        let base_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
             fee_bps
+        };
+
+        let ledger_base_fee = env.ledger().base_fee();
+        let mut multiplier = ledger_base_fee / 100;
+        if multiplier < 1 {
+            multiplier = 1;
+        } else if multiplier > Self::MAX_FEE_MULTIPLIER {
+            multiplier = Self::MAX_FEE_MULTIPLIER;
         }
+        
+        base_fee_bps * (multiplier as i128)
     }
 
     /// Set a new admin. Gated by the current admin if one exists.
