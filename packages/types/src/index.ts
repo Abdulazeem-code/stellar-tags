@@ -44,6 +44,7 @@ export const networks = {
 
 
 
+
 /**
  * Contract-level errors returned instead of panicking, so callers get a
  * specific, stable error code to branch on rather than an opaque trap.
@@ -857,3 +858,4 @@ export class Client extends ContractClient {
         set_platform_treasury: this.txFromJSON<Result<void>>
   }
 }
+
