@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(all(test, feature = "testutils"))]
 use soroban_sdk::{Env, vec, Address, testutils::Address as _};
 use payment_router::{PaymentRouter, PaymentRouterClient, Payment};
 
