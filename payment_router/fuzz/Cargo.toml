@@ -20,6 +20,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "router_fuzz"
+path = "fuzz_targets/router_fuzz.rs"
+test = false
+doc = false
+bench = false
+
 [patch.crates-io]
 ethnum = { path = "../ethnum-patch" }
 

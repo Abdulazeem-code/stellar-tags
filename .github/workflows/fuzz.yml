@@ -30,3 +30,6 @@ jobs:
 
       - name: Run route_payments fuzz target
         run: cargo fuzz run route_payments -- -max_total_time=120
+
+      - name: Run router_fuzz comprehensive target
+        run: cargo fuzz run router_fuzz -- -max_total_time=120

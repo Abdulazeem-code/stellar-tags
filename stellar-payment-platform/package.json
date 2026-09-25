@@ -48,6 +48,7 @@
     "@opentelemetry/exporter-zipkin": "^1.25.0",
     "@opentelemetry/sdk-node": "^0.52.1",
     "@prisma/client": "^6.19.3",
+    "@prisma/extension-read-replicas": "^0.4.0",
     "@prisma/instrumentation": "^6.19.3",
     "@sentry/node": "^10.68.0",
     "@stellar/stellar-sdk": "^16.0.1",
