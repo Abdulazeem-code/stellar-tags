@@ -218,6 +218,18 @@ cd payment_router
 cargo build
 ```
 
+### Contract storage benchmarks (issue #663)
+
+Per-user tag registration writes a single packed `UserRecord` ledger entry
+(24-hour spending window + lifetime volume in one `BytesN<40>`) instead of the
+legacy two-entry `UserSpending` + `UserVolume` split. The benchmark tests fail
+CI if the registration write path ever costs more than 80% of the legacy path:
+
+```bash
+cd payment_router
+cargo test benchmark -- --nocapture
+```
+
 ### Contract TypeScript bindings
 
 The TypeScript client for the `payment_router` contract lives in

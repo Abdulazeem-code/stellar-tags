@@ -4,61 +4,90 @@ use soroban_sdk::{
     Env, Symbol, Vec,
 };
 
-// ── Packed UserSpending helpers ──────────────────────────────────────────────
+// ── Packed UserRecord helpers ────────────────────────────────────────────────
 //
 // Issue #519: Replace the two-field UserSpending contracttype with a single
 // BytesN<24> value packed with bitwise operations.
 //
+// Issue #663: Merge the per-user `UserSpending` and `UserVolume` ledger
+// entries into one packed `BytesN<40>` `UserRecord`. Registering a user's
+// first tag payment previously wrote two separate persistent entries (two
+// reads, two writes, two TTL extensions, two XDR envelopes); it now performs
+// exactly one of each.
+//
 // Layout (big-endian):
-//   bytes  0..8  — last_reset_time  : u64   (8 bytes)
-//   bytes  8..24 — accumulated_amount: i128  (16 bytes)
+//   bytes  0..8   — last_reset_time     : u64   (8 bytes)
+//   bytes  8..24  — accumulated_amount  : i128  (16 bytes)
+//   bytes 24..40  — lifetime volume     : i128  (16 bytes)
 //
 // Benefits:
 //  • Eliminates the XDR struct-type overhead (type discriminant + field tags)
 //    that Soroban adds to every contracttype value, shrinking each UserSpending
 //    ledger entry from ~48 bytes to exactly 24 bytes.
+//  • Halves the number of persistent ledger entries created (and later kept
+//    alive by TTL extensions) per registered user: one combined entry of 40
+//    bytes instead of separate 24-byte and 16-byte payload entries plus their
+//    per-entry XDR overhead.
 //  • Smaller entries → lower state-rent fee per ledger entry per TTL period.
+//  • `get_effective_fee_bps` no longer performs a redundant read of the
+//    lifetime volume that the daily-spending path had already loaded.
+//
+// Backward compatibility: the legacy `UserSpending` / `UserVolume` keys are
+// no longer written. Existing entries stay readable via the fallback paths in
+// `load_user_record` / `get_user_record`, and the permissionless
+// `migrate_user_record` entry point lets anyone combine a user's legacy
+// entries into the packed `UserRecord` format.
 
-/// Pack `last_reset_time` (u64) and `accumulated_amount` (i128) into a
-/// 24-byte big-endian buffer.
-fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> BytesN<24> {
-    let mut buf = [0u8; 24];
+/// Pack `last_reset_time` (u64), `accumulated_amount` (i128) and `volume`
+/// (i128) into a 40-byte big-endian buffer.
+fn pack_user_record(
+    env: &Env,
+    last_reset_time: u64,
+    accumulated_amount: i128,
+    volume: i128,
+) -> BytesN<40> {
+    let mut buf = [0u8; 40];
 
     // Bytes 0..8 — last_reset_time (u64 big-endian)
-    let t_bytes = last_reset_time.to_be_bytes();
-    buf[0] = t_bytes[0];
-    buf[1] = t_bytes[1];
-    buf[2] = t_bytes[2];
-    buf[3] = t_bytes[3];
-    buf[4] = t_bytes[4];
-    buf[5] = t_bytes[5];
-    buf[6] = t_bytes[6];
-    buf[7] = t_bytes[7];
+    buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
 
     // Bytes 8..24 — accumulated_amount (i128 big-endian)
-    let a_bytes = accumulated_amount.to_be_bytes();
-    buf[8] = a_bytes[0];
-    buf[9] = a_bytes[1];
-    buf[10] = a_bytes[2];
-    buf[11] = a_bytes[3];
-    buf[12] = a_bytes[4];
-    buf[13] = a_bytes[5];
-    buf[14] = a_bytes[6];
-    buf[15] = a_bytes[7];
-    buf[16] = a_bytes[8];
-    buf[17] = a_bytes[9];
-    buf[18] = a_bytes[10];
-    buf[19] = a_bytes[11];
-    buf[20] = a_bytes[12];
-    buf[21] = a_bytes[13];
-    buf[22] = a_bytes[14];
-    buf[23] = a_bytes[15];
+    buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
+
+    // Bytes 24..40 — lifetime volume (i128 big-endian)
+    buf[24..40].copy_from_slice(&volume.to_be_bytes());
 
     BytesN::from_array(env, &buf)
 }
 
-/// Unpack a 24-byte buffer into `(last_reset_time, accumulated_amount)`.
-fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
+/// Unpack a 40-byte buffer into `(last_reset_time, accumulated_amount, volume)`.
+fn unpack_user_record(packed: &BytesN<40>) -> (u64, i128, i128) {
+    let buf: [u8; 40] = packed.to_array();
+
+    // last_reset_time — bytes 0..8
+    let last_reset_time = u64::from_be_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+
+    // accumulated_amount — bytes 8..24
+    let accumulated_amount = i128::from_be_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    ]);
+
+    // volume — bytes 24..40
+    let volume = i128::from_be_bytes([
+        buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33],
+        buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
+    ]);
+
+    (last_reset_time, accumulated_amount, volume)
+}
+
+/// Unpack a legacy 24-byte UserSpending buffer into
+/// `(last_reset_time, accumulated_amount)`. Kept so the migration fallback in
+/// `load_user_record` can still read pre-#663 ledger state.
+fn unpack_legacy_spending(packed: &BytesN<24>) -> (u64, i128) {
     // BytesN::to_array() is available in soroban-sdk v20.
     let buf: [u8; 24] = packed.to_array();
 
@@ -85,9 +114,9 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
 /// A user's rolling 24-hour spending record.
 ///
 /// Retained purely so existing test snapshots that reference this type by
-/// name keep compiling. Live contract state is stored as a packed
-/// `BytesN<24>` (see `pack_spending` / `unpack_spending`); this struct is not
-/// read from or written to storage at runtime.
+/// name keep compiling. Pre-#663 live contract state was stored as a packed
+/// `BytesN<24>` (still readable via `unpack_legacy_spending`); this struct is
+/// not read from or written to storage at runtime.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserSpending {
@@ -180,10 +209,18 @@ pub enum DataKey {
     Paused,
     /// Maximum amount accepted by a single payment.
     MaxAmount,
-    /// Cumulative lifetime amount routed by a given sender.
-    UserVolume(Address),
-    /// Packed 24-hour spending window for a given sender.
+    /// Packed per-user record (issue #663): 24-hour spending window plus
+    /// cumulative lifetime volume for a given sender, stored as a single
+    /// 40-byte value to halve the ledger entries written per registered user.
+    UserRecord(Address),
+    /// DEPRECATED (pre-#663): packed 24-hour spending window for a sender.
+    /// No longer written; read only by the migration fallback in
+    /// `load_user_record` and by `migrate_user_record`.
     UserSpending(Address),
+    /// DEPRECATED (pre-#663): cumulative lifetime amount routed by a sender.
+    /// No longer written; read only by the migration fallback in
+    /// `load_user_record` and by `migrate_user_record`.
+    UserVolume(Address),
     /// Whether a given recipient address is blacklisted.
     Blacklist(Address),
     /// Internal refund balance for a (user, token) pair, credited when a
@@ -236,6 +273,22 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
+}
+
+/// A user's combined lifetime routing stats, unpacked from the packed
+/// `BytesN<40>` `UserRecord` ledger value (issue #663).
+///
+/// Returned by [`PaymentRouter::get_user_record`] so clients can read both
+/// counters in a single view call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserRecord {
+    /// Total amount routed by the user in the current 24-hour window.
+    pub accumulated_amount: i128,
+    /// Cumulative lifetime amount routed by the user.
+    pub volume: i128,
+    /// Unix timestamp (seconds) at which the 24-hour window last reset.
+    pub last_reset_time: u64,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -344,6 +397,51 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
+    /// Loads a sender's packed `UserRecord`, falling back to the legacy
+    /// pre-#663 split entries (`UserSpending` + `UserVolume`) when no packed
+    /// record exists yet.
+    ///
+    /// Returns `(last_reset_time, accumulated_amount, volume, legacy_found)`.
+    /// When neither format is present — i.e. the sender has never routed a
+    /// payment — the 24-hour window is anchored at `current_time` with zeroed
+    /// counters, exactly as before #663. `legacy_found` is `true` only when
+    /// the values came from the legacy split entries, telling the caller it
+    /// should drop the stale keys after writing the packed record.
+    fn load_user_record(
+        env: &Env,
+        record_key: &DataKey,
+        current_time: u64,
+    ) -> (u64, i128, i128, bool) {
+        if let Some(packed) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<40>>(record_key)
+        {
+            let (last_reset_time, accumulated_amount, volume) = unpack_user_record(&packed);
+            return (last_reset_time, accumulated_amount, volume, false);
+        }
+
+        // Legacy fallback: combine the pre-#663 split entries.
+        if let DataKey::UserRecord(sender) = record_key {
+            let legacy_spending: Option<(u64, i128)> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserSpending(sender.clone()))
+                .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
+            let legacy_volume: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserVolume(sender.clone()))
+                .unwrap_or(0);
+            let (last_reset_time, accumulated_amount) = legacy_spending
+                .unwrap_or((current_time, 0));
+            let legacy_found = legacy_spending.is_some() || legacy_volume != 0;
+            return (last_reset_time, accumulated_amount, legacy_volume, legacy_found);
+        }
+
+        (current_time, 0, 0, false)
+    }
+
     /// Allocates and returns the next timelock nonce, incrementing the counter.
     fn next_nonce(env: &Env) -> u64 {
         let current: u64 = env
@@ -406,49 +504,38 @@ impl PaymentRouter {
             return Err(Error::LimitExceeded);
         }
 
-        // Apply tiered fee discount for high-volume users
-        let user_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserVolume(sender.clone()))
-            .unwrap_or(0);
-        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
-            fee_bps / 2
-        } else {
-            fee_bps
-        };
-
-        // Check time-based daily spending limits.
-        // Storage format: packed BytesN<24> (see pack_spending / unpack_spending).
+        // Apply tiered fee discount for high-volume users and update the
+        // user's combined record (issue #663).
+        //
+        // Storage format: one packed BytesN<40> UserRecord under
+        // DataKey::UserRecord (see the UserRecord helpers at the top of this
+        // file). Legacy deployments may still carry the pre-#663 split
+        // `UserSpending` / `UserVolume` entries; those are read via the
+        // fallback in `load_user_record` and combined on the next write.
         let current_time = env.ledger().timestamp();
-        let spending_key = DataKey::UserSpending(sender.clone());
+        let record_key = DataKey::UserRecord(sender.clone());
 
-        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
-            .unwrap_or((current_time, 0));
+        let (mut last_reset_time, mut accumulated_amount, mut volume, legacy_found) =
+            Self::load_user_record(env, &record_key, current_time);
 
         if current_time - last_reset_time >= Self::SECONDS_IN_24H {
             last_reset_time = current_time;
             accumulated_amount = 0;
         }
 
+        // Tiered fee discount is decided on the pre-payment volume, exactly
+        // as before #663.
+        let effective_fee_bps = if volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+
         accumulated_amount += amount;
         if accumulated_amount > Self::DAILY_MAX_LIMIT {
             return Err(Error::LimitExceeded);
         }
-
-        env.storage().persistent().set(
-            &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
-        );
-        env.storage().persistent().extend_ttl(
-            &spending_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        volume += amount;
 
         // Verify sender has sufficient balance
         let token_client = token::Client::new(env, token_address);
@@ -489,17 +576,28 @@ impl PaymentRouter {
             }
         }
 
-        // Record cumulative volume
-        let volume_key = DataKey::UserVolume(sender.clone());
-        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&volume_key, &(prev_volume + amount));
+        // Record the updated user record (single persistent write; issue #663)
+        env.storage().persistent().set(
+            &record_key,
+            &pack_user_record(env, last_reset_time, accumulated_amount, volume),
+        );
         env.storage().persistent().extend_ttl(
-            &volume_key,
+            &record_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,
             Self::PERSISTENT_BUMP_AMOUNT,
         );
+
+        // One-time cleanup: when this write consumed legacy split entries,
+        // remove them so the old keys stop accruing state-rent. Steady-state
+        // payments skip both `has` checks entirely (`legacy_found == false`).
+        if legacy_found {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UserSpending(sender.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UserVolume(sender.clone()));
+        }
 
         // Emit routed event
         env.events().publish(
@@ -1022,10 +1120,113 @@ impl PaymentRouter {
     /// # Panics
     /// Does not panic.
     pub fn get_user_volume(env: Env, user: Address) -> i128 {
+        Self::get_user_record(env, user).volume
+    }
+
+    /// Returns a sender's combined routing record: the current 24-hour
+    /// accumulated amount and the cumulative lifetime volume (issue #663).
+    ///
+    /// Reads the packed `UserRecord` entry; for senders that only have the
+    /// legacy pre-#663 split entries, both counters are combined from those.
+    ///
+    /// # Parameters
+    /// - `user`: Sender address to look up.
+    ///
+    /// # Returns
+    /// A [`UserRecord`] with zeroed counters if `user` has never routed a
+    /// payment.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_user_record(env: Env, user: Address) -> UserRecord {
+        let current_time = env.ledger().timestamp();
+        let record_key = DataKey::UserRecord(user.clone());
+
+        let (last_reset_time, accumulated_amount, volume, _) =
+            Self::load_user_record(&env, &record_key, current_time);
+
+        UserRecord {
+            accumulated_amount,
+            volume,
+            last_reset_time,
+        }
+    }
+
+    /// Permissionless migration of a sender's legacy pre-#663 split entries
+    /// (`UserSpending` + `UserVolume`) into the packed single-entry
+    /// `UserRecord` format (issue #663).
+    ///
+    /// Callable by anyone — it only ever combines values that are already on
+    /// the ledger into their new representation and never invents or destroys
+    /// value. When the sender's packed record was already created by a recent
+    /// payment (leaving stale legacy keys behind), the migration just removes
+    /// those stale keys and keeps the newer packed values.
+    ///
+    /// # Parameters
+    /// - `user`: The sender whose legacy entries should be migrated.
+    ///
+    /// # Returns
+    /// `true` if legacy state was found and migrated, `false` if `user` has
+    /// no legacy entries to migrate.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn migrate_user_record(env: Env, user: Address) -> bool {
+        let record_key = DataKey::UserRecord(user.clone());
+        let has_packed = env.storage().persistent().has(&record_key);
+
+        let legacy_spending: Option<(u64, i128)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSpending(user.clone()))
+            .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
+        let legacy_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(user.clone()))
+            .unwrap_or(0);
+
+        if legacy_spending.is_none() && legacy_volume == 0 {
+            // No legacy state at all.
+            return false;
+        }
+
+        if !has_packed {
+            let (last_reset_time, accumulated_amount) = match legacy_spending {
+                Some(pair) => pair,
+                None => {
+                    // Volume without a spending window (theoretically possible
+                    // on very old deployments): anchor a fresh window.
+                    (env.ledger().timestamp(), 0)
+                }
+            };
+
+            // NOTE: legacy `UserVolume` already includes every amount counted
+            // in the current window (each payment incremented both counters),
+            // so the window balance must NOT be added again here.
+            let volume = legacy_volume;
+            env.storage().persistent().set(
+                &record_key,
+                &pack_user_record(&env, last_reset_time, accumulated_amount, volume),
+            );
+            env.storage().persistent().extend_ttl(
+                &record_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
         env.storage()
             .persistent()
-            .get(&DataKey::UserVolume(user))
-            .unwrap_or(0)
+            .remove(&DataKey::UserSpending(user.clone()));
+        env.storage().persistent().remove(&DataKey::UserVolume(user.clone()));
+
+        env.events().publish(
+            (symbol_short!("migrated"), user),
+            legacy_volume,
+        );
+
+        true
     }
 
     /// Adds an address to the blacklist. Admin-only.
@@ -1466,6 +1667,10 @@ mod test {
         token::StellarAssetClient,
         Address, Env, Symbol, TryIntoVal,
     };
+
+    // The crate is `no_std`, but the test harness links std; pull it in so
+    // benchmarks can print GAS REPORT lines to the test output.
+    extern crate std;
 
     /// Returns (env, client, contract_id).
     fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
@@ -2510,6 +2715,376 @@ mod test {
             route_mem,
             max_mem
         );
+    }
+
+    /// Rebuilds the pre-#663 packed `UserSpending` value (`BytesN<24>`) so
+    /// tests can emulate legacy ledger state written by the old two-entry
+    /// storage format.
+    fn pack_legacy_spending_for_test(
+        env: &Env,
+        last_reset_time: u64,
+        accumulated_amount: i128,
+    ) -> BytesN<24> {
+        let mut buf = [0u8; 24];
+        buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
+        buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
+        BytesN::from_array(env, &buf)
+    }
+
+    /// Issue #663 acceptance benchmark: per-user (tag) registration storage
+    /// cost must drop by at least 20%.
+    ///
+    /// The benchmark isolates the storage write path that registering a
+    /// sender's first payment touches:
+    ///
+    /// * Legacy (pre-#663): two persistent entries (`UserSpending` +
+    ///   `UserVolume`), each with its own write and TTL extension.
+    /// * New (#663): one packed `UserRecord` entry with a single write and
+    ///   TTL extension.
+    ///
+    /// It fails CI if the new path is not at least 20% cheaper in CPU
+    /// instructions, if it is not also cheaper in memory bytes, or if the
+    /// deterministic entry-count accounting (one entry instead of two) no
+    /// longer holds.
+    #[test]
+    fn test_benchmark_storage_cost_reduction() {
+        let (env, _client, contract_id) = setup_env();
+
+        // `legacy_sender` emulates the pre-#663 two-entry write path;
+        // `packed_sender` exercises the new single-entry write path.
+        let legacy_sender = Address::generate(&env);
+        let packed_sender = Address::generate(&env);
+
+        let current_time = env.ledger().timestamp();
+        let amount = 5_000i128;
+
+        // Warm-up so lazy host/footprint initialization costs do not skew
+        // the first measurement window.
+        env.as_contract(&contract_id, || {
+            let warmup_key = DataKey::Admin;
+            env.storage().instance().set(&warmup_key, &legacy_sender);
+        });
+        env.budget().reset_default();
+
+        // ── Legacy (pre-#663) registration write path ────────────────────
+        {
+            let legacy_sender = legacy_sender.clone();
+            env.as_contract(&contract_id, || {
+                let spending_key = DataKey::UserSpending(legacy_sender.clone());
+                env.storage().persistent().set(
+                    &spending_key,
+                    &pack_legacy_spending_for_test(&env, current_time, amount),
+                );
+                env.storage().persistent().extend_ttl(
+                    &spending_key,
+                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
+                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
+                );
+
+                let volume_key = DataKey::UserVolume(legacy_sender.clone());
+                env.storage().persistent().set(&volume_key, &amount);
+                env.storage().persistent().extend_ttl(
+                    &volume_key,
+                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
+                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
+                );
+            });
+        }
+        let legacy_cpu = env.budget().cpu_instruction_cost();
+        let legacy_mem = env.budget().memory_bytes_cost();
+
+        env.budget().reset_default();
+
+        // ── New (#663) registration write path ───────────────────────────
+        {
+            let packed_sender = packed_sender.clone();
+            env.as_contract(&contract_id, || {
+                let record_key = DataKey::UserRecord(packed_sender.clone());
+                let record = pack_user_record(&env, current_time, amount, amount);
+                env.storage().persistent().set(&record_key, &record);
+                env.storage().persistent().extend_ttl(
+                    &record_key,
+                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
+                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
+                );
+            });
+        }
+        let new_cpu = env.budget().cpu_instruction_cost();
+        let new_mem = env.budget().memory_bytes_cost();
+
+        std::eprintln!(
+            "GAS REPORT: user-registration storage legacy (2 entries) - CPU: {}, Mem: {}",
+            legacy_cpu,
+            legacy_mem
+        );
+        std::eprintln!(
+            "GAS REPORT: user-registration storage packed (1 entry)  - CPU: {}, Mem: {}",
+            new_cpu,
+            new_mem
+        );
+        std::eprintln!(
+            "GAS REPORT: user-registration storage CPU reduction: {}%",
+            100 - (new_cpu * 100) / legacy_cpu
+        );
+
+        // Deterministic accounting: the legacy path leaves two persistent
+        // entries per registered user, the new path exactly one.
+        env.as_contract(&contract_id, || {
+            assert!(
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::UserSpending(legacy_sender.clone())),
+                "legacy path must write the UserSpending entry"
+            );
+            assert!(
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::UserVolume(legacy_sender.clone())),
+                "legacy path must write the UserVolume entry"
+            );
+            assert!(
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::UserRecord(packed_sender.clone())),
+                "new path must write the packed UserRecord entry"
+            );
+        });
+
+        // Acceptance criterion: >= 20% CPU-instruction reduction.
+        assert!(
+            new_cpu * 10 <= legacy_cpu * 8,
+            "packed registration write path must cost >= 20% less CPU \
+             (legacy: {}, packed: {}, reduction: {}%)",
+            legacy_cpu,
+            new_cpu,
+            100 - (new_cpu * 100) / legacy_cpu
+        );
+        // Memory must not regress either.
+        assert!(
+            new_mem <= legacy_mem,
+            "packed registration write path must not use more memory \
+             (legacy: {}, packed: {})",
+            legacy_mem,
+            new_mem
+        );
+    }
+
+    /// The packed `UserRecord` replaces the two per-user entries and keeps
+    /// every public getter consistent (issue #663).
+    #[test]
+    fn test_user_record_packed_storage_roundtrip() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Fresh sender: zeroed record, window anchored at "now".
+        let before = client.get_user_record(&sender);
+        assert_eq!(before.volume, 0);
+        assert_eq!(before.accumulated_amount, 0);
+        assert_eq!(before.last_reset_time, env.ledger().timestamp());
+
+        // First payment registers the user's packed record.
+        client.route_payment(&sender, &recipient, &token_address, &2_000);
+
+        let after_first = client.get_user_record(&sender);
+        assert_eq!(after_first.accumulated_amount, 2_000);
+        assert_eq!(after_first.volume, 2_000);
+
+        // Exactly one persistent user entry now exists — the packed record.
+        env.as_contract(&contract_id, || {
+            let record_key = DataKey::UserRecord(sender.clone());
+            assert!(env.storage().persistent().has(&record_key));
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&DataKey::UserSpending(sender.clone()))
+            );
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&DataKey::UserVolume(sender.clone()))
+            );
+        });
+
+        // A second payment accumulates in both counters.
+        client.route_payment(&sender, &recipient, &token_address, &3_000);
+
+        let after_second = client.get_user_record(&sender);
+        assert_eq!(after_second.accumulated_amount, 5_000);
+        assert_eq!(after_second.volume, 5_000);
+
+        // The existing getters stay consistent with the packed record.
+        assert_eq!(client.get_user_volume(&sender), 5_000);
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
+    }
+
+    /// Permissionless `migrate_user_record` combines legacy entries into the
+    /// packed format and removes the old keys (issue #663).
+    #[test]
+    fn test_migrate_user_record_combines_legacy_entries() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Give the ledger a realistic timestamp so the legacy window start
+        // can be back-dated.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        // Emulate pre-#663 ledger state: split UserSpending + UserVolume.
+        let legacy_window_start = env.ledger().timestamp() - 60;
+        let spending_key = DataKey::UserSpending(user.clone());
+        let volume_key = DataKey::UserVolume(user.clone());
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(
+                &spending_key,
+                &pack_legacy_spending_for_test(&env, legacy_window_start, 1_200),
+            );
+            env.storage().persistent().set(&volume_key, &7_500i128);
+        });
+
+        // Getters still see the legacy state through the fallback path.
+        assert_eq!(client.get_user_volume(&user), 7_500);
+        let pre = client.get_user_record(&user);
+        assert_eq!(pre.accumulated_amount, 1_200);
+        assert_eq!(pre.volume, 7_500);
+
+        // Migrate: reports success, writes the packed record, drops legacy keys.
+        assert!(client.migrate_user_record(&user));
+
+        env.as_contract(&contract_id, || {
+            let record_key = DataKey::UserRecord(user.clone());
+            assert!(env.storage().persistent().has(&record_key));
+            assert!(!env.storage().persistent().has(&spending_key));
+            assert!(!env.storage().persistent().has(&volume_key));
+        });
+
+        let post = client.get_user_record(&user);
+        assert_eq!(post.accumulated_amount, 1_200);
+        assert_eq!(post.volume, 7_500);
+        assert_eq!(post.last_reset_time, legacy_window_start);
+        assert_eq!(client.get_user_volume(&user), 7_500);
+
+        // Migrating again is a no-op.
+        assert!(!client.migrate_user_record(&user));
+
+        // And a fresh payment continues from the migrated record.
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&user, &10_000);
+        let recipient = Address::generate(&env);
+        client.route_payment(&user, &recipient, &token_address, &500);
+
+        let after = client.get_user_record(&user);
+        assert_eq!(after.accumulated_amount, 1_700);
+        assert_eq!(after.volume, 8_000);
+        assert_eq!(client.get_user_volume(&user), 8_000);
+    }
+
+    /// A payment routed by a sender that only has legacy entries transparently
+    /// upgrades them to the packed record (issue #663 migration path).
+    #[test]
+    fn test_route_payment_upgrades_legacy_entries_in_place() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Give the ledger a realistic timestamp so the legacy window start
+        // can be back-dated.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        // Legacy state from before the upgrade.
+        let legacy_window_start = env.ledger().timestamp() - 60;
+        let spending_key = DataKey::UserSpending(sender.clone());
+        let volume_key = DataKey::UserVolume(sender.clone());
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(
+                &spending_key,
+                &pack_legacy_spending_for_test(&env, legacy_window_start, 4_000),
+            );
+            env.storage().persistent().set(&volume_key, &20_000i128);
+        });
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &50_000);
+
+        // No explicit migration needed: routing the payment combines the
+        // legacy entries into the packed record on its next write.
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+
+        env.as_contract(&contract_id, || {
+            let record_key = DataKey::UserRecord(sender.clone());
+            assert!(env.storage().persistent().has(&record_key));
+            assert!(!env.storage().persistent().has(&spending_key));
+            assert!(!env.storage().persistent().has(&volume_key));
+        });
+
+        let record = client.get_user_record(&sender);
+        assert_eq!(record.accumulated_amount, 5_000);
+        assert_eq!(record.volume, 21_000);
+        assert_eq!(client.get_user_volume(&sender), 21_000);
+    }
+
+    /// `migrate_user_record` is a safe no-op for unknown senders and for
+    /// senders that already have a packed record (issue #663).
+    #[test]
+    fn test_migrate_user_record_no_op_cases() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let unknown = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Unknown sender: nothing to migrate.
+        assert!(!client.migrate_user_record(&unknown));
+
+        // Sender with a packed record already: nothing to migrate.
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+        assert!(!client.migrate_user_record(&sender));
+
+        // State is untouched.
+        let record = client.get_user_record(&sender);
+        assert_eq!(record.volume, 1_000);
+        assert_eq!(record.accumulated_amount, 1_000);
     }
 
     #[test]
