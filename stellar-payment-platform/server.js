@@ -350,16 +350,12 @@ const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
 const registerLocalUser = async ({ username, address }) => {
   const existingByAddress = await getLocalUserByAddress(address);
   if (existingByAddress) {
-    const conflictError = new Error('Address already registered');
-    conflictError.statusCode = 409;
-    throw conflictError;
+    throw new ApiError('CONFLICT', 'Address already registered');
   }
 
   const existingByUsername = await getLocalUserByUsername(username);
   if (existingByUsername) {
-    const conflictError = new Error('Username is already taken. Please choose another.');
-    conflictError.statusCode = 409;
-    throw conflictError;
+    throw new ApiError('CONFLICT', 'Username is already taken. Please choose another.');
   }
 
   await poolRun(
@@ -395,9 +391,7 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
 
         if (!row) return null;
         if (row.flaggedAt) {
-          const forbiddenError = new Error('Address is blocked');
-          forbiddenError.statusCode = 403;
-          throw forbiddenError;
+          throw new ApiError('FORBIDDEN', 'Address is blocked');
         }
 
         const response = {
@@ -412,9 +406,7 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
       });
 
       if (!cached) {
-        const notFoundError = new Error('Address not found');
-        notFoundError.statusCode = 404;
-        return next(notFoundError);
+        return next(new ApiError('NOT_FOUND', 'Address not found'));
       }
 
       return res.json(cached);
@@ -432,12 +424,10 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
           });
 
           if (row && row.flaggedAt) {
-            const forbiddenError = new Error('Address is blocked');
-            forbiddenError.statusCode = 403;
-            throw forbiddenError;
+            throw new ApiError('FORBIDDEN', 'Address is blocked');
           }
         } catch (error) {
-          if (error.statusCode === 403) throw error;
+          if (error instanceof ApiError && error.code === 'FORBIDDEN') throw error;
           if (!shouldFallbackToLocalRegistry(error)) {
             throw error;
           }
@@ -463,9 +453,7 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
       });
 
       if (!cached) {
-        const notFoundError = new Error('Name tag not found');
-        notFoundError.statusCode = 404;
-        return next(notFoundError);
+        return next(new ApiError('NOT_FOUND', 'Name tag not found'));
       }
 
       return res.json(cached);
@@ -475,9 +463,7 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
       );
     }
   } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(new ApiError('INTERNAL_ERROR', 'Database lookup failed', { cause: error }));
   }
 });
 
@@ -493,9 +479,7 @@ const verifyFreighterRegistrationSignature = ({
   const claimedSigner = signerAddress || address;
 
   if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error('Invalid signer address format.');
-    error.statusCode = 400;
-    throw error;
+    throw new ApiError('INVALID_INPUT', 'Invalid signer address format.');
   }
 
   const keypair = Keypair.fromPublicKey(claimedSigner);
@@ -518,7 +502,7 @@ const verifyFreighterRegistrationSignature = ({
       }
     }
   } else {
-    throw new Error('Invalid message signature format.');
+    throw new ApiError('INVALID_INPUT', 'Invalid message signature format.');
   }
 
   // --- SEP-0053 Verification Logic ---
@@ -534,17 +518,13 @@ const verifyFreighterRegistrationSignature = ({
     if (!keypair.verify(messageBytes, signatureBuffer)) {
       // Also try verifying the payload without hashing it
       if (!keypair.verify(payload, signatureBuffer)) {
-        const error = new Error('Signature verification failed.');
-        error.statusCode = 401;
-        throw error;
+        throw new ApiError('UNAUTHENTICATED', 'Signature verification failed.');
       }
     }
   }
 
   if (claimedSigner !== address) {
-    const error = new Error('Signer address does not match the connected wallet.');
-    error.statusCode = 401;
-    throw error;
+    throw new ApiError('UNAUTHENTICATED', 'Signer address does not match the connected wallet.');
   }
 
   return claimedSigner;
@@ -588,9 +568,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
-    const error = new Error('Invalid Stellar Public Key format.');
-    error.statusCode = 400;
-    return next(error);
+    return next(new ApiError('INVALID_INPUT', 'Invalid Stellar Public Key format.'));
   }
 
   const memoError = validateMemo(memoType, memo);
@@ -625,9 +603,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
     }
 
     if (existing) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+      return next(new ApiError('CONFLICT', 'Address already registered'));
     }
 
     let verificationResult = null;
@@ -641,11 +617,10 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         });
 
         if (!verificationResult.success) {
-          const verificationError = new Error(
-            verificationResult.errorMessage || 'Signature verification failed'
+          throw new ApiError(
+            'UNAUTHENTICATED',
+            verificationResult.errorMessage || 'Signature verification failed',
           );
-          verificationError.statusCode = 401;
-          throw verificationError;
         }
       } else {
         const claimedSigner = verifyFreighterRegistrationSignature({
@@ -722,21 +697,17 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
     
     // Handle verification errors
     if (error.message && error.message.includes('Account not found')) {
-      const notFoundError = new Error(`Account not found on Horizon: ${address}`);
-      notFoundError.statusCode = 404;
-      return next(notFoundError);
+      return next(new ApiError('NOT_FOUND', `Account not found on Horizon: ${address}`));
     }
 
-    // Handle signature verification errors
-    if (error.statusCode === 401) {
+    // Pass ApiError instances through unchanged (e.g. UNAUTHENTICATED from signature check)
+    if (error instanceof ApiError) {
       return next(error);
     }
 
     // Handle other errors
     logger.error({ err: error.message }, 'Registration error:');
-    const registrationError = new Error(`Registration verification failed: ${error.message}`);
-    registrationError.statusCode = 500;
-    return next(registrationError);
+    return next(new ApiError('INTERNAL_ERROR', 'Registration verification failed', { cause: error }));
   }
 });
 
@@ -764,18 +735,13 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
       });
 
       if (!result) {
-        const notFoundError = new Error('Username not found for this address');
-        notFoundError.statusCode = 404;
-        return next(notFoundError);
+        return next(new ApiError('NOT_FOUND', 'Username not found for this address'));
       }
 
       return res.json(result);
     } catch (err) {
-      logger.error(err, "🚨 ACTUAL PRISMA ERROR:");
-
-      const dbError = new Error('Database lookup failed', { cause: err });
-      dbError.statusCode = 500;
-      return next(dbError);
+      logger.error(err, '🚨 ACTUAL PRISMA ERROR:');
+      return next(new ApiError('INTERNAL_ERROR', 'Database lookup failed', { cause: err }));
     }
   }
 
@@ -844,9 +810,7 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
 
     return res.json(response);
   } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(new ApiError('INTERNAL_ERROR', 'Database lookup failed', { cause: error }));
   }
 });
 
@@ -918,9 +882,7 @@ app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, 
       currentPage: page,
     });
   } catch (error) {
-    const dbError = new Error('Database error', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(new ApiError('INTERNAL_ERROR', 'Database error', { cause: error }));
   }
 });
 // Mount v1 router for both legacy paths and explicit API versioning
