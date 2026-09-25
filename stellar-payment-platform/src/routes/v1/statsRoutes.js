@@ -2,7 +2,6 @@
 
 const express = require('express');
 const { prisma } = require('../../../prismaClient');
-const { poolGet } = require('../../db');
 const { logger } = require('../../logger');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { getCachedStats } = require('../../cache/statsCache');
@@ -13,7 +12,7 @@ module.exports = (redisClient) => {
 
   router.get('/stats', asyncHandler(async (req, res, next) => {
     try {
-      const stats = await getCachedStats(redisClient, () => fetchAdminStats(prisma, poolGet));
+      const stats = await getCachedStats(redisClient, () => fetchAdminStats(prisma));
       return res.status(200).json(stats);
     } catch (error) {
       logger.error(`[Correlation ID: ${req.correlationId}] Stats endpoint error`, error);

@@ -6,52 +6,29 @@ const WEBHOOK_TIMEOUT_MS = 10_000;
 const MAX_RETRY_BACKLOG_DAYS = 3;
 const RETRY_JOB_CRON = '*/5 * * * *'; // every 5 minutes
 
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
-};
-
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 };
 
-const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
-  try {
-    return await prisma.webhook.findMany({
-      where: {
-        user: { address: stellarAddress },
-      },
-      select: {
-        id: true,
-        username: true,
-        url: true,
-        secret: true,
-        failingSince: true,
-      },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-
-    const rows = await poolGetFn(
-      `SELECT w.id, w.username, w.url, w.secret, w.failing_since
-       FROM webhooks w
-       INNER JOIN username_registry u ON u.username = w.username
-       WHERE u.address = ?`,
-      [stellarAddress],
-    );
-    return (rows || []).map((r) => ({
-      id: r.id,
-      username: r.username,
-      url: r.url,
-      secret: r.secret,
-      failingSince: r.failing_since ? new Date(r.failing_since) : null,
-    }));
-  }
+/**
+ * Fetches all webhooks associated with a given Stellar address via Prisma.
+ *
+ * @param {import('@prisma/client').PrismaClient} prisma
+ * @param {string} stellarAddress
+ */
+const fetchWebhooksForAddress = async (prisma, stellarAddress) => {
+  return prisma.webhook.findMany({
+    where: {
+      user: { address: stellarAddress },
+    },
+    select: {
+      id: true,
+      username: true,
+      url: true,
+      secret: true,
+      failingSince: true,
+    },
+  });
 };
 
 const sendWebhook = async (url, payload, secret) => {
@@ -85,44 +62,40 @@ const sendWebhook = async (url, payload, secret) => {
   }
 };
 
-const markWebhookSuccess = async (prisma, poolRunFn, webhookId, now) => {
-  try {
-    await prisma.webhook.update({
-      where: { id: webhookId },
-      data: { lastSentAt: now, failingSince: null },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-    await poolRunFn(
-      `UPDATE webhooks SET last_sent_at = ?, failing_since = NULL WHERE id = ?`,
-      [now.toISOString(), webhookId],
-    );
-  }
+/**
+ * Marks a webhook delivery as successful in the database.
+ *
+ * @param {import('@prisma/client').PrismaClient} prisma
+ * @param {string} webhookId
+ * @param {Date} now
+ */
+const markWebhookSuccess = async (prisma, webhookId, now) => {
+  await prisma.webhook.update({
+    where: { id: webhookId },
+    data: { lastSentAt: now, failingSince: null },
+  });
 };
 
-const markWebhookFailure = async (prisma, poolRunFn, webhookId, now) => {
-  try {
-    const current = await prisma.webhook.findUnique({
-      where: { id: webhookId },
-      select: { failingSince: true },
-    });
-    await prisma.webhook.update({
-      where: { id: webhookId },
-      data: {
-        lastSentAt: now,
-        failingSince: current?.failingSince || now,
-      },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-    await poolRunFn(
-      `UPDATE webhooks
-       SET last_sent_at = ?,
-           failing_since = COALESCE(failing_since, ?)
-       WHERE id = ?`,
-      [now.toISOString(), now.toISOString(), webhookId],
-    );
-  }
+/**
+ * Marks a webhook delivery as failed in the database, preserving the original
+ * `failingSince` timestamp so retry windows stay correct.
+ *
+ * @param {import('@prisma/client').PrismaClient} prisma
+ * @param {string} webhookId
+ * @param {Date} now
+ */
+const markWebhookFailure = async (prisma, webhookId, now) => {
+  const current = await prisma.webhook.findUnique({
+    where: { id: webhookId },
+    select: { failingSince: true },
+  });
+  await prisma.webhook.update({
+    where: { id: webhookId },
+    data: {
+      lastSentAt: now,
+      failingSince: current?.failingSince || now,
+    },
+  });
 };
 
 const formatAsset = (payment) => {
@@ -131,10 +104,14 @@ const formatAsset = (payment) => {
   return `${payment.asset_code}:${payment.asset_issuer}`;
 };
 
+/**
+ * Dispatches payment webhooks for a given Stellar payment event using only
+ * Prisma for all database interactions.
+ *
+ * @param {{ prisma: import('@prisma/client').PrismaClient, payment: object }} args
+ */
 const dispatchPaymentWebhooks = async ({
   prisma,
-  poolGetFn,
-  poolRunFn,
   payment,
 }) => {
   if (!payment) return;
@@ -145,7 +122,7 @@ const dispatchPaymentWebhooks = async ({
 
   let webhooks;
   try {
-    webhooks = await fetchWebhooksForAddress(prisma, poolGetFn, recipientAddress);
+    webhooks = await fetchWebhooksForAddress(prisma, recipientAddress);
   } catch (err) {
     logger.error(`[webhook-worker] Failed to fetch webhooks for ${recipientAddress}:`, err.message);
     return;
@@ -178,14 +155,14 @@ const dispatchPaymentWebhooks = async ({
     try {
       await sendWebhook(wh.url, payload, wh.secret);
       try {
-        await markWebhookSuccess(prisma, poolRunFn, wh.id, now);
+        await markWebhookSuccess(prisma, wh.id, now);
       } catch (dbErr) {
         logger.error(`[webhook-worker] Failed to mark success for webhook ${wh.id}:`, dbErr.message);
       }
       logger.info(`[webhook-worker] Dispatched payment webhook id=${wh.id} url=${wh.url} recipient=${recipientAddress}`);
     } catch (err) {
       try {
-        await markWebhookFailure(prisma, poolRunFn, wh.id, now);
+        await markWebhookFailure(prisma, wh.id, now);
       } catch (dbErr) {
         logger.error(`[webhook-worker] Failed to mark failure for webhook ${wh.id}:`, dbErr.message);
       }
@@ -194,38 +171,36 @@ const dispatchPaymentWebhooks = async ({
   }
 };
 
-const listStaleFailingWebhooks = async (prisma, poolAllFn) => {
+/**
+ * Returns all webhooks that have been failing since within the retry backlog
+ * window, queried entirely through Prisma.
+ *
+ * @param {import('@prisma/client').PrismaClient} prisma
+ */
+const listStaleFailingWebhooks = async (prisma) => {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - MAX_RETRY_BACKLOG_DAYS);
-  try {
-    return await prisma.webhook.findMany({
-      where: {
-        failingSince: { not: null, gte: cutoff },
-      },
-      select: {
-        id: true,
-        username: true,
-        url: true,
-        secret: true,
-      },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-    const rows = await poolAllFn(
-      `SELECT id, username, url, secret FROM webhooks
-       WHERE failing_since IS NOT NULL AND failing_since >= ?`,
-      [cutoff.toISOString()],
-    );
-    return (rows || []).map((r) => ({
-      id: r.id,
-      username: r.username,
-      url: r.url,
-      secret: r.secret,
-    }));
-  }
+
+  return prisma.webhook.findMany({
+    where: {
+      failingSince: { not: null, gte: cutoff },
+    },
+    select: {
+      id: true,
+      username: true,
+      url: true,
+      secret: true,
+    },
+  });
 };
 
-const sendLivenessPing = async (prisma, poolRunFn, webhook) => {
+/**
+ * Sends a liveness ping to a single webhook endpoint.
+ *
+ * @param {import('@prisma/client').PrismaClient} prisma
+ * @param {object} webhook
+ */
+const sendLivenessPing = async (prisma, webhook) => {
   const payload = {
     event: 'webhook.ping',
     event_id: `ping-${crypto.randomBytes(16).toString('hex')}`,
@@ -235,23 +210,29 @@ const sendLivenessPing = async (prisma, poolRunFn, webhook) => {
   const now = new Date();
   try {
     await sendWebhook(webhook.url, payload, webhook.secret);
-    await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
+    await markWebhookSuccess(prisma, webhook.id, now);
     return true;
   } catch (err) {
-    await markWebhookFailure(prisma, poolRunFn, webhook.id, now);
+    await markWebhookFailure(prisma, webhook.id, now);
     return false;
   }
 };
 
-const scheduleWebhookRetryJob = ({ prisma, poolAllFn, poolRunFn }) => {
+/**
+ * Schedules a recurring cron job that pings stale failing webhooks so they can
+ * self-recover once their endpoint is back online.
+ *
+ * @param {{ prisma: import('@prisma/client').PrismaClient }} options
+ */
+const scheduleWebhookRetryJob = ({ prisma }) => {
   cron.schedule(RETRY_JOB_CRON, async () => {
     logger.info('[webhook-worker] Running periodic liveness pings for failing webhooks…');
     try {
-      const hooks = await listStaleFailingWebhooks(prisma, poolAllFn);
+      const hooks = await listStaleFailingWebhooks(prisma);
       if (hooks.length === 0) return;
       let recovered = 0;
       for (const wh of hooks) {
-        const ok = await sendLivenessPing(prisma, poolRunFn, wh);
+        const ok = await sendLivenessPing(prisma, wh);
         if (ok) recovered += 1;
       }
       logger.info(

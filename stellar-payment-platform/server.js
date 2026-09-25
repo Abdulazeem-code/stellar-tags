@@ -17,7 +17,6 @@ const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
 const { verifyMultiSignerThreshold } = require('./src/multisigner-verifier');
-const { poolGet, poolRun, poolAll } = require('./src/db');
 const { logger } = require('./src/logger');
 const pinoHttp = require('pino-http');
 const xss = require('xss');
@@ -60,7 +59,6 @@ const {
   validateMemo,
   RESERVED_NAMES,
   USER_DATABASE,
-  shouldFallbackToLocalRegistry,
 } = require('./src/utils');
 
 dotenv.config();
@@ -274,103 +272,6 @@ const etagCache = (req, res, next) => {
   next();
 };
 
-const getLocalUserByAddress = async (address) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
-    [address],
-  );
-
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
-    [username],
-  );
-
-const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
-  const searchPattern = `%${search}%`;
-  const LIKE_FILTER =
-    'WHERE (username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE)';
-
-  if (cursorPoint) {
-    // Keyset mode for the fallback path as well. created_at is stored as an
-    // ISO-8601 string, so lexicographic comparison matches chronological
-    // ordering and the tuple predicate seeks straight past the cursor row.
-    const rows = await poolAll(
-      `SELECT username, address, created_at
-      FROM username_registry
-      ${LIKE_FILTER}
-      AND (created_at < ? OR (created_at = ? AND username < ?))
-      ORDER BY created_at DESC, username DESC
-      LIMIT ?`,
-      [searchPattern, searchPattern, String(cursorPoint.createdAt), String(cursorPoint.createdAt), String(cursorPoint.username), limit + 1],
-    );
-    const normalized = rows.map((row) => ({
-      username: row.username,
-      address: row.address,
-      createdAt: row.created_at,
-    }));
-    const { rows: pageRows, hasMore, nextCursor } = paginateByKeyset(normalized, limit);
-    return cursorPaginatedResponse(
-      pageRows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt,
-      })),
-      { limit, nextCursor, hasMore },
-    );
-  }
-
-  const skip = (page - 1) * limit;
-  const rows = await poolAll(
-    `SELECT username, address, created_at
-     FROM username_registry
-     ${LIKE_FILTER}
-     ORDER BY created_at DESC
-     LIMIT ? OFFSET ?`,
-    [searchPattern, searchPattern, limit, skip],
-  );
-
-  const countRow = await poolGet(
-    `SELECT COUNT(*) AS totalCount
-     FROM username_registry
-     ${LIKE_FILTER}`,
-    [searchPattern, searchPattern],
-  );
-
-  const totalCount = Number(countRow?.totalCount || 0);
-  return paginatedResponse(
-    rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.created_at,
-    })),
-    totalCount,
-    { page, limit },
-  );
-};
-
-const registerLocalUser = async ({ username, address }) => {
-  const existingByAddress = await getLocalUserByAddress(address);
-  if (existingByAddress) {
-    const conflictError = new Error('Address already registered');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  const existingByUsername = await getLocalUserByUsername(username);
-  if (existingByUsername) {
-    const conflictError = new Error('Username is already taken. Please choose another.');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  await poolRun(
-    `INSERT INTO username_registry (username, address, created_at)
-     VALUES (?, ?, ?)`,
-    [username, address, new Date().toISOString()],
-  );
-};
-
 // Expose /metrics endpoint for Prometheus to scrape
 app.get('/metrics', async (req, res) => {
   try {
@@ -426,28 +327,15 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
       const cacheKey = federationNameKey(queryName);
 
       const cached = await federationLookupCached(cacheKey, async () => {
-        let row;
-        try {
-          row = await prisma.user.findFirst({
-            where: { username: queryName, deletedAt: null },
-            select: { address: true, memoType: true, memo: true, flaggedAt: true },
-          });
+        const row = await prisma.user.findFirst({
+          where: { username: queryName, deletedAt: null },
+          select: { address: true, memoType: true, memo: true, flaggedAt: true },
+        });
 
-          if (row && row.flaggedAt) {
-            const forbiddenError = new Error('Address is blocked');
-            forbiddenError.statusCode = 403;
-            throw forbiddenError;
-          }
-        } catch (error) {
-          if (error.statusCode === 403) throw error;
-          if (!shouldFallbackToLocalRegistry(error)) {
-            throw error;
-          }
-
-          const localRow = await getLocalUserByUsername(queryName);
-          row = localRow
-            ? { address: localRow.address, memoType: null, memo: null }
-            : null;
+        if (row && row.flaggedAt) {
+          const forbiddenError = new Error('Address is blocked');
+          forbiddenError.statusCode = 403;
+          throw forbiddenError;
         }
 
         const address = row?.address || USER_DATABASE[queryName];
@@ -613,18 +501,9 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   }
 
   try {
-    let existing = null;
-    try {
-      existing = await prisma.user.findFirst({
-        where: { address, deletedAt: null },
-      });
-    } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) {
-        throw error;
-      }
-
-      existing = await getLocalUserByAddress(address);
-    }
+    const existing = await prisma.user.findFirst({
+      where: { address, deletedAt: null },
+    });
 
     if (existing) {
       const conflictError = new Error('Address already registered');
@@ -694,11 +573,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       // Invalidate any stale federation cache entries for this username/address
       invalidateFederationCache(normalizedUsername, address);
     } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) {
-        throw error;
-      }
-
-      await registerLocalUser({ username: normalizedUsername, address });
+      throw error;
     }
 
     return res.status(201).json({
@@ -750,18 +625,10 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
   if (address) {
     try {
       const result = await lookupCached(address, async () => {
-        let row;
-        try {
-          row = await prisma.user.findFirst({
-            where: { address, deletedAt: null },
-            select: { username: true },
-          });
-        } catch (error) {
-          if (!shouldFallbackToLocalRegistry(error)) {
-            throw error;
-          }
-          row = await getLocalUserByAddress(address);
-        }
+        const row = await prisma.user.findFirst({
+          where: { address, deletedAt: null },
+          select: { username: true },
+        });
         return row ? { username: row.username, address } : null;
       });
 
@@ -837,11 +704,7 @@ app.get('/lookup', validateSchema({ query: lookupQuerySchema }), async (req, res
         );
       }
     } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) {
-        throw error;
-      }
-
-      response = await listLocalUsers(search, page, limit, cursor);
+      throw error;
     }
 
     return res.json(response);

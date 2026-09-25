@@ -3,7 +3,6 @@ const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
 const { transferAccount } = require('../../services/registrationService');
 const { lookupCached, invalidateFederationCache } = require('../../cache');
@@ -20,7 +19,6 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
-  shouldFallbackToLocalRegistry,
 } = require('../../utils');
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
@@ -49,71 +47,6 @@ const serializeUser = (user) => ({
   address: user.address,
   created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
 });
-
-const getLocalUserByAddress = async (address) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
-    [address],
-  );
-
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
-    [username],
-  );
-
-const listLocalUsers = async (search, page, limit) => {
-  const searchPattern = `%${search}%`;
-  const skip = (page - 1) * limit;
-  const rows = await poolAll(
-    `SELECT username, address, created_at
-     FROM username_registry
-     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE
-     ORDER BY created_at DESC
-     LIMIT ? OFFSET ?`,
-    [searchPattern, searchPattern, limit, skip],
-  );
-
-  const countRow = await poolGet(
-    `SELECT COUNT(*) AS totalCount
-     FROM username_registry
-     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE`,
-    [searchPattern, searchPattern],
-  );
-
-  const totalCount = Number(countRow?.totalCount || 0);
-  return paginatedResponse(
-    rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.created_at,
-    })),
-    totalCount,
-    { page, limit },
-  );
-};
-
-const registerLocalUser = async ({ username, address }) => {
-  const existingByAddress = await getLocalUserByAddress(address);
-  if (existingByAddress) {
-    const conflictError = new Error('Address already registered');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  const existingByUsername = await getLocalUserByUsername(username);
-  if (existingByUsername) {
-    const conflictError = new Error('Username is already taken. Please choose another.');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  await poolRun(
-    `INSERT INTO username_registry (username, address, created_at)
-     VALUES (?, ?, ?)`,
-    [username, address, new Date().toISOString()],
-  );
-};
 
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
@@ -158,8 +91,6 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   if (memoError) {
     return next(new ApiError('INVALID_INPUT', memoError));
   }
-
-
 
   const normalizedUsername = username.toLowerCase();
 
@@ -221,7 +152,8 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+    // Prisma unique constraint violation (PostgreSQL error code 23505)
+    if (error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
@@ -384,7 +316,7 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
       }),
     ]);
 
-const totalPages = Math.ceil(totalCount / limit);
+    const totalPages = Math.ceil(totalCount / limit);
     const data = rows.map((user) => ({
       username: user.username,
       address: user.address,
@@ -442,7 +374,7 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
       }),
     ]);
 
-const totalPages = Math.ceil(totalCount / limit);
+    const totalPages = Math.ceil(totalCount / limit);
     const data = rows.map((user) => ({
       username: user.username,
       address: user.address,

@@ -12,7 +12,6 @@
 
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
-const { poolGet, poolRun } = require('./src/db');
 const {
   dispatchPaymentWebhooks,
   scheduleWebhookRetryJob,
@@ -100,8 +99,6 @@ const watchAccount = (accountId) => {
           logger.info(formatPayment(payment, accountId));
           dispatchPaymentWebhooks({
             prisma,
-            poolGetFn: poolGet,
-            poolRunFn: poolRun,
             payment,
           }).catch((err) =>
             logger.error(
@@ -209,7 +206,7 @@ const main = async () => {
 
   // Schedule webhook retry / liveness pings
   try {
-    scheduleWebhookRetryJob({ prisma, poolAllFn: require('./src/db').poolAll, poolRunFn: poolRun });
+    scheduleWebhookRetryJob({ prisma });
   } catch (err) {
     logger.error('Failed to schedule webhook retry job:', err.message);
   }

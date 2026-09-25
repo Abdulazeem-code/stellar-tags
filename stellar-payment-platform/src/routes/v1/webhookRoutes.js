@@ -2,26 +2,13 @@ const express = require('express');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { prisma } = require('../../../prismaClient');
-const { normalizeNameTag, poolGet, poolRun, poolAll } = require('../../db');
+const { normalizeNameTag } = require('../../utils');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 
 const router = express.Router();
-
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
-
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
-};
 
 const verifyFreighterSignedMessage = ({
   message,
@@ -68,6 +55,11 @@ const verifyFreighterSignedMessage = ({
   return claimedSigner;
 };
 
+/**
+ * Authenticates a webhook management request by verifying the Stellar
+ * signature provided in the request body against the registered address for
+ * the given username. Uses Prisma for all DB lookups.
+ */
 const authenticateWebhookCall = async (req) => {
   const rawUsername = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
   const signature = typeof req.body?.signature === 'string' ? req.body.signature.trim() : '';
@@ -86,22 +78,10 @@ const authenticateWebhookCall = async (req) => {
 
   const normalizedUsername = normalizeNameTag(rawUsername).toLowerCase();
 
-  let userRecord = null;
-  try {
-    userRecord = await prisma.user.findUnique({
-      where: { username: normalizedUsername },
-      select: { username: true, address: true },
-    });
-  } catch (err) {
-    if (!shouldFallbackToLocalRegistry(err)) throw err;
-    const localRow = await poolGet(
-      'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
-      [normalizedUsername],
-    );
-    userRecord = localRow
-      ? { username: localRow.username, address: localRow.address }
-      : null;
-  }
+  const userRecord = await prisma.user.findUnique({
+    where: { username: normalizedUsername },
+    select: { username: true, address: true },
+  });
 
   if (!userRecord) {
     const error = new Error('Username not registered.');
@@ -185,14 +165,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
         conflictError.statusCode = 409;
         return next(conflictError);
       }
-      if (!shouldFallbackToLocalRegistry(error)) throw error;
-
-      await poolRun(
-        `INSERT INTO webhooks (id, username, url, secret, created_at, last_sent_at, failing_since)
-         VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
-        [id, user.username, rawUrl, secret, now.toISOString()],
-      );
-      webhook = { id, username: user.username, url: rawUrl, createdAt: now.toISOString() };
+      throw error;
     }
 
     return res.status(201).json({
@@ -226,28 +199,10 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
 
     const user = await authenticateWebhookCall(req);
 
-    let webhooks;
-    try {
-      webhooks = await prisma.webhook.findMany({
-        where: { username: user.username },
-        orderBy: { createdAt: 'desc' },
-      });
-    } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) throw error;
-      const rows = await poolAll(
-        `SELECT id, username, url, created_at, last_sent_at, failing_since
-         FROM webhooks WHERE username = ? ORDER BY created_at DESC`,
-        [user.username],
-      );
-      webhooks = rows.map((r) => ({
-        id: r.id,
-        username: r.username,
-        url: r.url,
-        createdAt: r.created_at,
-        lastSentAt: r.last_sent_at,
-        failingSince: r.failing_since,
-      }));
-    }
+    const webhooks = await prisma.webhook.findMany({
+      where: { username: user.username },
+      orderBy: { createdAt: 'desc' },
+    });
 
     return res.status(200).json({
       ok: true,
@@ -285,22 +240,11 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
       return res.status(400).json({ error: 'Webhook id is required in URL path.' });
     }
 
-    let deletedCount = 0;
-    try {
-      const deleted = await prisma.webhook.deleteMany({
-        where: { id, username: user.username },
-      });
-      deletedCount = deleted.count;
-    } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) throw error;
-      const result = await poolRun(
-        'DELETE FROM webhooks WHERE id = ? AND username = ?',
-        [id, user.username],
-      );
-      deletedCount = result?.changes || 0;
-    }
+    const deleted = await prisma.webhook.deleteMany({
+      where: { id, username: user.username },
+    });
 
-    if (deletedCount === 0) {
+    if (deleted.count === 0) {
       return res.status(404).json({ error: 'Webhook not found.' });
     }
 

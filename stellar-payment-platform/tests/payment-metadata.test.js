@@ -113,8 +113,6 @@ describe('payment intent metadata', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
-      poolRunFn: jest.fn(),
       payment: {
         id: 'payment-1',
         type: 'payment',

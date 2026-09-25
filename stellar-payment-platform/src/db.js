@@ -1,39 +1,19 @@
+/**
+ * db.js — Legacy shim retained for the etagCache middleware and utility
+ * re-exports. All database interactions have been migrated to Prisma Client.
+ * The raw PostgreSQL pool helpers (poolGet, poolRun, poolAll) have been
+ * removed as part of issue #724 (Migrate to Prisma ORM from Raw Queries/Knex).
+ */
 const crypto = require('crypto');
-const { Pool } = require('pg');
 const { logger } = require('./logger');
-const dotenv = require('dotenv');
-
-dotenv.config();
-
-const connectionString = process.env.DATABASE_URL;
-
-const pool = new Pool({
-  connectionString,
-  max: parseInt(process.env.DB_POOL_MAX, 10) || 10,
-  idleTimeoutMillis: 30000,
-});
-
-pool.on('error', (err) => {
-  logger.error(err, 'Unexpected PostgreSQL pool error');
-});
-
-const poolGet = async (sql, params = []) => {
-  const { rows } = await pool.query(sql, params);
-  return rows[0] || null;
-};
-
-const poolRun = async (sql, params = []) => {
-  const result = await pool.query(sql, params);
-  return { changes: result.rowCount, lastID: result.rows[0]?.id };
-};
-
-const poolAll = async (sql, params = []) => {
-  const { rows } = await pool.query(sql, params);
-  return rows;
-};
 
 const { USER_DATABASE, normalizeNameTag } = require('./utils');
 
+/**
+ * ETag caching middleware. Computes a SHA-256 hash of every JSON response
+ * body and sets the ETag header. If the client sends a matching If-None-Match
+ * header the response is short-circuited with 304 Not Modified.
+ */
 const etagCache = (req, res, next) => {
   const originalJson = res.json.bind(res);
 
@@ -56,11 +36,7 @@ const etagCache = (req, res, next) => {
 };
 
 module.exports = {
-  poolGet,
-  poolRun,
-  poolAll,
-  pool,
   USER_DATABASE,
   normalizeNameTag,
-  etagCache
+  etagCache,
 };
