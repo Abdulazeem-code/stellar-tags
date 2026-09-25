@@ -27,17 +27,7 @@ jest.mock('../../prismaClient', () => {
         }
         return row ? { ...row } : null;
       }),
-      updateMany: jest.fn(async ({ where, data }) => {
-        let count = 0;
-        for (const entry of mockDbUsers.values()) {
-          if (entry.address === where.address) {
-            const updated = { ...entry, ...data };
-            mockDbUsers.set(entry.address, updated);
-            count++;
-          }
-        }
-        return { count };
-      }),
+
       updateMany: jest.fn(async ({ where, data }) => {
         let count = 0;
         for (const [address, entry] of mockDbUsers.entries()) {

@@ -218,6 +218,26 @@ cd payment_router
 cargo build
 ```
 
+### Contract TypeScript bindings
+
+The TypeScript client for the `payment_router` contract lives in
+[`packages/types`](packages/types) and is **auto-generated** from the contract
+ABI, so the React dashboard gets end-to-end type safety with the Rust contract
+instead of manually copying contract IDs and argument shapes.
+
+Regenerate the bindings after any change to the contract's public interface
+(the contract must build with the `wasm32-unknown-unknown` target, and the
+`stellar` CLI must be on your PATH):
+
+```bash
+npm run generate:bindings
+```
+
+The result is committed to `packages/types` and consumed by the frontend as
+`@stellar-tags/payment-router` (a `file:` dependency). The `bindings-check` CI
+job fails the build if the checked-in bindings ever drift from the contract
+ABI.
+
 ## Webhook signature verification
 
 Every webhook delivery includes an HMAC-SHA256 signature in the
@@ -243,6 +263,16 @@ npm test
 cd ../payment_router
 cargo test
 ```
+
+### Coverage
+
+The server runs with coverage in CI via `npm run test:coverage` (same as
+`npm test` plus `--coverage`). Minimum coverage thresholds are set in
+`stellar-payment-platform/package.json` under `jest.coverageThreshold` — CI
+fails the build when coverage drops below the floor, and the `lcov`/HTML report
+is uploaded as a build artifact. Raise the thresholds as coverage improves so
+the floor keeps pace with the suite.
+
 
 ## Environment variables
 

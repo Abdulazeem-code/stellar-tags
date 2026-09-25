@@ -376,35 +376,7 @@ impl PaymentRouter {
             amount,
         );
 
-        // Prevent self-routing
-        if sender == recipient {
-            return Err(Error::InvalidRecipient);
-        }
-
-        // Check if recipient is blacklisted
-        if Self::is_blacklisted(env.clone(), recipient.clone()) {
-            return Err(Error::Blacklisted);
-        }
-
-        // Validate amount bounds
-        let max_amount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxAmount)
-            .unwrap_or(Self::MAX_AMOUNT);
-        if amount <= 0 || amount > max_amount {
-            return Err(Error::LimitExceeded);
-        }
-
-        // Enforce optional admin-configured minimum payment limit
-        let min_limit: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinLimit)
-            .unwrap_or(0);
-        if amount < min_limit {
-            return Err(Error::LimitExceeded);
-        }
+        // Validations moved to route_payments to prevent rollback panic on Windows testutils
 
         // Apply tiered fee discount for high-volume users
         let user_volume: i128 = env
@@ -1241,6 +1213,30 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_payment(
@@ -1277,6 +1273,33 @@ impl PaymentRouter {
         }
         if Self::is_paused(env.clone()) {
             return Err(Error::Paused);
+        }
+
+        // Pre-validate all payments to avoid rollback panic from require_auth
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        for payment in payments.iter() {
+            if payment.sender == payment.recipient {
+                return Err(Error::InvalidRecipient);
+            }
+            if Self::is_blacklisted(env.clone(), payment.recipient.clone()) {
+                return Err(Error::Blacklisted);
+            }
+            if payment.amount <= 0 || payment.amount > max_amount {
+                return Err(Error::LimitExceeded);
+            }
+            if payment.amount < min_limit {
+                return Err(Error::LimitExceeded);
+            }
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
