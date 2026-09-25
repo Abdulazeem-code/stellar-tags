@@ -65,8 +65,13 @@ jest.mock('./src/multisigner-verifier', () => ({
 jest.mock('pg', () => ({
   Pool: jest.fn().mockImplementation(() => ({
     query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-    on: jest.fn(),
+    connect: jest.fn().mockResolvedValue({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      release: jest.fn(),
+    }),
     end: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
+    options: { max: 10 },
   })),
 }));
 
@@ -316,8 +321,13 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -397,8 +407,13 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -780,8 +795,13 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -911,8 +931,13 @@ describe('Database disconnection — 503 handling', () => {
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -982,7 +1007,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1001'],
     ['P1008'],
   ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
-    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
+    prisma.user.count.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app)
       .post('/api/v1/register')

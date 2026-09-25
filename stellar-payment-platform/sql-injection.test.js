@@ -55,17 +55,11 @@ jest.mock('./prismaClient', () => ({
 
 const { prisma } = require('./prismaClient');
 
-// Load a fresh `app` instance inside isolated module context per test to avoid
-// cross-file mock leakage that causes inconsistent behavior when tests run
-// together in the full suite.
-const getApp = () => {
-  let app;
-  process.env.NODE_ENV = 'test';
-  jest.isolateModules(() => {
-    app = require('./server').app;
-  });
-  return app;
-};
+process.env.NODE_ENV = 'test';
+const { app } = require('./server');
+
+// Alias so test bodies can call getApp() without changes.
+const getApp = () => app;
 
 // ---------------------------------------------------------------------------
 // Common SQL injection payloads
@@ -163,8 +157,9 @@ describe('#35 Injection safety — POST /register (address conflict check)', () 
       // Either created (201) or rejected as a conflict (409) — never a crash.
       expect([201, 409]).toContain(res.status);
 
-      expect(prisma.user.findFirst).toHaveBeenCalledTimes(1);
-      const arg = prisma.user.findFirst.mock.calls[0][0];
+      // The address feeds the alias-count check as a bound Prisma argument.
+      expect(prisma.user.count).toHaveBeenCalledTimes(1);
+      const arg = prisma.user.count.mock.calls[0][0];
       expect(arg.where.address).toBe(payload);
     },
   );

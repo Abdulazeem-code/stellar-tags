@@ -11,7 +11,16 @@ if [ -z "${DATABASE_URL:-}" ]; then
   echo "Skipping database migrations and running in mock/fallback mode." >&2
 else
   echo "Running database migrations..."
+  # Automatically resolve the duplicate soft_deletes migration that failed on Render
+  "$PRISMA" migrate resolve --applied 20260829000000_soft_deletes || true
   "$PRISMA" migrate deploy
+  echo "Verifying migration status..."
+  if "$PRISMA" migrate status >/dev/null 2>&1; then
+    echo "Database schema is up to date."
+  else
+    echo "WARNING: Prisma schema is out of sync with the database." >&2
+    echo "Run './node_modules/.bin/prisma migrate deploy' and restart the server." >&2
+  fi
 fi
 
 if [ ! -x "$PRISMA" ]; then

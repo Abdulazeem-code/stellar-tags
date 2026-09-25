@@ -12,12 +12,13 @@ const httpRequestCounter = new client.Counter({
   labelNames: ['method', 'route', 'status_code'],
 });
 
-// Custom histogram: request duration in seconds
+// Custom histogram: request duration in seconds, bucketed for SLO work
+// (10ms, 50ms, 100ms, 500ms, 1s, 5s) so p50/p95/p99 latency can be derived.
 const httpRequestDuration = new client.Histogram({
   name: 'stellar_tags_http_request_duration_seconds',
   help: 'HTTP request duration in seconds',
   labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
 });
 
 // The Prisma and Redis clients are created after this module is imported, so
@@ -112,7 +113,13 @@ function metricsMiddleware(req, res, next) {
 
   res.on('finish', () => {
     const duration = (Date.now() - start) / 1000;
-    const route = req.route?.path ?? req.path ?? 'unknown';
+    // Normalize the route label: use the matched route pattern (never the raw
+    // path, query string, or concrete ids), include the router mount prefix
+    // (e.g. "/api/v1"), and collapse unmatched/404 paths to "unknown" so label
+    // cardinality stays bounded even under arbitrary-path probing.
+    const route = req.route
+      ? `${req.baseUrl || ''}${req.route.path}`
+      : 'unknown';
     const labels = {
       method: req.method,
       route,

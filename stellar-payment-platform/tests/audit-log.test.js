@@ -16,17 +16,18 @@ jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: 
 
 const mockAuditLogCreate = jest.fn().mockResolvedValue({});
 const mockAuditLogFindMany = jest.fn().mockResolvedValue([]);
-const mockUserUpdate = jest.fn();
+const mockUserUpdateMany = jest.fn();
+const mockUserFindMany = jest.fn();
 
 jest.mock('../prismaClient', () => ({
   prisma: {
     user: {
       findUnique: jest.fn(),
       findFirst: jest.fn(),
-      findMany: jest.fn(),
+      findMany: mockUserFindMany,
       count: jest.fn(),
       create: jest.fn(),
-      update: mockUserUpdate,
+      updateMany: mockUserUpdateMany,
     },
     payment: {
       findMany: jest.fn().mockResolvedValue([]),
@@ -71,7 +72,8 @@ describe('Admin Audit Logging System', () => {
   beforeEach(() => {
     mockAuditLogCreate.mockClear();
     mockAuditLogFindMany.mockClear();
-    mockUserUpdate.mockReset();
+    mockUserUpdateMany.mockReset();
+    mockUserFindMany.mockReset();
   });
 
   describe('redactSensitiveData', () => {
@@ -156,11 +158,8 @@ describe('Admin Audit Logging System', () => {
 
   describe('Audit Log Middleware Integration', () => {
     it('records an audit log for mutating admin actions (POST /admin/block)', async () => {
-      mockUserUpdate.mockResolvedValueOnce({
-        username: 'alice',
-        address: 'GABC1234567890123456789012345678901234567890123456789012',
-        flaggedAt: new Date(),
-      });
+      mockUserUpdateMany.mockResolvedValueOnce({ count: 1 });
+      mockUserFindMany.mockResolvedValueOnce([{ username: 'alice' }]);
 
       const res = await request(app)
         .post('/api/v1/admin/block')
@@ -205,11 +204,8 @@ describe('Admin Audit Logging System', () => {
 
     it('does not crash request if audit log persistence fails', async () => {
       mockAuditLogCreate.mockRejectedValueOnce(new Error('Database connection failure'));
-      mockUserUpdate.mockResolvedValueOnce({
-        username: 'bob',
-        address: 'GBOB1234567890123456789012345678901234567890123456789012',
-        flaggedAt: new Date(),
-      });
+      mockUserUpdateMany.mockResolvedValueOnce({ count: 1 });
+      mockUserFindMany.mockResolvedValueOnce([{ username: 'bob' }]);
 
       const res = await request(app)
         .post('/api/v1/admin/block')
