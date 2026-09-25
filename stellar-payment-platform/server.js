@@ -11,6 +11,7 @@ const rateLimit = require("express-rate-limit");
 const { RedisStore } = require("rate-limit-redis");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
+const { createGraphQLMiddleware } = require("./src/graphql");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
@@ -215,6 +216,7 @@ setMetricsSources({ prisma, redisClient });
 
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
+const graphQLMiddleware = createGraphQLMiddleware({ prismaClient: prisma });
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -317,6 +319,10 @@ const isPrimitive = (v) =>
   v === null || v === undefined || typeof v !== "object";
 
 const rejectNestedObjects = (req, res, next) => {
+  // GraphQL variables are intentionally nested; field-level schema validation
+  // replaces the flat-input guard used by the REST API.
+  if (req.path === "/graphql") return next();
+
   const sources = [req.query, req.body];
   for (const source of sources) {
     if (source && typeof source === "object") {
@@ -344,6 +350,7 @@ app.use(rejectNestedObjects);
 
 // Enable HTTP response compression for responses exceeding 1KB (1024 bytes)
 app.use(compression({ threshold: 1024 }));
+app.use("/graphql", graphQLMiddleware);
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
