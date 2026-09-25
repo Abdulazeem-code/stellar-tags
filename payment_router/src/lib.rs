@@ -123,6 +123,12 @@ pub trait LendingProtocol {
     fn harvest(env: Env, to: Address, token: Address) -> i128;
 }
 
+/// Minimal interface for an admin-selected KYC issuer or oracle contract.
+#[contractclient(name = "KycOracleClient")]
+pub trait KycOracle {
+    fn is_verified(env: Env, account: Address) -> bool;
+}
+
 // ── Timelock data structures ─────────────────────────────────────────────────
 //
 // Admin actions that change sensitive contract parameters (treasury, fees,
@@ -213,6 +219,10 @@ pub enum DataKey {
     YieldProtocol,
     /// Principal currently deposited for a treasury asset.
     YieldPrincipal(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -255,6 +265,10 @@ pub enum Error {
     YieldProtocolNotConfigured = 15,
     /// Yield amount must be positive and withdrawals cannot exceed principal.
     InvalidYieldAmount = 16,
+    /// The sender lacks a valid KYC claim for a high-value payment.
+    KycRequired = 17,
+    /// The configured KYC threshold must not be negative.
+    InvalidKycThreshold = 18,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -361,6 +375,25 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::Frozen)
             .unwrap_or(false)
+    }
+
+    /// Enforces KYC only after the admin has configured a threshold. This
+    /// preserves existing routing behavior until compliance is enabled.
+    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
+        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
+            return Ok(());
+        }
+
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycOracle)
+            .ok_or(Error::KycRequired)?;
+        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
+            return Err(Error::KycRequired);
+        }
+        Ok(())
     }
 
     /// Allocates and returns the next timelock nonce, incrementing the counter.
@@ -1213,6 +1246,27 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Configures the trusted KYC oracle and the high-value payment threshold.
+    pub fn set_kyc_config(env: Env, oracle: Address, threshold: i128) -> Result<(), Error> {
+        if threshold < 0 {
+            return Err(Error::InvalidKycThreshold);
+        }
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::KycOracle, &oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::KycThreshold, &threshold);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("kyc_cfg"), oracle), threshold);
+        Ok(())
+    }
+
     /// Deposits idle treasury funds into the configured lending protocol.
     ///
     /// Both the admin and treasury authorize this operation. The second
@@ -1319,6 +1373,11 @@ impl PaymentRouter {
             .unwrap_or(0)
     }
 
+    /// Returns the configured KYC threshold, or `None` when enforcement is off.
+    pub fn get_kyc_threshold(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::KycThreshold)
+    }
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
     /// # Parameters
@@ -1378,6 +1437,7 @@ impl PaymentRouter {
         if amount < min_limit {
             return Err(Error::LimitExceeded);
         }
+        Self::verify_kyc_for_amount(&env, &sender, amount)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -1442,6 +1502,7 @@ impl PaymentRouter {
             if payment.amount < min_limit {
                 return Err(Error::LimitExceeded);
             }
+            Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -1689,6 +1750,31 @@ mod test {
         }
     }
 
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockKycKey {
+        Verified(Address),
+    }
+
+    #[contract]
+    struct MockKycOracle;
+
+    #[contractimpl]
+    impl MockKycOracle {
+        pub fn set_verified(env: Env, account: Address, verified: bool) {
+            env.storage()
+                .instance()
+                .set(&MockKycKey::Verified(account), &verified);
+        }
+
+        pub fn is_verified(env: Env, account: Address) -> bool {
+            env.storage()
+                .instance()
+                .get(&MockKycKey::Verified(account))
+                .unwrap_or(false)
+        }
+    }
+
     /// Returns (env, client, contract_id).
     fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
         let env = Env::default();
@@ -1765,6 +1851,75 @@ mod test {
         assert_eq!(
             client.try_withdraw_from_yield(&token_address, &1),
             Err(Ok(Error::InvalidYieldAmount))
+        );
+    }
+
+    #[test]
+    fn test_kyc_oracle_gates_only_high_value_payments() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let oracle_client = MockKycOracleClient::new(&env, &oracle_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &10_000);
+
+        client.route_payment(&sender, &recipient, &token_address, &500);
+        assert_eq!(
+            client.try_route_payment(&sender, &recipient, &token_address, &2_000),
+            Err(Ok(Error::KycRequired))
+        );
+
+        oracle_client.set_verified(&sender, &true);
+        client.route_payment(&sender, &recipient, &token_address, &2_000);
+        assert_eq!(client.get_kyc_threshold(), Some(1_000));
+        assert_eq!(token_client.balance(&sender), 7_500);
+    }
+
+    #[test]
+    fn test_kyc_config_rejects_negative_threshold() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_set_kyc_config(&oracle, &-1),
+            Err(Ok(Error::InvalidKycThreshold))
+        );
+    }
+
+    #[test]
+    fn test_batch_payments_enforce_kyc_for_each_sender() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let (token_address, _token_client, token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &5_000);
+
+        let payments = Vec::from_array(
+            &env,
+            [Payment {
+                sender,
+                recipient,
+                token_address,
+                amount: 2_000,
+            }],
+        );
+        assert_eq!(
+            client.try_route_payments(&payments),
+            Err(Ok(Error::KycRequired))
         );
     }
 
