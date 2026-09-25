@@ -858,4 +858,3 @@ export class Client extends ContractClient {
         set_platform_treasury: this.txFromJSON<Result<void>>
   }
 }
-
