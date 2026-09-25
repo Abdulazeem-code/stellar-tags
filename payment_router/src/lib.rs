@@ -147,7 +147,28 @@ pub enum ActionType {
     /// Transfer admin rights to a new address.
     TransferAdmin(Address),
     /// Upgrade the contract WASM.
+    ///
+    /// Executing this action also requires the multi-signature admin group to
+    /// have approved `new_wasm_hash` (see [`PaymentRouter::approve_upgrade`]),
+    /// so the timelock delay and the M-of-N gate compose rather than replace
+    /// each other.
     Upgrade(BytesN<32>),
+    /// Replace the multi-signature admin group that authorizes upgrades.
+    SetMultisigConfig(Vec<Address>, u32),
+}
+
+/// The multi-signature admin group that authorizes contract upgrades.
+///
+/// `threshold` signers drawn from `signers` must approve a specific WASM hash
+/// before [`PaymentRouter::upgrade`] (or the timelock's
+/// [`ActionType::Upgrade`]) will install it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    /// The N addresses whose signatures count towards an upgrade approval.
+    pub signers: Vec<Address>,
+    /// The M signers that must approve before an upgrade is authorized.
+    pub threshold: u32,
 }
 
 /// A pending timelock entry stored in persistent ledger storage.
@@ -198,6 +219,21 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    /// The N addresses of the multi-signature admin group that authorize
+    /// contract upgrades.  Stored as `Vec<Address>` in instance storage.
+    ///
+    /// Absent until the admin calls `set_multisig_config`; while absent every
+    /// upgrade attempt fails closed with `Error::MultisigNotInitialized`.
+    MultisigSigners,
+    /// The M signers of the multi-signature admin group that must approve a
+    /// WASM hash before an upgrade is authorized.  Stored as `u32` in
+    /// instance storage, always alongside `MultisigSigners`.
+    MultisigThreshold,
+    /// The addresses that have already signed off on upgrading to a specific
+    /// WASM hash.  Keyed by that hash so approvals for concurrent upgrade
+    /// proposals are tracked independently.  Stored as `Vec<Address>` in
+    /// persistent storage and cleared once the upgrade is applied.
+    UpgradeApproval(BytesN<32>),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -236,6 +272,24 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
+    /// The multi-signature configuration is unusable: the signer set is empty,
+    /// contains a duplicate address, the threshold is zero, or the threshold
+    /// exceeds the number of signers (so the upgrade could never be authorized).
+    InvalidMultisigConfig = 15,
+    /// The calling address is not a member of the multi-signature admin group.
+    NotMultisigSigner = 16,
+    /// The number of collected upgrade approvals is below the configured
+    /// threshold, so the upgrade is not authorized yet.
+    InsufficientApprovals = 17,
+    /// No multi-signature admin group has been configured yet.  Upgrades fail
+    /// closed until `set_multisig_config` has been called, so a freshly
+    /// deployed contract can never be upgraded through the single admin key
+    /// that the group was introduced to de-risk.
+    MultisigNotInitialized = 18,
+    /// The calling address has already approved this WASM hash.  Duplicate
+    /// approvals are rejected rather than ignored so that a replayed signature
+    /// can never inflate the approval count towards the threshold.
+    AlreadyApproved = 19,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -287,6 +341,165 @@ impl PaymentRouter {
             admin.require_auth();
             Ok(())
         }
+    }
+
+    // ── Multi-signature (M-of-N) upgrade helpers ────────────────────────────
+    //
+    // Contract upgrades used to be gated on a single admin key, which made the
+    // admin both a single point of failure and a single point of
+    // centralization.  Upgrades are now gated on an explicit M-of-N admin
+    // group: each signer authorizes an individual WASM hash by calling
+    // `approve_upgrade`, and the hash only becomes installable once `M`
+    // distinct members of the group have signed off on that exact hash.
+    //
+    // Authorizations are recorded per-hash rather than per-time-window so that
+    // a signature collected for one upgrade can never be replayed to authorize
+    // a different one.
+
+    /// Loads the multi-signature admin group, or fails closed when none has
+    /// been configured.
+    ///
+    /// The signer set and the threshold are written together by
+    /// `set_multisig_config`, so a present `MultisigThreshold` key implies a
+    /// present `MultisigSigners` key; only the threshold has to be probed.
+    fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigThreshold)
+            .ok_or(Error::MultisigNotInitialized)?;
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigSigners)
+            .ok_or(Error::MultisigNotInitialized)?;
+        Ok((signers, threshold))
+    }
+
+    /// Validates a candidate signer set / threshold pair and returns the
+    /// configured threshold.
+    ///
+    /// Rejects configurations that could never authorize an upgrade, and
+    /// duplicate signers, which would otherwise let a single key pad the
+    /// effective signer count.
+    fn validate_multisig_config(signers: &Vec<Address>, threshold: u32) -> Result<u32, Error> {
+        if signers.is_empty() {
+            return Err(Error::InvalidMultisigConfig);
+        }
+        if threshold == 0 || threshold > signers.len() {
+            return Err(Error::InvalidMultisigConfig);
+        }
+        // O(n^2) over a group that is small by design; run once per config
+        // change rather than on the approval hot path.
+        for i in 0..signers.len() {
+            for j in (i + 1)..signers.len() {
+                if signers.get(i) == signers.get(j) {
+                    return Err(Error::InvalidMultisigConfig);
+                }
+            }
+        }
+        Ok(threshold)
+    }
+
+    /// Returns the approvals collected so far for `new_wasm_hash`.
+    fn load_upgrade_approvals(env: &Env, new_wasm_hash: &BytesN<32>) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeApproval(new_wasm_hash.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Returns the approvals for `new_wasm_hash` that still count, i.e. those
+    /// cast by a member of the *current* signer set.
+    ///
+    /// Stored approvals are filtered on read rather than rewritten when the
+    /// group rotates, so dropping a signer immediately strips the weight of any
+    /// approval it had already cast instead of leaving a stale vote behind. The
+    /// scan is over a group and an approval list that are both bounded by the
+    /// group size, so it stays cheap and every stored value is read at most
+    /// once.
+    fn load_effective_approvals(
+        env: &Env,
+        signers: &Vec<Address>,
+        new_wasm_hash: &BytesN<32>,
+    ) -> Vec<Address> {
+        let stored = Self::load_upgrade_approvals(env, new_wasm_hash);
+        let mut effective = Vec::new(env);
+        for i in 0..stored.len() {
+            let approver = stored.get(i).unwrap();
+            if signers.contains(&approver) {
+                effective.push_back(approver);
+            }
+        }
+        effective
+    }
+
+    /// Returns `true` when at least `M` distinct current group members have
+    /// approved `new_wasm_hash`, i.e. when the upgrade is authorized.
+    fn check_upgrade_authorized(env: &Env, new_wasm_hash: &BytesN<32>) -> Result<bool, Error> {
+        let (signers, threshold) = Self::load_multisig_config(env)?;
+        Ok(Self::load_effective_approvals(env, &signers, new_wasm_hash).len() >= threshold)
+    }
+
+    /// The M-of-N gate every upgrade path funnels through.  Returns the
+    /// approval count so callers can emit it in events.
+    fn require_upgrade_authorized(env: &Env, new_wasm_hash: &BytesN<32>) -> Result<u32, Error> {
+        let (signers, threshold) = Self::load_multisig_config(env)?;
+        let approvals = Self::load_effective_approvals(env, &signers, new_wasm_hash);
+        if approvals.len() < threshold {
+            return Err(Error::InsufficientApprovals);
+        }
+        Ok(approvals.len())
+    }
+
+    /// Installs `new_wasm_hash` and consumes the approvals that authorized it.
+    ///
+    /// Clearing the approvals is what makes a threshold reached exactly once
+    /// per set of signatures: after the swap the group has to sign off again
+    /// before any further upgrade can proceed.
+    fn apply_upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UpgradeApproval(new_wasm_hash.clone()));
+    }
+
+    /// Persists a validated signer set / threshold pair.
+    ///
+    /// The signer set is rotated as a whole: a signer that is dropped from the
+    /// group also loses the right to approve, *and* loses the weight of any
+    /// approval it had already cast, because authorization counts only
+    /// approvals made by current members. Outgoing approvals for hashes that
+    /// are still in flight are left in storage untouched — they simply stop
+    /// counting, so a rotation can revoke in-progress upgrades without having
+    /// to walk every hash. A signer that is added starts with no approvals.
+    fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigThreshold, &threshold);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+    }
+
+    /// Pre-flight checks for a queued timelock action, run before the entry is
+    /// removed so a rejected action leaves the queue intact.
+    fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
+        match action {
+            ActionType::Upgrade(new_wasm_hash) => {
+                Self::require_upgrade_authorized(env, new_wasm_hash)?;
+            }
+            ActionType::SetMultisigConfig(signers, threshold) => {
+                Self::validate_multisig_config(signers, *threshold)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
@@ -548,9 +761,15 @@ impl PaymentRouter {
     ///
     /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
     /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
-    /// `upgrade`) must go through the timelock.  Use the direct setter
-    /// functions only for actions that are not sensitive (e.g. `set_pause`
-    /// which can also be called directly for immediate operational pauses).
+    /// `set_multisig_config`, `upgrade`) must go through the timelock.  Use the
+    /// direct setter functions only for actions that are not sensitive (e.g.
+    /// `set_pause` which can also be called directly for immediate operational
+    /// pauses).
+    ///
+    /// Queueing does not pre-authorize anything on its own: `ActionType::Upgrade`
+    /// and `ActionType::SetMultisigConfig` are re-validated at execution time,
+    /// so an upgrade queued today still needs the multi-signature threshold to
+    /// be met for that hash when the delay elapses.
     ///
     /// The contract must not be frozen when queuing, and the admin must
     /// authorize the call.
@@ -609,6 +828,8 @@ impl PaymentRouter {
     /// - The admin must authorize.
     /// - The entry identified by `nonce` must exist.
     /// - At least 24 hours (`SECONDS_IN_24H`) must have passed since queuing.
+    /// - For [`ActionType::Upgrade`], the multi-signature threshold must
+    ///   already be met for that WASM hash.
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
@@ -630,6 +851,12 @@ impl PaymentRouter {
         if now < entry.queued_at + Self::SECONDS_IN_24H {
             return Err(Error::TimelockNotReady);
         }
+
+        // Validate the action before touching storage so that a rejected entry
+        // stays in the queue for the admin to retry or cancel.  Upgrades are
+        // gated on the M-of-N threshold here as well as in `upgrade`, so
+        // routing an upgrade through the timelock is not a way around it.
+        Self::validate_queued_action(&env, &entry.action)?;
 
         // Remove the entry before applying the action (checks-effects-interactions).
         env.storage().persistent().remove(&key);
@@ -658,7 +885,10 @@ impl PaymentRouter {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
             }
             ActionType::Upgrade(new_wasm_hash) => {
-                env.deployer().update_current_contract_wasm(new_wasm_hash);
+                Self::apply_upgrade(&env, &new_wasm_hash);
+            }
+            ActionType::SetMultisigConfig(signers, threshold) => {
+                Self::store_multisig_config(&env, signers, threshold);
             }
         }
 
@@ -1446,26 +1676,318 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Replaces this contract's WASM with a previously uploaded version. Admin-only.
+    // ── Multi-signature (M-of-N) contract upgrades ───────────────────────────
+    //
+    // Issue #664: upgrades used to be gated on a single admin key, which made
+    // that key both a single point of failure (lose it and the contract can
+    // never be patched) and a single point of centralization (compromise it and
+    // an attacker owns the contract).  Upgrades now require M signatures drawn
+    // from an N-member admin group, so no single key — including the admin's —
+    // can upgrade the contract on its own.
+    //
+    // The flow is:
+    //   1. The admin configures the group once with `set_multisig_config`.
+    //   2. Each signer authorizes a specific WASM hash with `approve_upgrade`.
+    //   3. Once M signatures are collected, `upgrade` (or the timelock's
+    //      `ActionType::Upgrade`) installs that exact hash and the approvals
+    //      are consumed.
+    //
+    // Until step 1 happens every upgrade fails closed with
+    // `Error::MultisigNotInitialized`; there is deliberately no fallback to the
+    // single admin key, because that fallback is the vulnerability being fixed.
+
+    // The admin is the root of trust for this call only: it can re-point the
+    // group but still cannot upgrade the contract by itself. Prefer
+    // `queue_action(ActionType::SetMultisigConfig(…))` to put the 24-hour
+    // timelock in front of a rotation, which this direct setter bypasses.
+    /// Configures the multi-signature admin group that authorizes upgrades.
+    ///
+    /// The signer set is replaced wholesale: addresses that are not in
+    /// `signers` immediately lose the ability to approve, and a threshold
+    /// already reached for a pending hash is re-evaluated against the new
+    /// configuration.
     ///
     /// # Parameters
-    /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
-    ///   network, to install as this contract's new executable.
+    /// - `signers`: The N addresses whose signatures count. Must be non-empty
+    ///   and free of duplicates.
+    /// - `threshold`: The M signers required to authorize an upgrade, in
+    ///   `1..=signers.len()`.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Ok(())` on success, `Err(Error::InvalidMultisigConfig)` if the signer
+    /// set is empty or holds a duplicate, or the threshold is zero or larger
+    /// than the set, or `Err(Error::NotInitialized)` if the contract has no
+    /// admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if
-    /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
-    ///
-    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_multisig_config(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        let validated = Self::validate_multisig_config(&signers, threshold)?;
+        Self::store_multisig_config(&env, signers, validated);
+
+        env.events()
+            .publish((Symbol::new(&env, "multisig_config_set"), admin), validated);
+
+        log!(
+            &env,
+            "Multi-signature upgrade threshold set to {}",
+            validated
+        );
+        Ok(())
+    }
+
+    /// Returns the current multi-signature admin group.
+    ///
+    /// # Returns
+    /// The configured signers and threshold, or `Err(Error::MultisigNotInitialized)`
+    /// if `set_multisig_config` has not been called yet.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, Error> {
+        let (signers, threshold) = Self::load_multisig_config(&env)?;
+        Ok(MultisigConfig { signers, threshold })
+    }
+
+    /// Records `signer`'s authorization of an upgrade to `new_wasm_hash`.
+    ///
+    /// Each group member signs off separately so the M signatures are genuinely
+    /// independent: one compromised key cannot produce a quorum, and every
+    /// approval is bound to one specific WASM hash.
+    ///
+    /// Reaching the threshold does not install the WASM by itself — call
+    /// `upgrade` (or `execute_action` on a queued [`ActionType::Upgrade`]) to
+    /// apply it. Keeping those two steps separate lets the group approve a hash
+    /// and then route the installation through the 24-hour timelock if it wants
+    /// observers to see it coming.
+    ///
+    /// # Parameters
+    /// - `signer`: The group member approving; must authorize this call.
+    /// - `new_wasm_hash`: The WASM hash being approved.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured, `Err(Error::NotMultisigSigner)` if `signer` is not a
+    /// group member, or `Err(Error::AlreadyApproved)` if `signer` already
+    /// approved this hash.
+    ///
+    /// # Panics
+    /// Panics if `signer` does not authorize the call.
+    pub fn approve_upgrade(
+        env: Env,
+        signer: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let (signers, threshold) = Self::load_multisig_config(&env)?;
+        if !signers.contains(&signer) {
+            return Err(Error::NotMultisigSigner);
+        }
+        signer.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if approvals.contains(&signer) {
+            return Err(Error::AlreadyApproved);
+        }
+        approvals.push_back(signer.clone());
+        env.storage().persistent().set(&key, &approvals);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"), signer, new_wasm_hash),
+            (approvals.len(), threshold),
+        );
+
+        log!(
+            &env,
+            "Upgrade approved by signer {}/{}",
+            approvals.len(),
+            threshold
+        );
+        Ok(())
+    }
+
+    /// Withdraws a signer's previously recorded approval of an upgrade.
+    ///
+    /// Lets a signer pull its signature back before the threshold is reached,
+    /// which is the way a group stops an upgrade it no longer wants without
+    /// having to rotate the whole signer set. Idempotent: withdrawing an
+    /// approval that was never recorded is a no-op.
+    ///
+    /// # Parameters
+    /// - `signer`: The group member withdrawing its approval; must authorize
+    ///   this call.
+    /// - `new_wasm_hash`: The WASM hash to withdraw the approval for.
+    ///
+    /// # Returns
+    /// `Ok(())` on success or `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured.
+    ///
+    /// # Panics
+    /// Panics if `signer` does not authorize the call.
+    pub fn revoke_upgrade_approval(
+        env: Env,
+        signer: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let (signers, _) = Self::load_multisig_config(&env)?;
+        if !signers.contains(&signer) {
+            return Err(Error::NotMultisigSigner);
+        }
+        signer.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Vec::first_index_of returns the position of the first match, which
+        // for a duplicate-free set is the one and only approval to drop.
+        if let Some(index) = approvals.first_index_of(&signer) {
+            approvals.remove(index);
+            if approvals.is_empty() {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &approvals);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+
+            env.events().publish(
+                (Symbol::new(&env, "upgrade_revoked"), signer, new_wasm_hash),
+                approvals.len(),
+            );
+
+            log!(&env, "Upgrade approval revoked");
+        }
+
+        Ok(())
+    }
+
+    /// Discards every approval collected for `new_wasm_hash`. Admin-only.
+    ///
+    /// The blunt instrument for a compromised hash: it drops the quorum even
+    /// when the threshold was already met, so the group can force the group
+    /// back to zero signatures. Note that `upgrade` is permissionless once the
+    /// threshold is met, so the admin should prefer having signers revoke their
+    /// own approvals (or rotate the group) while the hash is still in flight.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: The WASM hash to clear approvals for.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
+    /// no admin set yet. Clearing a hash with no approvals is a no-op.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn cancel_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_cancelled"), admin),
+            new_wasm_hash,
+        );
+
+        log!(&env, "Pending upgrade approvals cleared by admin");
+        Ok(())
+    }
+
+    /// Returns the signers whose approval of an upgrade to `new_wasm_hash`
+    /// currently counts.
+    ///
+    /// Approvals cast by a signer that has since been rotated out of the group
+    /// are omitted, so this list always agrees with `is_upgrade_authorized`.
+    ///
+    /// # Returns
+    /// The counted approvals in the order they were recorded, or an empty
+    /// vector if the hash has none. Empty when no group is configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_upgrade_approvals(env: Env, new_wasm_hash: BytesN<32>) -> Vec<Address> {
+        match Self::load_multisig_config(&env) {
+            Ok((signers, _)) => Self::load_effective_approvals(&env, &signers, &new_wasm_hash),
+            // Fail closed without erroring: a view of "who approved" is
+            // meaningless when there is no group to have authorized anything.
+            Err(_) => Vec::new(&env),
+        }
+    }
+
+    /// Returns whether an upgrade to `new_wasm_hash` is already authorized.
+    ///
+    /// # Returns
+    /// `true` once `M` group members have approved that exact hash.
+    /// `Err(Error::MultisigNotInitialized)` if no group is configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_upgrade_authorized(env: Env, new_wasm_hash: BytesN<32>) -> Result<bool, Error> {
+        Self::check_upgrade_authorized(&env, &new_wasm_hash)
+    }
+
+    // Deliberately permissionless: the M collected signatures *are* the
+    // authorization, so whoever submits the transaction once the threshold is
+    // met gets the same result, and no additional key — least of all the
+    // admin's — can stand in for a quorum. Approvals are consumed on success,
+    // so reaching the threshold authorizes exactly one installation. The same
+    // gate applies to the timelock path, so queueing an `ActionType::Upgrade`
+    // is not a way around it.
+    /// Replaces this contract's WASM with a previously uploaded version, once
+    /// the multi-signature group has authorized that exact hash.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
+    ///   network. Must match a hash with at least `threshold` approvals.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured, or `Err(Error::InsufficientApprovals)` if fewer than
+    /// `threshold` members have approved this hash.
+    ///
+    /// # Panics
+    /// Panics if `new_wasm_hash` does not reference an uploaded WASM blob.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let approvals = Self::require_upgrade_authorized(&env, &new_wasm_hash)?;
+
+        Self::apply_upgrade(&env, &new_wasm_hash);
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"), new_wasm_hash),
+            approvals,
+        );
+
+        log!(
+            &env,
+            "Contract upgraded with {} multisig approvals",
+            approvals
+        );
         Ok(())
     }
 
@@ -1487,7 +2009,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
-        Address, Env, Symbol, TryIntoVal,
+        Address, Bytes, Env, Symbol, TryIntoVal,
     };
 
     /// Returns (env, client, contract_id).
@@ -2605,6 +3127,678 @@ mod test {
         // Governance address can now update the fee
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
+    }
+
+    // ── Multi-signature (M-of-N) upgrade tests ───────────────────────────────
+    //
+    // Issue #664. The whole point of the feature is that no single key — the
+    // admin's included — can install new code, so the tests below are built
+    // around that invariant rather than around the happy path alone: for every
+    // M-of-N combination there is a case proving the (M-1)th signature is not
+    // enough and the Mth one is.
+
+    /// The smallest WASM module the Soroban host will accept as an installable
+    /// contract, so the success path of `upgrade` can be exercised without
+    /// building the real artifact first.
+    ///
+    /// The host refuses to swap a contract's executable unless the module both
+    /// parses and carries a `contractenvmetav0` custom section declaring the
+    /// host interface version it was built against, which is what this blob
+    /// assembles: the 8-byte module header, then one custom section. A custom
+    /// section is `id 0`, its byte length, then the section name as a
+    /// LEB128-prefixed string followed by the contents — here the XDR of
+    /// `SCEnvMetaEntry::SC_ENV_META_KIND_INTERFACE_VERSION(20 << 32 | 0)`,
+    /// which is a 4-byte union discriminant of 0 then the 8-byte big-endian
+    /// interface version. The host accepts contracts built for its own protocol
+    /// version or an older one, and released SDKs are pre-release 0, so this
+    /// stays installable across SDK upgrades.
+    const PLACEHOLDER_WASM: &[u8] = b"\0asm\x01\0\0\0\
+        \x00\x1e\
+        \x11contractenvmetav0\
+        \x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00";
+
+    /// A second, distinguishable copy of [`PLACEHOLDER_WASM`]: byte-for-byte
+    /// identical apart from one extra custom section, which the host ignores
+    /// but which makes the module hash differently. Used to prove that
+    /// approvals collected for one artifact do not carry over to another.
+    const PLACEHOLDER_WASM_ALT: &[u8] = b"\0asm\x01\0\0\0\
+        \x00\x1e\
+        \x11contractenvmetav0\
+        \x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00\
+        \x00\x03\x01t\xff";
+
+    /// Uploads [`PLACEHOLDER_WASM`] and returns the hash `upgrade` installs.
+    fn upload_placeholder_wasm(env: &Env) -> BytesN<32> {
+        env.deployer()
+            .upload_contract_wasm(Bytes::from_slice(env, PLACEHOLDER_WASM))
+    }
+
+    /// Same as [`upload_placeholder_wasm`], for [`PLACEHOLDER_WASM_ALT`].
+    fn upload_alt_placeholder_wasm(env: &Env) -> BytesN<32> {
+        env.deployer()
+            .upload_contract_wasm(Bytes::from_slice(env, PLACEHOLDER_WASM_ALT))
+    }
+
+    /// Reports whether the contract still holds `key` in persistent storage.
+    ///
+    /// The upgrade tests deliberately install a placeholder program that
+    /// exports nothing, so once a swap lands the contract can no longer answer
+    /// its own queries. Reading the ledger directly is the only remaining way
+    /// to observe the state a swap left behind.
+    fn contract_still_stores(env: &Env, contract: &Address, key: &DataKey) -> bool {
+        env.as_contract(contract, || env.storage().persistent().has(key))
+    }
+
+    /// Returns `n` fresh signer addresses.
+    fn signers(env: &Env, n: usize) -> Vec<Address> {
+        let mut out = Vec::new(env);
+        for _ in 0..n {
+            out.push_back(Address::generate(env));
+        }
+        out
+    }
+
+    /// Advances the test ledger past the 24-hour timelock delay.
+    fn advance_past_timelock(env: &Env) {
+        let current_time = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: current_time + PaymentRouter::SECONDS_IN_24H + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+    }
+
+    /// Asserts the approvals recorded for `hash` are exactly `expected`, in
+    /// order. Soroban's `Vec` cannot be compared against a slice, so this
+    /// compares length and then element by element.
+    fn assert_approvals(
+        client: &PaymentRouterClient<'static>,
+        hash: &BytesN<32>,
+        expected: &Vec<Address>,
+    ) {
+        let actual = client.get_upgrade_approvals(hash);
+        assert_eq!(actual.len(), expected.len(), "approval count mismatch");
+        for i in 0..expected.len() {
+            assert_eq!(actual.get(i), expected.get(i));
+        }
+    }
+
+    /// Boots an initialized router with a configured M-of-N admin group and a
+    /// WASM hash ready to be approved. Returns the env, client, admin, the
+    /// signer set and the candidate WASM hash.
+    fn setup_multisig(
+        signer_count: usize,
+        threshold: u32,
+    ) -> (
+        Env,
+        PaymentRouterClient<'static>,
+        Address,
+        Vec<Address>,
+        BytesN<32>,
+    ) {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signers = signers(&env, signer_count);
+        client.set_multisig_config(&signers, &threshold);
+        let new_wasm_hash = upload_placeholder_wasm(&env);
+
+        (env, client, admin, signers, new_wasm_hash)
+    }
+
+    #[test]
+    fn test_upgrades_fail_closed_before_a_group_is_configured() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let hash = upload_placeholder_wasm(&env);
+        let signer = Address::generate(&env);
+
+        // There is deliberately no fallback to the single admin key here: a
+        // deployment that has not configured a group cannot be upgraded at all
+        // rather than falling back to the key this feature de-risks.
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::MultisigNotInitialized
+        );
+        assert_eq!(
+            client
+                .try_approve_upgrade(&signer, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::MultisigNotInitialized
+        );
+        assert_eq!(
+            client.try_get_multisig_config().unwrap_err().unwrap(),
+            Error::MultisigNotInitialized
+        );
+        assert_eq!(
+            client
+                .try_is_upgrade_authorized(&hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::MultisigNotInitialized
+        );
+    }
+
+    #[test]
+    fn test_set_multisig_config_round_trips() {
+        let (_env, client, _, _, _) = setup_multisig(5, 3);
+
+        let config = client.get_multisig_config();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.signers.len(), 5);
+    }
+
+    #[test]
+    fn test_set_multisig_config_rejects_unsafe_configurations() {
+        let (env, client, _, signers, _) = setup_multisig(3, 2);
+
+        // An empty group could never authorize anything.
+        assert_eq!(
+            client
+                .try_set_multisig_config(&Vec::new(&env), &1)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        // A zero threshold would make the M-of-N gate vacuous.
+        assert_eq!(
+            client
+                .try_set_multisig_config(&signers, &0)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        // A threshold above the signer count could never be reached.
+        assert_eq!(
+            client
+                .try_set_multisig_config(&signers, &4)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        // Duplicates would let one key pad the effective signer count.
+        let dupes = Vec::from_slice(&env, &[signers.get(0).unwrap(), signers.get(0).unwrap()]);
+        assert_eq!(
+            client
+                .try_set_multisig_config(&dupes, &2)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+
+        // The rejected attempts left the working configuration untouched.
+        assert_eq!(client.get_multisig_config().threshold, 2);
+    }
+
+    #[test]
+    fn test_setting_the_group_requires_the_admin_signature() {
+        let (env, client, admin, _, _) = setup_multisig(3, 2);
+
+        client.set_multisig_config(&signers(&env, 4), &3);
+
+        // `auths()` reports the most recent invocation only, so this is the
+        // signature `set_multisig_config` itself demanded.
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths.first().map(|(addr, _)| addr.clone()), Some(admin));
+    }
+
+    #[test]
+    fn test_admin_alone_cannot_upgrade_the_contract() {
+        // The headline regression test for #664: the admin used to hold the
+        // only key that could install new code. With a 3-of-5 group its
+        // signature is not one of the three.
+        let (_env, client, _admin, _signers, hash) = setup_multisig(5, 3);
+
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_two_of_three_needs_two_signatures_not_one() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+        assert!(!client.is_upgrade_authorized(&hash));
+
+        // One signature short of the threshold.
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // The second distinct signature crosses it.
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_unanimous_two_of_two_rejects_a_single_signature() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(2, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_unanimous_three_of_three_rejects_two_signatures() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 3);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        client.approve_upgrade(&signers.get(2).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_signers_beyond_the_threshold_may_still_approve() {
+        // 3-of-5: the quorum is met after three signatures, and the remaining
+        // two are still legitimate group members rather than being rejected.
+        let (_env, client, _admin, signers, hash) = setup_multisig(5, 3);
+
+        let mut all = Vec::new(&client.env);
+        for i in 0..5u32 {
+            all.push_back(signers.get(i).unwrap());
+        }
+
+        for i in 0..5u32 {
+            client.approve_upgrade(&signers.get(i).unwrap(), &hash);
+        }
+
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 5);
+        assert!(client.is_upgrade_authorized(&hash));
+        assert_approvals(&client, &hash, &all);
+
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_one_of_one_threshold_allows_a_single_signer() {
+        // The degenerate configuration still works, so a solo deployment can
+        // use the same code path rather than needing a special case.
+        let (_env, client, _admin, signers, hash) = setup_multisig(1, 1);
+
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_outsiders_cannot_approve() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+        let outsider = Address::generate(&client.env);
+
+        assert_eq!(
+            client
+                .try_approve_upgrade(&outsider, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::NotMultisigSigner
+        );
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // The group members are unaffected by the rejected attempt.
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+    }
+
+    #[test]
+    fn test_approving_twice_cannot_inflate_the_quorum() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+        let first = signers.get(0).unwrap();
+
+        client.approve_upgrade(&first, &hash);
+        // A replayed signature is an error, never a second vote.
+        assert_eq!(
+            client
+                .try_approve_upgrade(&first, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::AlreadyApproved
+        );
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_approvals_are_scoped_to_one_wasm_hash() {
+        // Signatures authorize a specific artifact, so they must not carry over
+        // to a different one.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+        let other_hash = upload_alt_placeholder_wasm(&env);
+        assert_ne!(hash, other_hash);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+
+        assert!(client.is_upgrade_authorized(&hash));
+        assert_eq!(client.get_upgrade_approvals(&other_hash).len(), 0);
+        assert!(!client.is_upgrade_authorized(&other_hash));
+        assert_eq!(
+            client.try_upgrade(&other_hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_upgrade_consumes_the_approvals_that_authorized_it() {
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(contract_still_stores(
+            &env,
+            &client.address,
+            &DataKey::UpgradeApproval(hash.clone())
+        ));
+
+        client.upgrade(&hash);
+
+        // The quorum that authorized the swap is spent, so replaying the same
+        // hash needs a fresh round of signatures rather than reusing the old
+        // one. The placeholder program installed above exports nothing, so the
+        // cleared record is read straight off the ledger.
+        assert!(
+            !contract_still_stores(&env, &client.address, &DataKey::UpgradeApproval(hash)),
+            "the approvals that authorized an upgrade must not survive it"
+        );
+    }
+
+    #[test]
+    fn test_revoking_an_approval_drops_the_group_back_below_threshold() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+
+        client.revoke_upgrade_approval(&signers.get(1).unwrap(), &hash);
+
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_approvals(
+            &client,
+            &hash,
+            &Vec::from_slice(&client.env, &[signers.get(0).unwrap()]),
+        );
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // A signer that pulled its approval can put it back.
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+    }
+
+    #[test]
+    fn test_revoking_without_a_recorded_approval_is_a_no_op() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.revoke_upgrade_approval(&signers.get(0).unwrap(), &hash);
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.revoke_upgrade_approval(&signers.get(0).unwrap(), &hash);
+        // Revoking the last approval clears the entry entirely.
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+    }
+
+    #[test]
+    fn test_admin_can_cancel_pending_upgrade_approvals() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+
+        client.cancel_upgrade(&hash);
+
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_rotating_the_group_stops_removed_signers_from_approving() {
+        let (env, client, _admin, old_signers, hash) = setup_multisig(3, 2);
+
+        let dropped = old_signers.get(2).unwrap();
+        let newcomer = Address::generate(&env);
+        let kept = old_signers.get(0).unwrap();
+
+        // 2-of-2 over the retained signer plus a newcomer.
+        let rotated = Vec::from_slice(&env, &[kept.clone(), newcomer.clone()]);
+        client.set_multisig_config(&rotated, &2);
+
+        assert_eq!(client.get_multisig_config().signers.len(), 2);
+        assert_eq!(
+            client
+                .try_approve_upgrade(&dropped, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::NotMultisigSigner
+        );
+
+        // The retained signer carries over; the newcomer starts clean.
+        client.approve_upgrade(&kept, &hash);
+        assert_approvals(&client, &hash, &Vec::from_slice(&env, &[kept]));
+        assert!(!client.is_upgrade_authorized(&hash));
+        client.approve_upgrade(&newcomer, &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_raising_the_threshold_revalidates_in_flight_approvals() {
+        // Two signatures against a 2-of-3 group are enough, but the admin
+        // tightening the group to 3-of-3 must invalidate the collected quorum.
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+
+        client.set_multisig_config(&signers, &3);
+
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        client.approve_upgrade(&signers.get(2).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_rotating_out_a_signer_voids_the_approval_it_already_cast() {
+        // The dangerous shape: a lone approval meets a *lower* threshold after
+        // the group is rotated. If rotation left the stale vote counting, the
+        // one removed key would authorize an upgrade by itself.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        let removed = signers.get(0).unwrap();
+        client.approve_upgrade(&removed, &hash);
+        assert!(!client.is_upgrade_authorized(&hash));
+
+        // Drop the signer that approved and lower the threshold to 1, so the
+        // stored approval alone would clear the bar if it still counted.
+        let kept: Vec<Address> =
+            Vec::from_slice(&env, &[signers.get(1).unwrap(), signers.get(2).unwrap()]);
+        client.set_multisig_config(&kept, &1);
+
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // The new group's own member can authorize normally.
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_approving_an_upgrade_records_the_signers_own_signature() {
+        let (env, client, _, signers, hash) = setup_multisig(3, 2);
+        let signer = signers.get(0).unwrap();
+
+        client.approve_upgrade(&signer, &hash);
+
+        // Proves the contract demands a signature from the address it was told
+        // is approving, rather than trusting the caller's word.
+        let auths = env.auths();
+        assert!(
+            auths.iter().any(|(addr, _)| *addr == signer),
+            "approve_upgrade must require the approving signer to authorize"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_needs_no_signature_once_the_quorum_is_reached() {
+        // The M collected signatures are the whole authorization, so the
+        // installing transaction must not silently demand a seventh key.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        client.upgrade(&hash);
+
+        // `auths()` reports the most recent invocation only: the swap itself
+        // demanded no authorization at all.
+        assert!(
+            env.auths().is_empty(),
+            "upgrade must not require any authorization once the quorum is reached"
+        );
+    }
+
+    #[test]
+    fn test_timelock_upgrade_also_requires_the_multisig_threshold() {
+        // Queueing an upgrade and waiting out the delay must not be a way
+        // around the M-of-N gate.
+        let (env, client, _admin, _signers, hash) = setup_multisig(3, 2);
+
+        let nonce = client.queue_action(&ActionType::Upgrade(hash.clone()));
+        advance_past_timelock(&env);
+
+        assert_eq!(
+            client.try_execute_action(&nonce).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_timelock_upgrade_entry_survives_a_rejected_multisig_check() {
+        // Validation runs before the entry is consumed, so an upgrade that is
+        // not yet authorized stays in the queue instead of being burned.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        let nonce = client.queue_action(&ActionType::Upgrade(hash.clone()));
+        advance_past_timelock(&env);
+        assert_eq!(
+            client.try_execute_action(&nonce).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        assert_eq!(
+            client.get_queued_action(&nonce).action,
+            ActionType::Upgrade(hash.clone())
+        );
+
+        // Once the group signs off, the same entry executes unchanged.
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        client.execute_action(&nonce);
+
+        // Execution consumed the entry and, with it, the quorum that unlocked
+        // the swap. The placeholder program installed by the swap exports
+        // nothing, so both facts are read straight off the ledger.
+        assert!(
+            !contract_still_stores(&env, &client.address, &DataKey::TimelockEntry(nonce)),
+            "a successfully executed entry must not be left in the queue"
+        );
+        assert!(
+            !contract_still_stores(&env, &client.address, &DataKey::UpgradeApproval(hash)),
+            "the approvals that authorized the upgrade must not survive it"
+        );
+    }
+
+    #[test]
+    fn test_timelock_set_multisig_config_is_validated_when_it_executes() {
+        // An invalid rotation queued today must not be applied in 24 hours, and
+        // must not consume the queue slot either.
+        let (env, client, _admin, signers, _) = setup_multisig(3, 2);
+
+        let bad = client.queue_action(&ActionType::SetMultisigConfig(signers.clone(), 9));
+        advance_past_timelock(&env);
+
+        assert_eq!(
+            client.try_execute_action(&bad).unwrap_err().unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        assert_eq!(client.get_multisig_config().threshold, 2);
+    }
+
+    #[test]
+    fn test_timelock_set_multisig_config_applies_after_the_delay() {
+        let (env, client, _admin, old_signers, _) = setup_multisig(3, 2);
+
+        let new_signers = signers(&env, 4);
+        let nonce = client.queue_action(&ActionType::SetMultisigConfig(new_signers.clone(), 3));
+        advance_past_timelock(&env);
+        client.execute_action(&nonce);
+
+        let config = client.get_multisig_config();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.signers.len(), 4);
+        // The old set no longer counts.
+        assert_eq!(
+            client
+                .try_approve_upgrade(&old_signers.get(0).unwrap(), &upload_placeholder_wasm(&env))
+                .unwrap_err()
+                .unwrap(),
+            Error::NotMultisigSigner
+        );
     }
 }
 
