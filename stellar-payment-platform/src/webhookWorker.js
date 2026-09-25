@@ -30,6 +30,13 @@ const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 };
 
+// Bound signature for the `Stellar-*` headers: the dispatch timestamp is
+// cryptographically bound (`timestamp.rawBody`) so the header cannot be
+// swapped in transit without invalidating the signature.
+const computeBoundSignature = (secret, timestamp, rawBody) => {
+  return crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
+};
+
 const webhookEventMatches = (webhook, eventName) => {
   const subscriptions = Array.isArray(webhook?.events) ? webhook.events : ['*'];
   const normalized = subscriptions
@@ -117,6 +124,10 @@ const getWebhooksExhaustedRetries = async (prisma, poolAllFn) => {
 const sendWebhook = async (url, payload, secret) => {
   const rawBody = JSON.stringify(payload);
   const signature = computeSignature(secret, rawBody);
+  // `Stellar-Timestamp` is the ISO 8601 dispatch timestamp already present
+  // in `payload.timestamp`; it is bound into `Stellar-Signature`.
+  const timestamp = payload.timestamp;
+  const stellarSignature = computeBoundSignature(secret, timestamp, rawBody);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
@@ -129,7 +140,10 @@ const sendWebhook = async (url, payload, secret) => {
         'X-Webhook-Signature': signature,
         // Legacy alias kept for backward compatibility.
         'X-Stellar-Tags-Signature': signature,
-        'X-Webhook-Timestamp': payload.timestamp,
+        'X-Webhook-Timestamp': timestamp,
+        // Timestamp-bound headers per issue #727 spec.
+        'Stellar-Signature': stellarSignature,
+        'Stellar-Timestamp': timestamp,
       },
       body: rawBody,
       signal: controller.signal,
@@ -539,6 +553,7 @@ module.exports = {
   processWebhookJob,
   sendWebhook,
   computeSignature,
+  computeBoundSignature,
   WEBHOOK_TIMEOUT_MS,
   WEBHOOK_QUEUE_NAME,
   MAX_WEBHOOK_ATTEMPTS,

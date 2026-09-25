@@ -124,6 +124,38 @@ describe('webhook BullMQ delivery', () => {
     }));
   });
 
+  test('delivery includes timestamp-bound Stellar headers alongside legacy ones', async () => {
+    const crypto = require('crypto');
+    global.fetch.mockResolvedValue({ ok: true, status: 200 });
+    const prisma = {
+      webhook: {
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+
+    await processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    );
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const [, options] = global.fetch.mock.calls[0];
+    const rawBody = JSON.stringify(payload);
+    const expectedLegacy = crypto.createHmac('sha256', webhook.secret).update(rawBody).digest('hex');
+    const expectedBound = crypto
+      .createHmac('sha256', webhook.secret)
+      .update(`${payload.timestamp}.${rawBody}`)
+      .digest('hex');
+
+    expect(options.headers).toMatchObject({
+      'X-Webhook-Signature': expectedLegacy,
+      'X-Stellar-Tags-Signature': expectedLegacy,
+      'X-Webhook-Timestamp': payload.timestamp,
+      'Stellar-Signature': expectedBound,
+      'Stellar-Timestamp': payload.timestamp,
+    });
+  });
+
   test('configures and starts a BullMQ webhook worker', () => {
     const dependencies = {
       prisma: { webhook: {} },
