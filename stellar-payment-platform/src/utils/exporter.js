@@ -60,7 +60,10 @@ const writeChunk = async (res, chunk) => {
  * @returns {object} Prisma where clause fragment.
  */
 const buildDateFilter = (startDate, endDate) => {
-  if (!startDate && !endDate) return {};
+  // Soft-deleted payments stay out of every export; the predicate is always
+  // present so a date-less export is still scoped to live rows.
+  const where = { deletedAt: null };
+  if (!startDate && !endDate) return where;
 
   const filter = {};
   if (startDate) filter.gte = new Date(startDate);
@@ -70,7 +73,8 @@ const buildDateFilter = (startDate, endDate) => {
     end.setUTCHours(23, 59, 59, 999);
     filter.lte = end;
   }
-  return { createdAt: filter };
+  where.createdAt = filter;
+  return where;
 };
 
 /**

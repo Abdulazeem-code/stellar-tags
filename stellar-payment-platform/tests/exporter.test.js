@@ -71,25 +71,28 @@ const writtenText = (res) =>
 // ── buildDateFilter ──────────────────────────────────────────────────────────
 
 describe('buildDateFilter', () => {
-  it('returns an empty clause when neither date is given', () => {
-    expect(exporter.buildDateFilter()).toEqual({});
-    expect(exporter.buildDateFilter(undefined, undefined)).toEqual({});
+  it('scopes the filter to live rows when neither date is given', () => {
+    expect(exporter.buildDateFilter()).toEqual({ deletedAt: null });
+    expect(exporter.buildDateFilter(undefined, undefined)).toEqual({ deletedAt: null });
   });
 
   it('builds a gte filter when only startDate is given', () => {
     const result = exporter.buildDateFilter('2026-08-01');
+    expect(result.deletedAt).toBeNull();
     expect(result.createdAt.gte).toEqual(new Date('2026-08-01'));
     expect(result.createdAt.lte).toBeUndefined();
   });
 
   it('builds an end-of-day lte filter when only endDate is given', () => {
     const result = exporter.buildDateFilter(undefined, '2026-08-15');
+    expect(result.deletedAt).toBeNull();
     expect(result.createdAt.gte).toBeUndefined();
     expect(result.createdAt.lte.toISOString()).toBe('2026-08-15T23:59:59.999Z');
   });
 
   it('builds both bounds when startDate and endDate are given', () => {
     const result = exporter.buildDateFilter('2026-08-01', '2026-08-15');
+    expect(result.deletedAt).toBeNull();
     expect(result.createdAt.gte).toEqual(new Date('2026-08-01'));
     expect(result.createdAt.lte.toISOString()).toBe('2026-08-15T23:59:59.999Z');
   });
@@ -159,6 +162,7 @@ describe('streamAdminExport CSV', () => {
     expect(prisma.payment.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
+          deletedAt: null,
           createdAt: expect.objectContaining({
             gte: expect.any(Date),
             lte: expect.any(Date),

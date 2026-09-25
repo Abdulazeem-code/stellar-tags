@@ -27,6 +27,7 @@ try {
         e.code = 'P2025';
         throw e;
       },
+      updateMany: async () => ({ count: 0 }),
       findUnique: async () => null,
       findFirst: async () => null,
       findMany: async () => [],
@@ -52,6 +53,8 @@ try {
       findUnique: async () => null,
       findFirst: async () => null,
       create: async () => ({}),
+      update: async () => ({}),
+      updateMany: async () => ({ count: 0 }),
       count: async () => 0,
       aggregate: async () => ({ _sum: { amount: 0, fee: 0 }, _count: { id: 0 } }),
       groupBy: async () => [],

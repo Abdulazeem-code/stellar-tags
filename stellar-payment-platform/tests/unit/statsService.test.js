@@ -38,11 +38,11 @@ describe('fetchAdminStats', () => {
     expect(poolGet).toHaveBeenCalledTimes(2);
     expect(poolGet).toHaveBeenNthCalledWith(
       1,
-      'SELECT COUNT(*) AS totalCount FROM username_registry',
+      'SELECT COUNT(*) AS totalCount FROM username_registry WHERE deleted_at IS NULL',
     );
     expect(poolGet).toHaveBeenNthCalledWith(
       2,
-      'SELECT COUNT(*) AS activeCount FROM username_registry WHERE flagged_at IS NULL',
+      'SELECT COUNT(*) AS activeCount FROM username_registry WHERE flagged_at IS NULL AND deleted_at IS NULL',
     );
     expect(result).toMatchObject({
       total_registered_users: 7,

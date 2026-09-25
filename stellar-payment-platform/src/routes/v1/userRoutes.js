@@ -84,7 +84,8 @@ const listLocalUsers = async (search, page, limit) => {
   const rows = await poolAll(
     `SELECT username, address, created_at
      FROM username_registry
-     WHERE username ILIKE $1 OR address ILIKE $1
+     WHERE deleted_at IS NULL
+       AND (username ILIKE $1 OR address ILIKE $1)
      ORDER BY created_at DESC
      LIMIT $2 OFFSET $3`,
     [searchPattern, limit, skip],
@@ -93,7 +94,8 @@ const listLocalUsers = async (search, page, limit) => {
   const countRow = await poolGet(
     `SELECT COUNT(*) AS "totalCount"
      FROM username_registry
-     WHERE username ILIKE $1 OR address ILIKE $1`,
+     WHERE deleted_at IS NULL
+       AND (username ILIKE $1 OR address ILIKE $1)`,
     [searchPattern],
   );
 

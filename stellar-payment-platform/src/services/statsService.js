@@ -86,7 +86,10 @@ const getRoutingStats = async ({
   assetCode,
 }) => {
   const selectedInterval = interval || groupBy || 'day';
+  // Soft-deleted payments are excluded from every aggregate: a restored row
+  // reappears on the next request because it is filtered, not rewritten.
   const where = {
+    deletedAt: null,
     ...buildDateFilter(startDate, endDate),
   };
 
@@ -162,17 +165,17 @@ async function fetchAdminStats(prisma, poolGet) {
 
   try {
     [totalRegisteredUsers, activeTokens] = await prisma.$transaction([
-      prisma.user.count(),
-      prisma.user.count({ where: { flaggedAt: null } }),
+      prisma.user.count({ where: { deletedAt: null } }),
+      prisma.user.count({ where: { flaggedAt: null, deletedAt: null } }),
     ]);
   } catch (error) {
     if (!shouldFallbackToLocalRegistry(error)) throw error;
 
     const totalCountRow = await poolGet(
-      'SELECT COUNT(*) AS totalCount FROM username_registry',
+      'SELECT COUNT(*) AS totalCount FROM username_registry WHERE deleted_at IS NULL',
     );
     const activeCountRow = await poolGet(
-      'SELECT COUNT(*) AS activeCount FROM username_registry WHERE flagged_at IS NULL',
+      'SELECT COUNT(*) AS activeCount FROM username_registry WHERE flagged_at IS NULL AND deleted_at IS NULL',
     );
     totalRegisteredUsers = Number(totalCountRow?.totalCount || 0);
     activeTokens = Number(activeCountRow?.activeCount || 0);
