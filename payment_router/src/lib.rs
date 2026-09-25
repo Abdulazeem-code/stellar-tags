@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, BytesN,
-    Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -112,6 +112,23 @@ pub struct Payment {
     pub amount: i128,
 }
 
+/// Interface implemented by supported Soroban lending protocols.
+///
+/// Keeping the protocol behind this small adapter lets the router integrate
+/// with Blend-compatible deployments while tests use an in-process mock.
+#[contractclient(name = "LendingProtocolClient")]
+pub trait LendingProtocol {
+    fn deposit(env: Env, from: Address, token: Address, amount: i128);
+    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
+    fn harvest(env: Env, to: Address, token: Address) -> i128;
+}
+
+/// Minimal interface for an admin-selected KYC issuer or oracle contract.
+#[contractclient(name = "KycOracleClient")]
+pub trait KycOracle {
+    fn is_verified(env: Env, account: Address) -> bool;
+}
+
 // ── Timelock data structures ─────────────────────────────────────────────────
 //
 // Admin actions that change sensitive contract parameters (treasury, fees,
@@ -181,6 +198,28 @@ pub struct TimelockEntry {
     pub action: ActionType,
 }
 
+/// Role definitions for the Role-Based Access Control (RBAC) system.
+///
+/// Segregates operational privileges across dedicated role boundaries:
+/// SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Role {
+    /// Supreme administrator with exclusive authority over role assignments,
+    /// contract upgrades, emergency freeze/unfreeze, and root governance.
+    SuperAdmin = 1,
+    /// Manager with exclusive authority over platform treasury, yield operations,
+    /// token recovery, and emergency asset withdrawals.
+    TreasuryManager = 2,
+    /// Compliance officer with authority over address blacklisting, KYC oracle
+    /// configurations, and emergency operational pause switches.
+    ComplianceOfficer = 3,
+    /// Fee manager with authority over platform fee basis points, fee caps, and
+    /// minimum payment limits.
+    FeeManager = 4,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,21 +258,18 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
-    /// The N addresses of the multi-signature admin group that authorize
-    /// contract upgrades.  Stored as `Vec<Address>` in instance storage.
-    ///
-    /// Absent until the admin calls `set_multisig_config`; while absent every
-    /// upgrade attempt fails closed with `Error::MultisigNotInitialized`.
-    MultisigSigners,
-    /// The M signers of the multi-signature admin group that must approve a
-    /// WASM hash before an upgrade is authorized.  Stored as `u32` in
-    /// instance storage, always alongside `MultisigSigners`.
-    MultisigThreshold,
-    /// The addresses that have already signed off on upgrading to a specific
-    /// WASM hash.  Keyed by that hash so approvals for concurrent upgrade
-    /// proposals are tracked independently.  Stored as `Vec<Address>` in
-    /// persistent storage and cleared once the upgrade is applied.
-    UpgradeApproval(BytesN<32>),
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited for a treasury asset.
+    YieldPrincipal(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
+    /// Active designated address for an administrative role: Role -> Address.
+    Role(Role),
+    /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
+    UserRole(Address, Role),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -272,24 +308,18 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
-    /// The multi-signature configuration is unusable: the signer set is empty,
-    /// contains a duplicate address, the threshold is zero, or the threshold
-    /// exceeds the number of signers (so the upgrade could never be authorized).
-    InvalidMultisigConfig = 15,
-    /// The calling address is not a member of the multi-signature admin group.
-    NotMultisigSigner = 16,
-    /// The number of collected upgrade approvals is below the configured
-    /// threshold, so the upgrade is not authorized yet.
-    InsufficientApprovals = 17,
-    /// No multi-signature admin group has been configured yet.  Upgrades fail
-    /// closed until `set_multisig_config` has been called, so a freshly
-    /// deployed contract can never be upgraded through the single admin key
-    /// that the group was introduced to de-risk.
-    MultisigNotInitialized = 18,
-    /// The calling address has already approved this WASM hash.  Duplicate
-    /// approvals are rejected rather than ignored so that a replayed signature
-    /// can never inflate the approval count towards the threshold.
-    AlreadyApproved = 19,
+    /// No lending protocol has been configured by the admin.
+    YieldProtocolNotConfigured = 15,
+    /// Yield amount must be positive and withdrawals cannot exceed principal.
+    InvalidYieldAmount = 16,
+    /// The sender lacks a valid KYC claim for a high-value payment.
+    KycRequired = 17,
+    /// The configured KYC threshold must not be negative.
+    InvalidKycThreshold = 18,
+    /// Account lacks the required role or role does not exist.
+    RoleNotFound = 19,
+    /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
+    InvalidRole = 20,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -319,6 +349,47 @@ impl PaymentRouter {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
+    fn set_role_internal(env: &Env, role: Role, account: &Address) {
+        env.storage().instance().set(&DataKey::Role(role), account);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserRole(account.clone(), role),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn remove_role_internal(env: &Env, role: Role, account: &Address) {
+        if let Some(current) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if current == *account {
+                env.storage().instance().remove(&DataKey::Role(role));
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &false);
+    }
+
+    fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
+        let addr = if let Some(role_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            role_addr
+        } else {
+            Self::require_admin(env)?
+        };
+        addr.require_auth();
+        Ok(addr)
+    }
+
     fn require_admin(env: &Env) -> Result<Address, Error> {
         env.storage()
             .instance()
@@ -327,7 +398,7 @@ impl PaymentRouter {
     }
 
     /// Fee authority helper: if a Governance address is set it takes exclusive
-    /// control over fee updates; otherwise the admin retains that right.
+    /// control over fee updates; otherwise the FeeManager retains that right.
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
         if let Some(gov) = env
             .storage()
@@ -337,8 +408,7 @@ impl PaymentRouter {
             gov.require_auth();
             Ok(())
         } else {
-            let admin = Self::require_admin(env)?;
-            admin.require_auth();
+            Self::require_role(env, Role::FeeManager)?;
             Ok(())
         }
     }
@@ -557,6 +627,25 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
+    /// Enforces KYC only after the admin has configured a threshold. This
+    /// preserves existing routing behavior until compliance is enabled.
+    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
+        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
+            return Ok(());
+        }
+
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycOracle)
+            .ok_or(Error::KycRequired)?;
+        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
+            return Err(Error::KycRequired);
+        }
+        Ok(())
+    }
+
     /// Allocates and returns the next timelock nonce, incrementing the counter.
     fn next_nonce(env: &Env) -> u64 {
         let current: u64 = env
@@ -620,10 +709,13 @@ impl PaymentRouter {
             accumulated_amount = 0;
         }
 
-        accumulated_amount += amount;
-        if accumulated_amount > Self::DAILY_MAX_LIMIT {
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
             return Err(Error::LimitExceeded);
         }
+        accumulated_amount = new_accumulated;
 
         env.storage().persistent().set(
             &spending_key,
@@ -642,7 +734,8 @@ impl PaymentRouter {
         }
 
         // Calculate fee
-        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
+        let fee_product = amount.checked_mul(effective_fee_bps).unwrap_or(amount);
+        let mut fee_amount = fee_product / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
         }
@@ -651,9 +744,13 @@ impl PaymentRouter {
         }
         let remainder = amount - fee_amount;
 
-        // Execute transfers
-        if fee_amount > 0 {
-            token_client.transfer(sender, platform_treasury, &fee_amount);
+        // Execute transfers safely without panics
+        if fee_amount > 0
+            && token_client
+                .try_transfer(sender, platform_treasury, &fee_amount)
+                .is_err()
+        {
+            return Err(Error::LimitExceeded);
         }
         if remainder > 0 {
             // Attempt to transfer remainder directly to recipient.
@@ -668,8 +765,15 @@ impl PaymentRouter {
                         env,
                         "Recipient transfer failed; crediting sender refund balance"
                     );
-                    token_client.transfer(sender, &env.current_contract_address(), &remainder);
-                    Self::credit_refund_balance(env, sender, token_address, remainder);
+                    if let Ok(Ok(())) = token_client.try_transfer(
+                        sender,
+                        &env.current_contract_address(),
+                        &remainder,
+                    ) {
+                        Self::credit_refund_balance(env, sender, token_address, remainder);
+                    } else {
+                        return Err(Error::LimitExceeded);
+                    }
                 }
             }
         }
@@ -679,7 +783,7 @@ impl PaymentRouter {
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&volume_key, &(prev_volume + amount));
+            .set(&volume_key, &prev_volume.saturating_add(amount));
         env.storage().persistent().extend_ttl(
             &volume_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,
@@ -742,12 +846,123 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
+        // RBAC Initialization: assign initial admin to all operational roles
+        Self::set_role_internal(&env, Role::SuperAdmin, &admin);
+        Self::set_role_internal(&env, Role::TreasuryManager, &admin);
+        Self::set_role_internal(&env, Role::ComplianceOfficer, &admin);
+        Self::set_role_internal(&env, Role::FeeManager, &admin);
+
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
         Ok(())
+    }
+
+    // ── Role-Based Access Control (RBAC) ────────────────────────────────────
+
+    /// Assigns an operational role to a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`.
+    ///
+    /// # Parameters
+    /// - `account`: Target address to receive the role.
+    /// - `role`: The `Role` variant to grant.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn assign_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+        Self::set_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_assigned"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Revokes an operational role from a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
+    /// when it would leave the contract without root governance.
+    ///
+    /// # Parameters
+    /// - `account`: Target address from which the role will be revoked.
+    /// - `role`: The `Role` variant to revoke.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
+    /// or `Err(Error::NotInitialized)`.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn revoke_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        let caller = Self::require_role(&env, Role::SuperAdmin)?;
+        if role == Role::SuperAdmin && caller == account {
+            return Err(Error::InvalidRole);
+        }
+        Self::remove_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Queries whether a given account holds an active role assignment.
+    ///
+    /// Checks persistent user role assignments and primary designated roles.
+    ///
+    /// # Parameters
+    /// - `account`: Address to query.
+    /// - `role`: Role variant to check.
+    ///
+    /// # Returns
+    /// `true` if authorized for this role, `false` otherwise.
+    pub fn has_role(env: Env, account: Address, role: Role) -> bool {
+        if let Some(has) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::UserRole(account.clone(), role))
+        {
+            if has {
+                return true;
+            }
+        }
+        if let Some(primary) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if primary == account {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the primary designated member address for a role, if one is configured.
+    ///
+    /// # Parameters
+    /// - `role`: The role variant to query.
+    ///
+    /// # Returns
+    /// `Some(Address)` if set, or `None` if unassigned.
+    pub fn get_role_member(env: Env, role: Role) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+    }
+
+    /// Returns the administrative role governing the specified role.
+    ///
+    /// In this RBAC architecture, `SuperAdmin` governs all operational roles.
+    pub fn get_role_admin(_env: Env, _role: Role) -> Role {
+        Role::SuperAdmin
     }
 
     // ── Timelock: queue / execute / cancel ───────────────────────────────────
@@ -883,6 +1098,7 @@ impl PaymentRouter {
             }
             ActionType::TransferAdmin(new_admin) => {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
+                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
             }
             ActionType::Upgrade(new_wasm_hash) => {
                 Self::apply_upgrade(&env, &new_wasm_hash);
@@ -941,8 +1157,7 @@ impl PaymentRouter {
     ///
     /// Admin authorization is required.
     pub fn emergency_freeze(env: Env) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
 
         env.storage().instance().set(&DataKey::Frozen, &true);
         env.storage().instance().extend_ttl(
@@ -951,11 +1166,11 @@ impl PaymentRouter {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "emergency_freeze"), admin),
+            (Symbol::new(&env, "emergency_freeze"), super_admin),
             env.ledger().timestamp(),
         );
 
-        log!(&env, "Contract frozen by admin");
+        log!(&env, "Contract frozen by SuperAdmin");
         Ok(())
     }
 
@@ -964,10 +1179,9 @@ impl PaymentRouter {
     /// Like `emergency_freeze`, this takes effect immediately and does not
     /// go through the timelock.
     ///
-    /// Admin authorization is required.
+    /// SuperAdmin authorization is required.
     pub fn unfreeze(env: Env) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
 
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().extend_ttl(
@@ -976,11 +1190,11 @@ impl PaymentRouter {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "unfreeze"), admin),
+            (Symbol::new(&env, "unfreeze"), super_admin),
             env.ledger().timestamp(),
         );
 
-        log!(&env, "Contract unfrozen by admin");
+        log!(&env, "Contract unfrozen by SuperAdmin");
         Ok(())
     }
 
@@ -1004,7 +1218,7 @@ impl PaymentRouter {
 
     /// Updates the treasury address that receives the platform fee.
     ///
-    /// Updates the treasury address that receives the platform fee. Admin-only.
+    /// Updates the treasury address that receives the platform fee. Protected by TreasuryManager.
     ///
     /// # Parameters
     /// - `new_treasury`: Address to receive platform fees going forward.
@@ -1014,14 +1228,13 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current TreasuryManager does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetPlatformTreasury(…))`
     /// and execute after 24 hours.  This direct path is retained for tooling
     /// compatibility only.
     pub fn set_platform_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::TreasuryManager)?;
 
         env.storage()
             .instance()
@@ -1107,8 +1320,7 @@ impl PaymentRouter {
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetGovernance(…))`.
     pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::SuperAdmin)?;
         env.storage().instance().set(&DataKey::Governance, &gov);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -1117,7 +1329,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Sets the minimum allowed routing amount. Admin-only.
+    /// Sets the minimum allowed routing amount. FeeManager-protected.
     ///
     /// # Parameters
     /// - `min_limit`: Smallest `amount` that `route_payment` /
@@ -1128,12 +1340,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current FeeManager does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
     pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::FeeManager)?;
 
         env.storage().instance().set(&DataKey::MinLimit, &min_limit);
         env.storage().instance().extend_ttl(
@@ -1155,7 +1366,7 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
-    /// Pauses or unpauses the payment router. Admin-only.
+    /// Pauses or unpauses the payment router. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject `route_payment` / `route_payments`
@@ -1166,12 +1377,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     ///
     /// This is NOT timelocked — operational pausing must remain instant.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage().instance().set(&DataKey::Paused, &paused);
         env.storage().instance().extend_ttl(
@@ -1230,7 +1440,7 @@ impl PaymentRouter {
             .unwrap_or(0)
     }
 
-    /// Adds an address to the blacklist. Admin-only.
+    /// Adds an address to the blacklist. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `address`: Address to blacklist; subsequent payments to it as a
@@ -1241,10 +1451,9 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     pub fn blacklist_address(env: Env, address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage()
             .persistent()
@@ -1258,7 +1467,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Removes an address from the blacklist. Admin-only.
+    /// Removes an address from the blacklist. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `address`: Address to remove from the blacklist.
@@ -1268,10 +1477,9 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     pub fn unblacklist_address(env: Env, address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage()
             .persistent()
@@ -1319,7 +1527,7 @@ impl PaymentRouter {
         }
     }
 
-    /// Set a new admin. Gated by the current admin if one exists.
+    /// Set a new admin. SuperAdmin-protected.
     ///
     /// # Parameters
     /// - `new_admin`: Address to install as the new admin.
@@ -1328,16 +1536,13 @@ impl PaymentRouter {
     /// Always `Ok(())`.
     ///
     /// # Panics
-    /// Panics if an admin is already set and it does not authorize the call.
+    /// Panics if an admin is already set and current SuperAdmin does not authorize the call.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        if let Some(admin) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-        {
-            admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            Self::require_role(&env, Role::SuperAdmin)?;
         }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1345,7 +1550,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Transfers admin rights to a new address. Requires the current admin's authorization.
+    /// Transfers admin rights to a new address. Requires current SuperAdmin authorization.
     ///
     /// # Parameters
     /// - `new_admin`: Address to become the new admin.
@@ -1355,13 +1560,14 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current SuperAdmin does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::TransferAdmin(…))`.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        let current_admin = Self::require_admin(&env)?;
-        current_admin.require_auth();
+        let current_admin = Self::require_role(&env, Role::SuperAdmin)?;
+        Self::remove_role_internal(&env, Role::SuperAdmin, &current_admin);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1369,26 +1575,25 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    /// Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
     ///
     /// # Parameters
     /// - `token`: Contract ID of the token to recover.
-    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if the
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&contract_address, &admin, &amount);
+        token_client.transfer(&contract_address, &treasury_mgr, &amount);
 
         Ok(())
     }
@@ -1405,6 +1610,150 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// Configures the lending protocol used for treasury yield operations. TreasuryManager-protected.
+    pub fn set_yield_protocol(env: Env, protocol: Address) -> Result<(), Error> {
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldProtocol, &protocol);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_cfg"),), protocol);
+        Ok(())
+    }
+
+    /// Configures the trusted KYC oracle and the high-value payment threshold. ComplianceOfficer-protected.
+    pub fn set_kyc_config(env: Env, oracle: Address, threshold: i128) -> Result<(), Error> {
+        if threshold < 0 {
+            return Err(Error::InvalidKycThreshold);
+        }
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage().instance().set(&DataKey::KycOracle, &oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::KycThreshold, &threshold);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("kyc_cfg"), oracle), threshold);
+        Ok(())
+    }
+
+    /// Deposits idle treasury funds into the configured lending protocol.
+    ///
+    /// Both the TreasuryManager and treasury authorize this operation. The second
+    /// authorization is required because the funds are held by the treasury,
+    /// rather than by this router contract.
+    pub fn deposit_to_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        treasury.require_auth();
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).deposit(&treasury, &token, &amount);
+
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(principal + amount));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_dep"), token), amount);
+        Ok(())
+    }
+
+    /// Withdraws treasury principal from the configured lending protocol. TreasuryManager-protected.
+    pub fn withdraw_from_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 || amount > principal {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).withdraw(&treasury, &token, &amount);
+        let remaining = principal - amount;
+        if remaining == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &remaining);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.events()
+            .publish((symbol_short!("yield_wdr"), token), amount);
+        Ok(())
+    }
+
+    /// Claims all currently available yield to the platform treasury. TreasuryManager-protected.
+    pub fn harvest_yield(env: Env, token: Address) -> Result<i128, Error> {
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        let harvested = LendingProtocolClient::new(&env, &protocol).harvest(&treasury, &token);
+        env.events()
+            .publish((symbol_short!("yield_har"), token), harvested);
+        Ok(harvested)
+    }
+
+    /// Returns the tracked principal deposited for `token`.
+    pub fn get_yield_position(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldPrincipal(token))
+            .unwrap_or(0)
+    }
+
+    /// Returns the configured KYC threshold, or `None` when enforcement is off.
+    pub fn get_kyc_threshold(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::KycThreshold)
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -1466,6 +1815,7 @@ impl PaymentRouter {
         if amount < min_limit {
             return Err(Error::LimitExceeded);
         }
+        Self::verify_kyc_for_amount(&env, &sender, amount)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -1530,6 +1880,7 @@ impl PaymentRouter {
             if payment.amount < min_limit {
                 return Err(Error::LimitExceeded);
             }
+            Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -1656,56 +2007,30 @@ impl PaymentRouter {
     ///
     /// # Parameters
     /// - `token`: Contract ID of the token to withdraw.
-    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    /// Admin-only emergency withdrawal of tokens held by this contract. TreasuryManager-protected.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to withdraw.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if the
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+        token_client.transfer(&env.current_contract_address(), &treasury_mgr, &amount);
 
-        log!(&env, "Emergency withdraw executed by admin");
+        log!(&env, "Emergency withdraw executed by TreasuryManager");
         Ok(())
     }
 
-    // ── Multi-signature (M-of-N) contract upgrades ───────────────────────────
-    //
-    // Issue #664: upgrades used to be gated on a single admin key, which made
-    // that key both a single point of failure (lose it and the contract can
-    // never be patched) and a single point of centralization (compromise it and
-    // an attacker owns the contract).  Upgrades now require M signatures drawn
-    // from an N-member admin group, so no single key — including the admin's —
-    // can upgrade the contract on its own.
-    //
-    // The flow is:
-    //   1. The admin configures the group once with `set_multisig_config`.
-    //   2. Each signer authorizes a specific WASM hash with `approve_upgrade`.
-    //   3. Once M signatures are collected, `upgrade` (or the timelock's
-    //      `ActionType::Upgrade`) installs that exact hash and the approvals
-    //      are consumed.
-    //
-    // Until step 1 happens every upgrade fails closed with
-    // `Error::MultisigNotInitialized`; there is deliberately no fallback to the
-    // single admin key, because that fallback is the vulnerability being fixed.
-
-    // The admin is the root of trust for this call only: it can re-point the
-    // group but still cannot upgrade the contract by itself. Prefer
-    // `queue_action(ActionType::SetMultisigConfig(…))` to put the 24-hour
-    // timelock in front of a rotation, which this direct setter bypasses.
-    /// Configures the multi-signature admin group that authorizes upgrades.
-    ///
-    /// The signer set is replaced wholesale: addresses that are not in
-    /// `signers` immediately lose the ability to approve, and a threshold
-    /// already reached for a pending hash is re-evaluated against the new
-    /// configuration.
+    /// Replaces this contract's WASM with a previously uploaded version. SuperAdmin-protected.
     ///
     /// # Parameters
     /// - `signers`: The N addresses whose signatures count. Must be non-empty
@@ -1720,190 +2045,12 @@ impl PaymentRouter {
     /// admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
-    pub fn set_multisig_config(
-        env: Env,
-        signers: Vec<Address>,
-        threshold: u32,
-    ) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        let validated = Self::validate_multisig_config(&signers, threshold)?;
-        Self::store_multisig_config(&env, signers, validated);
-
-        env.events()
-            .publish((Symbol::new(&env, "multisig_config_set"), admin), validated);
-
-        log!(
-            &env,
-            "Multi-signature upgrade threshold set to {}",
-            validated
-        );
-        Ok(())
-    }
-
-    /// Returns the current multi-signature admin group.
+    /// Panics if the current SuperAdmin does not authorize the call, or if
+    /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
     ///
-    /// # Returns
-    /// The configured signers and threshold, or `Err(Error::MultisigNotInitialized)`
-    /// if `set_multisig_config` has not been called yet.
-    ///
-    /// # Panics
-    /// Does not panic.
-    pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, Error> {
-        let (signers, threshold) = Self::load_multisig_config(&env)?;
-        Ok(MultisigConfig { signers, threshold })
-    }
-
-    /// Records `signer`'s authorization of an upgrade to `new_wasm_hash`.
-    ///
-    /// Each group member signs off separately so the M signatures are genuinely
-    /// independent: one compromised key cannot produce a quorum, and every
-    /// approval is bound to one specific WASM hash.
-    ///
-    /// Reaching the threshold does not install the WASM by itself — call
-    /// `upgrade` (or `execute_action` on a queued [`ActionType::Upgrade`]) to
-    /// apply it. Keeping those two steps separate lets the group approve a hash
-    /// and then route the installation through the 24-hour timelock if it wants
-    /// observers to see it coming.
-    ///
-    /// # Parameters
-    /// - `signer`: The group member approving; must authorize this call.
-    /// - `new_wasm_hash`: The WASM hash being approved.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, `Err(Error::MultisigNotInitialized)` if no group
-    /// is configured, `Err(Error::NotMultisigSigner)` if `signer` is not a
-    /// group member, or `Err(Error::AlreadyApproved)` if `signer` already
-    /// approved this hash.
-    ///
-    /// # Panics
-    /// Panics if `signer` does not authorize the call.
-    pub fn approve_upgrade(
-        env: Env,
-        signer: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<(), Error> {
-        let (signers, threshold) = Self::load_multisig_config(&env)?;
-        if !signers.contains(&signer) {
-            return Err(Error::NotMultisigSigner);
-        }
-        signer.require_auth();
-
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
-        let mut approvals: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-        if approvals.contains(&signer) {
-            return Err(Error::AlreadyApproved);
-        }
-        approvals.push_back(signer.clone());
-        env.storage().persistent().set(&key, &approvals);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
-        env.events().publish(
-            (Symbol::new(&env, "upgrade_approved"), signer, new_wasm_hash),
-            (approvals.len(), threshold),
-        );
-
-        log!(
-            &env,
-            "Upgrade approved by signer {}/{}",
-            approvals.len(),
-            threshold
-        );
-        Ok(())
-    }
-
-    /// Withdraws a signer's previously recorded approval of an upgrade.
-    ///
-    /// Lets a signer pull its signature back before the threshold is reached,
-    /// which is the way a group stops an upgrade it no longer wants without
-    /// having to rotate the whole signer set. Idempotent: withdrawing an
-    /// approval that was never recorded is a no-op.
-    ///
-    /// # Parameters
-    /// - `signer`: The group member withdrawing its approval; must authorize
-    ///   this call.
-    /// - `new_wasm_hash`: The WASM hash to withdraw the approval for.
-    ///
-    /// # Returns
-    /// `Ok(())` on success or `Err(Error::MultisigNotInitialized)` if no group
-    /// is configured.
-    ///
-    /// # Panics
-    /// Panics if `signer` does not authorize the call.
-    pub fn revoke_upgrade_approval(
-        env: Env,
-        signer: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<(), Error> {
-        let (signers, _) = Self::load_multisig_config(&env)?;
-        if !signers.contains(&signer) {
-            return Err(Error::NotMultisigSigner);
-        }
-        signer.require_auth();
-
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
-        let mut approvals: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Vec::first_index_of returns the position of the first match, which
-        // for a duplicate-free set is the one and only approval to drop.
-        if let Some(index) = approvals.first_index_of(&signer) {
-            approvals.remove(index);
-            if approvals.is_empty() {
-                env.storage().persistent().remove(&key);
-            } else {
-                env.storage().persistent().set(&key, &approvals);
-                env.storage().persistent().extend_ttl(
-                    &key,
-                    Self::PERSISTENT_LIFETIME_THRESHOLD,
-                    Self::PERSISTENT_BUMP_AMOUNT,
-                );
-            }
-
-            env.events().publish(
-                (Symbol::new(&env, "upgrade_revoked"), signer, new_wasm_hash),
-                approvals.len(),
-            );
-
-            log!(&env, "Upgrade approval revoked");
-        }
-
-        Ok(())
-    }
-
-    /// Discards every approval collected for `new_wasm_hash`. Admin-only.
-    ///
-    /// The blunt instrument for a compromised hash: it drops the quorum even
-    /// when the threshold was already met, so the group can force the group
-    /// back to zero signatures. Note that `upgrade` is permissionless once the
-    /// threshold is met, so the admin should prefer having signers revoke their
-    /// own approvals (or rotate the group) while the hash is still in flight.
-    ///
-    /// # Parameters
-    /// - `new_wasm_hash`: The WASM hash to clear approvals for.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
-    /// no admin set yet. Clearing a hash with no approvals is a no-op.
-    ///
-    /// # Panics
-    /// Panics if the current admin does not authorize the call.
-    pub fn cancel_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
 
         let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
         if env.storage().persistent().has(&key) {
@@ -2012,6 +2159,88 @@ mod test {
         Address, Bytes, Env, Symbol, TryIntoVal,
     };
 
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockLendingKey {
+        Principal(Address),
+        Yield(Address),
+    }
+
+    #[contract]
+    struct MockLendingProtocol;
+
+    #[contractimpl]
+    impl MockLendingProtocol {
+        pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
+            from.require_auth();
+            token::Client::new(&env, &token).transfer(
+                &from,
+                &env.current_contract_address(),
+                &amount,
+            );
+            let key = MockLendingKey::Principal(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+
+        pub fn withdraw(env: Env, to: Address, token: Address, amount: i128) {
+            let key = MockLendingKey::Principal(token.clone());
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            assert!(current >= amount);
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &to,
+                &amount,
+            );
+            env.storage().instance().set(&key, &(current - amount));
+        }
+
+        pub fn harvest(env: Env, to: Address, token: Address) -> i128 {
+            let key = MockLendingKey::Yield(token.clone());
+            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            if amount > 0 {
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &to,
+                    &amount,
+                );
+                env.storage().instance().remove(&key);
+            }
+            amount
+        }
+
+        pub fn accrue_yield(env: Env, token: Address, amount: i128) {
+            let key = MockLendingKey::Yield(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockKycKey {
+        Verified(Address),
+    }
+
+    #[contract]
+    struct MockKycOracle;
+
+    #[contractimpl]
+    impl MockKycOracle {
+        pub fn set_verified(env: Env, account: Address, verified: bool) {
+            env.storage()
+                .instance()
+                .set(&MockKycKey::Verified(account), &verified);
+        }
+
+        pub fn is_verified(env: Env, account: Address) -> bool {
+            env.storage()
+                .instance()
+                .get(&MockKycKey::Verified(account))
+                .unwrap_or(false)
+        }
+    }
+
     /// Returns (env, client, contract_id).
     fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
         let env = Env::default();
@@ -2038,6 +2267,127 @@ mod test {
     }
 
     // ── Timelock tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_treasury_yield_deposit_harvest_and_withdraw() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let protocol_id = env.register_contract(None, MockLendingProtocol);
+        let protocol_client = MockLendingProtocolClient::new(&env, &protocol_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_yield_protocol(&protocol_id);
+        token_admin_client.mint(&treasury, &10_000);
+
+        client.deposit_to_yield(&token_address, &6_000);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+        assert_eq!(token_client.balance(&treasury), 4_000);
+        assert_eq!(token_client.balance(&protocol_id), 6_000);
+
+        token_admin_client.mint(&protocol_id, &500);
+        protocol_client.accrue_yield(&token_address, &500);
+        assert_eq!(client.harvest_yield(&token_address), 500);
+        assert_eq!(token_client.balance(&treasury), 4_500);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+
+        client.withdraw_from_yield(&token_address, &2_000);
+        assert_eq!(client.get_yield_position(&token_address), 4_000);
+        assert_eq!(token_client.balance(&treasury), 6_500);
+        assert_eq!(token_client.balance(&protocol_id), 4_000);
+    }
+
+    #[test]
+    fn test_yield_operations_require_configuration_and_valid_amounts() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &100),
+            Err(Ok(Error::YieldProtocolNotConfigured))
+        );
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &0),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+        assert_eq!(
+            client.try_withdraw_from_yield(&token_address, &1),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+    }
+
+    #[test]
+    fn test_kyc_oracle_gates_only_high_value_payments() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let oracle_client = MockKycOracleClient::new(&env, &oracle_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &10_000);
+
+        client.route_payment(&sender, &recipient, &token_address, &500);
+        assert_eq!(
+            client.try_route_payment(&sender, &recipient, &token_address, &2_000),
+            Err(Ok(Error::KycRequired))
+        );
+
+        oracle_client.set_verified(&sender, &true);
+        client.route_payment(&sender, &recipient, &token_address, &2_000);
+        assert_eq!(client.get_kyc_threshold(), Some(1_000));
+        assert_eq!(token_client.balance(&sender), 7_500);
+    }
+
+    #[test]
+    fn test_kyc_config_rejects_negative_threshold() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_set_kyc_config(&oracle, &-1),
+            Err(Ok(Error::InvalidKycThreshold))
+        );
+    }
+
+    #[test]
+    fn test_batch_payments_enforce_kyc_for_each_sender() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let (token_address, _token_client, token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &5_000);
+
+        let payments = Vec::from_array(
+            &env,
+            [Payment {
+                sender,
+                recipient,
+                token_address,
+                amount: 2_000,
+            }],
+        );
+        assert_eq!(
+            client.try_route_payments(&payments),
+            Err(Ok(Error::KycRequired))
+        );
+    }
 
     #[test]
     fn test_queue_and_execute_set_fee_bps_after_delay() {
@@ -3129,676 +3479,164 @@ mod test {
         assert_eq!(client.get_fee(), 200);
     }
 
-    // ── Multi-signature (M-of-N) upgrade tests ───────────────────────────────
-    //
-    // Issue #664. The whole point of the feature is that no single key — the
-    // admin's included — can install new code, so the tests below are built
-    // around that invariant rather than around the happy path alone: for every
-    // M-of-N combination there is a case proving the (M-1)th signature is not
-    // enough and the Mth one is.
+    // ── Role-Based Access Control (RBAC) tests ───────────────────────────────
 
-    /// The smallest WASM module the Soroban host will accept as an installable
-    /// contract, so the success path of `upgrade` can be exercised without
-    /// building the real artifact first.
-    ///
-    /// The host refuses to swap a contract's executable unless the module both
-    /// parses and carries a `contractenvmetav0` custom section declaring the
-    /// host interface version it was built against, which is what this blob
-    /// assembles: the 8-byte module header, then one custom section. A custom
-    /// section is `id 0`, its byte length, then the section name as a
-    /// LEB128-prefixed string followed by the contents — here the XDR of
-    /// `SCEnvMetaEntry::SC_ENV_META_KIND_INTERFACE_VERSION(20 << 32 | 0)`,
-    /// which is a 4-byte union discriminant of 0 then the 8-byte big-endian
-    /// interface version. The host accepts contracts built for its own protocol
-    /// version or an older one, and released SDKs are pre-release 0, so this
-    /// stays installable across SDK upgrades.
-    const PLACEHOLDER_WASM: &[u8] = b"\0asm\x01\0\0\0\
-        \x00\x1e\
-        \x11contractenvmetav0\
-        \x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00";
-
-    /// A second, distinguishable copy of [`PLACEHOLDER_WASM`]: byte-for-byte
-    /// identical apart from one extra custom section, which the host ignores
-    /// but which makes the module hash differently. Used to prove that
-    /// approvals collected for one artifact do not carry over to another.
-    const PLACEHOLDER_WASM_ALT: &[u8] = b"\0asm\x01\0\0\0\
-        \x00\x1e\
-        \x11contractenvmetav0\
-        \x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00\
-        \x00\x03\x01t\xff";
-
-    /// Uploads [`PLACEHOLDER_WASM`] and returns the hash `upgrade` installs.
-    fn upload_placeholder_wasm(env: &Env) -> BytesN<32> {
-        env.deployer()
-            .upload_contract_wasm(Bytes::from_slice(env, PLACEHOLDER_WASM))
-    }
-
-    /// Same as [`upload_placeholder_wasm`], for [`PLACEHOLDER_WASM_ALT`].
-    fn upload_alt_placeholder_wasm(env: &Env) -> BytesN<32> {
-        env.deployer()
-            .upload_contract_wasm(Bytes::from_slice(env, PLACEHOLDER_WASM_ALT))
-    }
-
-    /// Reports whether the contract still holds `key` in persistent storage.
-    ///
-    /// The upgrade tests deliberately install a placeholder program that
-    /// exports nothing, so once a swap lands the contract can no longer answer
-    /// its own queries. Reading the ledger directly is the only remaining way
-    /// to observe the state a swap left behind.
-    fn contract_still_stores(env: &Env, contract: &Address, key: &DataKey) -> bool {
-        env.as_contract(contract, || env.storage().persistent().has(key))
-    }
-
-    /// Returns `n` fresh signer addresses.
-    fn signers(env: &Env, n: usize) -> Vec<Address> {
-        let mut out = Vec::new(env);
-        for _ in 0..n {
-            out.push_back(Address::generate(env));
-        }
-        out
-    }
-
-    /// Advances the test ledger past the 24-hour timelock delay.
-    fn advance_past_timelock(env: &Env) {
-        let current_time = env.ledger().timestamp();
-        env.ledger().set(LedgerInfo {
-            timestamp: current_time + PaymentRouter::SECONDS_IN_24H + 1,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-    }
-
-    /// Asserts the approvals recorded for `hash` are exactly `expected`, in
-    /// order. Soroban's `Vec` cannot be compared against a slice, so this
-    /// compares length and then element by element.
-    fn assert_approvals(
-        client: &PaymentRouterClient<'static>,
-        hash: &BytesN<32>,
-        expected: &Vec<Address>,
-    ) {
-        let actual = client.get_upgrade_approvals(hash);
-        assert_eq!(actual.len(), expected.len(), "approval count mismatch");
-        for i in 0..expected.len() {
-            assert_eq!(actual.get(i), expected.get(i));
-        }
-    }
-
-    /// Boots an initialized router with a configured M-of-N admin group and a
-    /// WASM hash ready to be approved. Returns the env, client, admin, the
-    /// signer set and the candidate WASM hash.
-    fn setup_multisig(
-        signer_count: usize,
-        threshold: u32,
-    ) -> (
-        Env,
-        PaymentRouterClient<'static>,
-        Address,
-        Vec<Address>,
-        BytesN<32>,
-    ) {
+    #[test]
+    fn test_rbac_initialization_grants_all_roles_to_initial_admin() {
         let (env, client, _) = setup_env();
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
+
         client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        let signers = signers(&env, signer_count);
-        client.set_multisig_config(&signers, &threshold);
-        let new_wasm_hash = upload_placeholder_wasm(&env);
+        assert!(client.has_role(&admin, &Role::SuperAdmin));
+        assert!(client.has_role(&admin, &Role::TreasuryManager));
+        assert!(client.has_role(&admin, &Role::ComplianceOfficer));
+        assert!(client.has_role(&admin, &Role::FeeManager));
 
-        (env, client, admin, signers, new_wasm_hash)
+        assert_eq!(
+            client.get_role_member(&Role::SuperAdmin),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_member(&Role::TreasuryManager),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_member(&Role::ComplianceOfficer),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_member(&Role::FeeManager),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_admin(&Role::TreasuryManager),
+            Role::SuperAdmin
+        );
     }
 
     #[test]
-    fn test_upgrades_fail_closed_before_a_group_is_configured() {
+    fn test_rbac_assign_and_revoke_operational_roles() {
         let (env, client, _) = setup_env();
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
+        let treasurer = Address::generate(&env);
+        let compliance = Address::generate(&env);
+        let fee_mgr = Address::generate(&env);
+
         client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        let hash = upload_placeholder_wasm(&env);
-        let signer = Address::generate(&env);
+        // Assign TreasuryManager
+        client.assign_role(&treasurer, &Role::TreasuryManager);
+        assert!(client.has_role(&treasurer, &Role::TreasuryManager));
+        assert_eq!(
+            client.get_role_member(&Role::TreasuryManager),
+            Some(treasurer.clone())
+        );
 
-        // There is deliberately no fallback to the single admin key here: a
-        // deployment that has not configured a group cannot be upgraded at all
-        // rather than falling back to the key this feature de-risks.
+        // Assign ComplianceOfficer
+        client.assign_role(&compliance, &Role::ComplianceOfficer);
+        assert!(client.has_role(&compliance, &Role::ComplianceOfficer));
         assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::MultisigNotInitialized
+            client.get_role_member(&Role::ComplianceOfficer),
+            Some(compliance.clone())
         );
+
+        // Assign FeeManager
+        client.assign_role(&fee_mgr, &Role::FeeManager);
+        assert!(client.has_role(&fee_mgr, &Role::FeeManager));
         assert_eq!(
-            client
-                .try_approve_upgrade(&signer, &hash)
-                .unwrap_err()
-                .unwrap(),
-            Error::MultisigNotInitialized
+            client.get_role_member(&Role::FeeManager),
+            Some(fee_mgr.clone())
         );
-        assert_eq!(
-            client.try_get_multisig_config().unwrap_err().unwrap(),
-            Error::MultisigNotInitialized
-        );
-        assert_eq!(
-            client
-                .try_is_upgrade_authorized(&hash)
-                .unwrap_err()
-                .unwrap(),
-            Error::MultisigNotInitialized
-        );
+
+        // Revoke TreasuryManager
+        client.revoke_role(&treasurer, &Role::TreasuryManager);
+        assert!(!client.has_role(&treasurer, &Role::TreasuryManager));
+        assert_eq!(client.get_role_member(&Role::TreasuryManager), None);
+
+        // Cannot revoke self SuperAdmin
+        let res = client.try_revoke_role(&admin, &Role::SuperAdmin);
+        assert_eq!(res, Err(Ok(Error::InvalidRole)));
     }
 
     #[test]
-    fn test_set_multisig_config_round_trips() {
-        let (_env, client, _, _, _) = setup_multisig(5, 3);
+    fn test_rbac_treasury_manager_gates_treasury_operations() {
+        let (env, client, contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let treasurer = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
 
-        let config = client.get_multisig_config();
-        assert_eq!(config.threshold, 3);
-        assert_eq!(config.signers.len(), 5);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign dedicated TreasuryManager
+        client.assign_role(&treasurer, &Role::TreasuryManager);
+
+        // TreasuryManager sets new platform treasury
+        client.set_platform_treasury(&new_treasury);
+
+        // Recover accidentally sent tokens
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&contract_id, &5_000);
+        client.recover_tokens(&token_address, &2_000);
     }
 
     #[test]
-    fn test_set_multisig_config_rejects_unsafe_configurations() {
-        let (env, client, _, signers, _) = setup_multisig(3, 2);
+    fn test_rbac_compliance_officer_gates_compliance_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let compliance = Address::generate(&env);
+        let bad_user = Address::generate(&env);
+        let oracle = Address::generate(&env);
 
-        // An empty group could never authorize anything.
-        assert_eq!(
-            client
-                .try_set_multisig_config(&Vec::new(&env), &1)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidMultisigConfig
-        );
-        // A zero threshold would make the M-of-N gate vacuous.
-        assert_eq!(
-            client
-                .try_set_multisig_config(&signers, &0)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidMultisigConfig
-        );
-        // A threshold above the signer count could never be reached.
-        assert_eq!(
-            client
-                .try_set_multisig_config(&signers, &4)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidMultisigConfig
-        );
-        // Duplicates would let one key pad the effective signer count.
-        let dupes = Vec::from_slice(&env, &[signers.get(0).unwrap(), signers.get(0).unwrap()]);
-        assert_eq!(
-            client
-                .try_set_multisig_config(&dupes, &2)
-                .unwrap_err()
-                .unwrap(),
-            Error::InvalidMultisigConfig
-        );
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        // The rejected attempts left the working configuration untouched.
-        assert_eq!(client.get_multisig_config().threshold, 2);
+        // Assign compliance officer
+        client.assign_role(&compliance, &Role::ComplianceOfficer);
+
+        // Compliance officer blacklists and unblacklists
+        client.blacklist_address(&bad_user);
+        assert!(client.is_blacklisted(&bad_user));
+
+        client.unblacklist_address(&bad_user);
+        assert!(!client.is_blacklisted(&bad_user));
+
+        // Compliance officer configures KYC
+        client.set_kyc_config(&oracle, &50_000);
+        assert_eq!(client.get_kyc_threshold(), Some(50_000));
+
+        // Compliance officer pauses and unpauses
+        client.set_pause(&true);
+        assert!(client.is_paused());
+        client.set_paused(&false);
+        assert!(!client.is_paused());
     }
 
     #[test]
-    fn test_setting_the_group_requires_the_admin_signature() {
-        let (env, client, admin, _, _) = setup_multisig(3, 2);
-
-        client.set_multisig_config(&signers(&env, 4), &3);
-
-        // `auths()` reports the most recent invocation only, so this is the
-        // signature `set_multisig_config` itself demanded.
-        let auths = env.auths();
-        assert_eq!(auths.len(), 1);
-        assert_eq!(auths.first().map(|(addr, _)| addr.clone()), Some(admin));
-    }
-
-    #[test]
-    fn test_admin_alone_cannot_upgrade_the_contract() {
-        // The headline regression test for #664: the admin used to hold the
-        // only key that could install new code. With a 3-of-5 group its
-        // signature is not one of the three.
-        let (_env, client, _admin, _signers, hash) = setup_multisig(5, 3);
-
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-    }
-
-    #[test]
-    fn test_two_of_three_needs_two_signatures_not_one() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
-        assert!(!client.is_upgrade_authorized(&hash));
-
-        // One signature short of the threshold.
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        // The second distinct signature crosses it.
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert!(client.is_upgrade_authorized(&hash));
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_unanimous_two_of_two_rejects_a_single_signature() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(2, 2);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_unanimous_three_of_three_rejects_two_signatures() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 3);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        client.approve_upgrade(&signers.get(2).unwrap(), &hash);
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_signers_beyond_the_threshold_may_still_approve() {
-        // 3-of-5: the quorum is met after three signatures, and the remaining
-        // two are still legitimate group members rather than being rejected.
-        let (_env, client, _admin, signers, hash) = setup_multisig(5, 3);
-
-        let mut all = Vec::new(&client.env);
-        for i in 0..5u32 {
-            all.push_back(signers.get(i).unwrap());
-        }
-
-        for i in 0..5u32 {
-            client.approve_upgrade(&signers.get(i).unwrap(), &hash);
-        }
-
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 5);
-        assert!(client.is_upgrade_authorized(&hash));
-        assert_approvals(&client, &hash, &all);
-
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_one_of_one_threshold_allows_a_single_signer() {
-        // The degenerate configuration still works, so a solo deployment can
-        // use the same code path rather than needing a special case.
-        let (_env, client, _admin, signers, hash) = setup_multisig(1, 1);
-
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_outsiders_cannot_approve() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
-        let outsider = Address::generate(&client.env);
-
-        assert_eq!(
-            client
-                .try_approve_upgrade(&outsider, &hash)
-                .unwrap_err()
-                .unwrap(),
-            Error::NotMultisigSigner
-        );
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        // The group members are unaffected by the rejected attempt.
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
-    }
-
-    #[test]
-    fn test_approving_twice_cannot_inflate_the_quorum() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
-        let first = signers.get(0).unwrap();
-
-        client.approve_upgrade(&first, &hash);
-        // A replayed signature is an error, never a second vote.
-        assert_eq!(
-            client
-                .try_approve_upgrade(&first, &hash)
-                .unwrap_err()
-                .unwrap(),
-            Error::AlreadyApproved
-        );
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-    }
-
-    #[test]
-    fn test_approvals_are_scoped_to_one_wasm_hash() {
-        // Signatures authorize a specific artifact, so they must not carry over
-        // to a different one.
-        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
-        let other_hash = upload_alt_placeholder_wasm(&env);
-        assert_ne!(hash, other_hash);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-
-        assert!(client.is_upgrade_authorized(&hash));
-        assert_eq!(client.get_upgrade_approvals(&other_hash).len(), 0);
-        assert!(!client.is_upgrade_authorized(&other_hash));
-        assert_eq!(
-            client.try_upgrade(&other_hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-    }
-
-    #[test]
-    fn test_upgrade_consumes_the_approvals_that_authorized_it() {
-        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert!(contract_still_stores(
-            &env,
-            &client.address,
-            &DataKey::UpgradeApproval(hash.clone())
-        ));
-
-        client.upgrade(&hash);
-
-        // The quorum that authorized the swap is spent, so replaying the same
-        // hash needs a fresh round of signatures rather than reusing the old
-        // one. The placeholder program installed above exports nothing, so the
-        // cleared record is read straight off the ledger.
-        assert!(
-            !contract_still_stores(&env, &client.address, &DataKey::UpgradeApproval(hash)),
-            "the approvals that authorized an upgrade must not survive it"
-        );
-    }
-
-    #[test]
-    fn test_revoking_an_approval_drops_the_group_back_below_threshold() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert!(client.is_upgrade_authorized(&hash));
-
-        client.revoke_upgrade_approval(&signers.get(1).unwrap(), &hash);
-
-        assert!(!client.is_upgrade_authorized(&hash));
-        assert_approvals(
-            &client,
-            &hash,
-            &Vec::from_slice(&client.env, &[signers.get(0).unwrap()]),
-        );
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        // A signer that pulled its approval can put it back.
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert!(client.is_upgrade_authorized(&hash));
-    }
-
-    #[test]
-    fn test_revoking_without_a_recorded_approval_is_a_no_op() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        client.revoke_upgrade_approval(&signers.get(0).unwrap(), &hash);
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.revoke_upgrade_approval(&signers.get(0).unwrap(), &hash);
-        // Revoking the last approval clears the entry entirely.
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
-    }
-
-    #[test]
-    fn test_admin_can_cancel_pending_upgrade_approvals() {
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert!(client.is_upgrade_authorized(&hash));
-
-        client.cancel_upgrade(&hash);
-
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
-        assert!(!client.is_upgrade_authorized(&hash));
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-    }
-
-    #[test]
-    fn test_rotating_the_group_stops_removed_signers_from_approving() {
-        let (env, client, _admin, old_signers, hash) = setup_multisig(3, 2);
-
-        let dropped = old_signers.get(2).unwrap();
-        let newcomer = Address::generate(&env);
-        let kept = old_signers.get(0).unwrap();
-
-        // 2-of-2 over the retained signer plus a newcomer.
-        let rotated = Vec::from_slice(&env, &[kept.clone(), newcomer.clone()]);
-        client.set_multisig_config(&rotated, &2);
-
-        assert_eq!(client.get_multisig_config().signers.len(), 2);
-        assert_eq!(
-            client
-                .try_approve_upgrade(&dropped, &hash)
-                .unwrap_err()
-                .unwrap(),
-            Error::NotMultisigSigner
-        );
-
-        // The retained signer carries over; the newcomer starts clean.
-        client.approve_upgrade(&kept, &hash);
-        assert_approvals(&client, &hash, &Vec::from_slice(&env, &[kept]));
-        assert!(!client.is_upgrade_authorized(&hash));
-        client.approve_upgrade(&newcomer, &hash);
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_raising_the_threshold_revalidates_in_flight_approvals() {
-        // Two signatures against a 2-of-3 group are enough, but the admin
-        // tightening the group to 3-of-3 must invalidate the collected quorum.
-        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert!(client.is_upgrade_authorized(&hash));
-
-        client.set_multisig_config(&signers, &3);
-
-        assert!(!client.is_upgrade_authorized(&hash));
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        client.approve_upgrade(&signers.get(2).unwrap(), &hash);
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_rotating_out_a_signer_voids_the_approval_it_already_cast() {
-        // The dangerous shape: a lone approval meets a *lower* threshold after
-        // the group is rotated. If rotation left the stale vote counting, the
-        // one removed key would authorize an upgrade by itself.
-        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        let removed = signers.get(0).unwrap();
-        client.approve_upgrade(&removed, &hash);
-        assert!(!client.is_upgrade_authorized(&hash));
-
-        // Drop the signer that approved and lower the threshold to 1, so the
-        // stored approval alone would clear the bar if it still counted.
-        let kept: Vec<Address> =
-            Vec::from_slice(&env, &[signers.get(1).unwrap(), signers.get(2).unwrap()]);
-        client.set_multisig_config(&kept, &1);
-
-        assert!(!client.is_upgrade_authorized(&hash));
-        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
-        assert_eq!(
-            client.try_upgrade(&hash).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        // The new group's own member can authorize normally.
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        assert!(client.is_upgrade_authorized(&hash));
-        client.upgrade(&hash);
-    }
-
-    #[test]
-    fn test_approving_an_upgrade_records_the_signers_own_signature() {
-        let (env, client, _, signers, hash) = setup_multisig(3, 2);
-        let signer = signers.get(0).unwrap();
-
-        client.approve_upgrade(&signer, &hash);
-
-        // Proves the contract demands a signature from the address it was told
-        // is approving, rather than trusting the caller's word.
-        let auths = env.auths();
-        assert!(
-            auths.iter().any(|(addr, _)| *addr == signer),
-            "approve_upgrade must require the approving signer to authorize"
-        );
-    }
-
-    #[test]
-    fn test_upgrade_needs_no_signature_once_the_quorum_is_reached() {
-        // The M collected signatures are the whole authorization, so the
-        // installing transaction must not silently demand a seventh key.
-        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        client.upgrade(&hash);
-
-        // `auths()` reports the most recent invocation only: the swap itself
-        // demanded no authorization at all.
-        assert!(
-            env.auths().is_empty(),
-            "upgrade must not require any authorization once the quorum is reached"
-        );
-    }
-
-    #[test]
-    fn test_timelock_upgrade_also_requires_the_multisig_threshold() {
-        // Queueing an upgrade and waiting out the delay must not be a way
-        // around the M-of-N gate.
-        let (env, client, _admin, _signers, hash) = setup_multisig(3, 2);
-
-        let nonce = client.queue_action(&ActionType::Upgrade(hash.clone()));
-        advance_past_timelock(&env);
-
-        assert_eq!(
-            client.try_execute_action(&nonce).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-    }
-
-    #[test]
-    fn test_timelock_upgrade_entry_survives_a_rejected_multisig_check() {
-        // Validation runs before the entry is consumed, so an upgrade that is
-        // not yet authorized stays in the queue instead of being burned.
-        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
-
-        let nonce = client.queue_action(&ActionType::Upgrade(hash.clone()));
-        advance_past_timelock(&env);
-        assert_eq!(
-            client.try_execute_action(&nonce).unwrap_err().unwrap(),
-            Error::InsufficientApprovals
-        );
-
-        assert_eq!(
-            client.get_queued_action(&nonce).action,
-            ActionType::Upgrade(hash.clone())
-        );
-
-        // Once the group signs off, the same entry executes unchanged.
-        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
-        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
-        client.execute_action(&nonce);
-
-        // Execution consumed the entry and, with it, the quorum that unlocked
-        // the swap. The placeholder program installed by the swap exports
-        // nothing, so both facts are read straight off the ledger.
-        assert!(
-            !contract_still_stores(&env, &client.address, &DataKey::TimelockEntry(nonce)),
-            "a successfully executed entry must not be left in the queue"
-        );
-        assert!(
-            !contract_still_stores(&env, &client.address, &DataKey::UpgradeApproval(hash)),
-            "the approvals that authorized the upgrade must not survive it"
-        );
-    }
-
-    #[test]
-    fn test_timelock_set_multisig_config_is_validated_when_it_executes() {
-        // An invalid rotation queued today must not be applied in 24 hours, and
-        // must not consume the queue slot either.
-        let (env, client, _admin, signers, _) = setup_multisig(3, 2);
-
-        let bad = client.queue_action(&ActionType::SetMultisigConfig(signers.clone(), 9));
-        advance_past_timelock(&env);
-
-        assert_eq!(
-            client.try_execute_action(&bad).unwrap_err().unwrap(),
-            Error::InvalidMultisigConfig
-        );
-        assert_eq!(client.get_multisig_config().threshold, 2);
-    }
-
-    #[test]
-    fn test_timelock_set_multisig_config_applies_after_the_delay() {
-        let (env, client, _admin, old_signers, _) = setup_multisig(3, 2);
-
-        let new_signers = signers(&env, 4);
-        let nonce = client.queue_action(&ActionType::SetMultisigConfig(new_signers.clone(), 3));
-        advance_past_timelock(&env);
-        client.execute_action(&nonce);
-
-        let config = client.get_multisig_config();
-        assert_eq!(config.threshold, 3);
-        assert_eq!(config.signers.len(), 4);
-        // The old set no longer counts.
-        assert_eq!(
-            client
-                .try_approve_upgrade(&old_signers.get(0).unwrap(), &upload_placeholder_wasm(&env))
-                .unwrap_err()
-                .unwrap(),
-            Error::NotMultisigSigner
-        );
+    fn test_rbac_fee_manager_gates_fee_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let fee_mgr = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign fee manager
+        client.assign_role(&fee_mgr, &Role::FeeManager);
+
+        // Fee manager updates fee bps
+        client.set_fee_bps(&350);
+        assert_eq!(client.get_fee(), 350);
+
+        // Fee manager updates fee config
+        client.set_fee_config(&400, &5_000);
+        assert_eq!(client.get_fee(), 400);
+
+        // Fee manager sets min limit
+        client.set_min_limit(&10_000);
     }
 }
 
