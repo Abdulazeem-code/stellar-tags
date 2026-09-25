@@ -287,10 +287,12 @@ router.post('/webhooks/verify-test', (req, res) => {
       ok: false,
       valid: false,
       error: {
+        code: 'INVALID_WEBHOOK_SIGNATURE',
         message: 'Signature verification failed',
         expected: expectedSignature,
         received: signature,
-      }
+      },
+      receivedSignature: signature,
     });
   }
 });

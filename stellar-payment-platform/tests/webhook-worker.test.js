@@ -96,7 +96,7 @@ describe('webhook BullMQ delivery', () => {
 
     await expect(processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 0 },
-      { prisma, poolRunFn: jest.fn() },
+      { prisma,  },
     )).rejects.toThrow('HTTP 503');
 
     expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
@@ -115,7 +115,7 @@ describe('webhook BullMQ delivery', () => {
 
     await processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 2 },
-      { prisma, poolRunFn: jest.fn() },
+      { prisma,  },
     );
 
     expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
@@ -127,7 +127,7 @@ describe('webhook BullMQ delivery', () => {
   test('configures and starts a BullMQ webhook worker', () => {
     const dependencies = {
       prisma: { webhook: {} },
-      poolRunFn: jest.fn(),
+      
     };
 
     startWebhookWorker(dependencies);
@@ -154,7 +154,7 @@ describe('webhook BullMQ delivery', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-1',

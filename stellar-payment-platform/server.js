@@ -185,7 +185,7 @@ const limiter = rateLimit({
   }) : undefined,
   // Return the standard RateLimit-* headers only
   standardHeaders: true,
-  legacyHeaders: true,
+  legacyHeaders: false,
   message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
   // Prometheus scrapes /metrics on a fixed interval from a single address, so
   // counting those scrapes against the shared quota would 429 the scraper.
@@ -226,6 +226,24 @@ const limiter = rateLimit({
       return req.ip || '';
     }
   },
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  store: redisClient ? new RedisStore({
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }) : undefined,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: errorBody('RATE_LIMITED', 'Too many requests, please try again later.'),
+  keyGenerator: (req) => {
+    try {
+      return req.ip || (req.connection && req.connection.remoteAddress) || '';
+    } catch {
+      return req.ip || '';
+    }
+  }
 });
 
 app.use(cors(corsOptions));
@@ -321,6 +339,7 @@ app.get('/federation', etagCache, validateSchema({ query: federationQuerySchema 
       const cached = await federationLookupCached(cacheKey, async () => {
         const row = await prisma.user.findFirst({
           where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
           select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
         });
 
@@ -480,7 +499,7 @@ const verifyFreighterRegistrationSignature = ({
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
  */
-app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
+app.post('/register', idempotencyMiddleware(redisClient), signatureRateLimiter, requireJson, validateSchema({ body: registerBodySchema }), async (req, res, next) => {
   // registerBodySchema has already guaranteed that username is a trimmed
   // 3-20 character alphanumeric string and address is a non-empty trimmed
   // string, so those shape checks are not repeated here.
@@ -533,10 +552,8 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       where: { address, deletedAt: null },
     });
 
-    if (existingCount > 0) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+    if (existingCount >= 5) {
+      return next(new ApiError('CONFLICT', 'Address already registered - maximum of 5 usernames allowed per address'));
     }
 
     let verificationResult = null;
@@ -595,6 +612,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
         data: {
           username: normalizedUsername,
           address,
+          isPrimary: existingCount === 0,
           ...(memoType && { memoType, memo }),
         },
       });
@@ -609,6 +627,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       username: normalizedUsername,
       address,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      is_primary: existingCount === 0,
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,
@@ -828,7 +847,7 @@ app.use('/api/v1', v1Router);
 app.use('/api', v1Router);
 app.use('/', v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available
-app.use('/auth', require('./src/routes/v1/authRoutes')(redisClient));
+app.use('/auth', authLimiter, require('./src/routes/v1/authRoutes')(redisClient));
 
 // API key management endpoints (rotation, invalidation, listing)
 app.use('/auth/api-keys', require('./src/routes/v1/apiKeyRoutes')(redisClient));

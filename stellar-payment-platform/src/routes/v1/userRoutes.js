@@ -102,14 +102,12 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   }
 
   try {
-    const existing = await prisma.user.findFirst({
+    const existingCount = await prisma.user.count({
       where: { address, deletedAt: null }
     });
 
-    if (existing) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+    if (existingCount >= 5) {
+      return next(new ApiError('CONFLICT', 'Address already registered - maximum of 5 usernames allowed per address'));
     }
 
     let verificationResult = null;
@@ -132,6 +130,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       data: {
         username: normalizedUsername,
         address,
+        isPrimary: existingCount === 0,
         ...(memoType && { memoType, memo }),
       },
     });
@@ -143,6 +142,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       username: normalizedUsername,
       address,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      is_primary: existingCount === 0,
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,
