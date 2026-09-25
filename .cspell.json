@@ -78,6 +78,7 @@
     "scrape",
     "codebase",
     "postgres",
+    "psql",
     "PostgreSQL",
     "postgresql",
     "gitignore",

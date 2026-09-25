@@ -23,6 +23,39 @@ HMAC-SHA256( key=<webhook_secret>, message=<raw JSON body> )
 The raw JSON body is the exact byte sequence sent over the wire.  
 The webhook secret is the value you supplied when registering your webhook URL.
 
+## Test verification endpoint
+
+To validate a payload and signature before wiring up production code, send the
+payload and the secret to `POST /api/v1/webhooks/verify-test` and include the
+signature in the `X-Webhook-Signature` header. Because signatures are computed
+over the raw body bytes, pass the payload as a JSON **string** exactly as it was
+sent over the wire:
+
+```bash
+curl -X POST https://api.stellar-tags.example/api/v1/webhooks/verify-test \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Signature: <hex-signature>' \
+  -d '{
+    "secret": "your_webhook_secret",
+    "payload": "{\"event\":\"payment.created\",\"id\":\"evt_123\",\"amount\":42}"
+  }'
+```
+
+A successful response looks like:
+
+```json
+{
+  "ok": true,
+  "valid": true,
+  "message": "Webhook signature verification succeeded.",
+  "expectedSignature": "<hex-signature>",
+  "receivedSignature": "<hex-signature>"
+}
+```
+
+When the signature is wrong, the endpoint responds with `401` and a detailed
+error payload including the expected and received values.
+
 ## Verifying in Node.js
 
 ```js

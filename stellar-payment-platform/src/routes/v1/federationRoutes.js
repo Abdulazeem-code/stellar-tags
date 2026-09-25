@@ -15,7 +15,19 @@ const { asyncHandler } = require('../../middleware/asyncHandler');
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
+  
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
 
     try {
@@ -32,8 +44,10 @@ module.exports = (redisClient) => {
 
           if (!row) return null;
 
+          const domain = process.env.DOMAIN || 'localhost';
+          const stellar_address = row.username.includes('*') ? row.username : `${row.username}*${domain}`;
           const response = {
-            stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
+            stellar_address,
             account_id: row.address,
           };
           if (row.memoType) {
@@ -58,14 +72,14 @@ module.exports = (redisClient) => {
         const cached = await federationLookupCached(cacheKey, async () => {
           const row = await prisma.user.findFirst({
             where: { username: queryName, deletedAt: null },
-            select: { address: true, memoType: true, memo: true },
+            select: { username: true, address: true, memoType: true, memo: true },
           });
 
           const address = row?.address || USER_DATABASE[queryName];
           if (!address) return null;
 
           const response = {
-            stellar_address: address,
+            stellar_address: queryName,
             account_id: address,
           };
           if (row?.memoType) {
@@ -88,6 +102,7 @@ module.exports = (redisClient) => {
         );
       }
     } catch (error) {
+      console.log("FEDERATION LOOKUP ERROR:", error);
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);

@@ -9,6 +9,18 @@ const { fetchPaymentsForAccount } = require('../../services/stellarService');
 
 const router = express.Router();
 
+
+/**
+ * @openapi
+ * /accounts/:account/payments:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /accounts/:account/payments
+ *     responses:
+ *       200:
+ *         description: Success
+ */
 router.get('/accounts/:account/payments', validateSchema({ query: accountPaymentsQuerySchema }), asyncHandler(async (req, res, next) => {
   const { account } = req.params;
   if (!account || !StrKey.isValidEd25519PublicKey(account)) {

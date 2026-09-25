@@ -1,5 +1,18 @@
+# Every service belongs to a profile, so `docker compose up` on its own starts
+# nothing and you always say which stack you want:
+#
+#   docker compose --profile dev up          backend + postgres + redis
+#   docker compose --profile full up         the same, plus the built frontend
+#   docker compose --profile test up         API under test + its own database
+#   docker compose --profile integration up  local standalone Stellar network
+#
+# dev and test use separate databases on separate host ports, so both can run
+# at once without colliding.
+
 services:
+  # ── dev ────────────────────────────────────────────────────────────────────
   postgres:
+    profiles: ["dev", "full"]
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
@@ -16,6 +29,7 @@ services:
       retries: 5
 
   redis:
+    profiles: ["dev", "full"]
     image: redis:7-alpine
     ports:
       - "6379:6379"
@@ -26,6 +40,7 @@ services:
       retries: 5
 
   backend:
+    profiles: ["dev", "full"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -47,7 +62,10 @@ services:
       redis:
         condition: service_healthy
 
+  # Only in full, not dev: the Vite build is the slowest thing here and backend
+  # work does not need it. full is dev plus this.
   frontend:
+    profiles: ["full"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -58,6 +76,70 @@ services:
       - "3000:80"
     depends_on:
       - backend
+
+  # ── test ───────────────────────────────────────────────────────────────────
+  postgres-test:
+    profiles: ["test"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stellar_tags_test
+    # 5433 on the host so a dev postgres can stay up on 5432.
+    ports:
+      - "5433:5432"
+    # No volume: a test database should start empty every time.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api-test:
+    profiles: ["test"]
+    build:
+      context: ./stellar-payment-platform
+      dockerfile: Dockerfile.test
+    environment:
+      PORT: "5001"
+      DATABASE_URL: postgresql://postgres:postgres@postgres-test:5432/stellar_tags_test?schema=public
+    ports:
+      - "5001:5001"
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── integration ────────────────────────────────────────────────────────────
+  # Standalone Stellar network (Soroban-enabled) used by the contract
+  # integration tests. Exposes both the Horizon REST API (8000) and the
+  # Soroban RPC endpoint (8000/rpc) so the Rust SDK can submit real
+  # transactions against a local network. Kept out of the test profile
+  # because it pulls a multi-gigabyte image the API tests never touch.
+  stellar-standalone:
+    profiles: ["integration"]
+    image: stellar/quickstart:latest
+    command: [
+      "--standalone",
+      "--enable-soroban-rpc",
+      "--enable-core-artifacts",
+      "--local",
+    ]
+    environment:
+      ENABLE_LOGS: "true"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
 volumes:
   pgdata:

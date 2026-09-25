@@ -15,7 +15,8 @@ const { logger } = require('./src/logger');
 const { poolGet, poolRun } = require('./src/db');
 const {
   dispatchPaymentWebhooks,
-  scheduleWebhookRetryJob,
+  startWebhookWorker,
+  closeWebhookQueue,
 } = require('./src/webhookWorker');
 const {
   horizon,
@@ -186,6 +187,7 @@ const shutdown = async () => {
     logger.info(`  Closed stream for ${address}`);
   }
   activeStreams.clear();
+  await closeWebhookQueue();
   await prisma.$disconnect();
   process.exit(0);
 };
@@ -207,12 +209,8 @@ const main = async () => {
   // Initial sync
   await syncWatchedAccounts();
 
-  // Schedule webhook retry / liveness pings
-  try {
-    scheduleWebhookRetryJob({ prisma, poolAllFn: require('./src/db').poolAll, poolRunFn: poolRun });
-  } catch (err) {
-    logger.error('Failed to schedule webhook retry job:', err.message);
-  }
+  // Start the durable Redis-backed webhook delivery worker.
+  startWebhookWorker({ prisma, poolRunFn: poolRun });
 
   // Periodically check for newly registered accounts
   setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
