@@ -33,6 +33,32 @@ jobs:
       - name: Build contract to WASM
         run: cargo build --target wasm32-unknown-unknown --release
 
+  benchmarks:
+    name: Storage Gas Benchmarks (issue #663)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      # Runs the storage-cost benchmark tests (test_benchmark_*). These fail
+      # CI when the packed user-record registration write path is no longer
+      # at least 20% cheaper than the legacy two-entry path.
+      - name: Run storage gas benchmarks
+        run: cargo test benchmark -- --nocapture
+
   bindings-check:
     name: Bindings up-to-date
     runs-on: ubuntu-latest
