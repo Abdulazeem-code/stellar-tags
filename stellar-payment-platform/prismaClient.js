@@ -46,7 +46,6 @@ try {
       findFirst: async () => null,
       create: async (args) => args.data || {},
       count: async () => 0,
-      groupBy: async () => [],
     },
     auditLog: {
       findMany: async () => [],
@@ -72,7 +71,6 @@ try {
       update: async () => ({}),
       delete: async () => ({}),
       count: async () => 0,
-      groupBy: async () => [],
     },
     paymentIntent: {
       create: async (args) => args.data || {},

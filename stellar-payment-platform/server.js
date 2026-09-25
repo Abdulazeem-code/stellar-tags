@@ -42,7 +42,6 @@ const {
 const { ApiError, errorBody } = require("./src/errors");
 const { requireJson } = require("./src/middleware/requireJson");
 const { bodySizeLimit } = require("./src/middleware/bodyLimit");
-const { rejectNestedObjects } = require("./src/middleware/rejectNestedObjects");
 const { apiVersion } = require("./src/middleware/apiVersion");
 const { deprecationMiddleware } = require("./src/middleware/deprecation");
 const {
@@ -1343,12 +1342,6 @@ app.get("/api/v1/time", (_req, res) => {
 });
 
 app.use(require("./src/routes/v1/healthRoutes")(redisClient));
-
-// #685 — GraphQL read API over the same services the REST routes use. Mounted
-// after the rate limiter, body parser, and versioning middleware so it inherits
-// them, and before the 404 handler so unmatched paths still fall through to the
-// standard envelope. `GET /graphql` serves the development playground.
-require("./src/graphql").registerGraphQL(app, { prisma, redisClient, poolGet });
 
 // #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
 // they reach our own JSON error handler below.
