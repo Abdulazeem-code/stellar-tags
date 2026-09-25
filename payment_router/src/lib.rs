@@ -177,6 +177,28 @@ pub struct TimelockEntry {
     pub action: ActionType,
 }
 
+/// Role definitions for the Role-Based Access Control (RBAC) system.
+///
+/// Segregates operational privileges across dedicated role boundaries:
+/// SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Role {
+    /// Supreme administrator with exclusive authority over role assignments,
+    /// contract upgrades, emergency freeze/unfreeze, and root governance.
+    SuperAdmin = 1,
+    /// Manager with exclusive authority over platform treasury, yield operations,
+    /// token recovery, and emergency asset withdrawals.
+    TreasuryManager = 2,
+    /// Compliance officer with authority over address blacklisting, KYC oracle
+    /// configurations, and emergency operational pause switches.
+    ComplianceOfficer = 3,
+    /// Fee manager with authority over platform fee basis points, fee caps, and
+    /// minimum payment limits.
+    FeeManager = 4,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +245,10 @@ pub enum DataKey {
     KycOracle,
     /// Payments strictly above this amount require a valid KYC claim.
     KycThreshold,
+    /// Active designated address for an administrative role: Role -> Address.
+    Role(Role),
+    /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
+    UserRole(Address, Role),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -269,6 +295,10 @@ pub enum Error {
     KycRequired = 17,
     /// The configured KYC threshold must not be negative.
     InvalidKycThreshold = 18,
+    /// Account lacks the required role or role does not exist.
+    RoleNotFound = 19,
+    /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
+    InvalidRole = 20,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -298,6 +328,49 @@ impl PaymentRouter {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
+    fn set_role_internal(env: &Env, role: Role, account: &Address) {
+        env.storage()
+            .instance()
+            .set(&DataKey::Role(role), account);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserRole(account.clone(), role),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn remove_role_internal(env: &Env, role: Role, account: &Address) {
+        if let Some(current) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if current == *account {
+                env.storage().instance().remove(&DataKey::Role(role));
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &false);
+    }
+
+    fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
+        let addr = if let Some(role_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            role_addr
+        } else {
+            Self::require_admin(env)?
+        };
+        addr.require_auth();
+        Ok(addr)
+    }
+
     fn require_admin(env: &Env) -> Result<Address, Error> {
         env.storage()
             .instance()
@@ -306,7 +379,7 @@ impl PaymentRouter {
     }
 
     /// Fee authority helper: if a Governance address is set it takes exclusive
-    /// control over fee updates; otherwise the admin retains that right.
+    /// control over fee updates; otherwise the FeeManager retains that right.
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
         if let Some(gov) = env
             .storage()
@@ -316,8 +389,7 @@ impl PaymentRouter {
             gov.require_auth();
             Ok(())
         } else {
-            let admin = Self::require_admin(env)?;
-            admin.require_auth();
+            Self::require_role(env, Role::FeeManager)?;
             Ok(())
         }
     }
@@ -581,12 +653,123 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
+        // RBAC Initialization: assign initial admin to all operational roles
+        Self::set_role_internal(&env, Role::SuperAdmin, &admin);
+        Self::set_role_internal(&env, Role::TreasuryManager, &admin);
+        Self::set_role_internal(&env, Role::ComplianceOfficer, &admin);
+        Self::set_role_internal(&env, Role::FeeManager, &admin);
+
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
         Ok(())
+    }
+
+    // ── Role-Based Access Control (RBAC) ────────────────────────────────────
+
+    /// Assigns an operational role to a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`.
+    ///
+    /// # Parameters
+    /// - `account`: Target address to receive the role.
+    /// - `role`: The `Role` variant to grant.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn assign_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+        Self::set_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_assigned"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Revokes an operational role from a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
+    /// when it would leave the contract without root governance.
+    ///
+    /// # Parameters
+    /// - `account`: Target address from which the role will be revoked.
+    /// - `role`: The `Role` variant to revoke.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
+    /// or `Err(Error::NotInitialized)`.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn revoke_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        let caller = Self::require_role(&env, Role::SuperAdmin)?;
+        if role == Role::SuperAdmin && caller == account {
+            return Err(Error::InvalidRole);
+        }
+        Self::remove_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Queries whether a given account holds an active role assignment.
+    ///
+    /// Checks persistent user role assignments and primary designated roles.
+    ///
+    /// # Parameters
+    /// - `account`: Address to query.
+    /// - `role`: Role variant to check.
+    ///
+    /// # Returns
+    /// `true` if authorized for this role, `false` otherwise.
+    pub fn has_role(env: Env, account: Address, role: Role) -> bool {
+        if let Some(has) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::UserRole(account.clone(), role))
+        {
+            if has {
+                return true;
+            }
+        }
+        if let Some(primary) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if primary == account {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the primary designated member address for a role, if one is configured.
+    ///
+    /// # Parameters
+    /// - `role`: The role variant to query.
+    ///
+    /// # Returns
+    /// `Some(Address)` if set, or `None` if unassigned.
+    pub fn get_role_member(env: Env, role: Role) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+    }
+
+    /// Returns the administrative role governing the specified role.
+    ///
+    /// In this RBAC architecture, `SuperAdmin` governs all operational roles.
+    pub fn get_role_admin(_env: Env, _role: Role) -> Role {
+        Role::SuperAdmin
     }
 
     // ── Timelock: queue / execute / cancel ───────────────────────────────────
@@ -708,6 +891,7 @@ impl PaymentRouter {
             }
             ActionType::TransferAdmin(new_admin) => {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
+                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
             }
             ActionType::Upgrade(new_wasm_hash) => {
                 env.deployer().update_current_contract_wasm(new_wasm_hash);
@@ -763,8 +947,7 @@ impl PaymentRouter {
     ///
     /// Admin authorization is required.
     pub fn emergency_freeze(env: Env) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
 
         env.storage().instance().set(&DataKey::Frozen, &true);
         env.storage().instance().extend_ttl(
@@ -773,11 +956,11 @@ impl PaymentRouter {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "emergency_freeze"), admin),
+            (Symbol::new(&env, "emergency_freeze"), super_admin),
             env.ledger().timestamp(),
         );
 
-        log!(&env, "Contract frozen by admin");
+        log!(&env, "Contract frozen by SuperAdmin");
         Ok(())
     }
 
@@ -786,10 +969,9 @@ impl PaymentRouter {
     /// Like `emergency_freeze`, this takes effect immediately and does not
     /// go through the timelock.
     ///
-    /// Admin authorization is required.
+    /// SuperAdmin authorization is required.
     pub fn unfreeze(env: Env) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
 
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().extend_ttl(
@@ -798,11 +980,11 @@ impl PaymentRouter {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "unfreeze"), admin),
+            (Symbol::new(&env, "unfreeze"), super_admin),
             env.ledger().timestamp(),
         );
 
-        log!(&env, "Contract unfrozen by admin");
+        log!(&env, "Contract unfrozen by SuperAdmin");
         Ok(())
     }
 
@@ -826,7 +1008,7 @@ impl PaymentRouter {
 
     /// Updates the treasury address that receives the platform fee.
     ///
-    /// Updates the treasury address that receives the platform fee. Admin-only.
+    /// Updates the treasury address that receives the platform fee. Protected by TreasuryManager.
     ///
     /// # Parameters
     /// - `new_treasury`: Address to receive platform fees going forward.
@@ -836,14 +1018,13 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current TreasuryManager does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetPlatformTreasury(…))`
     /// and execute after 24 hours.  This direct path is retained for tooling
     /// compatibility only.
     pub fn set_platform_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::TreasuryManager)?;
 
         env.storage()
             .instance()
@@ -929,8 +1110,7 @@ impl PaymentRouter {
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetGovernance(…))`.
     pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::SuperAdmin)?;
         env.storage().instance().set(&DataKey::Governance, &gov);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -939,7 +1119,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Sets the minimum allowed routing amount. Admin-only.
+    /// Sets the minimum allowed routing amount. FeeManager-protected.
     ///
     /// # Parameters
     /// - `min_limit`: Smallest `amount` that `route_payment` /
@@ -950,12 +1130,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current FeeManager does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
     pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::FeeManager)?;
 
         env.storage().instance().set(&DataKey::MinLimit, &min_limit);
         env.storage().instance().extend_ttl(
@@ -977,7 +1156,7 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
-    /// Pauses or unpauses the payment router. Admin-only.
+    /// Pauses or unpauses the payment router. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject `route_payment` / `route_payments`
@@ -988,12 +1167,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     ///
     /// This is NOT timelocked — operational pausing must remain instant.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage().instance().set(&DataKey::Paused, &paused);
         env.storage().instance().extend_ttl(
@@ -1052,7 +1230,7 @@ impl PaymentRouter {
             .unwrap_or(0)
     }
 
-    /// Adds an address to the blacklist. Admin-only.
+    /// Adds an address to the blacklist. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `address`: Address to blacklist; subsequent payments to it as a
@@ -1063,10 +1241,9 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     pub fn blacklist_address(env: Env, address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage()
             .persistent()
@@ -1080,7 +1257,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Removes an address from the blacklist. Admin-only.
+    /// Removes an address from the blacklist. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `address`: Address to remove from the blacklist.
@@ -1090,10 +1267,9 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     pub fn unblacklist_address(env: Env, address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage()
             .persistent()
@@ -1141,7 +1317,7 @@ impl PaymentRouter {
         }
     }
 
-    /// Set a new admin. Gated by the current admin if one exists.
+    /// Set a new admin. SuperAdmin-protected.
     ///
     /// # Parameters
     /// - `new_admin`: Address to install as the new admin.
@@ -1150,16 +1326,13 @@ impl PaymentRouter {
     /// Always `Ok(())`.
     ///
     /// # Panics
-    /// Panics if an admin is already set and it does not authorize the call.
+    /// Panics if an admin is already set and current SuperAdmin does not authorize the call.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        if let Some(admin) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-        {
-            admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            Self::require_role(&env, Role::SuperAdmin)?;
         }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1167,7 +1340,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Transfers admin rights to a new address. Requires the current admin's authorization.
+    /// Transfers admin rights to a new address. Requires current SuperAdmin authorization.
     ///
     /// # Parameters
     /// - `new_admin`: Address to become the new admin.
@@ -1177,13 +1350,14 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current SuperAdmin does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::TransferAdmin(…))`.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        let current_admin = Self::require_admin(&env)?;
-        current_admin.require_auth();
+        let current_admin = Self::require_role(&env, Role::SuperAdmin)?;
+        Self::remove_role_internal(&env, Role::SuperAdmin, &current_admin);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1191,26 +1365,25 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    /// Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
     ///
     /// # Parameters
     /// - `token`: Contract ID of the token to recover.
-    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if the
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&contract_address, &admin, &amount);
+        token_client.transfer(&contract_address, &treasury_mgr, &amount);
 
         Ok(())
     }
@@ -1229,10 +1402,9 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Configures the lending protocol used for treasury yield operations.
+    /// Configures the lending protocol used for treasury yield operations. TreasuryManager-protected.
     pub fn set_yield_protocol(env: Env, protocol: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::TreasuryManager)?;
 
         env.storage()
             .instance()
@@ -1246,13 +1418,12 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Configures the trusted KYC oracle and the high-value payment threshold.
+    /// Configures the trusted KYC oracle and the high-value payment threshold. ComplianceOfficer-protected.
     pub fn set_kyc_config(env: Env, oracle: Address, threshold: i128) -> Result<(), Error> {
         if threshold < 0 {
             return Err(Error::InvalidKycThreshold);
         }
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage().instance().set(&DataKey::KycOracle, &oracle);
         env.storage()
@@ -1269,7 +1440,7 @@ impl PaymentRouter {
 
     /// Deposits idle treasury funds into the configured lending protocol.
     ///
-    /// Both the admin and treasury authorize this operation. The second
+    /// Both the TreasuryManager and treasury authorize this operation. The second
     /// authorization is required because the funds are held by the treasury,
     /// rather than by this router contract.
     pub fn deposit_to_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
@@ -1277,8 +1448,7 @@ impl PaymentRouter {
             return Err(Error::InvalidYieldAmount);
         }
 
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::TreasuryManager)?;
         let treasury: Address = env
             .storage()
             .instance()
@@ -1306,7 +1476,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Withdraws treasury principal from the configured lending protocol.
+    /// Withdraws treasury principal from the configured lending protocol. TreasuryManager-protected.
     pub fn withdraw_from_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
         let key = DataKey::YieldPrincipal(token.clone());
         let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -1314,8 +1484,7 @@ impl PaymentRouter {
             return Err(Error::InvalidYieldAmount);
         }
 
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::TreasuryManager)?;
         let treasury: Address = env
             .storage()
             .instance()
@@ -1344,10 +1513,9 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Claims all currently available yield to the platform treasury.
+    /// Claims all currently available yield to the platform treasury. TreasuryManager-protected.
     pub fn harvest_yield(env: Env, token: Address) -> Result<i128, Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::TreasuryManager)?;
         let treasury: Address = env
             .storage()
             .instance()
@@ -1629,27 +1797,30 @@ impl PaymentRouter {
     ///
     /// # Parameters
     /// - `token`: Contract ID of the token to withdraw.
-    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    /// Admin-only emergency withdrawal of tokens held by this contract. TreasuryManager-protected.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to withdraw.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if the
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+        token_client.transfer(&env.current_contract_address(), &treasury_mgr, &amount);
 
-        log!(&env, "Emergency withdraw executed by admin");
+        log!(&env, "Emergency withdraw executed by TreasuryManager");
         Ok(())
     }
 
-    /// Replaces this contract's WASM with a previously uploaded version. Admin-only.
+    /// Replaces this contract's WASM with a previously uploaded version. SuperAdmin-protected.
     ///
     /// # Parameters
     /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
@@ -1660,13 +1831,12 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if
+    /// Panics if the current SuperAdmin does not authorize the call, or if
     /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::SuperAdmin)?;
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
@@ -3011,6 +3181,142 @@ mod test {
         // Governance address can now update the fee
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
+    }
+
+    // ── Role-Based Access Control (RBAC) tests ───────────────────────────────
+
+    #[test]
+    fn test_rbac_initialization_grants_all_roles_to_initial_admin() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        assert!(client.has_role(&admin, &Role::SuperAdmin));
+        assert!(client.has_role(&admin, &Role::TreasuryManager));
+        assert!(client.has_role(&admin, &Role::ComplianceOfficer));
+        assert!(client.has_role(&admin, &Role::FeeManager));
+
+        assert_eq!(client.get_role_member(&Role::SuperAdmin), Some(admin.clone()));
+        assert_eq!(client.get_role_member(&Role::TreasuryManager), Some(admin.clone()));
+        assert_eq!(client.get_role_member(&Role::ComplianceOfficer), Some(admin.clone()));
+        assert_eq!(client.get_role_member(&Role::FeeManager), Some(admin.clone()));
+        assert_eq!(client.get_role_admin(&Role::TreasuryManager), Role::SuperAdmin);
+    }
+
+    #[test]
+    fn test_rbac_assign_and_revoke_operational_roles() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let treasurer = Address::generate(&env);
+        let compliance = Address::generate(&env);
+        let fee_mgr = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign TreasuryManager
+        client.assign_role(&treasurer, &Role::TreasuryManager);
+        assert!(client.has_role(&treasurer, &Role::TreasuryManager));
+        assert_eq!(client.get_role_member(&Role::TreasuryManager), Some(treasurer.clone()));
+
+        // Assign ComplianceOfficer
+        client.assign_role(&compliance, &Role::ComplianceOfficer);
+        assert!(client.has_role(&compliance, &Role::ComplianceOfficer));
+        assert_eq!(client.get_role_member(&Role::ComplianceOfficer), Some(compliance.clone()));
+
+        // Assign FeeManager
+        client.assign_role(&fee_mgr, &Role::FeeManager);
+        assert!(client.has_role(&fee_mgr, &Role::FeeManager));
+        assert_eq!(client.get_role_member(&Role::FeeManager), Some(fee_mgr.clone()));
+
+        // Revoke TreasuryManager
+        client.revoke_role(&treasurer, &Role::TreasuryManager);
+        assert!(!client.has_role(&treasurer, &Role::TreasuryManager));
+        assert_eq!(client.get_role_member(&Role::TreasuryManager), None);
+
+        // Cannot revoke self SuperAdmin
+        let res = client.try_revoke_role(&admin, &Role::SuperAdmin);
+        assert_eq!(res, Err(Ok(Error::InvalidRole)));
+    }
+
+    #[test]
+    fn test_rbac_treasury_manager_gates_treasury_operations() {
+        let (env, client, contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let treasurer = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign dedicated TreasuryManager
+        client.assign_role(&treasurer, &Role::TreasuryManager);
+
+        // TreasuryManager sets new platform treasury
+        client.set_platform_treasury(&new_treasury);
+
+        // Recover accidentally sent tokens
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&contract_id, &5_000);
+        client.recover_tokens(&token_address, &2_000);
+    }
+
+    #[test]
+    fn test_rbac_compliance_officer_gates_compliance_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let compliance = Address::generate(&env);
+        let bad_user = Address::generate(&env);
+        let oracle = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign compliance officer
+        client.assign_role(&compliance, &Role::ComplianceOfficer);
+
+        // Compliance officer blacklists and unblacklists
+        client.blacklist_address(&bad_user);
+        assert!(client.is_blacklisted(&bad_user));
+
+        client.unblacklist_address(&bad_user);
+        assert!(!client.is_blacklisted(&bad_user));
+
+        // Compliance officer configures KYC
+        client.set_kyc_config(&oracle, &50_000);
+        assert_eq!(client.get_kyc_threshold(), Some(50_000));
+
+        // Compliance officer pauses and unpauses
+        client.set_pause(&true);
+        assert!(client.is_paused());
+        client.set_paused(&false);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_rbac_fee_manager_gates_fee_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let fee_mgr = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign fee manager
+        client.assign_role(&fee_mgr, &Role::FeeManager);
+
+        // Fee manager updates fee bps
+        client.set_fee_bps(&350);
+        assert_eq!(client.get_fee(), 350);
+
+        // Fee manager updates fee config
+        client.set_fee_config(&400, &5_000);
+        assert_eq!(client.get_fee(), 400);
+
+        // Fee manager sets min limit
+        client.set_min_limit(&10_000);
     }
 }
 
