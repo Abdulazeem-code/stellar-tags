@@ -1,7 +1,8 @@
 #![no_std]
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
-    Address, BytesN, Env, Symbol, Vec,
+    Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -249,6 +250,10 @@ pub enum DataKey {
     Role(Role),
     /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
     UserRole(Address, Role),
+    /// Per-user meta-transaction nonce for replay protection.
+    /// Stored as `u64` in persistent storage, incremented on each
+    /// successful `route_payment_meta`.
+    MetaNonce(Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -299,6 +304,14 @@ pub enum Error {
     RoleNotFound = 19,
     /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
     InvalidRole = 20,
+    /// Off-chain ed25519 signature failed verification.
+    /// Note: `env.crypto().ed25519_verify` traps on invalid signatures,
+    /// so this variant documents the failure mode for integrators.
+    InvalidSignature = 21,
+    /// Supplied meta-transaction nonce does not match stored nonce.
+    InvalidNonce = 22,
+    /// Meta-transaction deadline has passed (`ledger.timestamp() > deadline`).
+    DeadlineExpired = 23,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -478,6 +491,42 @@ impl PaymentRouter {
         next
     }
 
+    /// Returns the current meta-transaction nonce for a user (`0` if never used).
+    fn get_meta_nonce_internal(env: &Env, user: &Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetaNonce(user.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Builds the domain-separated message for meta-transactions.
+    /// Binds `current_contract_address` + all call args + `signer_pubkey` +
+    /// `nonce` + `deadline`, then returns `SHA256(payload)` as `Bytes`
+    /// for `ed25519_verify`. Off-chain signers must sign these exact bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn build_meta_message(
+        env: &Env,
+        sender: &Address,
+        signer_pubkey: &BytesN<32>,
+        recipient: &Address,
+        token_address: &Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+    ) -> Bytes {
+        let mut payload = Bytes::new(env);
+        payload.append(&env.current_contract_address().to_xdr(env));
+        payload.append(&sender.to_xdr(env));
+        payload.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
+        payload.append(&recipient.to_xdr(env));
+        payload.append(&token_address.to_xdr(env));
+        payload.append(&amount.to_xdr(env));
+        payload.append(&nonce.to_xdr(env));
+        payload.append(&deadline.to_xdr(env));
+        let hash = env.crypto().sha256(&payload);
+        Bytes::from(&hash)
+    }
+
     /// Core payment logic shared by `route_payment` and `route_payments`.
     #[allow(clippy::too_many_arguments)]
     fn process_single_payment(
@@ -608,6 +657,168 @@ impl PaymentRouter {
         );
 
         // Emit routed event
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            amount,
+        );
+
+        log!(env, "Platform fee routed to treasury");
+
+        Ok(())
+    }
+
+    /// Allowance-based variant for meta-transactions.
+    /// Skips `sender.require_auth()`; funds move via `transfer_from` using
+    /// allowance previously granted to the router contract, so a relayer
+    /// can submit on the user's behalf after signature verification.
+    #[allow(clippy::too_many_arguments)]
+    fn process_single_payment_no_auth(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token_address: &Address,
+        amount: i128,
+        platform_treasury: &Address,
+        fee_bps: i128,
+        fee_cap: i128,
+    ) -> Result<(), Error> {
+        env.events().publish(
+            (Symbol::new(env, "payment_initiated"), sender.clone()),
+            amount,
+        );
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+
+        Self::verify_kyc_for_amount(env, sender, amount)?;
+
+        let user_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(sender.clone()))
+            .unwrap_or(0);
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+
+        let current_time = env.ledger().timestamp();
+        let spending_key = DataKey::UserSpending(sender.clone());
+
+        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<24>>(&spending_key)
+            .map(|packed| unpack_spending(&packed))
+            .unwrap_or((current_time, 0));
+
+        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
+            last_reset_time = current_time;
+            accumulated_amount = 0;
+        }
+
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
+            return Err(Error::LimitExceeded);
+        }
+        accumulated_amount = new_accumulated;
+
+        env.storage().persistent().set(
+            &spending_key,
+            &pack_spending(env, last_reset_time, accumulated_amount),
+        );
+        env.storage().persistent().extend_ttl(
+            &spending_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let router = env.current_contract_address();
+        let token_client = token::Client::new(env, token_address);
+        if token_client.balance(sender) < amount {
+            return Err(Error::InsufficientBalance);
+        }
+        if token_client.allowance(sender, &router) < amount {
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Calculate fee
+        let fee_product = amount.checked_mul(effective_fee_bps).unwrap_or(amount);
+        let mut fee_amount = fee_product / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        let remainder = amount - fee_amount;
+
+        // Execute transfers via allowance without panics
+        if fee_amount > 0
+            && token_client
+                .try_transfer_from(&router, sender, platform_treasury, &fee_amount)
+                .is_err()
+        {
+            return Err(Error::LimitExceeded);
+        }
+        if remainder > 0 {
+            match token_client.try_transfer_from(&router, sender, recipient, &remainder) {
+                Ok(Ok(())) => {
+                    log!(env, "Remaining balance routed to recipient");
+                }
+                _ => {
+                    log!(
+                        env,
+                        "Recipient transfer failed; crediting sender refund balance"
+                    );
+                    if let Ok(Ok(())) =
+                        token_client.try_transfer_from(&router, sender, &router, &remainder)
+                    {
+                        Self::credit_refund_balance(env, sender, token_address, remainder);
+                    } else {
+                        return Err(Error::LimitExceeded);
+                    }
+                }
+            }
+        }
+
+        let volume_key = DataKey::UserVolume(sender.clone());
+        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&volume_key, &prev_volume.saturating_add(amount));
+        env.storage().persistent().extend_ttl(
+            &volume_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
         env.events().publish(
             (symbol_short!("routed"), sender.clone(), recipient.clone()),
             amount,
@@ -1704,6 +1915,87 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Returns the current meta-transaction nonce for a user.
+    ///
+    /// Relayers must use this nonce when building the signed payload.
+    /// The nonce starts at `0` and increments after each successful
+    /// `route_payment_meta`, preventing replay attacks.
+    pub fn get_meta_nonce(env: Env, user: Address) -> u64 {
+        Self::get_meta_nonce_internal(&env, &user)
+    }
+
+    /// Relays a user-signed payment on behalf of the user.
+    ///
+    /// The user signs `SHA256(contract || sender || pubkey || recipient ||
+    /// token || amount || nonce || deadline)` off-chain with Ed25519.
+    /// Any relayer holding XLM for fees submits the payload; the contract
+    /// verifies the signature, checks `nonce` and `deadline`, then moves
+    /// funds via prior token allowance (`approve` + `transfer_from`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_payment_meta(
+        env: Env,
+        sender: Address,
+        signer_pubkey: BytesN<32>,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        if env.ledger().timestamp() > deadline {
+            return Err(Error::DeadlineExpired);
+        }
+
+        let stored = Self::get_meta_nonce_internal(&env, &sender);
+        if stored != nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        let message = Self::build_meta_message(
+            &env,
+            &sender,
+            &signer_pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+        );
+        // Traps on invalid signature; `Error::InvalidSignature` documents
+        // this failure mode for off-chain integrators.
+        env.crypto()
+            .ed25519_verify(&signer_pubkey, &message, &signature);
+
+        let key = DataKey::MetaNonce(sender.clone());
+        env.storage().persistent().set(&key, &(nonce + 1));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::process_single_payment_no_auth(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
+    }
+
     /// Returns the available internal refund balance for a user and token.
     ///
     /// # Parameters
@@ -2688,6 +2980,218 @@ mod test {
         // Route payment of 500 when balance is only 100
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
         assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
+    }
+
+    // ── Meta-transaction tests ─────────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_meta_payload(
+        env: &Env,
+        contract_id: &Address,
+        sender: &Address,
+        signer_pubkey: &BytesN<32>,
+        recipient: &Address,
+        token: &Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> BytesN<64> {
+        use ed25519_dalek::Signer;
+        use soroban_sdk::xdr::ToXdr;
+        let mut payload = soroban_sdk::Bytes::new(env);
+        payload.append(&contract_id.to_xdr(env));
+        payload.append(&sender.to_xdr(env));
+        payload.append(&soroban_sdk::Bytes::from_slice(
+            env,
+            &signer_pubkey.to_array(),
+        ));
+        payload.append(&recipient.to_xdr(env));
+        payload.append(&token.to_xdr(env));
+        payload.append(&amount.to_xdr(env));
+        payload.append(&nonce.to_xdr(env));
+        payload.append(&deadline.to_xdr(env));
+        let hash = env.crypto().sha256(&payload);
+        let msg = soroban_sdk::Bytes::from(&hash);
+        let mut buf = [0u8; 32];
+        msg.copy_into_slice(&mut buf);
+        let sig = signing_key.sign(&buf);
+        BytesN::from_array(env, &sig.to_bytes())
+    }
+
+    #[test]
+    fn test_meta_payment_success_and_nonce_increments() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+
+        let amount = 2000i128;
+        let nonce = client.get_meta_nonce(&sender);
+        assert_eq!(nonce, 0);
+        let deadline = env.ledger().timestamp() + 100_000;
+
+        token_client.approve(&sender, &contract_id, &amount, &1_000_000);
+
+        let sig = sign_meta_payload(
+            &env,
+            &contract_id,
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+            &signing_key,
+        );
+
+        client.route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+
+        assert_eq!(client.get_meta_nonce(&sender), 1);
+        assert_eq!(token_client.balance(&treasury), 20);
+        assert_eq!(token_client.balance(&recipient), 1980);
+        assert_eq!(token_client.balance(&sender), 10_000 - amount);
+    }
+
+    #[test]
+    fn test_meta_payment_replay_rejected() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+
+        let amount = 1000i128;
+        let nonce = client.get_meta_nonce(&sender);
+        let deadline = env.ledger().timestamp() + 100_000;
+
+        token_client.approve(&sender, &contract_id, &(amount * 2), &1_000_000);
+
+        let sig = sign_meta_payload(
+            &env,
+            &contract_id,
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+            &signing_key,
+        );
+
+        client.route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+
+        let res = client.try_route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidNonce);
+    }
+
+    #[test]
+    fn test_meta_payment_expired_rejected() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+
+        let amount = 1000i128;
+        let nonce = client.get_meta_nonce(&sender);
+        let deadline = env.ledger().timestamp() + 10;
+
+        token_client.approve(&sender, &contract_id, &amount, &1_000_000);
+
+        let sig = sign_meta_payload(
+            &env,
+            &contract_id,
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+            &signing_key,
+        );
+
+        let ts = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: ts + 100_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        let res = client.try_route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+        assert_eq!(res.unwrap_err().unwrap(), Error::DeadlineExpired);
     }
 
     #[test]

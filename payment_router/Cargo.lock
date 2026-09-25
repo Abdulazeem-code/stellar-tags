@@ -811,6 +811,7 @@ version = "0.1.0"
 dependencies = [
  "arbitrary",
  "derive_arbitrary",
+ "ed25519-dalek",
  "proptest",
  "soroban-sdk",
 ]
