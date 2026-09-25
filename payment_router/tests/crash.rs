@@ -1,6 +1,6 @@
 #![cfg(all(test, feature = "testutils"))]
-use soroban_sdk::{Env, vec, Address, testutils::Address as _};
-use payment_router::{PaymentRouter, PaymentRouterClient, Payment};
+use payment_router::{Payment, PaymentRouter, PaymentRouterClient};
+use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
 #[test]
 fn test_fuzz_crash() {
