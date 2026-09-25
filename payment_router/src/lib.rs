@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, BytesN,
-    Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -112,6 +112,17 @@ pub struct Payment {
     pub amount: i128,
 }
 
+/// Interface implemented by supported Soroban lending protocols.
+///
+/// Keeping the protocol behind this small adapter lets the router integrate
+/// with Blend-compatible deployments while tests use an in-process mock.
+#[contractclient(name = "LendingProtocolClient")]
+pub trait LendingProtocol {
+    fn deposit(env: Env, from: Address, token: Address, amount: i128);
+    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
+    fn harvest(env: Env, to: Address, token: Address) -> i128;
+}
+
 // ── Timelock data structures ─────────────────────────────────────────────────
 //
 // Admin actions that change sensitive contract parameters (treasury, fees,
@@ -198,6 +209,10 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited for a treasury asset.
+    YieldPrincipal(Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -236,6 +251,10 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
+    /// No lending protocol has been configured by the admin.
+    YieldProtocolNotConfigured = 15,
+    /// Yield amount must be positive and withdrawals cannot exceed principal.
+    InvalidYieldAmount = 16,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -1177,6 +1196,129 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Configures the lending protocol used for treasury yield operations.
+    pub fn set_yield_protocol(env: Env, protocol: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldProtocol, &protocol);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_cfg"),), protocol);
+        Ok(())
+    }
+
+    /// Deposits idle treasury funds into the configured lending protocol.
+    ///
+    /// Both the admin and treasury authorize this operation. The second
+    /// authorization is required because the funds are held by the treasury,
+    /// rather than by this router contract.
+    pub fn deposit_to_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        treasury.require_auth();
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).deposit(&treasury, &token, &amount);
+
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(principal + amount));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_dep"), token), amount);
+        Ok(())
+    }
+
+    /// Withdraws treasury principal from the configured lending protocol.
+    pub fn withdraw_from_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 || amount > principal {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).withdraw(&treasury, &token, &amount);
+        let remaining = principal - amount;
+        if remaining == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &remaining);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.events()
+            .publish((symbol_short!("yield_wdr"), token), amount);
+        Ok(())
+    }
+
+    /// Claims all currently available yield to the platform treasury.
+    pub fn harvest_yield(env: Env, token: Address) -> Result<i128, Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        let harvested = LendingProtocolClient::new(&env, &protocol).harvest(&treasury, &token);
+        env.events()
+            .publish((symbol_short!("yield_har"), token), harvested);
+        Ok(harvested)
+    }
+
+    /// Returns the tracked principal deposited for `token`.
+    pub fn get_yield_position(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldPrincipal(token))
+            .unwrap_or(0)
+    }
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
     /// # Parameters
@@ -1490,6 +1632,63 @@ mod test {
         Address, Env, Symbol, TryIntoVal,
     };
 
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockLendingKey {
+        Principal(Address),
+        Yield(Address),
+    }
+
+    #[contract]
+    struct MockLendingProtocol;
+
+    #[contractimpl]
+    impl MockLendingProtocol {
+        pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
+            from.require_auth();
+            token::Client::new(&env, &token).transfer(
+                &from,
+                &env.current_contract_address(),
+                &amount,
+            );
+            let key = MockLendingKey::Principal(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+
+        pub fn withdraw(env: Env, to: Address, token: Address, amount: i128) {
+            let key = MockLendingKey::Principal(token.clone());
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            assert!(current >= amount);
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &to,
+                &amount,
+            );
+            env.storage().instance().set(&key, &(current - amount));
+        }
+
+        pub fn harvest(env: Env, to: Address, token: Address) -> i128 {
+            let key = MockLendingKey::Yield(token.clone());
+            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            if amount > 0 {
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &to,
+                    &amount,
+                );
+                env.storage().instance().remove(&key);
+            }
+            amount
+        }
+
+        pub fn accrue_yield(env: Env, token: Address, amount: i128) {
+            let key = MockLendingKey::Yield(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+    }
+
     /// Returns (env, client, contract_id).
     fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
         let env = Env::default();
@@ -1516,6 +1715,58 @@ mod test {
     }
 
     // ── Timelock tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_treasury_yield_deposit_harvest_and_withdraw() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let protocol_id = env.register_contract(None, MockLendingProtocol);
+        let protocol_client = MockLendingProtocolClient::new(&env, &protocol_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_yield_protocol(&protocol_id);
+        token_admin_client.mint(&treasury, &10_000);
+
+        client.deposit_to_yield(&token_address, &6_000);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+        assert_eq!(token_client.balance(&treasury), 4_000);
+        assert_eq!(token_client.balance(&protocol_id), 6_000);
+
+        token_admin_client.mint(&protocol_id, &500);
+        protocol_client.accrue_yield(&token_address, &500);
+        assert_eq!(client.harvest_yield(&token_address), 500);
+        assert_eq!(token_client.balance(&treasury), 4_500);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+
+        client.withdraw_from_yield(&token_address, &2_000);
+        assert_eq!(client.get_yield_position(&token_address), 4_000);
+        assert_eq!(token_client.balance(&treasury), 6_500);
+        assert_eq!(token_client.balance(&protocol_id), 4_000);
+    }
+
+    #[test]
+    fn test_yield_operations_require_configuration_and_valid_amounts() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &100),
+            Err(Ok(Error::YieldProtocolNotConfigured))
+        );
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &0),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+        assert_eq!(
+            client.try_withdraw_from_yield(&token_address, &1),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+    }
 
     #[test]
     fn test_queue_and_execute_set_fee_bps_after_delay() {
