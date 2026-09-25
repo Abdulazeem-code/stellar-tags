@@ -407,10 +407,13 @@ impl PaymentRouter {
             accumulated_amount = 0;
         }
 
-        accumulated_amount += amount;
-        if accumulated_amount > Self::DAILY_MAX_LIMIT {
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
             return Err(Error::LimitExceeded);
         }
+        accumulated_amount = new_accumulated;
 
         env.storage().persistent().set(
             &spending_key,
@@ -429,7 +432,8 @@ impl PaymentRouter {
         }
 
         // Calculate fee
-        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
+        let fee_product = amount.checked_mul(effective_fee_bps).unwrap_or(amount);
+        let mut fee_amount = fee_product / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
         }
@@ -438,9 +442,14 @@ impl PaymentRouter {
         }
         let remainder = amount - fee_amount;
 
-        // Execute transfers
+        // Execute transfers safely without panics
         if fee_amount > 0 {
-            token_client.transfer(sender, platform_treasury, &fee_amount);
+            if token_client
+                .try_transfer(sender, platform_treasury, &fee_amount)
+                .is_err()
+            {
+                return Err(Error::LimitExceeded);
+            }
         }
         if remainder > 0 {
             // Attempt to transfer remainder directly to recipient.
@@ -455,8 +464,15 @@ impl PaymentRouter {
                         env,
                         "Recipient transfer failed; crediting sender refund balance"
                     );
-                    token_client.transfer(sender, &env.current_contract_address(), &remainder);
-                    Self::credit_refund_balance(env, sender, token_address, remainder);
+                    if let Ok(Ok(())) = token_client.try_transfer(
+                        sender,
+                        &env.current_contract_address(),
+                        &remainder,
+                    ) {
+                        Self::credit_refund_balance(env, sender, token_address, remainder);
+                    } else {
+                        return Err(Error::LimitExceeded);
+                    }
                 }
             }
         }
@@ -466,7 +482,7 @@ impl PaymentRouter {
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&volume_key, &(prev_volume + amount));
+            .set(&volume_key, &prev_volume.saturating_add(amount));
         env.storage().persistent().extend_ttl(
             &volume_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,

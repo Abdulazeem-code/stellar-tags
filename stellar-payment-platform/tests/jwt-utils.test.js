@@ -65,7 +65,9 @@ describe('jwt utils (configured keys)', () => {
     it('rejects tampered tokens', () => {
       const token = jwtUtils.signToken({ username: 'alice' });
       const [header, payload, signature] = token.split('.');
-      const tampered = `${header}.${payload}.${signature.slice(0, -1)}a`;
+      const lastChar = signature.slice(-1);
+      const replacementChar = lastChar === 'a' ? 'b' : 'a';
+      const tampered = `${header}.${payload}.${signature.slice(0, -1)}${replacementChar}`;
       expect(() => jwtUtils.verifyToken(tampered)).toThrow();
     });
   });
