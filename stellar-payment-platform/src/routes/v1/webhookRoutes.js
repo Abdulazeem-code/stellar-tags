@@ -265,4 +265,34 @@ router.all('/webhooks', (req, res) => {
   res.status(404).end();
 });
 
-module.exports = router;
+router.post('/webhooks/verify-test', (req, res) => {
+  const { secret, payload } = req.body;
+  const signature = req.headers['x-webhook-signature'] || req.headers['x-stellar-tags-signature'];
+
+  if (!secret || !payload) {
+    return res.status(400).json({ error: 'Missing secret or payload' });
+  }
+
+  const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+
+  if (signature === expectedSignature) {
+    return res.status(200).json({
+      ok: true,
+      valid: true,
+      message: 'Signature verification succeeded',
+      expectedSignature,
+    });
+  } else {
+    return res.status(401).json({
+      ok: false,
+      valid: false,
+      error: {
+        message: 'Signature verification failed',
+        expected: expectedSignature,
+        received: signature,
+      }
+    });
+  }
+});
+
+module.exports = (redisClient) => router;

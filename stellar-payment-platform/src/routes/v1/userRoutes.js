@@ -14,6 +14,8 @@ const {
   paginateByKeyset,
   cursorPaginatedResponse,
 } = require('../../pagination');
+const { authenticateUsernameOwner } = require('../../services/ownershipService');
+const { listActivity, serializeActivity, ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const {
   normalizeNameTag,
@@ -27,6 +29,7 @@ const {
   registerBodySchema,
   lookupQuerySchema,
   usersQuerySchema,
+  activityQuerySchema,
 } = require('../../schemas');
 
 const router = express.Router();
@@ -401,5 +404,71 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
     return next(dbError);
   }
 }));
+
+
+
+router.get(
+  '/users/:username/activity',
+  validateSchema({ query: activityQuerySchema }),
+  asyncHandler(async (req, res, next) => {
+    const rawUsername = typeof req.params.username === 'string' ? req.params.username : '';
+    const username = normalizeNameTag(rawUsername);
+    if (!username) {
+      return next(new ApiError('INVALID_INPUT', 'Missing username parameter'));
+    }
+
+    let user;
+    try {
+      const signature = req.headers['x-stellar-signature'] || req.body?.signature;
+      const signerAddress = req.headers['x-stellar-signer'] || req.body?.signerAddress;
+      
+      user = await authenticateUsernameOwner({
+        username,
+        signature,
+        signerAddress,
+        operation: 'activity'
+      });
+    } catch (err) {
+      if (err.statusCode) return next(err);
+      const e = new Error(err.message || 'Failed to authenticate');
+      e.statusCode = 401;
+      return next(e);
+    }
+
+    const { page, limit, skip } = parsePagination(req.query);
+    const range = req.query.startDate || req.query.endDate ? {
+      ...(req.query.startDate && { gte: new Date(req.query.startDate) }),
+      ...(req.query.endDate && { lte: new Date(req.query.endDate) }),
+    } : null;
+    
+    if (range && (
+      (range.gte && isNaN(range.gte.getTime())) || 
+      (range.lte && isNaN(range.lte.getTime())) ||
+      (range.gte && range.lte && range.gte > range.lte)
+    )) {
+       const e = new Error('Invalid date range');
+       e.statusCode = 400;
+       return next(e);
+    }
+
+    try {
+      const { rows, total } = await listActivity(prisma, {
+        username: user.username,
+        page,
+        limit,
+        range,
+      });
+
+      return res.status(200).json(
+        paginatedResponse(rows.map(serializeActivity), total, { page, limit }),
+      );
+    } catch (err) {
+      logger.error('[activity] error listing activity:', err);
+      const e = new Error('Failed to load activity');
+      e.statusCode = 500;
+      return next(e);
+    }
+  }),
+);
 
 module.exports = router;

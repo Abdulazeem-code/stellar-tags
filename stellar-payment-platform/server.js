@@ -1,3 +1,4 @@
+require("./src/utils/tracing");
 require('./config/envCheck');
 const express = require('express');
 const cors = require('cors');
@@ -21,6 +22,10 @@ const { logger } = require('./src/logger');
 const pinoHttp = require('pino-http');
 const xss = require('xss');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const swaggerJsdoc = require("swagger-jsdoc");
+const swaggerUi = require("swagger-ui-express");
+const { securityMiddleware } = require("./src/middleware/security");
+const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
 const {
   metricsMiddleware,
   getMetrics,
@@ -60,6 +65,7 @@ const {
   RESERVED_NAMES,
   USER_DATABASE,
 } = require('./src/utils');
+const { getCachedApprovedOrigins } = require("./src/originCache");
 
 dotenv.config();
 
@@ -71,11 +77,31 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
+const swaggerOptions = {
+  definition: {
+    openapi: "3.0.0",
+    info: {
+      title: "Stellar Tags API",
+      version: "1.0.0",
+      description: "API for Stellar Tags",
+    },
+    servers: [
+      {
+        url: "http://localhost:5000",
+      },
+    ],
+  },
+  apis: ["./server.js", "./src/routes/v1/*.js"],
+};
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
-app.use(helmet());
+app.disable("x-powered-by");
+app.use(securityMiddleware);
 
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
@@ -144,6 +170,8 @@ if (redisClient) {
 }
 
 setMetricsSources({ prisma, redisClient });
+
+const signatureRateLimiter = createSignatureRateLimiter(redisClient);
 
 const v1Router = require('./src/routes/v1')(redisClient);
 const v2Router = require('./src/routes/v2')(redisClient);
@@ -501,11 +529,11 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
   }
 
   try {
-    const existing = await prisma.user.findFirst({
+    const existingCount = await prisma.user.count({
       where: { address, deletedAt: null },
     });
 
-    if (existing) {
+    if (existingCount > 0) {
       const conflictError = new Error('Address already registered');
       conflictError.statusCode = 409;
       return next(conflictError);
@@ -593,7 +621,7 @@ app.post('/register', idempotencyMiddleware(redisClient), requireJson, validateS
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === '23505' || (error.message && error.message.includes('UNIQUE'))) {
+    if (error.code === 'P2002' || error.code === '23505' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
