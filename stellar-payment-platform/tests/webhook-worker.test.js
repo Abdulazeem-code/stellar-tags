@@ -26,9 +26,13 @@ jest.mock('bullmq', () => ({
 
 jest.mock('../src/config/redis', () => ({
   createRedisConnection: jest.fn(() => ({ quit: mockRedisQuit })),
+  // Real retry behaviour is covered in tests/redis-failover.test.js; the
+  // passthrough here keeps the enqueue assertions focused on the BullMQ shape.
+  withRedisRetry: jest.fn((operation) => operation()),
 }));
 
 const { Queue, Worker } = require('bullmq');
+const { withRedisRetry } = require('../src/config/redis');
 const {
   dispatchPaymentWebhooks,
   enqueueWebhookDelivery,
@@ -212,6 +216,18 @@ describe('webhook BullMQ delivery', () => {
     );
   });
 
+  test('routes enqueues through the Redis failover retry helper', async () => {
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    await enqueueWebhookDelivery(webhook, payload, queue);
+
+    expect(withRedisRetry).toHaveBeenCalledTimes(1);
+    expect(withRedisRetry.mock.calls[0][0]).toEqual(expect.any(Function));
+    expect(withRedisRetry.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ attempts: expect.any(Number), baseDelayMs: expect.any(Number) }),
+    );
+  });
+
   test('creates a lazy queue when no queue is injected', async () => {
     mockQueueAdd.mockResolvedValue({ id: 'job-1' });
 
@@ -224,3 +240,5 @@ describe('webhook BullMQ delivery', () => {
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
   });
 });
+
+

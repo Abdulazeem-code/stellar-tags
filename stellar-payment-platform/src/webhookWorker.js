@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { Queue, Worker } = require('bullmq');
-const { createRedisConnection } = require('./config/redis');
+const { createRedisConnection, withRedisRetry } = require('./config/redis');
 const { logger } = require('./logger');
 const { shouldFallbackToLocalRegistry } = require('./utils');
 
@@ -10,6 +10,10 @@ const MAX_WEBHOOK_ATTEMPTS = 5;
 const WEBHOOK_BACKOFF_DELAY_MS = 1_000;
 const WEBHOOK_WORKER_CONCURRENCY = 5;
 const MAX_RETRY_BACKLOG_DAYS = 3;
+// A cluster failover can reject an enqueue while the slot map is being
+// refreshed. Retry those transient errors so a delivery is never dropped.
+const WEBHOOK_ENQUEUE_RETRY_ATTEMPTS = 5;
+const WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS = 50;
 
 const WEBHOOK_JOB_OPTIONS = Object.freeze({
   attempts: MAX_WEBHOOK_ATTEMPTS,
@@ -281,13 +285,24 @@ const buildJobId = (webhookId, eventId) => {
 };
 
 const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
-  return queue.add(
-    'deliver',
-    { webhook, payload },
+  return withRedisRetry(
+    () => queue.add(
+      'deliver',
+      { webhook, payload },
+      {
+        ...WEBHOOK_JOB_OPTIONS,
+        backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
+        jobId: buildJobId(webhook.id, payload.event_id),
+      },
+    ),
     {
-      ...WEBHOOK_JOB_OPTIONS,
-      backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
-      jobId: buildJobId(webhook.id, payload.event_id),
+      attempts: WEBHOOK_ENQUEUE_RETRY_ATTEMPTS,
+      baseDelayMs: WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS,
+      onRetry: (error, attempt) => {
+        logger.warn(
+          `[webhook-queue] Enqueue for webhook=${webhook.id} failed (${error.message}); retrying after transient Redis error (attempt ${attempt}/${WEBHOOK_ENQUEUE_RETRY_ATTEMPTS})`,
+        );
+      },
     },
   );
 };
@@ -562,8 +577,12 @@ module.exports = {
   WEBHOOK_BACKOFF_DELAY_MS,
   WEBHOOK_JOB_OPTIONS,
   MAX_RETRY_BACKLOG_DAYS,
+  WEBHOOK_ENQUEUE_RETRY_ATTEMPTS,
+  WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS,
   getWebhooksExhaustedRetries,
   moveToDLQ,
   listDLQEntries,
   replayFromDLQ,
 };
+
+
