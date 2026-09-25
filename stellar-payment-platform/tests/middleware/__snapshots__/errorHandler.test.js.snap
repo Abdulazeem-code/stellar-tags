@@ -1,0 +1,97 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`errors module captures the complete public error response contract 1`] = `
+{
+  "CONFLICT": {
+    "error": {
+      "code": "CONFLICT",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "FORBIDDEN": {
+    "error": {
+      "code": "FORBIDDEN",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "INTERNAL_ERROR": {
+    "error": {
+      "code": "INTERNAL_ERROR",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "INVALID_INPUT": {
+    "error": {
+      "code": "INVALID_INPUT",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "METHOD_NOT_ALLOWED": {
+    "error": {
+      "code": "METHOD_NOT_ALLOWED",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "NOT_FOUND": {
+    "error": {
+      "code": "NOT_FOUND",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "PAYLOAD_TOO_LARGE": {
+    "error": {
+      "code": "PAYLOAD_TOO_LARGE",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "RATE_LIMITED": {
+    "error": {
+      "code": "RATE_LIMITED",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "SERVICE_UNAVAILABLE": {
+    "error": {
+      "code": "SERVICE_UNAVAILABLE",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "UNAUTHENTICATED": {
+    "error": {
+      "code": "UNAUTHENTICATED",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "UNSUPPORTED_MEDIA_TYPE": {
+    "error": {
+      "code": "UNSUPPORTED_MEDIA_TYPE",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "UPSTREAM_ERROR": {
+    "error": {
+      "code": "UPSTREAM_ERROR",
+      "message": "message",
+    },
+    "success": false,
+  },
+  "VALIDATION_FAILED": {
+    "error": {
+      "code": "VALIDATION_FAILED",
+      "message": "message",
+    },
+    "success": false,
+  },
+}
+`;

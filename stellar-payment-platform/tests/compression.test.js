@@ -42,7 +42,7 @@ describe('Global HTTP Response Compression Middleware', () => {
 
     it('should compress with gzip when Accept-Encoding: gzip is sent', async () => {
       const res = await request(app)
-        .get('/users')
+        .get('/api/v1/users')
         .set('Accept-Encoding', 'gzip');
 
       expect(res.statusCode).toBe(200);
@@ -51,7 +51,7 @@ describe('Global HTTP Response Compression Middleware', () => {
 
     it('should compress with br (Brotli) when Accept-Encoding: br is sent', async () => {
       const res = await request(app)
-        .get('/users')
+        .get('/api/v1/users')
         .set('Accept-Encoding', 'br');
 
       expect(res.statusCode).toBe(200);
@@ -60,7 +60,7 @@ describe('Global HTTP Response Compression Middleware', () => {
 
     it('should prioritize br (Brotli) over gzip if both are supported', async () => {
       const res = await request(app)
-        .get('/users')
+        .get('/api/v1/users')
         .set('Accept-Encoding', 'br, gzip');
 
       expect(res.statusCode).toBe(200);
@@ -69,7 +69,7 @@ describe('Global HTTP Response Compression Middleware', () => {
 
     it('should not compress if Accept-Encoding is not sent or does not match supported methods', async () => {
       const res = await request(app)
-        .get('/users')
+        .get('/api/v1/users')
         .set('Accept-Encoding', 'identity');
 
       expect(res.statusCode).toBe(200);
@@ -91,7 +91,7 @@ describe('Global HTTP Response Compression Middleware', () => {
 
     it('should not compress even if Accept-Encoding: gzip is sent', async () => {
       const res = await request(app)
-        .get('/users')
+        .get('/api/v1/users')
         .set('Accept-Encoding', 'gzip');
 
       expect(res.statusCode).toBe(200);
