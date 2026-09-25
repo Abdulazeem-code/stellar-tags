@@ -1,5 +1,4 @@
-const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
+const { createSlidingWindowRateLimiter } = require('./slidingWindowRateLimit');
 
 // Stricter secondary limit for endpoints that run signature verification
 // (Horizon lookups + crypto). Keyed by IP so a single client cannot exhaust
@@ -10,18 +9,12 @@ const MAX_REQUESTS = Number(process.env.SIGNATURE_RATE_LIMIT_MAX) || 10;
 const { errorBody } = require('../errors');
 
 const createSignatureRateLimiter = (redisClient) =>
-  rateLimit({
+  createSlidingWindowRateLimiter({
+    redisClient,
     windowMs: WINDOW_MS,
     max: MAX_REQUESTS,
-    standardHeaders: true,
-    legacyHeaders: false,
+    prefix: 'sig-rl:',
     keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
-    store: redisClient
-      ? new RedisStore({
-          prefix: 'sig-rl:',
-          sendCommand: (...args) => redisClient.sendCommand(args),
-        })
-      : undefined,
     message: errorBody("RATE_LIMITED", "Too many requests, please try again later."),
   });
 

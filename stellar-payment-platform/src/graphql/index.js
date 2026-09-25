@@ -1,60 +1,177 @@
-'use strict';
+const { ApolloServer } = require("@apollo/server");
+const { expressMiddleware } = require("@as-integrations/express4");
+const { buildSubgraphSchema } = require("@apollo/subgraph");
+const DataLoader = require("dataloader");
+const { GraphQLScalarType, Kind, parse } = require("graphql");
 
-/**
- * #685 — GraphQL layer.
- *
- * A read-only GraphQL API over the same services the REST routes use, so the
- * dashboard can ask for exactly the fields a screen needs in one round trip
- * instead of fanning out across several endpoints.
- *
- * Layout:
- *   typeDefs.js   — the SDL, i.e. the published contract
- *   schema.js     — compiles the SDL and attaches the resolvers
- *   loaders.js    — per-request DataLoaders (the N+1 guard)
- *   context.js    — per-request context and ownership checks
- *   resolvers/    — Query + type field resolvers
- *   playground.js — development-only GraphiQL page
- *   router.js     — Express mounting
- */
+const typeDefs = parse(`#graphql
+  extend schema
+    @link(url: "https://specs.apollo.dev/federation/v2.7", import: ["@key"])
 
-const { typeDefs } = require('./typeDefs');
-const { makeSchema, attachResolvers, serializeDateTime, parseDateTimeInput, scalarResolvers } = require('./schema');
-const { createLoaders, activityKey } = require('./loaders');
-const {
-  createContext,
-  resolveViewer,
-  requireUsernameOwner,
-  requireWebhookOwnerUsername,
-} = require('./context');
-const resolvers = require('./resolvers');
-const { playgroundHtml, playgroundPolicy } = require('./playground');
-const {
-  registerGraphQL,
-  createSchema,
-  formatError,
-  isPlaygroundEnabled,
-  GRAPHQL_PATH,
-} = require('./router');
+  scalar DateTime
+
+  type User @key(fields: "username") {
+    username: ID!
+    address: String!
+    isPrimary: Boolean!
+    createdAt: DateTime!
+    payments: [Payment!]!
+  }
+
+  type Payment @key(fields: "id") {
+    id: ID!
+    createdAt: DateTime!
+    fromAddress: String!
+    toAddress: String!
+    amount: Float!
+    fee: Float!
+    assetCode: String
+    transactionHash: String
+    status: String!
+    token: Token
+  }
+
+  type Token @key(fields: "code") {
+    code: ID!
+    payments: [Payment!]!
+  }
+
+  type Query {
+    user(username: ID!): User
+    users(limit: Int = 20): [User!]!
+    payment(id: ID!): Payment
+    payments(limit: Int = 20): [Payment!]!
+    token(code: ID!): Token!
+    tokens(limit: Int = 20): [Token!]!
+  }
+`);
+
+const clampLimit = (limit) => Math.min(100, Math.max(1, limit || 20));
+
+const dateTimeScalar = new GraphQLScalarType({
+  name: "DateTime",
+  description: "An ISO-8601 timestamp",
+  serialize(value) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) throw new TypeError("Invalid DateTime value");
+    return date.toISOString();
+  },
+  parseValue(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) throw new TypeError("Invalid DateTime value");
+    return date;
+  },
+  parseLiteral(ast) {
+    if (ast.kind !== Kind.STRING) return null;
+    const date = new Date(ast.value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  },
+});
+
+const createLoaders = (prismaClient) => ({
+  paymentsByAddress: new DataLoader(async (addresses) => {
+    const uniqueAddresses = [...new Set(addresses)];
+    const payments = await prismaClient.payment.findMany({
+      where: { fromAddress: { in: uniqueAddresses } },
+      orderBy: { createdAt: "desc" },
+    });
+    return addresses.map((address) =>
+      payments.filter((payment) => payment.fromAddress === address),
+    );
+  }),
+  paymentsByToken: new DataLoader(async (codes) => {
+    const uniqueCodes = [...new Set(codes)];
+    const payments = await prismaClient.payment.findMany({
+      where: { assetCode: { in: uniqueCodes } },
+      orderBy: { createdAt: "desc" },
+    });
+    return codes.map((code) =>
+      payments.filter((payment) => payment.assetCode === code),
+    );
+  }),
+});
+
+const createGraphQLContext = (prismaClient) => ({
+  prisma: prismaClient,
+  loaders: createLoaders(prismaClient),
+});
+
+const resolvers = {
+  DateTime: dateTimeScalar,
+  Query: {
+    user: (_root, { username }, { prisma }) =>
+      prisma.user.findUnique({ where: { username, deletedAt: null } }),
+    users: (_root, { limit }, { prisma }) =>
+      prisma.user.findMany({
+        where: { deletedAt: null },
+        orderBy: { createdAt: "desc" },
+        take: clampLimit(limit),
+      }),
+    payment: (_root, { id }, { prisma }) =>
+      prisma.payment.findUnique({ where: { id } }),
+    payments: (_root, { limit }, { prisma }) =>
+      prisma.payment.findMany({
+        orderBy: { createdAt: "desc" },
+        take: clampLimit(limit),
+      }),
+    token: (_root, { code }) => ({ code }),
+    tokens: async (_root, { limit }, { prisma }) => {
+      const rows = await prisma.payment.findMany({
+        where: { assetCode: { not: null } },
+        distinct: ["assetCode"],
+        select: { assetCode: true },
+        take: clampLimit(limit),
+      });
+      return rows.map(({ assetCode }) => ({ code: assetCode }));
+    },
+  },
+  User: {
+    __resolveReference: ({ username }, { prisma }) =>
+      prisma.user.findUnique({ where: { username, deletedAt: null } }),
+    payments: (user, _args, { loaders }) =>
+      loaders.paymentsByAddress.load(user.address),
+  },
+  Payment: {
+    __resolveReference: ({ id }, { prisma }) =>
+      prisma.payment.findUnique({ where: { id } }),
+    token: (payment) =>
+      payment.assetCode ? { code: payment.assetCode } : null,
+  },
+  Token: {
+    __resolveReference: ({ code }) => ({ code }),
+    payments: (token, _args, { loaders }) =>
+      loaders.paymentsByToken.load(token.code),
+  },
+};
+
+const schema = buildSubgraphSchema([{ typeDefs, resolvers }]);
+
+const createGraphQLServer = () => new ApolloServer({ schema });
+
+const createGraphQLMiddleware = ({ prismaClient }) => {
+  const server = createGraphQLServer();
+  const middleware = server.start().then(() =>
+    expressMiddleware(server, {
+      context: async () => createGraphQLContext(prismaClient),
+    }),
+  );
+
+  const handler = async (req, res, next) => {
+    try {
+      const startedMiddleware = await middleware;
+      return startedMiddleware(req, res, next);
+    } catch (error) {
+      return next(error);
+    }
+  };
+  handler.apolloServer = server;
+  return handler;
+};
 
 module.exports = {
-  typeDefs,
-  resolvers,
-  createSchema,
-  makeSchema,
-  attachResolvers,
-  serializeDateTime,
-  parseDateTimeInput,
-  scalarResolvers,
+  createGraphQLContext,
+  createGraphQLMiddleware,
+  createGraphQLServer,
   createLoaders,
-  activityKey,
-  createContext,
-  resolveViewer,
-  requireUsernameOwner,
-  requireWebhookOwnerUsername,
-  playgroundHtml,
-  playgroundPolicy,
-  registerGraphQL,
-  formatError,
-  isPlaygroundEnabled,
-  GRAPHQL_PATH,
+  schema,
 };

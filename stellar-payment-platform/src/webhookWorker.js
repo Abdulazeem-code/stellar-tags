@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { Queue, Worker } = require('bullmq');
-const { createRedisConnection } = require('./config/redis');
+const { createRedisConnection, withRedisRetry } = require('./config/redis');
 const { logger } = require('./logger');
 const { shouldFallbackToLocalRegistry } = require('./utils');
 
@@ -10,6 +10,10 @@ const MAX_WEBHOOK_ATTEMPTS = 5;
 const WEBHOOK_BACKOFF_DELAY_MS = 1_000;
 const WEBHOOK_WORKER_CONCURRENCY = 5;
 const MAX_RETRY_BACKLOG_DAYS = 3;
+// A cluster failover can reject an enqueue while the slot map is being
+// refreshed. Retry those transient errors so a delivery is never dropped.
+const WEBHOOK_ENQUEUE_RETRY_ATTEMPTS = 5;
+const WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS = 50;
 
 const WEBHOOK_JOB_OPTIONS = Object.freeze({
   attempts: MAX_WEBHOOK_ATTEMPTS,
@@ -28,6 +32,13 @@ let workerConnection;
 
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+};
+
+// Bound signature for the `Stellar-*` headers: the dispatch timestamp is
+// cryptographically bound (`timestamp.rawBody`) so the header cannot be
+// swapped in transit without invalidating the signature.
+const computeBoundSignature = (secret, timestamp, rawBody) => {
+  return crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
 };
 
 const webhookEventMatches = (webhook, eventName) => {
@@ -117,6 +128,10 @@ const getWebhooksExhaustedRetries = async (prisma, poolAllFn) => {
 const sendWebhook = async (url, payload, secret) => {
   const rawBody = JSON.stringify(payload);
   const signature = computeSignature(secret, rawBody);
+  // `Stellar-Timestamp` is the ISO 8601 dispatch timestamp already present
+  // in `payload.timestamp`; it is bound into `Stellar-Signature`.
+  const timestamp = payload.timestamp;
+  const stellarSignature = computeBoundSignature(secret, timestamp, rawBody);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
@@ -129,7 +144,10 @@ const sendWebhook = async (url, payload, secret) => {
         'X-Webhook-Signature': signature,
         // Legacy alias kept for backward compatibility.
         'X-Stellar-Tags-Signature': signature,
-        'X-Webhook-Timestamp': payload.timestamp,
+        'X-Webhook-Timestamp': timestamp,
+        // Timestamp-bound headers per issue #727 spec.
+        'Stellar-Signature': stellarSignature,
+        'Stellar-Timestamp': timestamp,
       },
       body: rawBody,
       signal: controller.signal,
@@ -267,13 +285,24 @@ const buildJobId = (webhookId, eventId) => {
 };
 
 const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
-  return queue.add(
-    'deliver',
-    { webhook, payload },
+  return withRedisRetry(
+    () => queue.add(
+      'deliver',
+      { webhook, payload },
+      {
+        ...WEBHOOK_JOB_OPTIONS,
+        backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
+        jobId: buildJobId(webhook.id, payload.event_id),
+      },
+    ),
     {
-      ...WEBHOOK_JOB_OPTIONS,
-      backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
-      jobId: buildJobId(webhook.id, payload.event_id),
+      attempts: WEBHOOK_ENQUEUE_RETRY_ATTEMPTS,
+      baseDelayMs: WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS,
+      onRetry: (error, attempt) => {
+        logger.warn(
+          `[webhook-queue] Enqueue for webhook=${webhook.id} failed (${error.message}); retrying after transient Redis error (attempt ${attempt}/${WEBHOOK_ENQUEUE_RETRY_ATTEMPTS})`,
+        );
+      },
     },
   );
 };
@@ -541,14 +570,19 @@ module.exports = {
   markWebhookSuccess,
   markWebhookFailure,
   computeSignature,
+  computeBoundSignature,
   WEBHOOK_TIMEOUT_MS,
   WEBHOOK_QUEUE_NAME,
   MAX_WEBHOOK_ATTEMPTS,
   WEBHOOK_BACKOFF_DELAY_MS,
   WEBHOOK_JOB_OPTIONS,
   MAX_RETRY_BACKLOG_DAYS,
+  WEBHOOK_ENQUEUE_RETRY_ATTEMPTS,
+  WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS,
   getWebhooksExhaustedRetries,
   moveToDLQ,
   listDLQEntries,
   replayFromDLQ,
 };
+
+

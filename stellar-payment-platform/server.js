@@ -7,10 +7,12 @@ const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
 const crypto = require("crypto");
-const rateLimit = require("express-rate-limit");
-const { RedisStore } = require("rate-limit-redis");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
+const {
+  createSlidingWindowRateLimiter,
+} = require("./src/middleware/slidingWindowRateLimit");
+const { createGraphQLMiddleware } = require("./src/graphql");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
@@ -216,19 +218,13 @@ setMetricsSources({ prisma, redisClient });
 
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
+const graphQLMiddleware = createGraphQLMiddleware({ prismaClient: prisma });
 
-const limiter = rateLimit({
+const limiter = createSlidingWindowRateLimiter({
+  redisClient,
   windowMs: 15 * 60 * 1000,
   max: 100,
-  // Use Redis-backed store when available
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  // Return the standard RateLimit-* headers only
-  standardHeaders: true,
-  legacyHeaders: false,
+  prefix: "global-rl:",
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -286,16 +282,11 @@ const limiter = rateLimit({
 // Per-IP limiter specifically for sensitive, unauthenticated endpoints.
 // Keys strictly by client IP so brute-force/spam from a single source is
 // blocked regardless of how many account ids are rotated in the payload.
-const ipLimiter = rateLimit({
+const ipLimiter = createSlidingWindowRateLimiter({
+  redisClient,
   windowMs: 15 * 60 * 1000,
   max: 100,
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  standardHeaders: true,
-  legacyHeaders: false,
+  prefix: "ip-rl:",
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -314,11 +305,42 @@ app.use(cors(corsOptions));
 app.use(bodySizeLimit);
 
 app.use(limiter);
+const isPrimitive = (v) =>
+  v === null || v === undefined || typeof v !== "object";
+
+const rejectNestedObjects = (req, res, next) => {
+  // GraphQL variables are intentionally nested; field-level schema validation
+  // replaces the flat-input guard used by the REST API.
+  if (req.path === "/graphql") return next();
+
+  const sources = [req.query, req.body];
+  for (const source of sources) {
+    if (source && typeof source === "object") {
+      for (const val of Object.values(source)) {
+        if (!isPrimitive(val)) {
+          // Responds directly rather than delegating, so the middleware stays
+          // usable on its own — the same way validateSchema behaves.
+          return res
+            .status(400)
+            .json(
+              errorBody(
+                "INVALID_INPUT",
+                "Invalid parameter type: nested objects and arrays are not allowed.",
+                { correlationId: req.correlationId },
+              ),
+            );
+        }
+      }
+    }
+  }
+  next();
+};
 
 app.use(rejectNestedObjects);
 
 // Enable HTTP response compression for responses exceeding 1KB (1024 bytes)
 app.use(compression({ threshold: 1024 }));
+app.use("/graphql", graphQLMiddleware);
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
@@ -1230,16 +1252,11 @@ app.use("/api/v1", v1Router);
 // brute-force targets, so they get a much tighter budget than the global
 // limiter. Uses the same Redis-backed store so the limit is shared across
 // all distributed nodes.
-const authLimiter = rateLimit({
+const authLimiter = createSlidingWindowRateLimiter({
+  redisClient,
   windowMs: 15 * 60 * 1000,
   max: 20,
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  standardHeaders: true,
-  legacyHeaders: false,
+  prefix: "auth-rl:",
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
