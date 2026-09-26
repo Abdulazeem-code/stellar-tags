@@ -2,36 +2,119 @@ const express = require('express');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { prisma } = require('../../../prismaClient');
-const { poolRun, poolAll } = require('../../db');
+const { normalizeNameTag } = require('../../utils');
+const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
+const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
-const { shouldFallbackToLocalRegistry } = require('../../utils');
-const { idempotencyMiddleware } = require('../../../middleware/idempotency');
-const { authenticateUsernameOwner } = require('../../services/ownershipService');
-const { ACTIVITY_ACTIONS, recordActivity } = require("../../services/activityService");
-const { createSignatureRateLimiter } = require('../../middleware/signatureRateLimit');
 
-module.exports = (redisClient) => {
-  const router = express.Router();
+const router = express.Router();
 
-  // ── Idempotency protection for mutating webhook routes (POST /webhooks and
-  // DELETE /webhooks/:id). Duplicate requests within 24h return the cached
-  // 2xx response. Read-only GET /webhooks is ignored. ────────────────────────
-  router.use(idempotencyMiddleware(redisClient));
+const verifyFreighterSignedMessage = ({
+  message,
+  signature,
+  signerAddress,
+  publicKey,
+}) => {
+  const claimedSigner = signerAddress || publicKey;
 
-  const signatureRateLimiter = createSignatureRateLimiter();
+  if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
+    const error = new Error('Invalid signer address format.');
+    error.statusCode = 400;
+    throw error;
+  }
 
+  const keypair = Keypair.fromPublicKey(claimedSigner);
 
+  let signatureBuffer;
+  if (Buffer.isBuffer(signature)) {
+    signatureBuffer = signature;
+  } else if (typeof signature === 'string') {
+    signatureBuffer = Buffer.from(signature, 'base64');
+  } else {
+    throw new Error('Invalid message signature format.');
+  }
 
-const DEFAULT_FEDERATION_DOMAIN = 'localhost';
+  const prefix = Buffer.from('Stellar Signed Message:\n', 'utf8');
+  const messageBytes = Buffer.from(message, 'utf8');
+  const payload = Buffer.concat([prefix, messageBytes]);
+  const messageHash = crypto.createHash('sha256').update(payload).digest();
 
-const authenticateWebhookCall = (req) =>
-  authenticateUsernameOwner({
-    username: req.body?.username,
-    signature: req.body?.signature,
-    signerAddress: req.body?.signerAddress,
-    operation: typeof req.body?.operation === 'string' ? req.body.operation : 'webhook',
+  if (!keypair.verify(messageHash, signatureBuffer)) {
+    const error = new Error('Signature verification failed.');
+    error.statusCode = 401;
+    throw error;
+  }
+
+  if (claimedSigner !== publicKey) {
+    const error = new Error('Signer address does not match the registered account.');
+    error.statusCode = 401;
+    throw error;
+  }
+
+  return claimedSigner;
+};
+
+/**
+ * Authenticates a webhook management request by verifying the Stellar
+ * signature provided in the request body against the registered address for
+ * the given username. Uses Prisma for all DB lookups.
+ */
+const authenticateWebhookCall = async (req) => {
+  const rawUsername = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
+  const signature = typeof req.body?.signature === 'string' ? req.body.signature.trim() : '';
+  const signerAddress = typeof req.body?.signerAddress === 'string' ? req.body.signerAddress.trim() : undefined;
+
+  if (!rawUsername) {
+    const error = new Error('Missing required field: username.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!signature) {
+    const error = new Error('Missing required field: signature.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const normalizedUsername = normalizeNameTag(rawUsername).toLowerCase();
+
+  const userRecord = await prisma.user.findUnique({
+    where: { username: normalizedUsername },
+    select: { username: true, address: true },
   });
+
+  if (!userRecord) {
+    const error = new Error('Username not registered.');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const operation =
+    typeof req.body?.operation === 'string' ? req.body.operation : 'webhook';
+  const message = `${operation}:${normalizedUsername}`;
+
+  if (StrKey.isValidEd25519PublicKey(signature) && !signerAddress) {
+    const verificationResult = await verifyMultiSignerThreshold(
+      userRecord.address,
+      [signature],
+      { operationType: 'management' },
+    );
+    if (!verificationResult.success) {
+      const error = new Error(verificationResult.errorMessage || 'Signature verification failed');
+      error.statusCode = 401;
+      throw error;
+    }
+  } else {
+    verifyFreighterSignedMessage({
+      message,
+      signature,
+      signerAddress,
+      publicKey: userRecord.address,
+    });
+  }
+
+  return userRecord;
+};
 
 const isValidWebhookUrl = (url) => {
   if (typeof url !== 'string' || url.length > 2048) return false;
@@ -56,6 +139,7 @@ const normalizeWebhookEvents = (input) => {
 
   return events;
 };
+
 const getWebhookSecret = (req) => {
   const headerValue = req.get ? req.get('X-Webhook-Secret') || req.get('X-Stellar-Tags-Secret') : '';
   const body = req.body && typeof req.body === 'object' ? req.body : {};
@@ -252,18 +336,7 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
   }
 }));
 
-/**
- * @openapi
- * /webhooks:
- *   post:
- *     tags:
- *       - v1
- *     description: POST /webhooks
- *     responses:
- *       200:
- *         description: Success
- */
-router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, next) => {
+router.post('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json')) {
       return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
@@ -271,7 +344,6 @@ router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, nex
 
     const user = await authenticateWebhookCall(req);
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
-    const events = normalizeWebhookEvents(req.body?.events);
 
     if (!isValidWebhookUrl(rawUrl)) {
       return res.status(400).json({ error: 'Invalid webhook URL. Must be http or https.' });
@@ -289,7 +361,6 @@ router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, nex
           username: user.username,
           url: rawUrl,
           secret,
-          events,
           createdAt: now,
         },
       });
@@ -304,22 +375,8 @@ router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, nex
         conflictError.statusCode = 409;
         return next(conflictError);
       }
-      if (!shouldFallbackToLocalRegistry(error)) throw error;
-
-      await poolRun(
-        `INSERT INTO webhooks (id, username, url, secret, events, created_at, last_sent_at, failing_since)
-         VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)`,
-        [id, user.username, rawUrl, secret, JSON.stringify(events), now.toISOString()],
-      );
-      webhook = { id, username: user.username, url: rawUrl, events, createdAt: now.toISOString() };
+      throw error;
     }
-
-    await recordActivity(prisma, {
-      username: user.username,
-      action: ACTIVITY_ACTIONS.WEBHOOK_CREATED,
-      metadata: { webhook_id: webhook.id, url: rawUrl, events },
-      req,
-    });
 
     return res.status(201).json({
       ok: true,
@@ -327,7 +384,6 @@ router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, nex
         id: webhook.id,
         username: webhook.username,
         url: webhook.url,
-        events: Array.isArray(webhook.events) ? webhook.events : normalizeWebhookEvents(webhook.events),
         secret,
         created_at: (webhook.createdAt instanceof Date
           ? webhook.createdAt
@@ -345,18 +401,6 @@ router.post('/webhooks', signatureRateLimiter, asyncHandler(async (req, res, nex
   }
 }));
 
-
-/**
- * @openapi
- * /webhooks:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /webhooks
- *     responses:
- *       200:
- *         description: Success
- */
 router.get('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
@@ -365,36 +409,16 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
 
     const user = await authenticateWebhookCall(req);
 
-    let webhooks;
-    try {
-      webhooks = await prisma.webhook.findMany({
-        where: { username: user.username },
-        orderBy: { createdAt: 'desc' },
-      });
-    } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) throw error;
-      const rows = await poolAll(
-        `SELECT id, username, url, events, created_at, last_sent_at, failing_since
-         FROM webhooks WHERE username = $1 ORDER BY created_at DESC`,
-        [user.username],
-      );
-      webhooks = rows.map((r) => ({
-        id: r.id,
-        username: r.username,
-        url: r.url,
-        events: Array.isArray(r.events) ? r.events : (typeof r.events === 'string' ? JSON.parse(r.events || '[]') : ['*']),
-        createdAt: r.created_at,
-        lastSentAt: r.last_sent_at,
-        failingSince: r.failing_since,
-      }));
-    }
+    const webhooks = await prisma.webhook.findMany({
+      where: { username: user.username },
+      orderBy: { createdAt: 'desc' },
+    });
 
     return res.status(200).json({
       ok: true,
       webhooks: webhooks.map((w) => ({
         id: w.id,
         url: w.url,
-        events: Array.isArray(w.events) ? w.events : normalizeWebhookEvents(w.events),
         created_at: (w.createdAt instanceof Date ? w.createdAt : new Date(w.createdAt)).toISOString(),
         last_sent_at: w.lastSentAt
           ? (w.lastSentAt instanceof Date ? w.lastSentAt : new Date(w.lastSentAt)).toISOString()
@@ -413,18 +437,6 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
   }
 }));
 
-
-/**
- * @openapi
- * /webhooks/:id:
- *   delete:
- *     tags:
- *       - v1
- *     description: DELETE /webhooks/:id
- *     responses:
- *       200:
- *         description: Success
- */
 router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
@@ -438,31 +450,13 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
       return res.status(400).json({ error: 'Webhook id is required in URL path.' });
     }
 
-    let deletedCount = 0;
-    try {
-      const deleted = await prisma.webhook.deleteMany({
-        where: { id, username: user.username },
-      });
-      deletedCount = deleted.count;
-    } catch (error) {
-      if (!shouldFallbackToLocalRegistry(error)) throw error;
-      const result = await poolRun(
-        'DELETE FROM webhooks WHERE id = $1 AND username = $2',
-        [id, user.username],
-      );
-      deletedCount = result?.changes || 0;
-    }
+    const deleted = await prisma.webhook.deleteMany({
+      where: { id, username: user.username },
+    });
 
-    if (deletedCount === 0) {
+    if (deleted.count === 0) {
       return res.status(404).json({ error: 'Webhook not found.' });
     }
-
-    await recordActivity(prisma, {
-      username: user.username,
-      action: ACTIVITY_ACTIONS.WEBHOOK_DELETED,
-      metadata: { webhook_id: id },
-      req,
-    });
 
     return res.status(200).json({ ok: true, deleted: true });
   } catch (err) {
@@ -474,39 +468,43 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   }
 }));
 
-  router.post('/webhooks/verify-test', (req, res) => {
-    const { secret, payload } = req.body;
-    const signature = req.headers['x-webhook-signature'];
+router.all('/webhooks', (req, res) => {
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
+  res.status(404).end();
+});
 
-    if (!secret || !payload) {
-      return res.status(400).json({ error: 'Missing secret or payload' });
-    }
+router.post('/webhooks/verify-test', (req, res) => {
+  const { secret, payload } = req.body;
+  const signature = req.headers['x-webhook-signature'] || req.headers['x-stellar-tags-signature'];
 
-    const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+  if (!secret || !payload) {
+    return res.status(400).json({ error: 'Missing secret or payload' });
+  }
 
-    if (signature === expectedSignature) {
-      return res.status(200).json({
-        ok: true,
-        valid: true,
-        message: 'Signature verification succeeded',
-        expectedSignature,
-      });
-    } else {
-      return res.status(401).json({
-        ok: false,
-        valid: false,
-        error: { code: 'INVALID_WEBHOOK_SIGNATURE' },
-        receivedSignature: signature,
-      });
-    }
-  });
+  const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
 
-  router.all('/webhooks', (req, res) => {
-    if (req.method !== 'GET' && req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method Not Allowed' });
-    }
-    res.status(404).end();
-  });
+  if (signature === expectedSignature) {
+    return res.status(200).json({
+      ok: true,
+      valid: true,
+      message: 'Signature verification succeeded',
+      expectedSignature,
+    });
+  } else {
+    return res.status(401).json({
+      ok: false,
+      valid: false,
+      error: {
+        code: 'INVALID_WEBHOOK_SIGNATURE',
+        message: 'Signature verification failed',
+        expected: expectedSignature,
+        received: signature,
+      },
+      receivedSignature: signature,
+    });
+  }
+});
 
-  return router;
-};
+module.exports = (redisClient) => router;
