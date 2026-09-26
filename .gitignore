@@ -33,3 +33,6 @@ stellar-payment-platform@1.0.0
 # Soroban test snapshots
 test_snapshots/
 .kiro/ 
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat

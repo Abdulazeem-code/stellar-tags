@@ -113,7 +113,7 @@ describe('payment intent metadata', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-1',
@@ -148,7 +148,7 @@ describe('payment intent metadata', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-2',
@@ -182,7 +182,7 @@ describe('payment intent metadata', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-3',

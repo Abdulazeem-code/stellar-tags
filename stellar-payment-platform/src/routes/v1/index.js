@@ -27,6 +27,7 @@ module.exports = (redisClient) => {
   router.use('/', paymentRoutes(redisClient));
   router.use('/', statsRoutes(redisClient));
   router.use('/', federationRoutes(redisClient));
+
   router.use('/', adminRoutes);
 
   return router;

@@ -490,9 +490,6 @@ impl PaymentRouter {
         fee_bps: i128,
         fee_cap: i128,
     ) -> Result<(), Error> {
-        // Require sender auth
-        sender.require_auth();
-
         env.events().publish(
             (Symbol::new(env, "payment_initiated"), sender.clone()),
             amount,
@@ -1620,6 +1617,8 @@ impl PaymentRouter {
         }
         Self::verify_kyc_for_amount(&env, &sender, amount)?;
 
+        sender.require_auth();
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_payment(
@@ -1671,6 +1670,7 @@ impl PaymentRouter {
             .unwrap_or(0);
 
         for payment in payments.iter() {
+            payment.sender.require_auth();
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
             }
