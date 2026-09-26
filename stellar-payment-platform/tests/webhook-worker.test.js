@@ -139,7 +139,7 @@ describe('webhook BullMQ delivery', () => {
 
     await processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 0 },
-      { prisma, poolRunFn: jest.fn() },
+      { prisma,  },
     );
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
