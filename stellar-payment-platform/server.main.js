@@ -7,12 +7,10 @@ const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
+const { RedisStore } = require("rate-limit-redis");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
-const {
-  createSlidingWindowRateLimiter,
-} = require("./src/middleware/slidingWindowRateLimit");
-const { createGraphQLMiddleware } = require("./src/graphql");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
@@ -24,6 +22,7 @@ const dotenv = require("dotenv");
 const timeout = require("connect-timeout");
 const compression = require("compression");
 const { verifyMultiSignerThreshold } = require("./src/multisigner-verifier");
+const { poolGet, poolRun, poolAll } = require("./src/db");
 const { logger, httpLogger } = require("./src/logger");
 const xss = require("xss");
 const { Keypair, StrKey } = require("@stellar/stellar-sdk");
@@ -76,6 +75,7 @@ const {
   MAX_USERNAMES_PER_ADDRESS,
   PRIMARY_USERNAME_ORDER,
   USER_DATABASE,
+  shouldFallbackToLocalRegistry,
 } = require("./src/utils");
 const { getCachedApprovedOrigins } = require("./src/originCache");
 
@@ -215,13 +215,19 @@ setMetricsSources({ prisma, redisClient });
 
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
-const graphQLMiddleware = createGraphQLMiddleware({ prismaClient: prisma });
 
-const limiter = createSlidingWindowRateLimiter({
-  redisClient,
+const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
-  prefix: "global-rl:",
+  // Use Redis-backed store when available
+  store: redisClient
+    ? new RedisStore({
+        sendCommand: (...args) => redisClient.sendCommand(args),
+      })
+    : undefined,
+  // Return the standard RateLimit-* headers only
+  standardHeaders: true,
+  legacyHeaders: false,
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -279,11 +285,16 @@ const limiter = createSlidingWindowRateLimiter({
 // Per-IP limiter specifically for sensitive, unauthenticated endpoints.
 // Keys strictly by client IP so brute-force/spam from a single source is
 // blocked regardless of how many account ids are rotated in the payload.
-const ipLimiter = createSlidingWindowRateLimiter({
-  redisClient,
+const ipLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
-  prefix: "ip-rl:",
+  store: redisClient
+    ? new RedisStore({
+        sendCommand: (...args) => redisClient.sendCommand(args),
+      })
+    : undefined,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -306,10 +317,6 @@ const isPrimitive = (v) =>
   v === null || v === undefined || typeof v !== "object";
 
 const rejectNestedObjects = (req, res, next) => {
-  // GraphQL variables are intentionally nested; field-level schema validation
-  // replaces the flat-input guard used by the REST API.
-  if (req.path === "/graphql") return next();
-
   const sources = [req.query, req.body];
   for (const source of sources) {
     if (source && typeof source === "object") {
@@ -337,7 +344,6 @@ app.use(rejectNestedObjects);
 
 // Enable HTTP response compression for responses exceeding 1KB (1024 bytes)
 app.use(compression({ threshold: 1024 }));
-app.use("/graphql", graphQLMiddleware);
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
@@ -377,11 +383,110 @@ const etagCache = (req, res, next) => {
   next();
 };
 
+const getLocalUserByAddress = async (address) =>
+  poolGet(
+    "SELECT username, address FROM username_registry WHERE address = $1 AND deleted_at IS NULL LIMIT 1",
+    [address],
+  );
+
 const getLocalUserByUsername = async (username) =>
   poolGet(
     "SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1",
     [username],
   );
+
+const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
+  const searchPattern = `%${search}%`;
+  const LIKE_FILTER =
+    "WHERE (username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE)";
+
+  if (cursorPoint) {
+    // Keyset mode for the fallback path as well. created_at is stored as an
+    // ISO-8601 string, so lexicographic comparison matches chronological
+    // ordering and the tuple predicate seeks straight past the cursor row.
+    const rows = await poolAll(
+      `SELECT username, address, created_at
+      FROM username_registry
+      ${LIKE_FILTER}
+      AND (created_at < ? OR (created_at = ? AND username < ?))
+      ORDER BY created_at DESC, username DESC
+      LIMIT ?`,
+      [
+        searchPattern,
+        searchPattern,
+        String(cursorPoint.createdAt),
+        String(cursorPoint.createdAt),
+        String(cursorPoint.username),
+        limit + 1,
+      ],
+    );
+    const normalized = rows.map((row) => ({
+      username: row.username,
+      address: row.address,
+      createdAt: row.created_at,
+    }));
+    const {
+      rows: pageRows,
+      hasMore,
+      nextCursor,
+    } = paginateByKeyset(normalized, limit);
+    return cursorPaginatedResponse(
+      pageRows.map((user) => ({
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt,
+      })),
+      { limit, nextCursor, hasMore },
+    );
+  }
+
+  const skip = (page - 1) * limit;
+  const rows = await poolAll(
+    `SELECT username, address, created_at
+     FROM username_registry
+     WHERE username ILIKE $1 OR address ILIKE $1
+     ORDER BY created_at DESC
+     LIMIT $2 OFFSET $3`,
+    [searchPattern, limit, skip],
+  );
+
+  const countRow = await poolGet(
+    `SELECT COUNT(*) AS "totalCount"
+     FROM username_registry
+     WHERE username ILIKE $1 OR address ILIKE $1`,
+    [searchPattern],
+  );
+
+  const totalCount = Number(countRow?.totalCount || 0);
+  return paginatedResponse(
+    rows.map((user) => ({
+      username: user.username,
+      address: user.address,
+      created_at: user.created_at,
+    })),
+    totalCount,
+    { page, limit },
+  );
+};
+
+const registerLocalUser = async ({ username, address, isPrimary = false }) => {
+  // #613 ΓÇö several usernames may share an address, so an existing address is
+  // no longer a conflict; only a duplicate username is.
+  const existingByUsername = await getLocalUserByUsername(username);
+  if (existingByUsername) {
+    const conflictError = new Error(
+      "Username is already taken. Please choose another.",
+    );
+    conflictError.statusCode = 409;
+    throw conflictError;
+  }
+
+  await poolRun(
+    `INSERT INTO username_registry (username, address, created_at)
+     VALUES ($1, $2, $3)`,
+    [username, address, new Date().toISOString()],
+  );
+};
 
 // Expose /metrics endpoint for Prometheus to scrape
 
@@ -478,20 +583,33 @@ app.get(
         const cacheKey = federationNameKey(queryName);
 
         const cached = await federationLookupCached(cacheKey, async () => {
-          let row = await prisma.user.findFirst({
-            where: { username: queryName, deletedAt: null },
-            select: {
-              address: true,
-              memoType: true,
-              memo: true,
-              flaggedAt: true,
-            },
-          });
+          let row;
+          try {
+            row = await prisma.user.findFirst({
+              where: { username: queryName, deletedAt: null },
+              select: {
+                address: true,
+                memoType: true,
+                memo: true,
+                flaggedAt: true,
+              },
+            });
 
-          if (row && row.flaggedAt) {
-            const forbiddenError = new Error("Address is blocked");
-            forbiddenError.statusCode = 403;
-            throw forbiddenError;
+            if (row && row.flaggedAt) {
+              const forbiddenError = new Error("Address is blocked");
+              forbiddenError.statusCode = 403;
+              throw forbiddenError;
+            }
+          } catch (error) {
+            if (error.statusCode === 403) throw error;
+            if (!shouldFallbackToLocalRegistry(error)) {
+              throw error;
+            }
+
+            const localRow = await getLocalUserByUsername(queryName);
+            row = localRow
+              ? { address: localRow.address, memoType: null, memo: null }
+              : null;
           }
 
           const address = row?.address || USER_DATABASE[queryName];
@@ -710,9 +828,20 @@ app.post(
       // adds another while the address is under the cap; the first username
       // registered for an address becomes its primary. Reverse (type=id)
       // federation lookups resolve to that primary.
-      let usernameCount = await prisma.user.count({
-        where: { address, deletedAt: null },
-      });
+      let usernameCount = 0;
+      try {
+        usernameCount = await prisma.user.count({
+          where: { address, deletedAt: null },
+        });
+      } catch (error) {
+        if (!shouldFallbackToLocalRegistry(error)) {
+          throw error;
+        }
+
+        // Degraded path: the exact alias count is unavailable, so fall back to
+        // a presence check. The 5-username cap is enforced best-effort here.
+        usernameCount = (await getLocalUserByAddress(address)) ? 1 : 0;
+      }
 
       if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
         return next(
@@ -780,16 +909,28 @@ app.post(
         }
       }
 
-      await prisma.user.create({
-        data: {
+      try {
+        await prisma.user.create({
+          data: {
+            username: normalizedUsername,
+            address,
+            isPrimary,
+            ...(memoType && { memoType, memo }),
+          },
+        });
+        // Invalidate any stale federation cache entries for this username/address
+        invalidateFederationCache(normalizedUsername, address);
+      } catch (error) {
+        if (!shouldFallbackToLocalRegistry(error)) {
+          throw error;
+        }
+
+        await registerLocalUser({
           username: normalizedUsername,
           address,
           isPrimary,
-          ...(memoType && { memoType, memo }),
-        },
-      });
-      // Invalidate any stale federation cache entries for this username/address
-      invalidateFederationCache(normalizedUsername, address);
+        });
+      }
 
       await recordActivity(prisma, {
         username: normalizedUsername,
@@ -882,12 +1023,20 @@ app.get(
     if (address) {
       try {
         const result = await lookupCached(address, async () => {
-          // #613 — an address can have several usernames; return the primary.
-          let row = await prisma.user.findFirst({
-            where: { address, deletedAt: null },
-            select: { username: true },
-            orderBy: PRIMARY_USERNAME_ORDER,
-          });
+          let row;
+          try {
+            // #613 ΓÇö an address can have several usernames; return the primary.
+            row = await prisma.user.findFirst({
+              where: { address, deletedAt: null },
+              select: { username: true },
+              orderBy: PRIMARY_USERNAME_ORDER,
+            });
+          } catch (error) {
+            if (!shouldFallbackToLocalRegistry(error)) {
+              throw error;
+            }
+            row = await getLocalUserByAddress(address);
+          }
           return row ? { username: row.username, address } : null;
         });
 
@@ -929,6 +1078,7 @@ app.get(
 
     try {
       let response = null;
+      try {
         if (cursor) {
           // Keyset mode: seek straight past the cursor row instead of skipping
           // every preceding row, so deep pages cost the same as page one.
@@ -970,7 +1120,13 @@ app.get(
             { page, limit },
           );
         }
+      } catch (error) {
+        if (!shouldFallbackToLocalRegistry(error)) {
+          throw error;
+        }
 
+        response = await listLocalUsers(search, page, limit, cursor);
+      }
 
       return res.json(response);
     } catch (error) {
@@ -1099,11 +1255,16 @@ app.use("/api/v1", v1Router);
 // brute-force targets, so they get a much tighter budget than the global
 // limiter. Uses the same Redis-backed store so the limit is shared across
 // all distributed nodes.
-const authLimiter = createSlidingWindowRateLimiter({
-  redisClient,
+const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
-  prefix: "auth-rl:",
+  store: redisClient
+    ? new RedisStore({
+        sendCommand: (...args) => redisClient.sendCommand(args),
+      })
+    : undefined,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",

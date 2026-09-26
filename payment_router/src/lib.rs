@@ -726,11 +726,6 @@ impl PaymentRouter {
         fee_bps: i128,
         fee_cap: i128,
     ) -> Result<(), Error> {
-        // Authorization is the caller's responsibility; see the note on
-        // `require_auth` above.  Re-checking here would trap a batch that
-        // lists the same sender twice, so it is deliberately not done.
-        // The transfers below still re-check it inside the token contract.
-
         env.events().publish(
             (Symbol::new(env, "payment_initiated"), sender.clone()),
             amount,
@@ -1875,8 +1870,6 @@ impl PaymentRouter {
         }
         Self::verify_kyc_for_amount(&env, &sender, amount)?;
 
-        // The single-payment path authorizes here; `process_single_payment`
-        // assumes the caller has already done so.
         sender.require_auth();
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -1936,6 +1929,7 @@ impl PaymentRouter {
         let mut authorized: Vec<Address> = Vec::new(&env);
 
         for payment in payments.iter() {
+            payment.sender.require_auth();
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
             }
