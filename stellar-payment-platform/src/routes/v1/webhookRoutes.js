@@ -126,6 +126,56 @@ const isValidWebhookUrl = (url) => {
   }
 };
 
+const normalizeWebhookEvents = (input) => {
+  if (input === undefined || input === null) return ['*'];
+  const raw = Array.isArray(input) ? input : [input];
+  const events = raw
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => value.trim())
+    .filter((value, index, arr) => arr.indexOf(value) === index);
+
+  if (events.length === 0) return ['*'];
+  if (events.includes('*')) return ['*'];
+
+  return events;
+};
+
+const getWebhookSecret = (req) => {
+  const headerValue = req.get ? req.get('X-Webhook-Secret') || req.get('X-Stellar-Tags-Secret') : '';
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const secret = typeof body.secret === 'string' ? body.secret : (typeof body.webhookSecret === 'string' ? body.webhookSecret : headerValue);
+  return typeof secret === 'string' && secret.trim() ? secret.trim() : '';
+};
+
+const getPayloadForVerification = (body) => {
+  if (body && typeof body === 'object' && !Array.isArray(body) && Object.prototype.hasOwnProperty.call(body, 'payload')) {
+   return body.payload;
+  }
+
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+   const { secret, webhookSecret, signature, ...rest } = body;
+   if (Object.keys(rest).length > 0) {
+     return rest;
+   }
+  }
+
+  return body;
+};
+
+const normalizeSignature = (value) => {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/^sha256=/i, '');
+};
+
+const getSigningPayloadBuffer = (payload) => {
+  if (Buffer.isBuffer(payload)) return payload;
+  if (typeof payload === 'string') return Buffer.from(payload, 'utf8');
+  if (payload === undefined || payload === null) {
+   throw new Error('Missing required field: payload.');
+  }
+  return Buffer.from(JSON.stringify(payload), 'utf8');
+};
+
 // Issue #727: `Stellar-Timestamp` is an ISO 8601 timestamp (the same value as
 // `payload.timestamp`). Dispatches older than 5 minutes are expired; more
 // than 1 minute in the future is rejected to bound clock skew.
