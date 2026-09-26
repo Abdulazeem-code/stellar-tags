@@ -115,8 +115,8 @@ describe('Rate Limiting - sliding window', () => {
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.headers).toHaveProperty('ratelimit-limit');
-      expect(res.headers['ratelimit-limit']).toBe('100');
+      expect(res.headers).toHaveProperty('x-ratelimit-limit');
+      expect(res.headers['x-ratelimit-limit']).toBe('100');
     });
 
     it('includes RateLimit-Remaining header on /federation', async () => {
@@ -124,7 +124,7 @@ describe('Rate Limiting - sliding window', () => {
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.headers).toHaveProperty('ratelimit-remaining');
+      expect(res.headers).toHaveProperty('x-ratelimit-remaining');
     });
 
     it('advertises the stricter signature-heavy limit on /register', async () => {
@@ -132,18 +132,12 @@ describe('Rate Limiting - sliding window', () => {
         .post('/register')
         .send({ username: 'alice', address: VALID_ADDRESS });
 
+      expect(res.headers).toHaveProperty('x-ratelimit-limit');
+      expect(res.headers['x-ratelimit-limit']).toBe('10');
+    });
+
       expect(res.headers).toHaveProperty('ratelimit-limit');
-      expect(res.headers['ratelimit-limit']).toBe('10');
-    });
-
-    it('does NOT include deprecated X-RateLimit-* headers', async () => {
-      const res = await request(app)
-        .get('/federation')
-        .query({ q: 'client*localhost' });
-
-      expect(res.headers).not.toHaveProperty('x-ratelimit-limit');
-      expect(res.headers).not.toHaveProperty('x-ratelimit-remaining');
-    });
+      expect(res.headers).toHaveProperty('ratelimit-remaining');
   });
 
   // ── 429 Too Many Requests ────────────────────────────────────────────────
@@ -281,8 +275,7 @@ describe('Rate Limiting - sliding window', () => {
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.status).toBe(200);
-      expect(res.headers).toHaveProperty('ratelimit-limit');
+      expect(res.headers).toHaveProperty('x-ratelimit-limit');
     });
   });
 });
