@@ -78,6 +78,7 @@ describe('E2E: Admin Flow', () => {
     // 1. Block User
     let res = await request(app)
       .post('/api/v1/admin/block')
+        .set('Idempotency-Key', 'test-key-1')
       .set('x-api-key', 'e2e-admin-key')
       .send({ address: 'GABC123XYZ456789ADMIN' });
 
@@ -100,6 +101,7 @@ describe('E2E: Admin Flow', () => {
   it('should return 401 for unauthorized admin access', async () => {
     const res = await request(app)
       .post('/api/v1/admin/block')
+        .set('Idempotency-Key', 'test-key-2')
       .set('x-api-key', 'wrong-key')
       .send({ address: 'GABC123XYZ456789ADMIN' });
 
