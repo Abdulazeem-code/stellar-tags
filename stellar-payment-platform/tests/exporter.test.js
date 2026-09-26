@@ -207,6 +207,52 @@ describe('streamAdminExport CSV', () => {
       delete process.env.EXPORT_MAX_PAGES;
     }
   });
+
+  it('walks pages by keyset seek on (createdAt, id) instead of OFFSET', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const lastRow = makeRecord(exporter.PAGE_SIZE - 1);
+    const page1 = Array.from({ length: exporter.PAGE_SIZE }, (_, i) => makeRecord(i));
+    const page2 = [makeRecord(500), makeRecord(501)];
+    const prisma = makePrisma();
+    prisma.payment.findMany
+      .mockResolvedValueOnce(page1)
+      .mockResolvedValueOnce(page2)
+      .mockResolvedValueOnce([]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'corr-keyset',
+    });
+
+    const calls = prisma.payment.findMany.mock.calls.map(([args]) => args);
+    // No call may carry OFFSET/skip, and ordering must be deterministic on
+    // (createdAt, id).
+    for (const args of calls) {
+      expect(args.skip).toBeUndefined();
+      expect(args.orderBy).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
+    }
+    // Page 1 has no cursor predicate; page 2 seeks strictly past the last row
+    // of page 1.
+    expect(calls[0].where).toEqual({});
+    expect(calls[1].where).toEqual({
+      AND: [
+        {},
+        {
+          OR: [
+            { createdAt: { lt: lastRow.createdAt } },
+            { AND: [{ createdAt: { equals: lastRow.createdAt } }, { id: { lt: lastRow.id } }] },
+          ],
+        },
+      ],
+    });
+
+    const lines = writtenText(res).trim().split('\n').filter(Boolean);
+    expect(lines.length).toBe(exporter.PAGE_SIZE + 2);
+  });
 });
 
 // ── streamAdminExport (JSON) ─────────────────────────────────────────────────
