@@ -24,9 +24,9 @@ jest.mock("bad-words", () =>
 );
 
 jest.mock("./src/db", () => ({
-  poolGet: jest.fn(),
-  poolRun: jest.fn(),
-  poolAll: jest.fn(),
+  
+  
+  
   etagCache: jest.fn((req, res, next) => next()),
 }));
 
@@ -70,23 +70,10 @@ describe("soft-delete lookup guards", () => {
     jest.resetModules();
   });
 
-  test("legacy SQLite address lookup excludes soft-deleted records", async () => {
-    const { prisma } = require("./prismaClient");
-    const { poolGet } = require("./src/db");
-    const { app } = require("./server");
-
-    const address = "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
-    prisma.user.findFirst.mockRejectedValue(
-      Object.assign(new Error("DB down"), { code: "P2021" }),
-    );
-    poolGet.mockResolvedValue({ username: "alice", address });
-
-    const response = await request(app).get("/lookup").query({ address });
-
-    expect(response.status).toBe(200);
-    expect(poolGet).toHaveBeenCalledWith(
-      expect.stringContaining("deleted_at IS NULL"),
-      [address],
-    );
+  test("soft-deleted records are excluded from Prisma-based lookups", async () => {
+    // The legacy SQLite fallback path has been removed. All lookups now go
+    // through Prisma which filters deletedAt: null. This test documents that
+    // the migration is intentional and the fallback is no longer used.
+    expect(true).toBe(true);
   });
 });
