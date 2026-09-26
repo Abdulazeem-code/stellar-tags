@@ -284,7 +284,12 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 ### Server (`stellar-payment-platform/.env` or exported directly)
 - `DATABASE_URL` - **(Required)** PostgreSQL connection string used by Prisma (see [Database setup](#database-setup)).
 - `PORT` - (Optional) The port for the Node.js server to listen on. Defaults to `5000`.
-- `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default) or `public`.
+- `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default), `public`, or `futurenet`. Selects the public Horizon endpoint; `HORIZON_BASE` overrides it entirely.
+- `POLL_INTERVAL_MS` - (Optional) Base delay between Horizon poll cycles, in milliseconds. Defaults to `60000`. This is also the healthy steady-state interval: with no failures the listener never waits longer than this.
+- `POLL_MAX_INTERVAL_MS` - (Optional) Ceiling for the exponential backoff curve while Horizon is unhealthy. Defaults to `900000` (15 minutes).
+- `POLL_EMPTY_THRESHOLD` - (Optional) Consecutive poll cycles that return no accounts before the interval starts stretching. Defaults to `3`.
+- `HORIZON_POLL_JITTER` - (Optional) Jitter strategy: `equal` (default, 50-100% of the delay), `full` (0-100%), or `none`. `none` is not recommended when more than one listener instance runs.
+- `STREAM_RECONNECT_BASE_MS` / `STREAM_RECONNECT_MAX_MS` - (Optional) Base delay and ceiling for reconnecting a dropped payment stream. Default `5000` / `300000`.
 - `STELLAR_TAG_DOMAIN` - (Optional) Extra origin to add to the CORS allow-list.
 - `LOG_DIR` - (Optional) Directory for the rotating log files. Defaults to `stellar-payment-platform/logs`.
 - `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
@@ -293,6 +298,33 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). `warn` (default) logs a clear warning and continues; `strict` logs an error and exits non-zero before the server binds a port; `off` skips the check. Set to `strict` where you want deploys to fail fast on schema drift instead of failing on the first query.
 
 For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
+
+## Horizon polling: backoff and jitter
+
+The payment listener (`npm run listener`) watches every registered Stellar account with a
+Server-Sent Events stream, and periodically re-reads the federation table to pick up newly
+registered accounts. Horizon is a shared, rate-limited public service, so the listener does
+**not** poll on a fixed interval. Every request is scheduled through an exponential-backoff
+policy with jitter (`stellar-payment-platform/src/horizonBackoff.js`):
+
+| Situation | Behaviour |
+| --- | --- |
+| Healthy | Polls every `POLL_INTERVAL_MS` (default 60s). |
+| Horizon failing | Delay doubles per consecutive failure, capped at `POLL_MAX_INTERVAL_MS` (default 15 min). A successful cycle resets the curve. |
+| No accounts registered | After `POLL_EMPTY_THRESHOLD` consecutive empty cycles, the interval stretches using the same curve. A cycle that finds accounts resets it. |
+| HTTP 429 | The response's `Retry-After` becomes a hard floor on the next delay, so the listener never retries before Horizon's own cool-down expires. |
+| Dropped stream | Reconnects on its own per-account backoff curve (`STREAM_RECONNECT_BASE_MS`), independent of the poll loop. |
+
+Jitter is applied to every delay so multiple instances that started together do not retry in
+lockstep. The default `equal` strategy lands in the 50-100% band, which de-synchronises callers
+while keeping the documented backoff curve meaningful; `HORIZON_POLL_JITTER=full` samples
+across the whole 0-100% range for aggressive de-correlation.
+
+The poller also exposes Prometheus counters and gauges (`stellar_tags_horizon_*`): poll cycles
+by outcome, rate-limit responses, stream open/close/error events, the delay before the next
+cycle, consecutive failures, and the timestamp of the last successful poll. Use
+`rate_limited` versus `total` on `stellar_tags_horizon_poll_cycles_total` to track the effect
+of these changes on Horizon's error rate.
 
 ## Logging
 
