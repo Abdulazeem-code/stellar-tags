@@ -1,12 +1,12 @@
 # Every service belongs to a profile, so `docker compose up` on its own starts
 # nothing and you always say which stack you want:
 #
-#   docker compose --profile dev up          backend + postgres + redis
+#   docker compose --profile dev up          backend + postgres + redis + rabbitmq
 #   docker compose --profile full up         the same, plus the built frontend
 #   docker compose --profile test up         API under test + its own database
 #   docker compose --profile integration up  local standalone Stellar network
 #   docker compose --profile cluster up      6-node Redis Cluster (3 primaries
-#                                            + 3 replicas) for BullMQ failover
+#                                            + 3 replicas) for cache failover
 #
 # dev and test use separate databases on separate host ports, so both can run
 # at once without colliding.
@@ -72,6 +72,26 @@ services:
       timeout: 3s
       retries: 5
 
+  # Durable broker for the webhook delivery queue (topic exchange + retry queue
+  # + dead-letter queue). Data is persisted so an in-flight delivery survives a
+  # broker restart; management UI is published on 15672.
+  rabbitmq:
+    profiles: ["dev", "full"]
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   backend:
     profiles: ["dev", "full"]
     build:
@@ -83,8 +103,11 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stellar_tags?schema=public
       REDIS_URL: redis://redis:6379
+      # Durable webhook delivery queue (topic exchange + retry queue + DLQ).
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       # Leave blank to keep using the single-instance REDIS_URL above. Set it to
-      # the cluster seeds (comma-separated) to switch BullMQ to cluster mode.
+      # the cluster seeds (comma-separated) to switch the cache/rate-limit
+      # clients to cluster mode.
       REDIS_CLUSTER_NODES: ${REDIS_CLUSTER_NODES:-}
       PORT: "5000"
       LOG_DIR: /app/logs
@@ -96,6 +119,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   # Only in full, not dev: the Vite build is the slowest thing here and backend
@@ -114,8 +139,8 @@ services:
       - backend
 
   # ── redis cluster ──────────────────────────────────────────────────────────
-  # Six-node Redis Cluster (3 primaries + 3 replicas) for exercising BullMQ
-  # sharding and node failover locally. redis-cluster-init bootstraps it once
+  # Six-node Redis Cluster (3 primaries + 3 replicas) for exercising Redis
+  # cache sharding and node failover locally. redis-cluster-init bootstraps it once
   # every node answers PING, then exits:
   #
   #   docker compose --profile cluster up -d
@@ -239,5 +264,6 @@ services:
 volumes:
   pgdata:
   backendlogs:
+  rabbitmqdata:
 
 
