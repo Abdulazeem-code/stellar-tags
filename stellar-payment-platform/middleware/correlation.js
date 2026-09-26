@@ -14,16 +14,7 @@ const correlationId = (req, res, next) => {
   req.correlationId = id;
   res.set(CORRELATION_HEADER, id);
 
-  // Tag request logs with the correlation ID so a single API call can be traced
-  // end-to-end across the backend's log output (console and rotating files).
-  res.on('finish', () => {
-    logger.info(`${req.method} ${req.originalUrl} ${res.statusCode}`, {
-      correlationId: id,
-      method: req.method,
-      url: req.originalUrl,
-      statusCode: res.statusCode,
-    });
-  });
+  // Logging is handled by pino-http in server.js using httpLogger
 
   next();
 };

@@ -32,9 +32,11 @@ const redactSensitive = (obj) => {
 const httpLogger = pinoHttp({
   logger,
   autoLogging: true,
+  genReqId: (req) => req.correlationId || require('crypto').randomUUID(),
   serializers: {
     req: (req) => {
       const serialized = {
+        id: req.id,
         method: req.method,
         path: req.url,
       };

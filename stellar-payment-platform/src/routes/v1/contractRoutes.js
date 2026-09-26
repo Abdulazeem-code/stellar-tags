@@ -8,7 +8,8 @@ router.get('/contract/status', async (req, res) => {
     const status = await getContractStatus();
     return res.status(200).json(status);
   } catch (error) {
-    console.error('Error fetching contract status:', error);
+    const { logger } = require('../../logger');
+    (req.log || logger).error({ err: error }, 'Error fetching contract status');
     if (error.message.includes('not set')) {
       return res.status(500).json({ error: 'Contract configuration is missing' });
     }
