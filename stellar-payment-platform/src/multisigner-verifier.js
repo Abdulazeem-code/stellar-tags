@@ -6,22 +6,22 @@
  * meet the minimum threshold requirements based on ledger configuration.
  */
 
-const { Horizon } = require('@stellar/stellar-sdk');
-
-const HORIZON_BASE = process.env.HORIZON_BASE || 'https://horizon-testnet.stellar.org';
+const { loadAccount, HORIZON_BASE } = require('./services/stellarService');
 
 /**
- * Fetches account details from Horizon network including signer configuration
+ * Fetches account details from Horizon network including signer configuration.
+ * Uses the circuit-breaker–protected `loadAccount` helper so a Horizon outage
+ * fast-fails instead of hanging until the TCP timeout.
+ *
  * @param {string} accountId - The Stellar account public key
- * @param {string} horizonUrl - Optional custom Horizon URL
+ * @param {string} horizonUrl - Optional custom Horizon URL (unused; kept for API compat)
  * @returns {Promise<Object>} Account object with signers array and thresholds
  * @throws {Error} If account not found or network error
  */
-async function fetchAccountSigners(accountId, horizonUrl = HORIZON_BASE) {
+async function fetchAccountSigners(accountId, _horizonUrl) {
   try {
-    const server = new Horizon.Server(horizonUrl);
-    const account = await server.loadAccount(accountId);
-    
+    const account = await loadAccount(accountId);
+
     return {
       accountId: account.id,
       signers: account.signers,
@@ -35,9 +35,9 @@ async function fetchAccountSigners(accountId, horizonUrl = HORIZON_BASE) {
     };
   } catch (error) {
     if (error.response?.status === 404) {
-      throw new Error(`Account not found on Horizon: ${accountId}`);
+      throw new Error(`Account not found on Horizon: ${accountId}`, { cause: error });
     }
-    throw new Error(`Failed to fetch account signers: ${error.message}`);
+    throw new Error(`Failed to fetch account signers: ${error.message}`, { cause: error });
   }
 }
 
@@ -123,39 +123,35 @@ async function verifyMultiSignerThreshold(accountId, signaturePublicKeys = [], o
   // Remove duplicates
   const uniqueSignatures = [...new Set(signaturePublicKeys)];
 
-  try {
-    // Fetch account details from Horizon
-    const accountDetails = await fetchAccountSigners(accountId, horizonUrl);
-    
-    // Determine applicable threshold based on operation type
-    const requiredThreshold = getApplicableThreshold(operationType, accountDetails.thresholds);
+  // Fetch account details from Horizon
+  const accountDetails = await fetchAccountSigners(accountId, horizonUrl);
+  
+  // Determine applicable threshold based on operation type
+  const requiredThreshold = getApplicableThreshold(operationType, accountDetails.thresholds);
 
-    // Calculate total weight from provided signatures
-    const { totalWeight, signatureDetails } = calculateSignatureWeight(
-      uniqueSignatures,
-      accountDetails.signers
-    );
+  // Calculate total weight from provided signatures
+  const { totalWeight, signatureDetails } = calculateSignatureWeight(
+    uniqueSignatures,
+    accountDetails.signers
+  );
 
-    // Check if weight meets threshold
-    const meetsThreshold = totalWeight >= requiredThreshold;
+  // Check if weight meets threshold
+  const meetsThreshold = totalWeight >= requiredThreshold;
 
-    return {
-      success: meetsThreshold,
-      accountId,
-      operationType,
-      requiredThreshold,
-      totalWeight,
-      signatureCount: uniqueSignatures.length,
-      uniqueSignerCount: signatureDetails.filter(s => s.isValid).length,
-      signatures: signatureDetails,
-      thresholds: accountDetails.thresholds,
-      signerCount: accountDetails.signers.length,
-      errorMessage: meetsThreshold ? null : 
-        `Insufficient signing weight. Required: ${requiredThreshold}, Provided: ${totalWeight}`,
-    };
-  } catch (error) {
-    throw error;
-  }
+  return {
+    success: meetsThreshold,
+    accountId,
+    operationType,
+    requiredThreshold,
+    totalWeight,
+    signatureCount: uniqueSignatures.length,
+    uniqueSignerCount: signatureDetails.filter(s => s.isValid).length,
+    signatures: signatureDetails,
+    thresholds: accountDetails.thresholds,
+    signerCount: accountDetails.signers.length,
+    errorMessage: meetsThreshold ? null : 
+      `Insufficient signing weight. Required: ${requiredThreshold}, Provided: ${totalWeight}`,
+  };
 }
 
 /**
@@ -191,7 +187,7 @@ async function verifyMasterSignature(accountId, signaturePublicKey, horizonUrl =
     const signerExists = accountDetails.signers.some(s => s.key === signaturePublicKey);
     
     return signerExists;
-  } catch (error) {
+  } catch {
     return false;
   }
 }

@@ -1,22 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
 import toast from 'react-hot-toast';
+import { Client as PaymentRouterClient, networks } from '@stellar-tags/payment-router';
 import { useLatencyTracker } from '../useLatencyTracker';
 import LatencyGauge from '../LatencyGauge';
 import NetworkBadge from '../NetworkBadge';
 import { useDebounce } from '../useDebounce';
 import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
+import RecentAddresses from '../components/RecentAddresses';
+import { useRecentAddresses } from '../useRecentAddresses';
 import {
   API_BASE,
-  CONTRACT_ID,
   NAV_STORAGE_KEY,
   TOKEN_ADDRESS,
-  TREASURY_ADDRESS,
   formatShortAddress,
   formatUsername,
-  loadStellarSdk,
   resolveRecipient,
+  apiErrorMessage,
   useNavState,
   useWalletMenu,
 } from './shared';
@@ -52,6 +53,8 @@ function Dashboard({
     action()
   }
   const [nameTag, setNameTag] = useState('')
+  const [showRecent, setShowRecent] = useState(false);
+  const { recentAddresses, saveAddress, clearAddresses } = useRecentAddresses();
   const recipientRef = useRef(null);
   const debouncedNameTag = useDebounce(nameTag, 300)
   const [amount, setAmount] = useState('')
@@ -129,11 +132,12 @@ function Dashboard({
             "#D97706",
             "#FEF3C7",
           );
-          onRegistrationStateChange("new");
+          // Change "new" to "skipped" to break the infinite redirect loop
+          onRegistrationStateChange("skipped"); 
           return;
         }
 
-        throw new Error((data && data.detail) || `Backend error (${response.status}).`)
+        throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`))
       } catch (error){
         setReceiveAddress(userPublicKey)
         setReceiveTag('')
@@ -233,40 +237,23 @@ function Dashboard({
       }
 
       toast.loading("Simulating smart contract execution...", { id: toastId });
-      const StellarSdk = await loadStellarSdk();
       const amountStroops = BigInt(Math.floor(amountValue * 10000000));
 
-      const contractArgs = [
-        new StellarSdk.Address(userPublicKey).toScVal(),
-        new StellarSdk.Address(recipientAddress).toScVal(),
-        new StellarSdk.Address(TREASURY_ADDRESS).toScVal(),
-        new StellarSdk.Address(TOKEN_ADDRESS).toScVal(),
-        StellarSdk.nativeToScVal(amountStroops, { type: "i128" }),
-      ];
+      // Build and simulate the payment through the type-safe client generated
+      // from the contract ABI (packages/types).
+      const client = new PaymentRouterClient({
+        ...networks.testnet,
+        rpcUrl: "https://soroban-testnet.stellar.org",
+      });
 
-      const server = new StellarSdk.rpc.Server(
-        "https://soroban-testnet.stellar.org",
-      );
-      const account = await server.getAccount(userPublicKey);
-      const contract = new StellarSdk.Contract(CONTRACT_ID);
-
-      const transaction = new StellarSdk.TransactionBuilder(account, {
-        fee: "100000",
-        networkPassphrase: "Test SDF Network ; September 2015",
-      })
-        .addOperation(contract.call("route_payment", ...contractArgs))
-        .setTimeout(300)
-        .build();
-
-      let preparedTransaction;
+      let assembledTransaction;
       try {
-        preparedTransaction = await server.prepareTransaction(transaction);
-        if (preparedTransaction.error) {
-          throw new Error(
-            preparedTransaction.error.message ||
-              "Simulation rejected by network.",
-          );
-        }
+        assembledTransaction = await client.route_payment({
+          sender: userPublicKey,
+          recipient: recipientAddress,
+          token_address: TOKEN_ADDRESS,
+          amount: amountStroops,
+        });
       } catch (err) {
         throw new Error(`Simulation failed: ${err.message}`, { cause: err });
       }
@@ -275,7 +262,7 @@ function Dashboard({
       let signedXdrResponse;
       try {
         signedXdrResponse = await freighterApi.signTransaction(
-          preparedTransaction.toXDR(),
+          assembledTransaction.toXDR(),
           {
             network: "TESTNET",
             networkPassphrase: "Test SDF Network ; September 2015",
@@ -340,6 +327,7 @@ function Dashboard({
         );
 
         displayMessage("Payment successful!", "#059669", "#D1FAE5");
+        saveAddress(recipientInput);
         setAmount("");
         onRefreshBalance();
         window.dispatchEvent(new Event("stellar:tx-update"));
@@ -514,7 +502,7 @@ function Dashboard({
               <div className="balance-error">{balanceError}</div>
             )}
             <div className="metric">
-              {balance !== null
+              {userPublicKey && balance !== null
                 ? showBalance
                   ? balance.toLocaleString(undefined, {
                       minimumFractionDigits: 2,
@@ -565,15 +553,32 @@ function Dashboard({
                   <div className="wallet-status">{walletLabel}</div>
                 )}
                 <label>Recipient username or address</label>
-                <input
-                  ref={recipientRef}
-                  type="text"
-                  value={nameTag}
-                  onChange={(event) => setNameTag(event.target.value)}
-                  placeholder="e.g., walzeem or G..."
-                  autoComplete="off"
-                  disabled={!userPublicKey || isProcessing}
-                />
+                <div style={{ position: 'relative' }}>
+                  <input
+                    ref={recipientRef}
+                    type="text"
+                    value={nameTag}
+                    onChange={(event) => {
+                      setNameTag(event.target.value);
+                      setShowRecent(true);
+                    }}
+                    onFocus={() => setShowRecent(true)}
+                    placeholder="e.g., walzeem or G..."
+                    autoComplete="off"
+                    disabled={!userPublicKey || isProcessing}
+                  />
+                  <RecentAddresses
+                    addresses={recentAddresses}
+                    isVisible={showRecent && recentAddresses.length > 0}
+                    onSelect={(address) => {
+                      setNameTag(address);
+                      setShowRecent(false);
+                      recipientRef.current?.focus();
+                    }}
+                    onClear={clearAddresses}
+                    onClose={() => setShowRecent(false)}
+                  />
+                </div>
                 {nameTag === userPublicKey && (
                   <span className="field-error">Warning: You are sending funds to your own address.</span>
                 )}

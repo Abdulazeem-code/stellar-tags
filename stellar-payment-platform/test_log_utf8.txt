@@ -1,0 +1,37 @@
+﻿  console.log
+    Ôùç injected env (1) from .env // tip: Ôùê encrypted .env [www.dotenvx.com]
+
+      at _log (node_modules/dotenv/lib/main.js:131:11)
+
+  console.log
+    Ôùç injected env (0) from .env // tip: Ôîÿ multiple files { path: ['.env.local', '.env'] }
+
+      at _log (node_modules/dotenv/lib/main.js:131:11)
+
+FAIL ./integration.test.js (5.887 s)
+  API Integration Lifecycle Suite
+    ├ù Full lifecycle: register a user, query the user, and attempt to register a duplicate username (126 ms)
+
+  ÔùÅ API Integration Lifecycle Suite ÔÇ║ Full lifecycle: register a user, query the user, and attempt to register a duplicate username
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 200
+    Received: 500
+
+    [0m [90m 184 |[39m       [33m.[39m[36mget[39m([32m`/api/v1/lookup?address=${user1.address}`[39m)[33m;[39m
+     [90m 185 |[39m
+    [31m[1m>[22m[39m[90m 186 |[39m     expect(queryRes[33m.[39mstatus)[33m.[39mtoBe([35m200[39m)[33m;[39m
+     [90m     |[39m                             [31m[1m^[22m[39m
+     [90m 187 |[39m     expect(queryRes[33m.[39mbody)[33m.[39mtoMatchObject({
+     [90m 188 |[39m       username[33m:[39m user1[33m.[39mfederationTag[33m,[39m
+     [90m 189 |[39m       address[33m:[39m user1[33m.[39maddress[33m,[39m[0m
+
+      at Object.toBe (integration.test.js:186:29)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 1 total
+Snapshots:   0 total
+Time:        6.051 s
+Ran all test suites matching /integration.test.js/i.
+Force exiting Jest: Have you considered using `--detectOpenHandles` to detect async operations that kept running after all tests finished?

@@ -1,5 +1,51 @@
+# Every service belongs to a profile, so `docker compose up` on its own starts
+# nothing and you always say which stack you want:
+#
+#   docker compose --profile dev up          backend + postgres + redis
+#   docker compose --profile full up         the same, plus the built frontend
+#   docker compose --profile test up         API under test + its own database
+#   docker compose --profile integration up  local standalone Stellar network
+#   docker compose --profile cluster up      6-node Redis Cluster (3 primaries
+#                                            + 3 replicas) for BullMQ failover
+#
+# dev and test use separate databases on separate host ports, so both can run
+# at once without colliding.
+#
+# To run the app against the Redis Cluster instead of the single-instance
+# redis service, add the profile and pass the seeds through the host env:
+#
+#   REDIS_CLUSTER_NODES=redis-cluster-1:6379,redis-cluster-2:6379,... \
+#     docker compose --profile dev --profile cluster up
+
+x-redis-cluster-node: &redis-cluster-node
+  image: redis:7-alpine
+  profiles: ["cluster"]
+  command:
+    - redis-server
+    - --port
+    - "6379"
+    - --cluster-enabled
+    - "yes"
+    - --cluster-config-file
+    - /data/nodes.conf
+    - --cluster-node-timeout
+    - "5000"
+    - --appendonly
+    - "yes"
+  volumes:
+    # Anonymous volume: `docker compose --profile cluster down -v` resets the
+    # slot map and data so a clean bootstrap is possible.
+    - /data
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
 services:
+  # ── dev ────────────────────────────────────────────────────────────────────
   postgres:
+    profiles: ["dev", "full"]
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
@@ -16,6 +62,7 @@ services:
       retries: 5
 
   redis:
+    profiles: ["dev", "full"]
     image: redis:7-alpine
     ports:
       - "6379:6379"
@@ -26,6 +73,7 @@ services:
       retries: 5
 
   backend:
+    profiles: ["dev", "full"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -35,14 +83,25 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stellar_tags?schema=public
       REDIS_URL: redis://redis:6379
+      # Leave blank to keep using the single-instance REDIS_URL above. Set it to
+      # the cluster seeds (comma-separated) to switch BullMQ to cluster mode.
+      REDIS_CLUSTER_NODES: ${REDIS_CLUSTER_NODES:-}
       PORT: "5000"
+      LOG_DIR: /app/logs
+    volumes:
+      # Keep rotated logs across container restarts. The transports cap the
+      # volume's growth by rotating daily / at 20MB and pruning old archives.
+      - backendlogs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
 
+  # Only in full, not dev: the Vite build is the slowest thing here and backend
+  # work does not need it. full is dev plus this.
   frontend:
+    profiles: ["full"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -54,5 +113,131 @@ services:
     depends_on:
       - backend
 
+  # ── redis cluster ──────────────────────────────────────────────────────────
+  # Six-node Redis Cluster (3 primaries + 3 replicas) for exercising BullMQ
+  # sharding and node failover locally. redis-cluster-init bootstraps it once
+  # every node answers PING, then exits:
+  #
+  #   docker compose --profile cluster up -d
+  #
+  # Clients must live on this compose network: cluster redirects advertise
+  # container IPs, so the host-published ports below are for troubleshooting
+  # only. The backend joins this network under the dev profile.
+  redis-cluster-1:
+    <<: *redis-cluster-node
+    ports:
+      - "7001:6379"
+  redis-cluster-2:
+    <<: *redis-cluster-node
+    ports:
+      - "7002:6379"
+  redis-cluster-3:
+    <<: *redis-cluster-node
+    ports:
+      - "7003:6379"
+  redis-cluster-4:
+    <<: *redis-cluster-node
+    ports:
+      - "7004:6379"
+  redis-cluster-5:
+    <<: *redis-cluster-node
+    ports:
+      - "7005:6379"
+  redis-cluster-6:
+    <<: *redis-cluster-node
+    ports:
+      - "7006:6379"
+
+  redis-cluster-init:
+    profiles: ["cluster"]
+    image: redis:7-alpine
+    depends_on:
+      redis-cluster-1:
+        condition: service_healthy
+      redis-cluster-2:
+        condition: service_healthy
+      redis-cluster-3:
+        condition: service_healthy
+      redis-cluster-4:
+        condition: service_healthy
+      redis-cluster-5:
+        condition: service_healthy
+      redis-cluster-6:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        redis-cli --cluster create
+        redis-cluster-1:6379 redis-cluster-2:6379 redis-cluster-3:6379 redis-cluster-4:6379 redis-cluster-5:6379 redis-cluster-6:6379
+        --cluster-replicas 1 --cluster-yes
+
+  # ── test ───────────────────────────────────────────────────────────────────
+  postgres-test:
+    profiles: ["test"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stellar_tags_test
+    # 5433 on the host so a dev postgres can stay up on 5432.
+    ports:
+      - "5433:5432"
+    # No volume: a test database should start empty every time.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api-test:
+    profiles: ["test"]
+    build:
+      context: ./stellar-payment-platform
+      dockerfile: Dockerfile.test
+    environment:
+      PORT: "5001"
+      DATABASE_URL: postgresql://postgres:postgres@postgres-test:5432/stellar_tags_test?schema=public
+    ports:
+      - "5001:5001"
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── integration ────────────────────────────────────────────────────────────
+  # Standalone Stellar network (Soroban-enabled) used by the contract
+  # integration tests. Exposes both the Horizon REST API (8000) and the
+  # Soroban RPC endpoint (8000/rpc) so the Rust SDK can submit real
+  # transactions against a local network. Kept out of the test profile
+  # because it pulls a multi-gigabyte image the API tests never touch.
+  stellar-standalone:
+    profiles: ["integration"]
+    image: stellar/quickstart:latest
+    command: [
+      "--standalone",
+      "--enable-soroban-rpc",
+      "--enable-core-artifacts",
+      "--local",
+    ]
+    environment:
+      ENABLE_LOGS: "true"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
 volumes:
   pgdata:
+  backendlogs:
+
+

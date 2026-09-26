@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { logger } = require('./src/logger');
 
 const targetFile = path.join(__dirname, 'server.js');
 let code = fs.readFileSync(targetFile, 'utf8');
@@ -44,4 +45,4 @@ require.cache[require.resolve('express')] = {
 `;
 
 fs.writeFileSync(targetFile, injection + code, 'utf8');
-console.log('Successfully applied structural API routes reflection matrix!');
+logger.info('Successfully applied structural API routes reflection matrix!');
