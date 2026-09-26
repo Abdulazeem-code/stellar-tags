@@ -1,4 +1,5 @@
 const cron = require('node-cron');
+const { logger } = require('./logger');
 
 /**
  * Number of days after which a registration is considered stale.
@@ -68,18 +69,18 @@ async function runCleanup(prisma) {
 function scheduleCleanupJob(prisma) {
   // Cron expression: "0 0 * * 0" → runs at 00:00 every Sunday.
   cron.schedule('0 0 * * 0', async () => {
-    console.log('[cleanup-cron] Starting stale-account sweep…');
+    logger.info('[cleanup-cron] Starting stale-account sweep…');
     try {
       const { pruned, flagged } = await runCleanup(prisma);
-      console.log(
+      logger.info(
         `[cleanup-cron] Sweep complete – pruned: ${pruned}, flagged: ${flagged}`,
       );
     } catch (err) {
-      console.error('[cleanup-cron] Sweep failed:', err.message);
+      logger.error('[cleanup-cron] Sweep failed:', err.message);
     }
   });
 
-  console.log('[cleanup-cron] Weekly cleanup job scheduled (Sundays at midnight).');
+  logger.info('[cleanup-cron] Weekly cleanup job scheduled (Sundays at midnight).');
 }
 
 module.exports = { scheduleCleanupJob, runCleanup, STALE_THRESHOLD_DAYS };

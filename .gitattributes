@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings. With core.autocrlf=true on Windows a
+# CRLF checkout bakes `#!/bin/sh\r` into the Docker image, and the container
+# fails at startup with a confusing "./startup.sh: not found".
+*.sh text eol=lf

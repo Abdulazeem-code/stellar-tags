@@ -7,3 +7,14 @@ node_modules/
 
 # Legacy SQLite database (replaced by PostgreSQL/Prisma)
 data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Rotating log files (#294)
+logs/
+
+# Generated webhook load-test keypairs (see scripts/seed-webhook-load-test-users.js)
+scripts/.load-test-fixtures/
+
+# Jest coverage reports
+coverage/
