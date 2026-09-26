@@ -129,6 +129,37 @@ pub trait KycOracle {
     fn is_verified(env: Env, account: Address) -> bool;
 }
 
+/// Interface for a decentralized price-feed oracle contract.
+///
+/// Implementations must return a price quote with a `timestamp` (Unix seconds)
+/// so staleness can be checked against the contract's configured threshold.
+/// The `price` is expressed as a fixed-point integer with the number of
+/// decimal places indicated by `decimals`.  For example, a USD/XLM price of
+/// 0.12500000 with `decimals = 8` would be returned as `price = 12500000`.
+///
+/// Keeping the protocol behind this thin adapter lets the router integrate
+/// with any Soroban-compatible price oracle while tests use an in-process mock.
+#[contractclient(name = "PriceFeedOracleClient")]
+pub trait PriceFeedOracle {
+    /// Returns the latest price of `base_asset` denominated in `quote_asset`.
+    ///
+    /// # Returns
+    /// A `PriceData` struct containing `price`, `decimals`, and `timestamp`.
+    fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData;
+}
+
+/// A single price quote returned by the oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceData {
+    /// Fixed-point price value. The true price is `price / 10^decimals`.
+    pub price: i128,
+    /// Number of decimal places used in `price`.
+    pub decimals: u32,
+    /// Unix timestamp (seconds) when this price was last updated on-chain.
+    pub timestamp: u64,
+}
+
 // ── Timelock data structures ─────────────────────────────────────────────────
 //
 // Admin actions that change sensitive contract parameters (treasury, fees,
@@ -249,6 +280,15 @@ pub enum DataKey {
     Role(Role),
     /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
     UserRole(Address, Role),
+    /// Address of the configured price-feed oracle contract.
+    OracleAddress,
+    /// Maximum age (in seconds) a price reading may have before it is
+    /// considered stale and rejected.  Defaults to 3 600 s (1 hour).
+    StalenessThreshold,
+    /// Administrator-supplied fallback price for a (base, quote) asset pair.
+    /// Used when the live oracle is unavailable or returns a stale value.
+    /// Keyed by `(base_asset, quote_asset)`.
+    FallbackPrice(Address, Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -299,6 +339,18 @@ pub enum Error {
     RoleNotFound = 19,
     /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
     InvalidRole = 20,
+    /// No price-feed oracle has been configured by the admin.
+    OracleNotConfigured = 21,
+    /// The price reading returned by the oracle is older than the configured
+    /// staleness threshold and cannot be used.
+    OraclePriceStale = 22,
+    /// The price returned by the oracle is zero or negative, which is
+    /// logically invalid for an asset price.
+    OraclePriceInvalid = 23,
+    /// The call to the external oracle contract failed (e.g. the oracle
+    /// contract is unavailable or returned an unexpected error), and no
+    /// fallback price has been configured for the requested asset pair.
+    OracleCallFailed = 24,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -1556,6 +1608,266 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::KycThreshold)
     }
 
+    // ── Price-feed oracle ────────────────────────────────────────────────────
+
+    /// Configures the price-feed oracle contract address. ComplianceOfficer-protected.
+    ///
+    /// The oracle contract must implement the [`PriceFeedOracle`] interface:
+    /// it must expose a `get_price(base_asset, quote_asset) -> PriceData`
+    /// method that returns the latest price together with a Unix timestamp so
+    /// staleness can be validated against the configured threshold.
+    ///
+    /// # Parameters
+    /// - `oracle`: Address of the oracle contract to use for price lookups.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has not been initialized.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn set_price_oracle(env: Env, oracle: Address) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAddress, &oracle);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("price_cfg"),), oracle);
+        Ok(())
+    }
+
+    /// Sets the maximum age (in seconds) a price reading may have before it is
+    /// considered stale. ComplianceOfficer-protected.
+    ///
+    /// When a price timestamp is older than `(current_ledger_time - threshold)`
+    /// the reading is rejected with [`Error::OraclePriceStale`] and the
+    /// fallback price (if configured) is used instead.
+    ///
+    /// # Parameters
+    /// - `threshold_secs`: Maximum allowed age in seconds. A value of `0`
+    ///   disables the staleness check entirely (every price is accepted).
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn set_staleness_threshold(env: Env, threshold_secs: u64) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::StalenessThreshold, &threshold_secs);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("stale_cfg"),), threshold_secs);
+        Ok(())
+    }
+
+    /// Stores an admin-supplied fallback price for a (base, quote) asset pair.
+    /// ComplianceOfficer-protected.
+    ///
+    /// The fallback is used by [`get_price`] when the live oracle is
+    /// unavailable or returns data that fails validation (stale or invalid).
+    /// Setting a fallback price to `0` effectively removes the fallback,
+    /// meaning that oracle failures will propagate as errors rather than
+    /// silently using a stale cached value.
+    ///
+    /// # Parameters
+    /// - `base_asset`: Address of the base asset (e.g. XLM contract).
+    /// - `quote_asset`: Address of the quote asset (e.g. USDC contract).
+    /// - `fallback_price`: Price expressed in the same fixed-point format as
+    ///   the oracle (`price / 10^decimals`). Pass `0` to clear the fallback.
+    /// - `decimals`: Decimal precision of `fallback_price`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn set_fallback_price(
+        env: Env,
+        base_asset: Address,
+        quote_asset: Address,
+        fallback_price: i128,
+        decimals: u32,
+    ) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        let key = DataKey::FallbackPrice(base_asset.clone(), quote_asset.clone());
+        if fallback_price == 0 {
+            // A zero fallback means "no fallback configured": remove the entry.
+            env.storage().persistent().remove(&key);
+        } else {
+            let data = PriceData {
+                price: fallback_price,
+                decimals,
+                // Timestamp 0 signals "static fallback — staleness does not apply".
+                timestamp: 0,
+            };
+            env.storage().persistent().set(&key, &data);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("fall_cfg"), base_asset, quote_asset),
+            fallback_price,
+        );
+        Ok(())
+    }
+
+    /// Returns the stored fallback price for a (base, quote) asset pair, if any.
+    ///
+    /// # Parameters
+    /// - `base_asset`: Address of the base asset.
+    /// - `quote_asset`: Address of the quote asset.
+    ///
+    /// # Returns
+    /// `Some(PriceData)` if a fallback has been configured, `None` otherwise.
+    pub fn get_fallback_price(
+        env: Env,
+        base_asset: Address,
+        quote_asset: Address,
+    ) -> Option<PriceData> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FallbackPrice(base_asset, quote_asset))
+    }
+
+    /// Fetches the current exchange rate for a (base, quote) asset pair from
+    /// the configured price-feed oracle, validates it, and returns the result.
+    ///
+    /// ## Validation flow
+    ///
+    /// 1. **Oracle configured?** — If no oracle address is stored, return
+    ///    `Err(Error::OracleNotConfigured)` (unless a fallback is available).
+    /// 2. **Call oracle** — Invoke the oracle's `get_price` method.  If the
+    ///    call fails (oracle contract unavailable or traps), attempt to return
+    ///    the fallback price.  If there is no fallback either, return
+    ///    `Err(Error::OracleCallFailed)`.
+    /// 3. **Staleness check** — Compare `price_data.timestamp` with the
+    ///    current ledger time.  If older than the configured threshold (default
+    ///    3 600 s), attempt to return the fallback price.  If there is no
+    ///    fallback, return `Err(Error::OraclePriceStale)`.
+    /// 4. **Validity check** — A price ≤ 0 is logically invalid.  Attempt
+    ///    fallback; if unavailable return `Err(Error::OraclePriceInvalid)`.
+    /// 5. **Return** — The validated `PriceData` is returned to the caller.
+    ///
+    /// A staleness threshold of `0` disables the staleness check entirely.
+    ///
+    /// ## Parameters
+    /// - `base_asset`: Address of the base asset (e.g. XLM native contract).
+    /// - `quote_asset`: Address of the quote asset (e.g. USDC contract).
+    ///
+    /// ## Returns
+    /// `Ok(PriceData)` on success, or one of:
+    /// - `Err(Error::OracleNotConfigured)` — no oracle set and no fallback.
+    /// - `Err(Error::OracleCallFailed)` — oracle call failed and no fallback.
+    /// - `Err(Error::OraclePriceStale)` — data too old and no fallback.
+    /// - `Err(Error::OraclePriceInvalid)` — price ≤ 0 and no fallback.
+    pub fn get_price(
+        env: Env,
+        base_asset: Address,
+        quote_asset: Address,
+    ) -> Result<PriceData, Error> {
+        // Retrieve the oracle address, falling back gracefully if absent.
+        let oracle_opt: Option<Address> =
+            env.storage().instance().get(&DataKey::OracleAddress);
+
+        let staleness_threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StalenessThreshold)
+            .unwrap_or(3_600u64); // default: 1 hour
+
+        // Helper closure: return the fallback price if one is configured,
+        // otherwise propagate the supplied error.
+        let fallback_or_err =
+            |env: &Env, base: &Address, quote: &Address, err: Error| -> Result<PriceData, Error> {
+                if let Some(fallback) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(
+                        base.clone(),
+                        quote.clone(),
+                    ))
+                {
+                    log!(env, "Oracle error; using fallback price");
+                    Ok(fallback)
+                } else {
+                    Err(err)
+                }
+            };
+
+        // 1. Check oracle is configured.
+        let oracle = match oracle_opt {
+            Some(addr) => addr,
+            None => {
+                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleNotConfigured);
+            }
+        };
+
+        // 2. Call the oracle. Use try_get_price to avoid trapping on failure.
+        let price_data = match PriceFeedOracleClient::new(&env, &oracle)
+            .try_get_price(&base_asset, &quote_asset)
+        {
+            Ok(Ok(data)) => data,
+            _ => {
+                log!(&env, "Oracle contract call failed");
+                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleCallFailed);
+            }
+        };
+
+        // 3. Staleness check (skip when threshold is 0).
+        if staleness_threshold > 0 {
+            let current_time = env.ledger().timestamp();
+            if price_data.timestamp == 0
+                || current_time.saturating_sub(price_data.timestamp) > staleness_threshold
+            {
+                log!(&env, "Oracle price is stale");
+                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OraclePriceStale);
+            }
+        }
+
+        // 4. Validity check.
+        if price_data.price <= 0 {
+            log!(&env, "Oracle price is invalid (<=0)");
+            return fallback_or_err(&env, &base_asset, &quote_asset, Error::OraclePriceInvalid);
+        }
+
+        // 5. Emit event and return the validated price.
+        env.events().publish(
+            (
+                symbol_short!("price_ok"),
+                base_asset.clone(),
+                quote_asset.clone(),
+            ),
+            price_data.price,
+        );
+
+        log!(&env, "Oracle price fetched and validated");
+        Ok(price_data)
+    }
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
     /// # Parameters
@@ -1956,6 +2268,264 @@ mod test {
                 .get(&MockKycKey::Verified(account))
                 .unwrap_or(false)
         }
+    }
+
+    // ── Mock price-feed oracle ───────────────────────────────────────────────
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockOracleKey {
+        Price(Address, Address),
+        ShouldFail,
+    }
+
+    #[contract]
+    struct MockPriceFeedOracle;
+
+    #[contractimpl]
+    impl MockPriceFeedOracle {
+        /// Store a price for a given (base, quote) pair.
+        pub fn set_price(
+            env: Env,
+            base_asset: Address,
+            quote_asset: Address,
+            price: i128,
+            decimals: u32,
+            timestamp: u64,
+        ) {
+            let data = PriceData {
+                price,
+                decimals,
+                timestamp,
+            };
+            env.storage()
+                .instance()
+                .set(&MockOracleKey::Price(base_asset, quote_asset), &data);
+        }
+
+        /// Configure the mock to trap on the next `get_price` call.
+        pub fn set_should_fail(env: Env, fail: bool) {
+            env.storage()
+                .instance()
+                .set(&MockOracleKey::ShouldFail, &fail);
+        }
+
+        /// Implements the PriceFeedOracle interface.
+        pub fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData {
+            let should_fail: bool = env
+                .storage()
+                .instance()
+                .get(&MockOracleKey::ShouldFail)
+                .unwrap_or(false);
+            if should_fail {
+                panic!("mock oracle failure");
+            }
+            env.storage()
+                .instance()
+                .get(&MockOracleKey::Price(base_asset, quote_asset))
+                .unwrap_or(PriceData {
+                    price: 0,
+                    decimals: 7,
+                    timestamp: 0,
+                })
+        }
+    }
+
+    // ── Oracle helper ────────────────────────────────────────────────────────
+
+    fn setup_oracle_env() -> (
+        Env,
+        PaymentRouterClient<'static>,
+        Address,
+        MockPriceFeedOracleClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+        let oracle_id = env.register_contract(None, MockPriceFeedOracle);
+        let oracle_client = MockPriceFeedOracleClient::new(&env, &oracle_id);
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        (env, client, contract_id, oracle_client, oracle_id, base, quote)
+    }
+
+    // ── Oracle tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_price_returns_valid_oracle_price() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+
+        // Populate mock: 0.125 USD/XLM with 7 decimals = 1_250_000, fresh timestamp
+        let now = env.ledger().timestamp();
+        oracle_client.set_price(&base, &quote, &1_250_000, &7, &now);
+
+        let price_data = client.get_price(&base, &quote).unwrap();
+        assert_eq!(price_data.price, 1_250_000);
+        assert_eq!(price_data.decimals, 7);
+        assert_eq!(price_data.timestamp, now);
+    }
+
+    #[test]
+    fn test_get_price_fails_when_oracle_not_configured() {
+        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // No oracle set, no fallback
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OracleNotConfigured))
+        );
+    }
+
+    #[test]
+    fn test_get_price_uses_fallback_when_oracle_not_configured() {
+        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Set a fallback price but no live oracle
+        client.set_fallback_price(&base, &quote, &1_000_000, &7);
+
+        let fallback = client.get_fallback_price(&base, &quote);
+        assert!(fallback.is_some());
+        assert_eq!(fallback.unwrap().price, 1_000_000);
+
+        // get_price should return the fallback
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 1_000_000);
+    }
+
+    #[test]
+    fn test_get_price_rejects_stale_data_and_uses_fallback() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+        // Threshold of 3600 seconds (default)
+        client.set_staleness_threshold(&3_600u64);
+
+        // Oracle returns a price with a very old timestamp (2 hours ago)
+        let stale_timestamp = env.ledger().timestamp().saturating_sub(7_200);
+        oracle_client.set_price(&base, &quote, &2_000_000, &7, &stale_timestamp);
+
+        // Without fallback: should return OraclePriceStale
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OraclePriceStale))
+        );
+
+        // Add a fallback: should now return the fallback price
+        client.set_fallback_price(&base, &quote, &1_800_000, &7);
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 1_800_000);
+    }
+
+    #[test]
+    fn test_get_price_rejects_invalid_price() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+
+        // Oracle returns price = 0 with a fresh timestamp
+        let now = env.ledger().timestamp();
+        oracle_client.set_price(&base, &quote, &0, &7, &now);
+
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OraclePriceInvalid))
+        );
+    }
+
+    #[test]
+    fn test_get_price_falls_back_when_oracle_call_fails() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+
+        // Configure mock to fail
+        oracle_client.set_should_fail(&true);
+
+        // No fallback: should error
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OracleCallFailed))
+        );
+
+        // With fallback configured: should succeed
+        client.set_fallback_price(&base, &quote, &5_000_000, &7);
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 5_000_000);
+    }
+
+    #[test]
+    fn test_staleness_threshold_zero_disables_staleness_check() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+        // Set threshold to 0 = staleness check disabled
+        client.set_staleness_threshold(&0u64);
+
+        // Oracle returns a price with timestamp 0 (would normally be stale)
+        oracle_client.set_price(&base, &quote, &3_000_000, &7, &0);
+
+        // Should pass because staleness check is disabled
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 3_000_000);
+    }
+
+    #[test]
+    fn test_set_fallback_price_zero_clears_fallback() {
+        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Set then clear fallback
+        client.set_fallback_price(&base, &quote, &1_000_000, &7);
+        assert!(client.get_fallback_price(&base, &quote).is_some());
+
+        client.set_fallback_price(&base, &quote, &0, &7);
+        assert!(client.get_fallback_price(&base, &quote).is_none());
+    }
+
+    #[test]
+    fn test_set_price_oracle_requires_compliance_officer_role() {
+        let (env, client, _, _oracle_client, oracle_id, _base, _quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Only ComplianceOfficer (admin in this test via mock_all_auths) can set the oracle.
+        // Verify auth is recorded for admin.
+        client.set_price_oracle(&oracle_id);
+        let auths = env.auths();
+        let admin_auth_present = auths.iter().any(|(addr, _)| *addr == admin);
+        assert!(
+            admin_auth_present,
+            "set_price_oracle must require admin/ComplianceOfficer authorization"
+        );
     }
 
     /// Returns (env, client, contract_id).
