@@ -139,6 +139,10 @@ jest.mock('./prismaClient', () => {
         return row;
       }),
     },
+    walletBalance: {
+      findMany: jest.fn(async () => []),
+      upsert: jest.fn(),
+    },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };
