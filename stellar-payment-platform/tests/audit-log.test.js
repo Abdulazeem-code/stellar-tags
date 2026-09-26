@@ -165,6 +165,7 @@ describe('Admin Audit Logging System', () => {
         .post('/api/v1/admin/block')
         .set('x-api-key', 'test-admin-key')
         .set('x-user-id', 'admin-user-1')
+        .set('Idempotency-Key', 'test-key-3')
         .send({
           address: 'GABC1234567890123456789012345678901234567890123456789012',
           secret: 'should-be-redacted',
