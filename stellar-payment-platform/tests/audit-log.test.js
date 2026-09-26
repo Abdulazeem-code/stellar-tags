@@ -170,7 +170,7 @@ describe('Admin Audit Logging System', () => {
           secret: 'should-be-redacted',
         });
 
-      expect(res.status).toBe(200);
+      if (res.status !== 200) console.log(res.body); expect(res.status).toBe(200);
 
       // Wait a tick for async setImmediate callback in middleware
       await new Promise((resolve) => setImmediate(resolve));
@@ -210,6 +210,7 @@ describe('Admin Audit Logging System', () => {
       const res = await request(app)
         .post('/api/v1/admin/block')
         .set('x-api-key', 'test-admin-key')
+        .set('Idempotency-Key', 'test-key-1')
         .send({ address: 'GBOB1234567890123456789012345678901234567890123456789012' });
 
       expect(res.status).toBe(200);
