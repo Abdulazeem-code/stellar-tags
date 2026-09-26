@@ -16,6 +16,7 @@ const { createGraphQLMiddleware } = require("./src/graphql");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
+const { scheduleReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
 const { correlationId } = require("./middleware/correlation");
 const { idempotencyMiddleware } = require("./middleware/idempotency");
@@ -111,14 +112,14 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 // #31 ΓÇö Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
-app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
+app.use(httpLogger);
 app.disable("x-powered-by");
 app.use(securityMiddleware);
 
 app.use(timeout("10s"));
 app.use((err, req, res, next) => {
   if (req.timedout) {
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Request Timeout`);
+    req.log.error({ err }, "Request Timeout");
     return next(new ApiError("SERVICE_UNAVAILABLE", undefined, { cause: err }));
   }
   next(err);
@@ -341,6 +342,7 @@ app.use("/graphql", graphQLMiddleware);
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
+scheduleReconciliationJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
 const RESERVED_USERNAMES = [

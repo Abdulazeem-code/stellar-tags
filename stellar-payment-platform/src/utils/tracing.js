@@ -20,9 +20,11 @@ const sdk = new NodeSDK({
 
 sdk.start();
 
+const { logger } = require('../logger');
+
 process.on('SIGTERM', () => {
   sdk.shutdown()
-    .then(() => console.log('Tracing terminated'))
-    .catch((error) => console.log('Error terminating tracing', error))
+    .then(() => logger.info('Tracing terminated'))
+    .catch((error) => logger.error({ err: error }, 'Error terminating tracing'))
     .finally(() => process.exit(0));
 });

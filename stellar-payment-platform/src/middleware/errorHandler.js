@@ -77,10 +77,11 @@ const buildErrorHandler = (isPrismaConnectionError) =>
 
     if (statusCode >= 500) {
       const referenceId = crypto.randomUUID();
-      if (process.env.NODE_ENV !== 'test') {
-        console.warn(`[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`, err);
+      if (req.log) {
+        req.log.error({ err, referenceId }, `[Error ID: ${referenceId}]`);
+      } else {
+        logger.error({ err, referenceId }, `[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`);
       }
-      logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`, err);
 
       return res.status(statusCode).json(
         errorBody(code, expected ? message : DEFAULT_MESSAGES.INTERNAL_ERROR, {
