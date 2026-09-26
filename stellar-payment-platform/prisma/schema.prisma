@@ -202,18 +202,22 @@ model ActivityLog {
   @@map("activity_logs")
 }
 
-// Stores discrepancies found between internal DB state and the Stellar Horizon API.
-model ReconciliationAnomaly {
-  id              String   @id @default(uuid())
-  paymentId       String?  @map("payment_id")
-  transactionHash String?  @map("transaction_hash")
-  discrepancyType String   @map("discrepancy_type") // e.g. "missing_on_chain", "amount_mismatch", "status_mismatch"
-  details         String?
-  resolved        Boolean  @default(false)
-  createdAt       DateTime @default(now()) @map("created_at")
-  resolvedAt      DateTime? @map("resolved_at")
+// Custom Dynamic Rules Engine for enterprise payment routing.
+// Evaluated safely in a sandboxed AST environment against incoming payment intents.
+model RoutingRule {
+  id          String    @id @default(uuid())
+  name        String
+  description String?
+  priority    Int       @default(0) // Higher priority rules evaluated first
+  active      Boolean   @default(true)
+  clientOrg   String?   @map("client_org") // Optional enterprise tenant identifier
+  conditions  Json      // JSON AST expression / predicate definition
+  actions     Json      // Dynamic routing instructions (e.g. { route, targetAddress, feeOverride, memoFormat, priorityTier })
+  metadata    Json?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
 
-  @@index([createdAt])
-  @@index([resolved])
-  @@map("reconciliation_anomalies")
+  @@index([active, priority])
+  @@index([clientOrg])
+  @@map("routing_rules")
 }
