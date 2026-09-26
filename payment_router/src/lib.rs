@@ -487,9 +487,6 @@ impl PaymentRouter {
         fee_bps: i128,
         fee_cap: i128,
     ) -> Result<(), Error> {
-        // Require sender auth
-        sender.require_auth();
-
         env.events().publish(
             (Symbol::new(env, "payment_initiated"), sender.clone()),
             amount,
