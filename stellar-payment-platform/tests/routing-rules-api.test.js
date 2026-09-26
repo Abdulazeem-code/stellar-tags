@@ -127,6 +127,7 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
 
       const res = await request(app)
         .post('/api/v1/routing/rules')
+        .set('Idempotency-Key', 'test-key-1')
         .send(payload);
 
       expect(res.status).toBe(201);
@@ -138,7 +139,8 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
     });
 
     test('GET /api/v1/routing/rules lists active rules', async () => {
-      await request(app).post('/api/v1/routing/rules').send({
+      await request(app).post('/api/v1/routing/rules')
+        .set('Idempotency-Key', 'test-key-2').send({
         name: 'Rule Alpha',
         priority: 50,
         conditions: { field: 'asset', operator: '==', value: 'EURC' },
@@ -153,7 +155,8 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
     });
 
     test('PATCH /api/v1/routing/rules/:id updates priority and active state', async () => {
-      const created = await request(app).post('/api/v1/routing/rules').send({
+      const created = await request(app).post('/api/v1/routing/rules')
+        .set('Idempotency-Key', 'test-key-3').send({
         name: 'Updatable Rule',
         priority: 10,
         conditions: { field: 'amount', operator: '>', value: 50 },
@@ -163,6 +166,7 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
       const ruleId = created.body.data.id;
       const updateRes = await request(app)
         .patch(`/api/v1/routing/rules/${ruleId}`)
+        .set('Idempotency-Key', 'test-key-10')
         .send({ priority: 999, active: false });
 
       expect(updateRes.status).toBe(200);
@@ -171,14 +175,16 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
     });
 
     test('DELETE /api/v1/routing/rules/:id removes rule', async () => {
-      const created = await request(app).post('/api/v1/routing/rules').send({
+      const created = await request(app).post('/api/v1/routing/rules')
+        .set('Idempotency-Key', 'test-key-4').send({
         name: 'Rule to Delete',
         conditions: { field: 'amount', operator: '>', value: 1 },
         actions: { route: 'discard' },
       });
 
       const ruleId = created.body.data.id;
-      const delRes = await request(app).delete(`/api/v1/routing/rules/${ruleId}`);
+      const delRes = await request(app).delete(`/api/v1/routing/rules/${ruleId}`)
+        .set('Idempotency-Key', 'test-key-11');
       expect(delRes.status).toBe(200);
       expect(delRes.body.ok).toBe(true);
       expect(mockRules.length).toBe(0);
@@ -213,6 +219,7 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
 
       const res = await request(app)
         .post('/api/v1/routing/evaluate')
+        .set('Idempotency-Key', 'test-key-5')
         .send(payload);
 
       expect(res.status).toBe(200);
@@ -227,7 +234,8 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
 
   describe('POST /api/v1/payments/route (Live Endpoint)', () => {
     test('evaluates database rules and returns dynamic routing decision', async () => {
-      await request(app).post('/api/v1/routing/rules').send({
+      await request(app).post('/api/v1/routing/rules')
+        .set('Idempotency-Key', 'test-key-6').send({
         name: 'Micropayments Route',
         priority: 75,
         conditions: {
@@ -245,6 +253,7 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
 
       const res = await request(app)
         .post('/api/v1/payments/route')
+        .set('Idempotency-Key', 'test-key-7')
         .send({
           from: 'GSENDER',
           to: 'GRECIPIENT',
@@ -263,7 +272,8 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
   describe('POST /api/v1/payments/bulk with Dynamic Routing Integration', () => {
     test('dynamically overrides payment target address and enriches metadata based on DB rules', async () => {
       // 1. Seed a high-priority enterprise rule
-      await request(app).post('/api/v1/routing/rules').send({
+      await request(app).post('/api/v1/routing/rules')
+        .set('Idempotency-Key', 'test-key-8').send({
         name: 'Enterprise VIP Routing',
         priority: 200,
         conditions: {
@@ -301,6 +311,7 @@ describe('Payment Routing Rules API & Dynamic Route Switching', () => {
 
       const res = await request(app)
         .post('/api/v1/payments/bulk')
+        .set('Idempotency-Key', 'test-key-9')
         .send(intents);
 
       expect(res.status).toBe(201);
