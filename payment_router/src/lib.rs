@@ -489,6 +489,7 @@ impl PaymentRouter {
         platform_treasury: &Address,
         fee_bps: i128,
         fee_cap: i128,
+    ) -> Result<(), Error> {
         env.events().publish(
             (Symbol::new(env, "payment_initiated"), sender.clone()),
             amount,
