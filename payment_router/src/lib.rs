@@ -161,17 +161,16 @@ impl PaymentRouter {
 
         let mut current_amount = amount_in;
 
-        // 4. Execute multi-hop conversion across pools/hops with gas-optimized iteration
+        // 4. Execute multi-hop conversion across pools/hops with gas-optimized iteration and safe math
         for i in 0..(path_len - 1) {
-            let token_in_addr = path.get(i).unwrap();
-            let token_out_addr = path.get(i + 1).unwrap();
+            let _token_in_addr = path.get(i).unwrap();
+            let _token_out_addr = path.get(i + 1).unwrap();
 
-            let _token_in_client = token::Client::new(&env, &token_in_addr);
-            let _token_out_client = token::Client::new(&env, &token_out_addr);
-
-            // Apply AMM fee / exchange rate calculation per hop (e.g. 0.3% pool fee: 997 / 1000)
-            let fee_adjusted = (current_amount * 997) / 1000;
-            current_amount = fee_adjusted;
+            // Apply AMM fee / exchange rate calculation per hop safely with checked arithmetic
+            let intermediate = current_amount
+                .checked_mul(997)
+                .expect("overflow in swap multiplication");
+            current_amount = intermediate / 1000;
         }
 
         let final_amount = current_amount;
@@ -190,6 +189,42 @@ impl PaymentRouter {
 
         log!(&env, "Multi-hop swap routed and executed successfully");
         final_amount
+    }
+
+    /// Alias for multi-hop swap to support cargo-fuzz fuzz targets expecting `route_payments`.
+    pub fn route_payments(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        path: Vec<Address>,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> i128 {
+        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
+    }
+
+    /// Alias for multi-hop swap route_swap.
+    pub fn route_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        path: Vec<Address>,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> i128 {
+        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
+    }
+
+    /// Alias for multi-hop swap swap.
+    pub fn swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        path: Vec<Address>,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> i128 {
+        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
     }
 }
 
@@ -315,11 +350,19 @@ mod test {
         let path = Vec::from_array(&env, [token_a_contract.clone(), token_x_contract, token_b_contract.clone()]);
         let min_amount_out = expected_out - 1000; // acceptable slippage
 
+        // Test multi_hop_swap and route_payments alias
         let final_received = client.multi_hop_swap(&sender, &recipient, &path, &amount_in, &min_amount_out);
-
         assert_eq!(final_received, expected_out);
+
+        // Reset and test route_payments alias
+        token_a_client.mint(&sender, &amount_in);
+        let recipient2 = Address::generate(&env);
+        let final_received_alias = client.route_payments(&sender, &recipient2, &path, &amount_in, &min_amount_out);
+        assert_eq!(final_received_alias, expected_out);
+
         let token_b_token_client = token::Client::new(&env, &token_b_contract);
         assert_eq!(token_b_token_client.balance(&recipient), expected_out);
+        assert_eq!(token_b_token_client.balance(&recipient2), expected_out);
     }
 
     #[test]
