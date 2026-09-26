@@ -202,7 +202,41 @@ model ActivityLog {
   @@map("activity_logs")
 }
 
-// Custom Dynamic Rules Engine for enterprise payment routing.
+// #667 — Data archival strategy.
+// ArchiveEpoch records each on-chain commit_archive_root call so the
+// off-chain service can reconstruct Merkle paths without hitting the RPC.
+model ArchiveEpoch {
+  id          String         @id @default(uuid())
+  epoch       BigInt         @unique
+  merkleRoot  String         @map("merkle_root")
+  recordCount Int            @default(0) @map("record_count")
+  description String?
+  committedAt DateTime       @default(now()) @map("committed_at")
+  createdAt   DateTime       @default(now()) @map("created_at")
+  leaves      ArchiveLeaf[]
+
+  @@index([epoch])
+  @@map("archive_epochs")
+}
+
+// One row per leaf in an archive epoch.
+// leaf_hash is the hex-encoded SHA-256 of the canonical leaf bytes so the
+// Merkle path can be recomputed without re-reading Soroban state.
+model ArchiveLeaf {
+  id           String       @id @default(uuid())
+  epochId      String       @map("epoch_id")
+  epoch        ArchiveEpoch @relation(fields: [epochId], references: [id], onDelete: Cascade)
+  recordType   String       @map("record_type")  // UserVolume | UserSpending | RefundBalance
+  primaryKey   String       @map("primary_key")   // sender / user address
+  secondaryKey String?      @map("secondary_key") // token address (RefundBalance only)
+  leafHash     String       @map("leaf_hash")     // hex SHA-256 of canonical leaf bytes
+  valueJson    Json?        @map("value_json")    // on-chain value snapshot
+  createdAt    DateTime     @default(now()) @map("created_at")
+
+  @@index([epochId])
+  @@index([primaryKey])
+  @@map("archive_leaves")
+}
 // Evaluated safely in a sandboxed AST environment against incoming payment intents.
 model RoutingRule {
   id          String    @id @default(uuid())
