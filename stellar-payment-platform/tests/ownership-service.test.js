@@ -31,24 +31,13 @@ jest.mock('../prismaClient', () => ({
   },
 }));
 
-jest.mock('../src/db', () => ({
-  poolGet: jest.fn(),
-}));
-
 jest.mock('../src/multisigner-verifier', () => ({
   verifyMultiSignerThreshold: jest.fn(),
 }));
 
-jest.mock('../src/utils', () => {
-  const actual = jest.requireActual('../src/utils');
-  return {
-    ...actual,
-    shouldFallbackToLocalRegistry: jest.fn().mockReturnValue(false),
-  };
-});
 
 const { prisma } = require('../prismaClient');
-const { poolGet } = require('../src/db');
+
 const { verifyMultiSignerThreshold } = require('../src/multisigner-verifier');
 const sdk = require('@stellar/stellar-sdk');
 const {

@@ -205,3 +205,23 @@ model ActivityLog {
   @@index([username, createdAt])
   @@map("activity_logs")
 }
+
+// Custom Dynamic Rules Engine for enterprise payment routing.
+// Evaluated safely in a sandboxed AST environment against incoming payment intents.
+model RoutingRule {
+  id          String    @id @default(uuid())
+  name        String
+  description String?
+  priority    Int       @default(0) // Higher priority rules evaluated first
+  active      Boolean   @default(true)
+  clientOrg   String?   @map("client_org") // Optional enterprise tenant identifier
+  conditions  Json      // JSON AST expression / predicate definition
+  actions     Json      // Dynamic routing instructions (e.g. { route, targetAddress, feeOverride, memoFormat, priorityTier })
+  metadata    Json?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  @@index([active, priority])
+  @@index([clientOrg])
+  @@map("routing_rules")
+}

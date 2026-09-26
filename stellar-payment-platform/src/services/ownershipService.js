@@ -12,9 +12,8 @@
 const crypto = require('crypto');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../prismaClient');
-const { poolGet } = require('../db');
 const { verifyMultiSignerThreshold } = require('../multisigner-verifier');
-const { normalizeNameTag, shouldFallbackToLocalRegistry } = require('../utils');
+const { normalizeNameTag } = require('../utils');
 
 const httpError = (message, statusCode) => {
   const error = new Error(message);
@@ -72,6 +71,10 @@ const findUserRecord = async (username) => {
     );
     return localRow ? { username: localRow.username, address: localRow.address } : null;
   }
+  return await prisma.user.findUnique({
+    where: { username },
+    select: { username: true, address: true },
+  });
 };
 
 /**
