@@ -129,6 +129,23 @@ pub trait KycOracle {
     fn is_verified(env: Env, account: Address) -> bool;
 }
 
+/// Adapter interface implemented by the DEX used for an arbitrary token swap.
+/// The router transfers the input asset to the adapter. The result must contain
+/// `[amount_received, unused_input]`; the adapter must send the output asset to
+/// `recipient` and return any unused input to the router.
+#[contractclient(name = "DexRouterClient")]
+pub trait DexRouter {
+    fn swap_exact_tokens_for_tokens(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        path: Vec<Address>,
+        recipient: Address,
+    ) -> Vec<i128>;
+}
+
 // ── Timelock data structures ─────────────────────────────────────────────────
 //
 // Admin actions that change sensitive contract parameters (treasury, fees,
@@ -249,6 +266,31 @@ pub enum DataKey {
     Role(Role),
     /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
     UserRole(Address, Role),
+    /// Governance token used to weight fee proposals.
+    GovernanceToken,
+    /// Minimum token voting weight required to execute a fee proposal.
+    GovernanceQuorum,
+    /// Monotonically increasing governance proposal ID.
+    GovernanceNonce,
+    /// Fee proposal stored by ID.
+    GovernanceProposal(u64),
+    /// Whether an address has voted on a proposal.
+    GovernanceVote(u64, Address),
+}
+
+/// A fee change proposal weighted by governance-token balances.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeProposal {
+    pub proposer: Address,
+    pub fee_bps: i128,
+    pub fee_cap: i128,
+    pub created_at: u64,
+    pub voting_ends_at: u64,
+    pub yes_votes: i128,
+    pub no_votes: i128,
+    pub quorum: i128,
+    pub executed: bool,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -299,6 +341,16 @@ pub enum Error {
     RoleNotFound = 19,
     /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
     InvalidRole = 20,
+    /// A swap path is empty, malformed, or does not connect the requested assets.
+    InvalidSwapPath = 21,
+    /// The DEX returned less than the caller's minimum acceptable output.
+    SlippageExceeded = 22,
+    /// A governance token has not been configured.
+    GovernanceNotConfigured = 23,
+    /// A governance proposal is missing, expired, or not yet ready.
+    InvalidProposal = 24,
+    /// The caller already voted on the proposal.
+    AlreadyVoted = 25,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -462,6 +514,23 @@ impl PaymentRouter {
             .ok_or(Error::KycRequired)?;
         if !KycOracleClient::new(env, &oracle).is_verified(sender) {
             return Err(Error::KycRequired);
+        }
+        Ok(())
+    }
+
+    fn validate_swap_path(
+        token_in: &Address,
+        token_out: &Address,
+        path: &Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if min_amount_out <= 0 || path.len() < 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.get(0) != Some(token_in.clone())
+            || path.get(path.len() - 1) != Some(token_out.clone())
+        {
+            return Err(Error::InvalidSwapPath);
         }
         Ok(())
     }
@@ -1129,6 +1198,148 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Configures the DAO token and minimum voting weight for fee proposals.
+    /// This administrative bootstrap does not itself change fees; subsequent
+    /// fee changes can be made through the proposal lifecycle.
+    pub fn configure_governance(
+        env: Env,
+        governance_token: Address,
+        quorum: i128,
+    ) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+        if quorum <= 0 {
+            return Err(Error::InvalidProposal);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceToken, &governance_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceQuorum, &quorum);
+        Ok(())
+    }
+
+    /// Creates a fee proposal weighted by governance-token balances.
+    pub fn propose_fee_change(
+        env: Env,
+        proposer: Address,
+        fee_bps: i128,
+        fee_cap: i128,
+        voting_period: u64,
+    ) -> Result<u64, Error> {
+        proposer.require_auth();
+        let governance_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceToken)
+            .ok_or(Error::GovernanceNotConfigured)?;
+        if token::Client::new(&env, &governance_token).balance(&proposer) <= 0 {
+            return Err(Error::GovernanceNotConfigured);
+        }
+        if !(0..=10_000).contains(&fee_bps) || fee_cap < 0 || voting_period == 0 {
+            return Err(Error::InvalidProposal);
+        }
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceNonce)
+            .unwrap_or(0);
+        let id = nonce.saturating_add(1);
+        env.storage().instance().set(&DataKey::GovernanceNonce, &id);
+        let quorum = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceQuorum)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::GovernanceProposal(id),
+            &FeeProposal {
+                proposer,
+                fee_bps,
+                fee_cap,
+                created_at: env.ledger().timestamp(),
+                voting_ends_at: env.ledger().timestamp().saturating_add(voting_period),
+                yes_votes: 0,
+                no_votes: 0,
+                quorum,
+                executed: false,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Casts one weighted vote on an open fee proposal.
+    pub fn vote_fee_proposal(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<(), Error> {
+        voter.require_auth();
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceToken)
+            .ok_or(Error::GovernanceNotConfigured)?;
+        let key = DataKey::GovernanceProposal(proposal_id);
+        let mut proposal: FeeProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::InvalidProposal)?;
+        if proposal.executed || env.ledger().timestamp() >= proposal.voting_ends_at {
+            return Err(Error::InvalidProposal);
+        }
+        let vote_key = DataKey::GovernanceVote(proposal_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::AlreadyVoted);
+        }
+        let weight = token::Client::new(&env, &token_address).balance(&voter);
+        if weight <= 0 {
+            return Err(Error::InvalidProposal);
+        }
+        if support {
+            proposal.yes_votes = proposal.yes_votes.saturating_add(weight);
+        } else {
+            proposal.no_votes = proposal.no_votes.saturating_add(weight);
+        }
+        env.storage().persistent().set(&key, &proposal);
+        env.storage().persistent().set(&vote_key, &true);
+        Ok(())
+    }
+
+    /// Finalizes a successful fee proposal after its voting period ends.
+    pub fn execute_fee_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
+        let key = DataKey::GovernanceProposal(proposal_id);
+        let mut proposal: FeeProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::InvalidProposal)?;
+        if proposal.executed
+            || env.ledger().timestamp() < proposal.voting_ends_at
+            || proposal.yes_votes <= proposal.no_votes
+            || proposal.yes_votes.saturating_add(proposal.no_votes) < proposal.quorum
+        {
+            return Err(Error::InvalidProposal);
+        }
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeBps, &proposal.fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCap, &proposal.fee_cap);
+        Ok(())
+    }
+
+    pub fn get_fee_proposal(env: Env, proposal_id: u64) -> Option<FeeProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovernanceProposal(proposal_id))
+    }
+
     /// Sets the minimum allowed routing amount. FeeManager-protected.
     ///
     /// # Parameters
@@ -1627,6 +1838,87 @@ impl PaymentRouter {
             &recipient,
             &token_address,
             amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
+    }
+
+    /// Swaps `token_in` through a caller-supplied DEX path and routes the
+    /// resulting `token_out` to the recipient. The DEX adapter must return the
+    /// received output and any unused input as `[received, unused]`; unused
+    /// input is credited to the sender's refund balance.
+    pub fn route_payment_with_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex_router: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        Self::validate_swap_path(&token_in, &token_out, &path, min_amount_out)?;
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let token_in_client = token::Client::new(&env, &token_in);
+        token_in_client.transfer(&sender, &dex_router, &amount_in);
+
+        let swap_result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
+            &token_in,
+            &token_out,
+            &amount_in,
+            &min_amount_out,
+            &path,
+            &env.current_contract_address(),
+        );
+        if swap_result.len() != 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        let amount_received: i128 = swap_result.get(0).unwrap();
+        let unused_input: i128 = swap_result.get(1).unwrap();
+        if amount_received < min_amount_out || amount_received <= 0 || unused_input < 0 {
+            return Err(Error::SlippageExceeded);
+        }
+        if unused_input > 0 {
+            token_in_client.transfer(&env.current_contract_address(), &sender, &unused_input);
+        }
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_out,
+            amount_received,
             &platform_treasury,
             fee_bps,
             fee_cap,
@@ -3194,6 +3486,64 @@ mod test {
         // Governance address can now update the fee
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
+    }
+
+    #[test]
+    fn test_token_weighted_fee_governance_lifecycle() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (governance_token, _token_client, token_admin) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.configure_governance(&governance_token, &100);
+        token_admin.mint(&admin, &100);
+
+        let proposal_id = client.propose_fee_change(&admin, &250, &2_000, &100);
+        client.vote_fee_proposal(&admin, &proposal_id, &true);
+
+        let mut ledger = env.ledger().get();
+        ledger.timestamp = 101;
+        env.ledger().set(ledger);
+        client.execute_fee_proposal(&proposal_id);
+
+        assert_eq!(client.get_fee(), 250);
+        assert_eq!(
+            client.get_fee_proposal(&proposal_id).unwrap().fee_cap,
+            2_000
+        );
+    }
+
+    #[test]
+    fn test_swap_route_rejects_invalid_path_before_dex_call() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let dex = Address::generate(&env);
+        let (token_in, _in_client, _in_admin) = setup_token(&env);
+        let (token_out, _out_client, _out_admin) = setup_token(&env);
+
+        client.initialize(
+            &admin,
+            &Address::generate(&env),
+            &100,
+            &1_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        let invalid_path = Vec::from_array(&env, [token_in.clone()]);
+        let result = client.try_route_payment_with_swap(
+            &sender,
+            &recipient,
+            &dex,
+            &token_in,
+            &token_out,
+            &100,
+            &invalid_path,
+            &90,
+        );
+
+        assert_eq!(result, Err(Ok(Error::InvalidSwapPath)));
     }
 
     // ── Role-Based Access Control (RBAC) tests ───────────────────────────────
