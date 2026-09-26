@@ -13,9 +13,7 @@ module.exports = (redisClient) => {
   const router = express.Router();
   
 
-  // ── Idempotency protection for payment intent creation (POST /payments/bulk).
-  // Duplicate submissions within 24h return the originally created intents. ──
-  router.use(idempotencyMiddleware(redisClient, { enforce: true }));
+
   // POST /payments/route — Evaluate payment context against dynamic routing rules
   router.post('/payments/route', requireJson, asyncHandler(async (req, res) => {
     const { clientOrg, client_org, ...paymentData } = req.body;
