@@ -1,8 +1,11 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
-    Address, BytesN, Env, Symbol, Vec,
+    Address, BytesN, Env, String, Symbol, Vec,
 };
+
+mod archival;
+use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
 //
@@ -249,6 +252,16 @@ pub enum DataKey {
     Role(Role),
     /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
     UserRole(Address, Role),
+    // ── Archival keys ────────────────────────────────────────────────────────
+    /// Monotonically-increasing epoch counter, incremented on every
+    /// `commit_archive_root` call.  Stored as `u64` in instance storage.
+    ArchiveEpoch,
+    /// SHA-256 Merkle root committed for a given epoch.
+    /// Stored in persistent storage so it outlives instance eviction.
+    ArchiveRoot(u64),
+    /// Human-readable metadata for a given epoch: record count, timestamp,
+    /// and a free-form description tag.
+    ArchiveMeta(u64),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -1867,6 +1880,184 @@ impl PaymentRouter {
     }
 }
 
+// ── Archival extension ────────────────────────────────────────────────────────
+//
+// A second #[contractimpl] block keeps the archival surface separate and avoids
+// hitting the soroban-sdk per-impl function-count ceiling.
+#[contractimpl]
+impl PaymentRouter {
+    /// Commits a SHA-256 Merkle root of a batch of payment-record snapshots
+    /// into persistent storage, opening a new archive epoch.
+    ///
+    /// Call this before `prune_archived_entries`. Requires TreasuryManager.
+    /// Returns the new epoch number.
+    ///
+    /// Errors: NotInitialized, ContractFrozen.
+    pub fn commit_archive_root(
+        env: Env,
+        root: BytesN<32>,
+        leaves: Vec<ArchiveLeaf>,
+        description: String,
+    ) -> Result<u64, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        let current_epoch: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0u64);
+        let new_epoch = current_epoch + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ArchiveEpoch, &new_epoch);
+
+        let record_count = leaves.len() as u32;
+        let committed_at = env.ledger().timestamp();
+
+        // Persist the Merkle root.
+        let root_key = DataKey::ArchiveRoot(new_epoch);
+        env.storage().persistent().set(&root_key, &root);
+        env.storage().persistent().extend_ttl(
+            &root_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Persist metadata.
+        let meta = ArchiveMetadata {
+            committed_at,
+            record_count,
+            description,
+        };
+        let meta_key = DataKey::ArchiveMeta(new_epoch);
+        env.storage().persistent().set(&meta_key, &meta);
+        env.storage().persistent().extend_ttl(
+            &meta_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        archival::emit_archive_committed(&env, new_epoch, &root, record_count);
+        log!(
+            &env,
+            "Archive epoch {} committed: {} records",
+            new_epoch,
+            record_count
+        );
+
+        Ok(new_epoch)
+    }
+
+    /// Returns the Merkle root and metadata for an archive epoch, or `None`
+    /// if no archive exists for that epoch.
+    pub fn get_archive_info(
+        env: Env,
+        epoch: u64,
+    ) -> Option<(BytesN<32>, ArchiveMetadata)> {
+        let root: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArchiveRoot(epoch));
+        let meta: Option<ArchiveMetadata> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArchiveMeta(epoch));
+        match (root, meta) {
+            (Some(r), Some(m)) => Some((r, m)),
+            _ => None,
+        }
+    }
+
+    /// Returns the current archive epoch counter (0 = no epochs committed yet).
+    pub fn get_archive_epoch(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0)
+    }
+
+    /// Deletes on-chain ledger entries committed via `commit_archive_root`.
+    ///
+    /// Requires the epoch from a prior commit call. Silently skips absent
+    /// entries. Returns the count of entries removed.
+    ///
+    /// Supported: UserVolume, UserSpending, RefundBalance.
+    /// Errors: NotInitialized, ContractFrozen, TimelockNotFound (unknown epoch).
+    /// Requires TreasuryManager.
+    pub fn prune_archived_entries(
+        env: Env,
+        committed_epoch: u64,
+        leaves: Vec<ArchiveLeaf>,
+    ) -> Result<u32, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        // Guard: a committed root must exist for this epoch.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::ArchiveRoot(committed_epoch))
+        {
+            return Err(Error::TimelockNotFound);
+        }
+
+        let mut removed: u32 = 0;
+
+        for leaf in leaves.iter() {
+            match leaf.record_type {
+                ArchiveRecordType::UserVolume => {
+                    let key = DataKey::UserVolume(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::UserSpending => {
+                    let key = DataKey::UserSpending(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::RefundBalance => {
+                    let key = DataKey::RefundBalance(
+                        leaf.primary_key.clone(),
+                        leaf.secondary_key.clone(),
+                    );
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "entries_pruned"), committed_epoch),
+            (removed, env.ledger().timestamp()),
+        );
+
+        log!(
+            &env,
+            "Pruned {} entries for archive epoch {}",
+            removed,
+            committed_epoch
+        );
+
+        Ok(removed)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -3194,6 +3385,238 @@ mod test {
         // Governance address can now update the fee
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
+    }
+
+    // ── Archival tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_commit_archive_root_increments_epoch() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(client.get_archive_epoch(), 0);
+
+        let root = BytesN::from_array(&env, &[0u8; 32]);
+        let leaves = soroban_sdk::Vec::new(&env);
+        let desc = soroban_sdk::String::from_str(&env, "test:epoch1");
+
+        let epoch = client.commit_archive_root(&root, &leaves, &desc);
+        assert_eq!(epoch, 1);
+        assert_eq!(client.get_archive_epoch(), 1);
+    }
+
+    #[test]
+    fn test_commit_archive_root_stores_root_and_meta() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let root_bytes = [1u8; 32];
+        let root = BytesN::from_array(&env, &root_bytes);
+        let leaves = soroban_sdk::Vec::new(&env);
+        let desc = soroban_sdk::String::from_str(&env, "user_volume:2026-09");
+
+        let epoch = client.commit_archive_root(&root, &leaves, &desc);
+
+        let info = client.get_archive_info(&epoch);
+        assert!(info.is_some());
+        let (stored_root, meta) = info.unwrap();
+        assert_eq!(stored_root, root);
+        assert_eq!(meta.record_count, 0);
+        // committed_at is set to env.ledger().timestamp() which is 0 in the
+        // default testutils ledger — just verify the field is present and type-correct.
+        let _ = meta.committed_at;
+    }
+
+    #[test]
+    fn test_commit_archive_root_records_leaf_count() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+
+        let root = BytesN::from_array(&env, &[2u8; 32]);
+        let leaves = soroban_sdk::Vec::from_array(
+            &env,
+            [
+                ArchiveLeaf {
+                    record_type: ArchiveRecordType::UserVolume,
+                    primary_key: sender.clone(),
+                    secondary_key: sender.clone(),
+                },
+                ArchiveLeaf {
+                    record_type: ArchiveRecordType::UserSpending,
+                    primary_key: sender.clone(),
+                    secondary_key: sender.clone(),
+                },
+            ],
+        );
+        let desc = soroban_sdk::String::from_str(&env, "batch");
+
+        let epoch = client.commit_archive_root(&root, &leaves, &desc);
+        let info = client.get_archive_info(&epoch).unwrap();
+        assert_eq!(info.1.record_count, 2);
+    }
+
+    #[test]
+    fn test_prune_archived_entries_removes_user_volume_and_spending() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+
+        // Confirm on-chain volume exists before archival.
+        assert_eq!(client.get_user_volume(&sender), 1_000);
+
+        let root = BytesN::from_array(&env, &[3u8; 32]);
+        let leaves = soroban_sdk::Vec::from_array(
+            &env,
+            [
+                ArchiveLeaf {
+                    record_type: ArchiveRecordType::UserVolume,
+                    primary_key: sender.clone(),
+                    secondary_key: sender.clone(),
+                },
+                ArchiveLeaf {
+                    record_type: ArchiveRecordType::UserSpending,
+                    primary_key: sender.clone(),
+                    secondary_key: sender.clone(),
+                },
+            ],
+        );
+        let desc = soroban_sdk::String::from_str(&env, "prune-test");
+
+        let epoch = client.commit_archive_root(&root, &leaves, &desc);
+        let removed = client.prune_archived_entries(&epoch, &leaves);
+        assert_eq!(removed, 2);
+
+        // After pruning the volume entry is gone (returns 0 default).
+        assert_eq!(client.get_user_volume(&sender), 0);
+    }
+
+    #[test]
+    fn test_prune_archived_entries_rejects_unknown_epoch() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let leaves = soroban_sdk::Vec::new(&env);
+        let res = client.try_prune_archived_entries(&99u64, &leaves);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+    }
+
+    #[test]
+    fn test_prune_skips_absent_entries_gracefully() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let ghost = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let root = BytesN::from_array(&env, &[4u8; 32]);
+        // Leaf for an address that never routed a payment (no on-chain entry).
+        let leaves = soroban_sdk::Vec::from_array(
+            &env,
+            [ArchiveLeaf {
+                record_type: ArchiveRecordType::UserVolume,
+                primary_key: ghost.clone(),
+                secondary_key: ghost.clone(),
+            }],
+        );
+        let desc = soroban_sdk::String::from_str(&env, "ghost-prune");
+
+        let epoch = client.commit_archive_root(&root, &leaves, &desc);
+        // Should succeed with 0 removed (no panic, no error).
+        let removed = client.prune_archived_entries(&epoch, &leaves);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_commit_archive_root_blocked_when_frozen() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.emergency_freeze();
+
+        let root = BytesN::from_array(&env, &[5u8; 32]);
+        let leaves = soroban_sdk::Vec::new(&env);
+        let desc = soroban_sdk::String::from_str(&env, "frozen");
+        let res = client.try_commit_archive_root(&root, &leaves, &desc);
+        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
+    }
+
+    #[test]
+    fn test_prune_archived_entries_blocked_when_frozen() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Commit first so the epoch exists.
+        let root = BytesN::from_array(&env, &[6u8; 32]);
+        let leaves = soroban_sdk::Vec::new(&env);
+        let desc = soroban_sdk::String::from_str(&env, "pre-freeze");
+        let epoch = client.commit_archive_root(&root, &leaves, &desc);
+
+        client.emergency_freeze();
+
+        let res = client.try_prune_archived_entries(&epoch, &leaves);
+        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
+    }
+
+    #[test]
+    fn test_archive_info_returns_none_for_missing_epoch() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        assert!(client.get_archive_info(&99u64).is_none());
+    }
+
+    #[test]
+    fn test_multiple_archive_epochs_are_independent() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let root1 = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let root2 = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let leaves = soroban_sdk::Vec::new(&env);
+        let desc1 = soroban_sdk::String::from_str(&env, "epoch-1");
+        let desc2 = soroban_sdk::String::from_str(&env, "epoch-2");
+
+        let e1 = client.commit_archive_root(&root1, &leaves, &desc1);
+        let e2 = client.commit_archive_root(&root2, &leaves, &desc2);
+
+        assert_eq!(e1, 1);
+        assert_eq!(e2, 2);
+        assert_eq!(client.get_archive_epoch(), 2);
+
+        let (r1, _) = client.get_archive_info(&e1).unwrap();
+        let (r2, _) = client.get_archive_info(&e2).unwrap();
+        assert_eq!(r1, root1);
+        assert_eq!(r2, root2);
+        assert_ne!(r1, r2);
     }
 
     // ── Role-Based Access Control (RBAC) tests ───────────────────────────────
