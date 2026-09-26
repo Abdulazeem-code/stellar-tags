@@ -697,6 +697,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "LastHeartbeat"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "MaxAmount"
                             }
                           ]
