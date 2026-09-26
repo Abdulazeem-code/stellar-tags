@@ -605,6 +605,44 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
 
+## Contract Circuit Breaker (Pause Switch)
+
+In the event of an unforeseen exploit or extreme network volatility, the `PaymentRouter`
+contract can be halted without an upgrade. The pause switch acts as a circuit breaker:
+while it is open, every **non-essential state change** is rejected with `Error::Paused`,
+while **essential recovery operations** keep working so an incident can always be
+resolved.
+
+### Authorized controls
+
+- `set_pause(paused: bool) -> Result<(), Error>` / `set_paused(paused: bool) -> Result<(), Error>`
+  — open or close the breaker. Requires the `ComplianceOfficer` role.
+- `is_paused() -> bool` — read the current breaker state.
+- `emergency_freeze() -> Result<(), Error>` / `unfreeze() -> Result<(), Error>`
+  — a SuperAdmin hard freeze that additionally blocks timelock execution and applies
+  immediately (it never goes through the 24-hour timelock). Freeze failures surface as
+  `Error::ContractFrozen`.
+
+### Blocked while the breaker is open (non-essential state changes)
+
+- Payments: `route_payment`, `route_payments`.
+- Timelock: `queue_action`, `execute_action`.
+- Configuration: `set_platform_treasury`, `set_fee_config`, `set_fee_config_legacy`,
+  `set_fee_bps`, `set_governance`, `set_min_limit`.
+- Treasury yield: `deposit_to_yield`, `withdraw_from_yield`, `harvest_yield`.
+- Token recovery: `recover_tokens`.
+
+### Available while the breaker is open (essential recovery)
+
+- Resetting the breaker: `set_pause(false)`, `set_paused(false)`, `unfreeze()`.
+- User and emergency funds: `withdraw_refund`, `claim_all_refunds`, `emergency_withdraw`.
+- Abort a queued governance action: `cancel_action`.
+- Governance and compliance: `set_admin` / `transfer_admin`, `assign_role` / `revoke_role`,
+  `blacklist_address` / `unblacklist_address`, `set_kyc_config`, `upgrade`.
+
+All read-only getters (`is_paused`, `is_frozen`, `get_fee`, `get_refund_balance`, …) remain
+callable at all times.
+
 ## Smart Contract Deployment & Upgrades
 
 The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts/deploy_contract.sh`) to automate WASM compilation, optimization, network deployment, contract initialization, and contract upgrades.

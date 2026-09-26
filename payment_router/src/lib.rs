@@ -447,6 +447,33 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
+    /// Returns whether the circuit breaker (pause switch) is currently open.
+    fn is_paused_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Circuit-breaker guard applied to every non-essential operation.
+    ///
+    /// While the pause switch is engaged all operational state changes —
+    /// payments, timelock queue/execute, fee/treasury/governance/min-limit
+    /// configuration, treasury yield movements and token recovery — are
+    /// rejected with `Error::Paused`.
+    ///
+    /// Essential recovery paths (unpausing/unfreezing, cancelling a queued
+    /// action, withdrawing refunds or emergency funds, role and admin
+    /// governance, compliance configuration and upgrades) deliberately bypass
+    /// this guard, so an incident can always be resolved while the breaker is
+    /// open.
+    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+        if Self::is_paused_internal(env) {
+            return Err(Error::Paused);
+        }
+        Ok(())
+    }
+
     /// Enforces KYC only after the admin has configured a threshold. This
     /// preserves existing routing behavior until compliance is enabled.
     fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
@@ -803,6 +830,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
+        // Circuit breaker: queuing a parameter change is a non-essential state
+        // change and is blocked while paused.
+        Self::require_circuit_closed(&env)?;
 
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -860,6 +890,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
+        // Circuit breaker: applying a queued parameter change is a
+        // non-essential state change and is blocked while paused.
+        Self::require_circuit_closed(&env)?;
 
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -1034,6 +1067,8 @@ impl PaymentRouter {
     /// and execute after 24 hours.  This direct path is retained for tooling
     /// compatibility only.
     pub fn set_platform_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
+        // Circuit breaker: platform parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
         Self::require_role(&env, Role::TreasuryManager)?;
 
         env.storage()
@@ -1062,6 +1097,8 @@ impl PaymentRouter {
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
     pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+        // Circuit breaker: fee parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
         Self::require_fee_authority(&env)?;
 
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
@@ -1105,6 +1142,8 @@ impl PaymentRouter {
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeBps(…))`.
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
+        // Circuit breaker: fee parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
         Self::require_fee_authority(&env)?;
 
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
@@ -1120,6 +1159,8 @@ impl PaymentRouter {
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetGovernance(…))`.
     pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
+        // Circuit breaker: governance parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
         Self::require_role(&env, Role::SuperAdmin)?;
         env.storage().instance().set(&DataKey::Governance, &gov);
         env.storage().instance().extend_ttl(
@@ -1144,6 +1185,8 @@ impl PaymentRouter {
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
     pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
+        // Circuit breaker: routing limit changes are non-essential.
+        Self::require_circuit_closed(&env)?;
         Self::require_role(&env, Role::FeeManager)?;
 
         env.storage().instance().set(&DataKey::MinLimit, &min_limit);
@@ -1216,10 +1259,7 @@ impl PaymentRouter {
     /// # Panics
     /// Does not panic.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        Self::is_paused_internal(&env)
     }
 
     /// Returns the cumulative amount a given sender has routed through the contract.
@@ -1389,6 +1429,9 @@ impl PaymentRouter {
     /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        // Circuit breaker: token recovery is a non-essential state change (the
+        // TreasuryManager still has `emergency_withdraw` while paused).
+        Self::require_circuit_closed(&env)?;
         let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
         let contract_address = env.current_contract_address();
@@ -1454,6 +1497,8 @@ impl PaymentRouter {
     /// authorization is required because the funds are held by the treasury,
     /// rather than by this router contract.
     pub fn deposit_to_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        // Circuit breaker: moving treasury funds into yield is non-essential.
+        Self::require_circuit_closed(&env)?;
         if amount <= 0 {
             return Err(Error::InvalidYieldAmount);
         }
@@ -1488,6 +1533,9 @@ impl PaymentRouter {
 
     /// Withdraws treasury principal from the configured lending protocol. TreasuryManager-protected.
     pub fn withdraw_from_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        // Circuit breaker: yield principal movements are non-essential while
+        // paused; `emergency_withdraw` remains the funds-out path.
+        Self::require_circuit_closed(&env)?;
         let key = DataKey::YieldPrincipal(token.clone());
         let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if amount <= 0 || amount > principal {
@@ -1525,6 +1573,8 @@ impl PaymentRouter {
 
     /// Claims all currently available yield to the platform treasury. TreasuryManager-protected.
     pub fn harvest_yield(env: Env, token: Address) -> Result<i128, Error> {
+        // Circuit breaker: yield harvesting is a non-essential state change.
+        Self::require_circuit_closed(&env)?;
         Self::require_role(&env, Role::TreasuryManager)?;
         let treasury: Address = env
             .storage()
@@ -2627,6 +2677,160 @@ mod test {
 
         // Route payment should succeed now
         client.route_payment(&sender, &recipient, &token_address, &1000);
+    }
+
+    // ── Circuit breaker tests ────────────────────────────────────────────────
+
+    /// While the breaker is open, non-essential state changes — payments,
+    /// timelock queuing and the direct parameter setters — are rejected with
+    /// `Error::Paused`.
+    #[test]
+    fn test_circuit_breaker_blocks_non_essential_state_changes() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.set_pause(&true);
+        assert!(client.is_paused());
+
+        // Timelock state changes are blocked.
+        assert_eq!(
+            client.try_queue_action(&ActionType::SetFeeBps(250)),
+            Err(Ok(Error::Paused))
+        );
+
+        // Direct parameter setters are blocked.
+        assert_eq!(client.try_set_fee_bps(&250), Err(Ok(Error::Paused)));
+        assert_eq!(
+            client.try_set_fee_config(&250, &1000),
+            Err(Ok(Error::Paused))
+        );
+        assert_eq!(client.try_set_min_limit(&50), Err(Ok(Error::Paused)));
+        let new_treasury = Address::generate(&env);
+        assert_eq!(
+            client.try_set_platform_treasury(&new_treasury),
+            Err(Ok(Error::Paused))
+        );
+        let gov = Address::generate(&env);
+        assert_eq!(client.try_set_governance(&gov), Err(Ok(Error::Paused)));
+
+        let (token_address, _token_client, _sac) = setup_token(&env);
+        assert_eq!(
+            client.try_recover_tokens(&token_address, &10),
+            Err(Ok(Error::Paused))
+        );
+
+        // Routing stays blocked too.
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        assert_eq!(
+            client.try_route_payment(&sender, &recipient, &token_address, &10),
+            Err(Ok(Error::Paused))
+        );
+    }
+
+    /// A queued action cannot be executed while the breaker is open, but it can
+    /// still be cancelled so the timelock queue is never stuck.
+    #[test]
+    fn test_circuit_breaker_blocks_execution_but_allows_cancel() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.queue_action(&ActionType::SetFeeBps(250));
+
+        // Advance past the 24h timelock window.
+        let ts = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: ts + PaymentRouter::SECONDS_IN_24H + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        // Open the breaker before execution: the change is not applied.
+        client.set_pause(&true);
+        assert_eq!(client.try_execute_action(&nonce), Err(Ok(Error::Paused)));
+        assert_eq!(client.get_fee(), 100);
+
+        // Cancelling the queued action remains available while paused.
+        client.cancel_action(&nonce);
+        assert_eq!(
+            client.try_get_queued_action(&nonce).unwrap_err().unwrap(),
+            Error::TimelockNotFound
+        );
+    }
+
+    /// Essential recovery paths stay callable while the breaker is open:
+    /// user refunds, emergency withdrawals and resetting the breaker.
+    #[test]
+    fn test_circuit_breaker_keeps_essential_operations_available() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+
+        // Seed a refund balance and some stranded tokens for the emergency path.
+        let refund_amount = 3_000i128;
+        let stranded_amount = 2_000i128;
+        stellar_asset_client.mint(&contract_id, &(refund_amount + stranded_amount));
+        env.as_contract(&contract_id, || {
+            PaymentRouter::credit_refund_balance(&env, &user, &token_address, refund_amount);
+        });
+
+        client.set_pause(&true);
+
+        // Users can still withdraw their own refunded funds.
+        client.withdraw_refund(&user, &token_address, &1_000);
+        assert_eq!(token_client.balance(&user), 1_000);
+
+        // Emergency withdrawal of stranded funds stays available.
+        client.emergency_withdraw(&token_address, &stranded_amount);
+        assert_eq!(token_client.balance(&admin), stranded_amount);
+
+        // The breaker can always be reset.
+        client.set_pause(&false);
+        assert!(!client.is_paused());
+    }
+
+    /// Treasury yield movements are non-essential and are blocked while paused.
+    #[test]
+    fn test_circuit_breaker_blocks_yield_movements() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let protocol_id = env.register_contract(None, MockLendingProtocol);
+        let (token_address, _token_client, _sac) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_yield_protocol(&protocol_id);
+
+        client.set_pause(&true);
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &100),
+            Err(Ok(Error::Paused))
+        );
+        assert_eq!(
+            client.try_harvest_yield(&token_address),
+            Err(Ok(Error::Paused))
+        );
+        assert_eq!(
+            client.try_withdraw_from_yield(&token_address, &50),
+            Err(Ok(Error::Paused))
+        );
     }
 
     #[test]
