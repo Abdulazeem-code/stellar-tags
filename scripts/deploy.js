@@ -80,6 +80,10 @@ const parseArgs = (argv = process.argv.slice(2)) => {
     maxAmount: '1000000000000000',
     contractId: process.env.CONTRACT_ID || process.env.PAYMENT_ROUTER_CONTRACT_ID || null,
     wasmPath: null,
+    // Multisig: repeated `--signer G...:S...` pairs that can sign approvals.
+    signers: [],
+    newWasmHash: null,
+    threshold: null,
     dryRun: false,
     skipBuild: false,
     envFiles: [
@@ -118,6 +122,13 @@ const parseArgs = (argv = process.argv.slice(2)) => {
       options.contractId = argv[++i];
     } else if (arg === '--wasm') {
       options.wasmPath = argv[++i];
+    } else if (arg === '--signer') {
+      // Repeatable: `--signer <address>:<secret>`.
+      options.signers.push(argv[++i]);
+    } else if (arg === '--new-wasm-hash') {
+      options.newWasmHash = argv[++i];
+    } else if (arg === '--threshold') {
+      options.threshold = parseInt(argv[++i], 10);
     } else if (arg === '--dry-run') {
       options.dryRun = true;
     } else if (arg === '--skip-build') {
@@ -131,7 +142,9 @@ const parseArgs = (argv = process.argv.slice(2)) => {
 
   if (positional.length > 0) {
     const cmd = positional[0].toLowerCase();
-    if (['build', 'deploy', 'upgrade', 'init', 'status'].includes(cmd)) {
+    if (
+      ['build', 'deploy', 'upgrade', 'init', 'status', 'approve', 'set-multisig'].includes(cmd)
+    ) {
       options.command = cmd;
     }
     if (positional[1] && !options.contractId) {
@@ -287,6 +300,100 @@ const compileAndOptimizeWasm = (options = {}) => {
   return finalWasmPath;
 };
 
+// ── Multisig Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Parses repeated `--signer G...:S...` arguments into usable pairs.
+ *
+ * @param {string[]} raw - Raw `address:secret` strings.
+ * @returns {Array<{address: string, secret: string}>}
+ */
+const parseSignerPairs = (raw = []) => {
+  const pairs = [];
+  for (const entry of raw) {
+    const idx = entry.lastIndexOf(':');
+    if (idx <= 0 || idx === entry.length - 1) {
+      throw new Error(
+        `Invalid --signer value "${entry}". Expected <address>:<secret>, e.g. --signer GABC...:SABC...`
+      );
+    }
+    pairs.push({ address: entry.slice(0, idx), secret: entry.slice(idx + 1) });
+  }
+  return pairs;
+};
+
+/**
+ * Extracts the JSON result payload from `stellar contract invoke` output.
+ *
+ * The CLI prefixes its result with human-readable log lines, so the JSON
+ * object is located rather than assumed to be the whole stdout.
+ *
+ * @param {string} stdout - Raw CLI stdout.
+ * @returns {any} The parsed value.
+ */
+const parseInvokeResult = (stdout) => {
+  const lines = String(stdout)
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .reverse();
+  for (const line of lines) {
+    if (!line.startsWith('{') && !line.startsWith('[')) continue;
+    try {
+      return JSON.parse(line);
+    } catch {
+      /* keep scanning: not this line */
+    }
+  }
+  throw new Error(`Could not parse contract invocation output:\n${stdout}`);
+};
+
+/**
+ * Reads the M-of-N upgrade group currently configured on a contract.
+ *
+ * @param {object} options
+ * @returns {{signers: string[], threshold: number}|null} Null when unconfigured.
+ */
+const readMultisigConfig = (options) => {
+  const network = NETWORKS[options.network] || NETWORKS.testnet;
+  const cmd = `stellar contract invoke --id "${options.contractId}" --network "${network.name}"${options.source ? ` --source "${options.source}"` : ''} -- get_multisig_config`;
+  const result = parseInvokeResult(execSync(cmd, { encoding: 'utf8' }));
+
+  // The contract returns Result<MultisigConfig>; an unconfigured contract
+  // answers `{"err":{...}}` with Error::MultisigNotInitialized.
+  if (result && typeof result === 'object' && 'ok' in result) {
+    return result.ok;
+  }
+  return null;
+};
+
+/**
+ * Submits one signer approval for a specific WASM hash.
+ *
+ * Approvals are bound to the exact artifact, so this is safe to run from each
+ * signer independently and in any order.
+ *
+ * @param {object} options
+ * @param {{address: string, secret: string}} signer
+ * @param {string} newWasmHash
+ * @returns {string} The hash that was approved.
+ */
+const submitApproval = (options, signer, newWasmHash) => {
+  const network = NETWORKS[options.network] || NETWORKS.testnet;
+  const cmd = [
+    'stellar contract invoke',
+    `--id "${options.contractId}"`,
+    `--network "${network.name}"`,
+    `--source "${signer.secret}"`,
+    `--signer "${signer.address}"`,
+    '-- approve_upgrade',
+    `--signer "${signer.address}"`,
+    `--new_wasm_hash "${newWasmHash}"`,
+  ].join(' ');
+  execSync(cmd, { stdio: 'inherit' });
+  return newWasmHash;
+};
+
 // ── Deployment & Upgrade Workflows ───────────────────────────────────────────
 
 /**
@@ -355,17 +462,31 @@ const executeDeploy = async (options) => {
 const executeUpgrade = async (options) => {
   const network = NETWORKS[options.network] || NETWORKS.testnet;
   const contractId = options.contractId;
+  // The CLI always supplies an array (see parseArgs), but this function is
+  // exported and called directly by tooling and tests, so normalize rather
+  // than assume.
+  const signers = options.signers || [];
 
   if (!contractId) {
     throw new Error('Missing target contract ID for upgrade. Pass --contract-id <CONTRACT_ID>.');
   }
 
   console.log(`\n🔄 Upgrading PaymentRouter contract [${contractId}] on [${network.name.toUpperCase()}]...`);
+  console.log('   Upgrades are authorized by an M-of-N signer group, not by the admin key.');
 
   if (options.dryRun) {
     const mockWasmHash = 'f4c8996fb92427ae41e4649b934ca495991b7852b855e3b0c44298fc1c149afb';
+    const configured = signers.length > 0;
     console.log(`   [Dry Run] Uploaded new WASM hash: ${mockWasmHash}`);
-    console.log(`   [Dry Run] Invoked upgrade(${mockWasmHash}) as admin`);
+    if (configured) {
+      console.log(
+        `   [Dry Run] Collected ${signers.length} approval(s) for ${mockWasmHash}`
+      );
+      console.log(`   [Dry Run] Invoked upgrade(${mockWasmHash}) once the quorum is reached`);
+    } else {
+      console.log(`   [Dry Run] No --signer keys given, so no approval would be collected.`);
+      console.log(`   [Dry Run] The upgrade would abort: the group has not reached its threshold.`);
+    }
     return { contractId, newWasmHash: mockWasmHash };
   }
 
@@ -382,6 +503,49 @@ const executeUpgrade = async (options) => {
     newWasmHash = execSync(installCmd, { encoding: 'utf8' }).trim().split('\n').pop().trim();
     console.log(`   New WASM Hash: ${newWasmHash}`);
 
+    const config = readMultisigConfig(options);
+    if (!config) {
+      throw new Error(
+        'This contract has no multisig group configured, so it cannot be upgraded at all.\n' +
+          '   Configure one first:\n' +
+          '     node scripts/deploy.js set-multisig --contract-id C... \\\n' +
+          '       --signer G...:S... --signer G...:S... --threshold 2'
+      );
+    }
+
+    const available = parseSignerPairs(signers);
+    const configured = new Set(config.signers);
+    const usable = available.filter((s) => configured.has(s.address));
+
+    const missing = available.filter((s) => !configured.has(s.address));
+    if (missing.length > 0) {
+      console.warn(
+        `⚠️  Ignoring ${missing.length} key(s) that are not in the configured group: ` +
+          missing.map((s) => s.address).join(', ')
+      );
+    }
+
+    console.log(
+      `👥 Configured group: ${config.threshold}-of-${config.signers.length}. ` +
+        `${usable.length} usable key(s) supplied.`
+    );
+
+    if (usable.length < config.threshold) {
+      throw new Error(
+        `Not enough signer keys to reach the ${config.threshold}-of-${config.signers.length} threshold ` +
+          `(${usable.length} usable supplied). Pass --signer <address>:<secret> once per signer.`
+      );
+    }
+
+    // Any M approvals authorize the upgrade; stop at the threshold rather than
+    // spending more keys than the group requires.
+    const approving = usable.slice(0, config.threshold);
+    console.log(`✍️  Collecting ${approving.length} approval(s) for ${newWasmHash}...`);
+    for (const signer of approving) {
+      console.log(`   → approval from ${signer.address}`);
+      submitApproval(options, signer, newWasmHash);
+    }
+
     console.log('⚙️  Invoking contract upgrade method...');
     const invokeCmd = `stellar contract invoke --id "${contractId}" --network "${network.name}" ${sourceFlag} -- upgrade --new_wasm_hash "${newWasmHash}"`.trim();
     execSync(invokeCmd, { stdio: 'inherit' });
@@ -395,6 +559,92 @@ const executeUpgrade = async (options) => {
   return { contractId, newWasmHash };
 };
 
+/**
+ * Records a single signer approval against an already-installed WASM hash.
+ *
+ * Useful when signers coordinate out of band: each of them runs this once,
+ * and whoever collects the last required signature runs `upgrade`.
+ *
+ * @param {object} options
+ * @returns {Promise<{contractId: string, newWasmHash: string}>}
+ */
+const executeApprove = async (options) => {
+  const network = NETWORKS[options.network] || NETWORKS.testnet;
+  const signers = options.signers || [];
+
+  if (!options.contractId) {
+    throw new Error('Missing target contract ID. Pass --contract-id <CONTRACT_ID>.');
+  }
+  if (!options.newWasmHash) {
+    throw new Error('Missing --new-wasm-hash <HASH> to approve.');
+  }
+  if (signers.length === 0) {
+    throw new Error('Missing --signer <address>:<secret> for the approving key.');
+  }
+
+  const [signer] = parseSignerPairs(signers);
+
+  if (options.dryRun) {
+    console.log(
+      `   [Dry Run] ${signer.address} would approve ${options.newWasmHash} on [${network.name.toUpperCase()}]`
+    );
+    return { contractId: options.contractId, newWasmHash: options.newWasmHash };
+  }
+
+  console.log(
+    `\n✍️  Recording approval from ${signer.address} for WASM ${options.newWasmHash}...`
+  );
+  submitApproval(options, signer, options.newWasmHash);
+  console.log(`✅ Approval recorded. Run \`upgrade\` once ${options.newWasmHash} has enough signatures.`);
+  return { contractId: options.contractId, newWasmHash: options.newWasmHash };
+};
+
+/**
+ * Configures the M-of-N group that authorizes future upgrades.
+ *
+ * @param {object} options
+ * @returns {Promise<{contractId: string, threshold: number}>}
+ */
+const executeSetMultisig = async (options) => {
+  const network = NETWORKS[options.network] || NETWORKS.testnet;
+
+  if (!options.contractId) {
+    throw new Error('Missing target contract ID. Pass --contract-id <CONTRACT_ID>.');
+  }
+  if (!Number.isInteger(options.threshold) || options.threshold < 1) {
+    throw new Error('Missing --threshold <M> (an integer of at least 1).');
+  }
+
+  const signers = parseSignerPairs(options.signers || []).map((s) => s.address);
+  if (signers.length === 0) {
+    throw new Error('Missing --signer <address>:<secret> entries for the group members.');
+  }
+  if (options.threshold > signers.length) {
+    throw new Error(
+      `Threshold ${options.threshold} exceeds the ${signers.length} signer(s) given; ` +
+        'the group could never authorize an upgrade.'
+    );
+  }
+
+  if (options.dryRun) {
+    console.log(
+      `   [Dry Run] Would set a ${options.threshold}-of-${signers.length} group on [${network.name.toUpperCase()}]`
+    );
+    return { contractId: options.contractId, threshold: options.threshold };
+  }
+
+  const sourceFlag = options.source ? `--source "${options.source}"` : '';
+  console.log(
+    `\n👥 Configuring a ${options.threshold}-of-${signers.length} upgrade group on [${network.name.toUpperCase()}]...`
+  );
+  const cmd =
+    `stellar contract invoke --id "${options.contractId}" --network "${network.name}" ${sourceFlag} ` +
+    `-- set_multisig_config --signers '${JSON.stringify(signers)}' --threshold ${options.threshold}`.trim();
+  execSync(cmd, { stdio: 'inherit' });
+  console.log(`✅ Group configured. Future upgrades need ${options.threshold} of these keys.`);
+  return { contractId: options.contractId, threshold: options.threshold };
+};
+
 // ── Help & Banner ────────────────────────────────────────────────────────────
 
 const printHelp = () => {
@@ -406,11 +656,13 @@ USAGE:
   ./scripts/deploy_contract.sh [command] [options]
 
 COMMANDS:
-  deploy    Compile, optimize, deploy, and update config files (default)
-  upgrade   Compile, upload new WASM, and invoke contract upgrade method
-  build     Compile and optimize WASM without deploying
-  init      Initialize a deployed contract with admin and fee parameters
-  help      Show this help message
+  deploy        Compile, optimize, deploy, and update config files (default)
+  upgrade       Compile, upload new WASM, collect the M approvals, and upgrade
+  approve       Record one signer's approval for an already-installed WASM hash
+  set-multisig  Configure the M-of-N group that authorizes future upgrades
+  build         Compile and optimize WASM without deploying
+  init          Initialize a deployed contract with admin and fee parameters
+  help          Show this help message
 
 OPTIONS:
   -n, --network <name>       Network to deploy to: testnet (default), mainnet, local, futurenet
@@ -422,6 +674,9 @@ OPTIONS:
   --fee-cap <number>         Fee cap amount in stroops (default: 10000000 = 1 XLM)
   --max-amount <number>      Maximum payment limit per transaction
   --wasm <path>              Path to precompiled .wasm file
+  --signer <address:secret>  A member of the upgrade group; repeat once per key
+  --new-wasm-hash <hash>     WASM hash to approve (approve)
+  --threshold <M>            Signatures required out of the group (set-multisig)
   --dry-run                  Simulate actions without submitting on-chain transactions
   --skip-build               Skip cargo compilation if wasm is already built
   --env-file <path>          Custom .env file to update with contract ID
@@ -434,10 +689,20 @@ EXAMPLES:
   # Deploy to testnet with custom admin and secret
   node scripts/deploy.js deploy --network testnet --source S... --admin G...
 
-  # Upgrade contract on testnet
-  node scripts/deploy.js upgrade --contract-id CD... --network testnet --source S...
+  # Configure a 2-of-3 upgrade group (admin must sign)
+  node scripts/deploy.js set-multisig --contract-id C... --network testnet --source S... \\
+    --signer G1...:S1... --signer G2...:S2... --signer G3...:S3... --threshold 2
+
+  # Upgrade contract, approving with enough of the group to reach the threshold
+  node scripts/deploy.js upgrade --contract-id C... --network testnet --source S... \\
+    --signer G1...:S1... --signer G2...:S2...
+
+  # Out-of-band flow: each signer approves separately, then upgrade runs
+  node scripts/deploy.js approve --contract-id C... --network testnet \\
+    --signer G1...:S1... --new-wasm-hash <HASH>
 `);
 };
+
 
 // ── Main Entrypoint ──────────────────────────────────────────────────────────
 
@@ -465,6 +730,16 @@ const main = async () => {
     return;
   }
 
+  if (options.command === 'approve') {
+    await executeApprove(options);
+    return;
+  }
+
+  if (options.command === 'set-multisig') {
+    await executeSetMultisig(options);
+    return;
+  }
+
   // Default: deploy
   await executeDeploy(options);
 };
@@ -483,5 +758,9 @@ module.exports = {
   compileAndOptimizeWasm,
   executeDeploy,
   executeUpgrade,
+  executeApprove,
+  executeSetMultisig,
+  parseSignerPairs,
+  parseInvokeResult,
   NETWORKS,
 };
