@@ -148,6 +148,9 @@ pub enum ActionType {
     TransferAdmin(Address),
     /// Upgrade the contract WASM.
     Upgrade(BytesN<32>),
+    /// Arm the dead man's switch: nominate a backup admin and its claim
+    /// timeout in seconds (see `set_backup_admin_internal`).
+    SetBackupAdmin(Address, u64),
 }
 
 /// A pending timelock entry stored in persistent ledger storage.
@@ -198,6 +201,15 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    /// The backup admin that can claim ownership via the dead man's switch.
+    /// Stored as `Address` in instance storage.
+    BackupAdmin,
+    /// Unix timestamp of the last admin heartbeat (see `ping`).
+    /// Stored as `u64` in instance storage.
+    LastHeartbeat,
+    /// Inactivity window (seconds) after which the backup admin may claim.
+    /// Stored as `u64` in instance storage.
+    DmsTimeout,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -236,6 +248,13 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
+    /// No backup admin has been configured for the dead man's switch.
+    NoBackupAdmin = 15,
+    /// The dead man's switch timeout period has not elapsed yet.
+    DmsNotReady = 16,
+    /// A dead man's switch parameter is invalid (e.g. zero timeout,
+    /// timeout shorter than the minimum, or identical admin/backup).
+    InvalidDmsConfig = 17,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -252,6 +271,10 @@ impl PaymentRouter {
     const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
     const VOLUME_THRESHOLD: i128 = 10_000 * Self::XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
     const SECONDS_IN_24H: u64 = 24 * 3600;
+    /// Minimum configurable dead man's switch timeout (7 days). Keeps the
+    /// claim window long enough that a briefly-offline admin cannot lose
+    /// the contract, while still guaranteeing recoverability.
+    const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
     const VERSION: u32 = 1;
 
     const DAY_IN_LEDGERS: u32 = 17280;
@@ -342,6 +365,17 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::Frozen)
             .unwrap_or(false)
+    }
+
+    /// Records an admin heartbeat (`now`) if the dead man's switch has a
+    /// timeout configured, so the claim clock restarts from the current
+    /// ledger timestamp. Cheap no-op when no backup admin is configured.
+    fn bump_heartbeat(env: &Env) {
+        if env.storage().instance().has(&DataKey::BackupAdmin) {
+            env.storage()
+                .instance()
+                .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        }
     }
 
     /// Allocates and returns the next timelock nonce, incrementing the counter.
@@ -557,6 +591,7 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
+        env.storage().instance().set(&DataKey::LastHeartbeat, &0u64);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -576,9 +611,10 @@ impl PaymentRouter {
     ///
     /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
     /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
-    /// `upgrade`) must go through the timelock.  Use the direct setter
-    /// functions only for actions that are not sensitive (e.g. `set_pause`
-    /// which can also be called directly for immediate operational pauses).
+    /// `upgrade`, arming the dead man's switch) must go through the timelock.
+    /// Use the direct setter functions only for actions that are not sensitive
+    /// (e.g. `set_pause` which can also be called directly for immediate
+    /// operational pauses).
     ///
     /// The contract must not be frozen when queuing, and the admin must
     /// authorize the call.
@@ -684,6 +720,9 @@ impl PaymentRouter {
             }
             ActionType::TransferAdmin(new_admin) => {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
+            }
+            ActionType::SetBackupAdmin(backup, timeout_seconds) => {
+                Self::apply_set_backup_admin(&env, backup, timeout_seconds)?;
             }
             ActionType::Upgrade(new_wasm_hash) => {
                 env.deployer().update_current_contract_wasm(new_wasm_hash);
@@ -1167,6 +1206,270 @@ impl PaymentRouter {
         Ok(())
     }
 
+    // ── Dead man's switch (Issue #720) ───────────────────────────────────────
+    //
+    // If the admin loses their keys, the contract would otherwise become
+    // permanently unmanageable.  The dead man's switch lets the admin nominate
+    // a backup address: if the admin does not `ping` the contract (or process
+    // any payment, which bumps the heartbeat automatically) for longer than
+    // the configured timeout, the backup may claim admin rights.
+    //
+    // The timeout is enforced in *claim* only, so an active admin is never
+    // disrupted: every admin heartbeat simply restarts the clock.
+
+    /// Configures the dead man's switch: nominates `backup` as the recovery
+    /// address and sets the inactivity `timeout_seconds` after which the
+    /// backup may claim admin rights.
+    ///
+    /// This is a sensitive administrative change and therefore goes through
+    /// the timelock: call `queue_action` with
+    /// `ActionType::SetBackupAdmin { backup, timeout_seconds }` and execute
+    /// after the 24-hour delay.  The claim itself is NOT timelocked — if the
+    /// admin is gone, nobody would be left to execute a queued claim.
+    ///
+    /// # Parameters
+    /// - `backup`: Address allowed to claim admin rights after the timeout.
+    /// - `timeout_seconds`: Inactivity window in seconds. Must be at least
+    ///   `MIN_DMS_TIMEOUT` (7 days).
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet, or `Err(Error::InvalidDmsConfig)` if
+    /// `timeout_seconds` is below the minimum or `backup` equals the
+    /// current admin.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_backup_admin_internal(
+        env: Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        Self::apply_set_backup_admin(&env, backup, timeout_seconds)
+    }
+
+    /// Shared implementation for arming the dead man's switch: validates the
+    /// configuration, stores the backup admin and timeout, and starts the
+    /// claim clock. Performs NO authorization; callers must do that first
+    /// (direct admin call or timelock execution).
+    fn apply_set_backup_admin(
+        env: &Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        if timeout_seconds < Self::MIN_DMS_TIMEOUT {
+            return Err(Error::InvalidDmsConfig);
+        }
+        let admin = Self::require_admin(env)?;
+        if backup == admin {
+            return Err(Error::InvalidDmsConfig);
+        }
+
+        env.storage().instance().set(&DataKey::BackupAdmin, &backup);
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsTimeout, &timeout_seconds);
+        // The claim clock starts ticking from the moment the switch is armed.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "backup_admin_set"), admin),
+            (backup, timeout_seconds),
+        );
+
+        log!(env, "Dead man's switch armed");
+        Ok(())
+    }
+
+    /// Disables the dead man's switch, removing the backup admin and its
+    /// claim window. The inactivity timeout is left in storage untouched so
+    /// a later re-arming (via timelock) can reuse it.
+    ///
+    /// Admin authorization is required.
+    pub fn remove_backup_admin(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "backup_admin_removed"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Dead man's switch disarmed");
+        Ok(())
+    }
+
+    /// Heartbeat: records the current ledger timestamp as the admin's last
+    /// sign of life, restarting the dead man's switch claim clock.
+    ///
+    /// This is the primary way for the admin to reset the timer without
+    /// changing any contract state. Routing a payment also bumps the
+    /// heartbeat automatically. A no-op when no backup admin is configured.
+    ///
+    /// Admin authorization is required. Works even while the contract is
+    /// frozen so the legitimate admin can keep the switch alive.
+    pub fn ping(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        Self::bump_heartbeat(&env);
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("ping"), admin), env.ledger().timestamp());
+
+        log!(&env, "Admin heartbeat recorded");
+        Ok(())
+    }
+
+    /// Dead man's switch claim: transfers admin rights to `claimant` if they
+    /// are the configured backup admin and the admin has not pinged (directly
+    /// or via routing a payment) for at least the configured timeout.
+    ///
+    /// Deliberately NOT timelocked and NOT blocked by a contract freeze: if
+    /// the primary admin is gone there is nobody left to execute a queued
+    /// action, and freezing must not be able to brick recovery.
+    ///
+    /// # Parameters
+    /// - `claimant`: Address claiming admin rights. Must be the configured
+    ///   backup admin and must authorize the call.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::NoBackupAdmin)` if no backup is
+    /// configured, `Err(Error::Unauthorized)` if `claimant` is not the
+    /// backup, or `Err(Error::DmsNotReady)` if the timeout has not elapsed.
+    pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
+        claimant.require_auth();
+
+        let backup: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackupAdmin)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if claimant != backup {
+            return Err(Error::Unauthorized);
+        }
+
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .ok_or(Error::InvalidDmsConfig)?;
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .ok_or(Error::InvalidDmsConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < last_heartbeat.saturating_add(timeout) {
+            return Err(Error::DmsNotReady);
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &claimant);
+        // Fully disarm the switch: the backup is consumed and the clock is
+        // cleared so the new admin starts from a clean slate (re-arm via the
+        // timelock if desired).
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().remove(&DataKey::DmsTimeout);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_claimed"), claimant.clone()), now);
+
+        log!(&env, "Admin claimed via dead man's switch");
+        Ok(())
+    }
+
+    /// Returns the current admin address.
+    ///
+    /// # Returns
+    /// `Some(admin)` if the contract is initialized, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Returns the dead man's switch configuration.
+    ///
+    /// # Returns
+    /// `(backup_admin, timeout_seconds, last_heartbeat, seconds_since_heartbeat)`.
+    /// `backup_admin` is `None` and the timestamps `0` when no backup is
+    /// configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_dead_mans_switch(env: Env) -> (Option<Address>, u64, u64, u64) {
+        let backup = env.storage().instance().get(&DataKey::BackupAdmin);
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let elapsed = if backup.is_some() {
+            now.saturating_sub(last)
+        } else {
+            0
+        };
+        (backup, timeout, last, elapsed)
+    }
+
+    /// Returns `true` if the dead man's switch is armed (a backup admin is
+    /// configured) and the timeout has elapsed, i.e. `claim_admin` would
+    /// currently succeed for the backup.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_dead_mans_switch_expired(env: Env) -> bool {
+        let backup_set = env.storage().instance().has(&DataKey::BackupAdmin);
+        if !backup_set {
+            return false;
+        }
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        env.ledger().timestamp().saturating_sub(last) >= timeout
+    }
+
     /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
     ///
     /// # Parameters
@@ -1252,7 +1555,13 @@ impl PaymentRouter {
             &platform_treasury,
             fee_bps,
             fee_cap,
-        )
+        )?;
+
+        // A successful routing proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
+
+        Ok(())
     }
 
     /// Routes multiple payments in a single transaction. If any payment fails,
@@ -1281,6 +1590,10 @@ impl PaymentRouter {
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
+        // Successful routing proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
+
         for payment in payments.iter() {
             Self::process_single_payment(
                 &env,
@@ -1293,6 +1606,10 @@ impl PaymentRouter {
                 fee_cap,
             )?;
         }
+
+        // A successful batch proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
 
         Ok(())
     }
@@ -2121,6 +2438,312 @@ mod test {
         // VOLUME_THRESHOLD, so the halved rate applies: 2000 * 50 bps = 10.
         client.route_payment(&sender, &recipient, &token_address, &2000);
         assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 10));
+    }
+
+    /// Advances the ledger clock by `seconds`.
+    fn advance_time(env: &Env, seconds: u64) {
+        let current_time = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: current_time + seconds,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+    }
+
+    /// Initializes the contract and arms the dead man's switch through the
+    /// full timelock path (queue → wait 24h → execute), returning the
+    /// addresses involved.
+    fn setup_dms_env(
+        env: &Env,
+        client: &PaymentRouterClient<'static>,
+        admin: &Address,
+        backup: &Address,
+        timeout: u64,
+    ) {
+        let treasury = Address::generate(env);
+        client.initialize(admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.queue_action(&ActionType::SetBackupAdmin(backup.clone(), timeout));
+        advance_time(env, PaymentRouter::SECONDS_IN_24H + 1);
+        client.execute_action(&nonce);
+    }
+
+    #[test]
+    fn test_dms_configure_via_timelock_and_getter() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        let timeout: u64 = 30 * 24 * 3600;
+
+        // Unarmed before configuration.
+        let (b, t, last, elapsed) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+        assert_eq!((t, last, elapsed), (0, 0, 0));
+        assert!(!client.is_dead_mans_switch_expired());
+
+        setup_dms_env(&env, &client, &admin, &backup, timeout);
+
+        let (b, t, _last, elapsed) = client.get_dead_mans_switch();
+        assert_eq!(b.unwrap(), backup);
+        assert_eq!(t, timeout);
+        assert!(elapsed < 5, "clock should start at arm time");
+        assert!(!client.is_dead_mans_switch_expired());
+    }
+
+    #[test]
+    fn test_dms_rejects_short_timeout_and_admin_as_backup() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Timeout below MIN_DMS_TIMEOUT.
+        let res = client.try_set_backup_admin_internal(
+            &Address::generate(&env),
+            &(PaymentRouter::MIN_DMS_TIMEOUT - 1),
+        );
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidDmsConfig);
+
+        // Backup identical to the current admin.
+        let res = client.try_set_backup_admin_internal(&admin, &PaymentRouter::MIN_DMS_TIMEOUT);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidDmsConfig);
+
+        // Nothing was armed.
+        let (b, _, _, _) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+    }
+
+    #[test]
+    fn test_dms_claim_fails_before_timeout_then_succeeds() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        // Not the backup cannot claim.
+        let res = client.try_claim_admin(&Address::generate(&env));
+        assert_eq!(res.unwrap_err().unwrap(), Error::Unauthorized);
+
+        // Backup cannot claim before the timeout elapses.
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+
+        // Admin pings just before the deadline; the clock restarts.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        client.ping();
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+
+        // After the timeout since the *ping*, the claim succeeds.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+
+        // The switch is disarmed after a successful claim.
+        let (b, t, last, elapsed) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+        assert_eq!((t, last, elapsed), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_dms_ping_resets_timer() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        // Repeated pings keep the switch alive indefinitely.
+        for _ in 0..3 {
+            advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+            client.ping();
+            let res = client.try_claim_admin(&backup);
+            assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+        }
+
+        // Silence for the full timeout, then the backup takes over.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+    }
+
+    #[test]
+    fn test_dms_routing_payment_bumps_heartbeat() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        let (token_addr, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        // Advance almost to the deadline, then route a payment: the
+        // successful payment is a sign of life and restarts the clock.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        client.route_payment(&sender, &recipient, &token_addr, &1_000);
+
+        advance_time(&env, 1);
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+
+        // Failed routing must NOT bump the heartbeat: sender without funds.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        let broke_sender = Address::generate(&env);
+        let res = client.try_route_payment(&broke_sender, &recipient, &token_addr, &1_000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
+
+        // The failed payment did not reset the clock, so the claim succeeds.
+        advance_time(&env, 2);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+    }
+
+    #[test]
+    fn test_dms_claim_works_while_frozen_and_paused() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        client.emergency_freeze();
+        client.set_pause(&true);
+
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+    }
+
+    #[test]
+    fn test_dms_remove_backup_admin_disarms_switch() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        client.remove_backup_admin();
+
+        let (b, _, last, _) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+        assert_eq!(last, 0);
+
+        // Even after a long silence the claim fails: no backup is configured.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT * 10);
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoBackupAdmin);
+    }
+
+    #[test]
+    fn test_dms_no_backup_claim_fails() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_claim_admin(&Address::generate(&env));
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoBackupAdmin);
+    }
+
+    #[test]
+    fn test_dms_new_admin_can_rearm_after_claim() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        // Silence long enough for the backup to take over.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+
+        // The new admin arms a fresh switch with a new backup.
+        let new_backup = Address::generate(&env);
+        let nonce = client.queue_action(&ActionType::SetBackupAdmin(
+            new_backup.clone(),
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        ));
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+        client.execute_action(&nonce);
+
+        let (b, _, _, _) = client.get_dead_mans_switch();
+        assert_eq!(b.unwrap(), new_backup);
+
+        // And the new admin's own ping keeps the fresh switch alive.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        client.ping();
+        let res = client.try_claim_admin(&new_backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+    }
+
+    #[test]
+    fn test_dms_heartbeat_is_noop_without_backup() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Ping works before any backup exists but is a no-op for the
+        // heartbeat: the switch is unarmed, so there is no clock to reset.
+        advance_time(&env, 1_000);
+        client.ping();
+        let (_, _, last, elapsed) = client.get_dead_mans_switch();
+        assert_eq!(last, 0);
+        assert_eq!(elapsed, 0);
+
+        let res = client.try_claim_admin(&Address::generate(&env));
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoBackupAdmin);
     }
 
     #[test]
