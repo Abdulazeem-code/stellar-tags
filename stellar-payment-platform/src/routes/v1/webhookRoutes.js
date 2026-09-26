@@ -123,6 +123,9 @@ const isValidWebhookUrl = (url) => {
     return u.protocol === 'http:' || u.protocol === 'https:';
   } catch {
     return false;
+  }
+};
+
 // Issue #727: `Stellar-Timestamp` is an ISO 8601 timestamp (the same value as
 // `payload.timestamp`). Dispatches older than 5 minutes are expired; more
 // than 1 minute in the future is rejected to bound clock skew.
