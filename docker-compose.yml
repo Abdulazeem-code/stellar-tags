@@ -5,9 +5,42 @@
 #   docker compose --profile full up         the same, plus the built frontend
 #   docker compose --profile test up         API under test + its own database
 #   docker compose --profile integration up  local standalone Stellar network
+#   docker compose --profile cluster up      6-node Redis Cluster (3 primaries
+#                                            + 3 replicas) for BullMQ failover
 #
 # dev and test use separate databases on separate host ports, so both can run
 # at once without colliding.
+#
+# To run the app against the Redis Cluster instead of the single-instance
+# redis service, add the profile and pass the seeds through the host env:
+#
+#   REDIS_CLUSTER_NODES=redis-cluster-1:6379,redis-cluster-2:6379,... \
+#     docker compose --profile dev --profile cluster up
+
+x-redis-cluster-node: &redis-cluster-node
+  image: redis:7-alpine
+  profiles: ["cluster"]
+  command:
+    - redis-server
+    - --port
+    - "6379"
+    - --cluster-enabled
+    - "yes"
+    - --cluster-config-file
+    - /data/nodes.conf
+    - --cluster-node-timeout
+    - "5000"
+    - --appendonly
+    - "yes"
+  volumes:
+    # Anonymous volume: `docker compose --profile cluster down -v` resets the
+    # slot map and data so a clean bootstrap is possible.
+    - /data
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
 
 services:
   # ── dev ────────────────────────────────────────────────────────────────────
@@ -50,6 +83,9 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stellar_tags?schema=public
       REDIS_URL: redis://redis:6379
+      # Leave blank to keep using the single-instance REDIS_URL above. Set it to
+      # the cluster seeds (comma-separated) to switch BullMQ to cluster mode.
+      REDIS_CLUSTER_NODES: ${REDIS_CLUSTER_NODES:-}
       PORT: "5000"
       LOG_DIR: /app/logs
     volumes:
@@ -76,6 +112,65 @@ services:
       - "3000:80"
     depends_on:
       - backend
+
+  # ── redis cluster ──────────────────────────────────────────────────────────
+  # Six-node Redis Cluster (3 primaries + 3 replicas) for exercising BullMQ
+  # sharding and node failover locally. redis-cluster-init bootstraps it once
+  # every node answers PING, then exits:
+  #
+  #   docker compose --profile cluster up -d
+  #
+  # Clients must live on this compose network: cluster redirects advertise
+  # container IPs, so the host-published ports below are for troubleshooting
+  # only. The backend joins this network under the dev profile.
+  redis-cluster-1:
+    <<: *redis-cluster-node
+    ports:
+      - "7001:6379"
+  redis-cluster-2:
+    <<: *redis-cluster-node
+    ports:
+      - "7002:6379"
+  redis-cluster-3:
+    <<: *redis-cluster-node
+    ports:
+      - "7003:6379"
+  redis-cluster-4:
+    <<: *redis-cluster-node
+    ports:
+      - "7004:6379"
+  redis-cluster-5:
+    <<: *redis-cluster-node
+    ports:
+      - "7005:6379"
+  redis-cluster-6:
+    <<: *redis-cluster-node
+    ports:
+      - "7006:6379"
+
+  redis-cluster-init:
+    profiles: ["cluster"]
+    image: redis:7-alpine
+    depends_on:
+      redis-cluster-1:
+        condition: service_healthy
+      redis-cluster-2:
+        condition: service_healthy
+      redis-cluster-3:
+        condition: service_healthy
+      redis-cluster-4:
+        condition: service_healthy
+      redis-cluster-5:
+        condition: service_healthy
+      redis-cluster-6:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        redis-cli --cluster create
+        redis-cluster-1:6379 redis-cluster-2:6379 redis-cluster-3:6379 redis-cluster-4:6379 redis-cluster-5:6379 redis-cluster-6:6379
+        --cluster-replicas 1 --cluster-yes
 
   # ── test ───────────────────────────────────────────────────────────────────
   postgres-test:
@@ -144,3 +239,5 @@ services:
 volumes:
   pgdata:
   backendlogs:
+
+
