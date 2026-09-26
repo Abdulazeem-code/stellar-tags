@@ -26,9 +26,13 @@ jest.mock('bullmq', () => ({
 
 jest.mock('../src/config/redis', () => ({
   createRedisConnection: jest.fn(() => ({ quit: mockRedisQuit })),
+  // Real retry behaviour is covered in tests/redis-failover.test.js; the
+  // passthrough here keeps the enqueue assertions focused on the BullMQ shape.
+  withRedisRetry: jest.fn((operation) => operation()),
 }));
 
 const { Queue, Worker } = require('bullmq');
+const { withRedisRetry } = require('../src/config/redis');
 const {
   dispatchPaymentWebhooks,
   enqueueWebhookDelivery,
@@ -96,7 +100,7 @@ describe('webhook BullMQ delivery', () => {
 
     await expect(processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 0 },
-      { prisma, poolRunFn: jest.fn() },
+      { prisma,  },
     )).rejects.toThrow('HTTP 503');
 
     expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
@@ -115,7 +119,7 @@ describe('webhook BullMQ delivery', () => {
 
     await processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 2 },
-      { prisma, poolRunFn: jest.fn() },
+      { prisma,  },
     );
 
     expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
@@ -124,10 +128,42 @@ describe('webhook BullMQ delivery', () => {
     }));
   });
 
+  test('delivery includes timestamp-bound Stellar headers alongside legacy ones', async () => {
+    const crypto = require('crypto');
+    global.fetch.mockResolvedValue({ ok: true, status: 200 });
+    const prisma = {
+      webhook: {
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+
+    await processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    );
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const [, options] = global.fetch.mock.calls[0];
+    const rawBody = JSON.stringify(payload);
+    const expectedLegacy = crypto.createHmac('sha256', webhook.secret).update(rawBody).digest('hex');
+    const expectedBound = crypto
+      .createHmac('sha256', webhook.secret)
+      .update(`${payload.timestamp}.${rawBody}`)
+      .digest('hex');
+
+    expect(options.headers).toMatchObject({
+      'X-Webhook-Signature': expectedLegacy,
+      'X-Stellar-Tags-Signature': expectedLegacy,
+      'X-Webhook-Timestamp': payload.timestamp,
+      'Stellar-Signature': expectedBound,
+      'Stellar-Timestamp': payload.timestamp,
+    });
+  });
+
   test('configures and starts a BullMQ webhook worker', () => {
     const dependencies = {
       prisma: { webhook: {} },
-      poolRunFn: jest.fn(),
+      
     };
 
     startWebhookWorker(dependencies);
@@ -154,7 +190,7 @@ describe('webhook BullMQ delivery', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-1',
@@ -180,6 +216,18 @@ describe('webhook BullMQ delivery', () => {
     );
   });
 
+  test('routes enqueues through the Redis failover retry helper', async () => {
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    await enqueueWebhookDelivery(webhook, payload, queue);
+
+    expect(withRedisRetry).toHaveBeenCalledTimes(1);
+    expect(withRedisRetry.mock.calls[0][0]).toEqual(expect.any(Function));
+    expect(withRedisRetry.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ attempts: expect.any(Number), baseDelayMs: expect.any(Number) }),
+    );
+  });
+
   test('creates a lazy queue when no queue is injected', async () => {
     mockQueueAdd.mockResolvedValue({ id: 'job-1' });
 
@@ -192,3 +240,5 @@ describe('webhook BullMQ delivery', () => {
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
   });
 });
+
+
