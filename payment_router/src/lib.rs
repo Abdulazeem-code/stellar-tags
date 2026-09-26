@@ -210,6 +210,19 @@ pub enum DataKey {
     /// Inactivity window (seconds) after which the backup admin may claim.
     /// Stored as `u64` in instance storage.
     DmsTimeout,
+    // ── Rate limiting (issue #716) ───────────────────────────────────────
+    /// Per-address payment invocation cap per ledger sequence.
+    /// Stored as `u32` in instance storage (`0` disables rate limiting).
+    /// Absent storage falls back to `DEFAULT_RATE_LIMIT` so upgraded
+    /// deployments are protected without re-running `initialize`.
+    RateLimitConfig,
+    /// Packed invocation counter for a given sender: bytes 0..8 hold the
+    /// ledger sequence the window started at, bytes 8..24 the number of
+    /// payment invocations made in that window.
+    RateLimitCounter(Address),
+    /// Whether a given sender is whitelisted and therefore exempt from the
+    /// rate limiter.
+    RateLimitWhitelist(Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -255,6 +268,10 @@ pub enum Error {
     /// A dead man's switch parameter is invalid (e.g. zero timeout,
     /// timeout shorter than the minimum, or identical admin/backup).
     InvalidDmsConfig = 17,
+    /// The sender exceeded the per-ledger invocation cap enforced by the
+    /// contract-level rate limiter (issue #716). The caller must wait for the
+    /// next ledger sequence, or be whitelisted by the admin.
+    RateLimited = 18,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -275,6 +292,22 @@ impl PaymentRouter {
     /// claim window long enough that a briefly-offline admin cannot lose
     /// the contract, while still guaranteeing recoverability.
     const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
+
+    // ── Rate limiting (issue #716) ───────────────────────────────────────
+    /// Default number of payments one address may settle per ledger sequence.
+    /// Rate limiting is active from the very first payment (and after
+    /// upgrading a deployment that predates this feature) with this cap; the
+    /// admin can raise, lower, or disable it via `set_rate_limit`.
+    ///
+    /// Ten comfortably covers a busy-but-legitimate sender while throttling
+    /// spam floods. Note that `route_payments` counts *each* payment in the
+    /// batch against its sender's cap, so a single batch must not contain
+    /// more than this many payments from any one address.
+    const DEFAULT_RATE_LIMIT: u32 = 10;
+    /// Upper bound for `set_rate_limit`, so a typo or a compromised admin
+    /// cannot turn the limiter off by setting an absurdly large cap.
+    const MAX_RATE_LIMIT: u32 = 1_000_000;
+
     const VERSION: u32 = 1;
 
     const DAY_IN_LEDGERS: u32 = 17280;
@@ -378,6 +411,102 @@ impl PaymentRouter {
         }
     }
 
+    // ── Rate limiting (issue #716) ───────────────────────────────────────
+    //
+    // A spammer who can settle arbitrarily many payments per ledger bloats
+    // contract state and degrades performance. The limiter is keyed on the
+    // ledger *sequence* rather than wall-clock time: the window is simply
+    // "this ledger", so no time bookkeeping is needed and the counter
+    // resets automatically when the next ledger is sealed.
+    //
+    // Scope of the protection, precisely: the cap bounds the number of
+    // *successful* payments a single address can settle per ledger, and that
+    // is the only thing a Soroban contract can bound. It cannot charge for or
+    // throttle *rejected* transactions, because a contract function that
+    // returns `Err` has its entire invocation rolled back by the host -
+    // including this counter. A rejected attempt therefore costs the spammer
+    // the transaction fee but leaves no state behind, and reverts the counter
+    // increment. Callers must not rely on this to throttle failing traffic.
+
+    /// Returns the stored per-ledger invocation cap, or `None` when no
+    /// configuration has been written yet.
+    fn get_rate_limit_config(env: &Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::RateLimitConfig)
+    }
+
+    /// Returns the effective per-ledger invocation cap. Falls back to
+    /// `DEFAULT_RATE_LIMIT` when no configuration is stored so deployments
+    /// upgraded from before this feature are protected immediately.
+    fn rate_limit_raw(env: &Env) -> u32 {
+        Self::get_rate_limit_config(env).unwrap_or(Self::DEFAULT_RATE_LIMIT)
+    }
+
+    /// Returns whether `address` is whitelisted (exempt from rate limiting).
+    /// Performs no authorization and never touches missing storage.
+    fn is_whitelisted(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateLimitWhitelist(address.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Returns how many payment invocations `sender` has already consumed in
+    /// the current ledger window. A counter stamped with an earlier ledger
+    /// sequence reads as `0`, which is what makes the window roll over on its
+    /// own when the next ledger seals - no time bookkeeping required.
+    fn rate_limit_used(env: &Env, sender: &Address) -> i128 {
+        let packed = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<24>>(&DataKey::RateLimitCounter(sender.clone()));
+
+        match packed {
+            Some(packed) => {
+                let (window_ledger, count) = unpack_spending(&packed);
+                if window_ledger == u64::from(env.ledger().sequence()) {
+                    count
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Enforces the per-address, per-ledger invocation cap for one payment.
+    ///
+    /// Whitelisted senders bypass the check entirely and never touch the
+    /// counter. Everyone else consumes one slot per payment invocation that
+    /// is part of a *successful* invocation; a payment that is later rejected
+    /// has its slot returned, since the host reverts the whole call.
+    ///
+    /// Storage overhead is one packed 24-byte persistent entry per active
+    /// sender (ledger sequence + invocation count, same layout as the
+    /// daily-limit record), overwritten in place on every payment.
+    fn check_rate_limit(env: &Env, sender: &Address) -> Result<(), Error> {
+        let limit = Self::rate_limit_raw(env);
+        if limit == 0 || Self::is_whitelisted(env, sender) {
+            return Ok(());
+        }
+
+        let used = Self::rate_limit_used(env, sender);
+        if used >= i128::from(limit) {
+            log!(env, "Rate limit exceeded for sender this ledger");
+            return Err(Error::RateLimited);
+        }
+
+        let key = DataKey::RateLimitCounter(sender.clone());
+        let updated = pack_spending(env, u64::from(env.ledger().sequence()), used + 1);
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
     /// Allocates and returns the next timelock nonce, incrementing the counter.
     fn next_nonce(env: &Env) -> u64 {
         let current: u64 = env
@@ -404,6 +533,10 @@ impl PaymentRouter {
     ) -> Result<(), Error> {
         // Require sender auth
         sender.require_auth();
+
+        // Contract-level rate limiting (issue #716): one invocation slot per
+        // payment, consumed after auth so only authorized senders are counted.
+        Self::check_rate_limit(env, sender)?;
 
         env.events().publish(
             (Symbol::new(env, "payment_initiated"), sender.clone()),
@@ -592,6 +725,11 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
         env.storage().instance().set(&DataKey::LastHeartbeat, &0u64);
+        // Rate limiting (issue #716) is on by default with the standard cap;
+        // the admin can adjust it afterwards via `set_rate_limit`.
+        env.storage()
+            .instance()
+            .set(&DataKey::RateLimitConfig, &Self::DEFAULT_RATE_LIMIT);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -819,6 +957,169 @@ impl PaymentRouter {
 
         log!(&env, "Contract unfrozen by admin");
         Ok(())
+    }
+
+    // ── Rate limiting (issue #716) ───────────────────────────────────────
+
+    /// Sets the maximum number of payment invocations a single sender may
+    /// make per ledger sequence. Admin-only.
+    ///
+    /// Rate limiting is active immediately after `initialize` with a default
+    /// cap of 10 invocations per address per ledger. This setter changes the
+    /// cap; a value of `0` disables rate limiting entirely (whitelisting
+    /// individual addresses via `set_rate_limit_whitelist` is usually
+    /// preferable to disabling the limiter for everyone).
+    ///
+    /// # Parameters
+    /// - `max_calls_per_ledger`: Invocation cap per address per ledger.
+    ///   Must not exceed `MAX_RATE_LIMIT` (1,000,000).
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::NotInitialized)` if the contract has
+    /// no admin set yet, or `Err(Error::LimitExceeded)` if the cap exceeds
+    /// `MAX_RATE_LIMIT`.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_rate_limit(env: Env, max_calls_per_ledger: u32) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        if max_calls_per_ledger > Self::MAX_RATE_LIMIT {
+            return Err(Error::LimitExceeded);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RateLimitConfig, &max_calls_per_ledger);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_set"), admin),
+            max_calls_per_ledger,
+        );
+
+        log!(&env, "Rate limit updated");
+        Ok(())
+    }
+
+    /// Whitelists an address, exempting it from the per-ledger invocation cap
+    /// so legitimate high-volume senders are never throttled. Admin-only.
+    ///
+    /// # Parameters
+    /// - `address`: Sender to exempt from rate limiting.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_rate_limit_whitelist(env: Env, address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::RateLimitWhitelist(address.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_whitelist_added"), address),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Address whitelisted from rate limiting");
+        Ok(())
+    }
+
+    /// Removes an address from the rate-limit whitelist, restoring the
+    /// standard per-ledger cap for it. Admin-only.
+    ///
+    /// # Parameters
+    /// - `address`: Sender to remove from the whitelist.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn remove_rate_limit_whitelist(env: Env, address: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RateLimitWhitelist(address.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_whitelist_removed"), address),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Address removed from rate-limit whitelist");
+        Ok(())
+    }
+
+    /// Returns the active per-ledger invocation cap. A value of `0` means
+    /// rate limiting is disabled.
+    ///
+    /// # Returns
+    /// The configured cap, or the default cap (10) when no explicit
+    /// configuration has been stored.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_rate_limit(env: Env) -> u32 {
+        Self::rate_limit_raw(&env)
+    }
+
+    /// Returns whether an address is exempt from the rate limiter.
+    ///
+    /// # Parameters
+    /// - `address`: Address to check.
+    ///
+    /// # Returns
+    /// `true` if the address is on the rate-limit whitelist.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_rate_limit_whitelisted(env: Env, address: Address) -> bool {
+        Self::is_whitelisted(&env, &address)
+    }
+
+    /// Returns how many more payment invocations `sender` can make in the
+    /// current ledger under the active cap.
+    ///
+    /// # Parameters
+    /// - `sender`: Address whose remaining allowance to compute.
+    ///
+    /// # Returns
+    /// Remaining invocations in the current ledger window, saturating at 0
+    /// once the cap is reached. Whitelisted senders (and a disabled limiter)
+    /// report `u32::MAX`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_rate_limit_remaining(env: Env, sender: Address) -> u32 {
+        let limit = Self::rate_limit_raw(&env);
+        if limit == 0 || Self::is_whitelisted(&env, &sender) {
+            return u32::MAX;
+        }
+
+        // The remainder is at most the cap, and `set_rate_limit` refuses any
+        // cap above `MAX_RATE_LIMIT`, so the narrowing conversion back to
+        // `u32` cannot fail. `saturating_sub` keeps it at 0 if a counter
+        // were somehow ahead of the cap.
+        u32::try_from(i128::from(limit).saturating_sub(Self::rate_limit_used(&env, &sender)))
+            .unwrap_or(0)
     }
 
     /// Returns whether the contract is currently frozen.
@@ -1522,10 +1823,9 @@ impl PaymentRouter {
     /// paused, `Err(Error::NotInitialized)` if the contract has no admin
     /// set, `Err(Error::InvalidRecipient)` if `sender == recipient`,
     /// `Err(Error::Blacklisted)` if `recipient` is blacklisted,
-    /// `Err(Error::LimitExceeded)` if `amount` is outside the configured
-    /// bounds or exceeds the sender's remaining daily limit, or
-    /// `Err(Error::InsufficientBalance)` if `sender`'s token balance is
-    /// below `amount`.
+    /// `Err(Error::RateLimited)` if the sender's per-ledger cap (#716) is
+    /// exhausted, `Err(Error::LimitExceeded)` if `amount` is out of bounds,
+    /// or `Err(Error::InsufficientBalance)` if the balance is too low.
     ///
     /// # Panics
     /// Panics if `sender` does not authorize the call, or if the underlying
@@ -3205,6 +3505,368 @@ mod test {
         // Governance address can now update the fee
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
+    }
+
+    // ── Rate limiting tests (issue #716) ─────────────────────────────────────
+
+    /// Sets the ledger's sequence number to `sequence`, leaving everything
+    /// else untouched. Each Soroban ledger is a fresh rate-limit window.
+    fn advance_ledger(env: &Env, sequence: u32) {
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp(),
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: sequence,
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+    }
+
+    /// A contract deployed before this feature existed carries no
+    /// `RateLimitConfig`, and `initialize` is not re-run on upgrade. The
+    /// limiter must therefore fall back to the default cap rather than
+    /// reading the cap as absent or zero.
+    #[test]
+    fn test_rate_limit_falls_back_to_default_without_config() {
+        let (env, client, _) = setup_env();
+
+        // No `initialize` call, so nothing has ever written the config.
+        assert_eq!(client.get_rate_limit(), PaymentRouter::DEFAULT_RATE_LIMIT);
+
+        let sender = Address::generate(&env);
+        assert_eq!(
+            client.get_rate_limit_remaining(&sender),
+            PaymentRouter::DEFAULT_RATE_LIMIT
+        );
+        assert!(!client.is_rate_limit_whitelisted(&sender));
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_after_cap_and_resets_next_ledger() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _, sac) = setup_token(&env);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // Rate limiting is on by default right after initialize.
+        assert_eq!(client.get_rate_limit(), PaymentRouter::DEFAULT_RATE_LIMIT);
+        assert_eq!(
+            client.get_rate_limit_remaining(&sender),
+            PaymentRouter::DEFAULT_RATE_LIMIT
+        );
+
+        // The default cap allows exactly this many payments, then rejects
+        // gracefully with a dedicated error instead of panicking.
+        for _ in 0..PaymentRouter::DEFAULT_RATE_LIMIT {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+        assert_eq!(client.get_rate_limit_remaining(&sender), 0);
+
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+
+        // The cap is per ledger sequence: a new ledger resets the window.
+        advance_ledger(&env, env.ledger().sequence() + 1);
+        assert_eq!(
+            client.get_rate_limit_remaining(&sender),
+            PaymentRouter::DEFAULT_RATE_LIMIT
+        );
+        client.route_payment(&sender, &recipient, &token_address, &100);
+    }
+
+    #[test]
+    fn test_rate_limit_whitelist_is_exempt() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // Fill the counter exactly to the default cap in this ledger.
+        for _ in 0..PaymentRouter::DEFAULT_RATE_LIMIT {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+
+        // Whitelisting a high-volume sender exempts it entirely: payments
+        // beyond the cap succeed without touching the counter.
+        client.set_rate_limit_whitelist(&sender);
+        assert!(client.is_rate_limit_whitelisted(&sender));
+        assert_eq!(client.get_rate_limit_remaining(&sender), u32::MAX);
+
+        for _ in 0..2 {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+
+        // Removing the exemption restores the standard cap (the counter is
+        // untouched by whitelisted activity, so the current window is full).
+        client.remove_rate_limit_whitelist(&sender);
+        assert!(!client.is_rate_limit_whitelisted(&sender));
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+    }
+
+    /// Builds a one-payment batch for `sender`.
+    fn single_payment_batch(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token_address: &Address,
+    ) -> Vec<Payment> {
+        let mut payments = Vec::new(env);
+        payments.push_back(Payment {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        payments
+    }
+
+    /// A rate-limited payment inside a batch reverts the whole batch.
+    ///
+    /// Each address appears at most once per batch here on purpose: calling
+    /// `require_auth` twice for the same address in a single contract frame
+    /// is rejected by the host's auth machinery, which is a separate
+    /// pre-existing limitation of `route_payments` (see issue #716 notes).
+    #[test]
+    fn test_rate_limit_batch_rejection_is_atomic() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let throttled = Address::generate(&env);
+        let other = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&throttled, &1_000_000);
+        sac.mint(&other, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        client.set_rate_limit(&1);
+
+        // Exhaust the first sender's allowance for this ledger.
+        client.route_payment(&throttled, &recipient, &token_address, &100);
+        let res = client.try_route_payment(&throttled, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+
+        // A batch whose *last* payment is throttled must revert in full: the
+        // earlier payment must not settle, and no counter may be consumed.
+        let mut payments = single_payment_batch(&env, &other, &recipient, &token_address);
+        payments.push_back(Payment {
+            sender: throttled.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        let res = client.try_route_payments(&payments);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+        assert_eq!(token_client.balance(&other), 1_000_000);
+        assert_eq!(token_client.balance(&throttled), 1_000_000 - 100);
+        assert_eq!(client.get_rate_limit_remaining(&other), 1);
+
+        // `other` was not charged by the reverted batch, so its single
+        // payment still settles in this ledger.
+        client.route_payments(&single_payment_batch(
+            &env,
+            &other,
+            &recipient,
+            &token_address,
+        ));
+        assert_eq!(token_client.balance(&other), 1_000_000 - 100);
+    }
+
+    /// Every payment in a batch counts against its own sender's per-ledger
+    /// cap, and the caps are tracked independently per address.
+    #[test]
+    fn test_rate_limit_batch_counts_each_sender_independently() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&a, &1_000_000);
+        sac.mint(&b, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        client.set_rate_limit(&1);
+
+        // One payment each: both senders are now at their own cap.
+        let mut payments = single_payment_batch(&env, &a, &recipient, &token_address);
+        payments.push_back(Payment {
+            sender: b.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        client.route_payments(&payments);
+        assert_eq!(token_client.balance(&a), 1_000_000 - 100);
+        assert_eq!(token_client.balance(&b), 1_000_000 - 100);
+        assert_eq!(client.get_rate_limit_remaining(&a), 0);
+        assert_eq!(client.get_rate_limit_remaining(&b), 0);
+
+        // A second batch in the same ledger is rejected, and the rejection
+        // does not leak across addresses: a fresh sender is still allowed.
+        let mut payments = single_payment_batch(&env, &a, &recipient, &token_address);
+        payments.push_back(Payment {
+            sender: b.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        let res = client.try_route_payments(&payments);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+        assert_eq!(token_client.balance(&a), 1_000_000 - 100);
+        assert_eq!(token_client.balance(&b), 1_000_000 - 100);
+
+        let fresh = Address::generate(&env);
+        sac.mint(&fresh, &1_000);
+        client.route_payments(&single_payment_batch(
+            &env,
+            &fresh,
+            &recipient,
+            &token_address,
+        ));
+        assert_eq!(token_client.balance(&fresh), 1_000 - 100);
+
+        // The next ledger opens a fresh window for everyone.
+        advance_ledger(&env, env.ledger().sequence() + 1);
+        assert_eq!(client.get_rate_limit_remaining(&a), 1);
+        assert_eq!(client.get_rate_limit_remaining(&b), 1);
+    }
+
+    /// A rejected payment does not consume rate-limit budget.
+    ///
+    /// The Soroban host rolls back the whole invocation when a contract
+    /// returns `Err`, which includes the counter written by
+    /// `check_rate_limit`. This pins that behaviour down, because the
+    /// limiter's protection scope depends on it: only successful payments
+    /// are throttled.
+    #[test]
+    fn test_rate_limit_rejected_payment_keeps_allowance() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        client.set_rate_limit(&2);
+
+        // A zero-value payment is rejected by the amount bounds, which run
+        // after the rate-limit check has already reserved a slot.
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &0);
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+        assert_eq!(client.get_rate_limit_remaining(&sender), 2);
+
+        // The full allowance is therefore still available in this ledger.
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(client.get_rate_limit_remaining(&sender), 0);
+        assert_eq!(token_client.balance(&sender), 1_000_000 - 200);
+
+        // A rate-limit rejection is likewise not charged to the sender: the
+        // next ledger opens with the full allowance rather than a stale
+        // counter.
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+        advance_ledger(&env, env.ledger().sequence() + 1);
+        assert_eq!(client.get_rate_limit_remaining(&sender), 2);
+    }
+
+    #[test]
+    fn test_rate_limit_admin_config_and_disable() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _, sac) = setup_token(&env);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // Tighten the cap to 2; the third payment in the same ledger fails.
+        client.set_rate_limit(&2);
+        assert_eq!(client.get_rate_limit(), 2);
+
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+
+        // A cap above MAX_RATE_LIMIT is rejected.
+        let res = client.try_set_rate_limit(&(PaymentRouter::MAX_RATE_LIMIT + 1));
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+
+        // Zero disables the limiter entirely.
+        client.set_rate_limit(&0);
+        assert_eq!(client.get_rate_limit(), 0);
+        for _ in 0..(PaymentRouter::DEFAULT_RATE_LIMIT * 2) {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+        assert_eq!(client.get_rate_limit_remaining(&sender), u32::MAX);
     }
 }
 
