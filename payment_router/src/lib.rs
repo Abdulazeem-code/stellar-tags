@@ -1922,14 +1922,12 @@ impl PaymentRouter {
             .get(&DataKey::MinLimit)
             .unwrap_or(0);
 
-        // Authorize each distinct sender exactly once, while the batch is
-        // still untouched, so an unauthorized sender is refused before any
-        // transfer has run.  Asking an address that has already authorized
-        // this invocation again would trap it, so the seen-set matters.
+        // Authorize each distinct sender exactly once, after the batch is known
+        // to be valid.  Asking an address that has already authorized this
+        // invocation again would trap it, so the seen-set matters.
         let mut authorized: Vec<Address> = Vec::new(&env);
 
         for payment in payments.iter() {
-            payment.sender.require_auth();
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
             }
@@ -1944,9 +1942,14 @@ impl PaymentRouter {
             }
             Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
             if !authorized.contains(&payment.sender) {
-                payment.sender.require_auth();
                 authorized.push_back(payment.sender.clone());
             }
+        }
+
+        // Only once the whole batch is known to be valid, so a rejected batch
+        // never records an authorization it then has to roll back.
+        for addr in authorized.iter() {
+            addr.require_auth();
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -2778,6 +2781,93 @@ mod test {
         );
         // Nothing was moved: validation rejects the whole batch up front.
         assert_eq!(token_client.balance(&recipient), 0);
+    }
+
+    /// A batch from several distinct senders must pay every one of them.
+    ///
+    /// The authorization pass walks a de-duplicated seen-set, so a sender
+    /// appearing several times is authorized once while a batch of different
+    /// senders is authorized once each.  This had no active coverage at all
+    /// before, which is how an over-eager `require_auth` in the per-payment
+    /// loop could abort every multi-payment batch.
+    #[test]
+    fn test_batch_with_several_distinct_senders_succeeds() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        let starting_balance = 1_000_000_000_i128;
+        let mut senders: Vec<Address> = Vec::new(&env);
+        for _ in 0..2 {
+            let sender = Address::generate(&env);
+            token_admin_client.mint(&sender, &starting_balance);
+            senders.push_back(sender);
+        }
+
+        let first_recipient = Address::generate(&env);
+        let second_recipient = Address::generate(&env);
+        let amount = 1_000_000_i128;
+        let fee = amount * 100 / 10_000;
+        let expected_net = amount - fee;
+
+        // The first sender pays twice, the second once, so the batch mixes a
+        // repeated sender with a distinct one.
+        let payments = Vec::from_array(
+            &env,
+            [
+                Payment {
+                    sender: senders.get(0).unwrap().clone(),
+                    recipient: first_recipient.clone(),
+                    token_address: token_address.clone(),
+                    amount,
+                },
+                Payment {
+                    sender: senders.get(0).unwrap().clone(),
+                    recipient: second_recipient.clone(),
+                    token_address: token_address.clone(),
+                    amount,
+                },
+                Payment {
+                    sender: senders.get(1).unwrap().clone(),
+                    recipient: first_recipient.clone(),
+                    token_address: token_address.clone(),
+                    amount,
+                },
+            ],
+        );
+
+        client.route_payments(&payments);
+
+        assert_eq!(
+            token_client.balance(&first_recipient),
+            expected_net * 2,
+            "first recipient should be paid for both incoming payments"
+        );
+        assert_eq!(
+            token_client.balance(&second_recipient),
+            expected_net,
+            "second recipient should be paid once"
+        );
+        assert_eq!(token_client.balance(&treasury), fee * 3, "fee mismatch");
+        // The first sender funded two payments, the second only one.
+        assert_eq!(
+            token_client.balance(&senders.get(0).unwrap()),
+            starting_balance - (expected_net * 2) - (fee * 2),
+            "first sender was debited the wrong total"
+        );
+        assert_eq!(
+            token_client.balance(&senders.get(1).unwrap()),
+            starting_balance - expected_net - fee,
+            "second sender was debited the wrong total"
+        );
     }
 
     #[test]
