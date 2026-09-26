@@ -22,11 +22,9 @@
 
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
-const { poolGet, poolRun } = require('./src/db');
 const {
   dispatchPaymentWebhooks,
-  startWebhookWorker,
-  closeWebhookQueue,
+  scheduleWebhookRetryJob,
 } = require('./src/webhookWorker');
 const {
   horizon,
@@ -338,8 +336,6 @@ const watchAccount = (accountId) => {
           logger.info(formatPayment(payment, accountId));
           dispatchPaymentWebhooks({
             prisma,
-            poolGetFn: poolGet,
-            poolRunFn: poolRun,
             payment,
           }).catch((err) =>
             logger.error(
@@ -523,7 +519,6 @@ const shutdown = async () => {
     forgetAccount(address);
   }
   activeStreams.clear();
-  await closeWebhookQueue();
   await prisma.$disconnect();
   process.exit(0);
 };
@@ -546,8 +541,15 @@ const main = async () => {
   );
   logger.info('═══════════════════════════════════════════════════════');
 
-  // Start the durable Redis-backed webhook delivery worker.
-  startWebhookWorker({ prisma, poolRunFn: poolRun });
+  // Initial sync
+  await syncWatchedAccounts();
+
+  // Schedule webhook retry / liveness pings
+  try {
+    scheduleWebhookRetryJob({ prisma });
+  } catch (err) {
+    logger.error('Failed to schedule webhook retry job:', err.message);
+  }
 
   // First cycle runs immediately, then reschedules itself on a backoff timer.
   await runPollCycle();

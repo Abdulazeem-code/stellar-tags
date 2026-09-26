@@ -1,0 +1,64 @@
+config:
+  target: "{{ $processEnvironment.TARGET_URL || 'http://localhost:5000' }}"
+  processor: "./scripts/webhook-load-processor.js"
+  plugins:
+    expect: {}
+  ensure:
+    p95: 500
+    maxErrorRate: 1
+  phases:
+    - duration: 1
+      arrivalCount: 50
+      name: "Spike: 50 concurrent users hitting the webhook API"
+  defaults:
+    headers:
+      content-type: "application/json"
+
+before:
+  flow:
+    - log: "Prereqs: node scripts/seed-webhook-load-test-users.js && node scripts/mock-webhook-receiver.js (or `npm run test:load:webhooks` to do both automatically)"
+
+scenarios:
+  - name: "Register a webhook, trigger a delivery, list, then remove it"
+    beforeScenario: "assignTestUser"
+    flow:
+      - post:
+          url: "/webhooks"
+          json:
+            username: "{{ username }}"
+            signature: "{{ signature }}"
+            signerAddress: "{{ signerAddress }}"
+            url: "{{ webhookUrl }}"
+            events: ["payment.received"]
+          expect:
+            - statusCode: 201
+          capture:
+            - json: "$.webhook.id"
+              as: "webhookId"
+
+      - post:
+          url: "/webhooks/{{ webhookId }}/test"
+          json:
+            username: "{{ username }}"
+            signature: "{{ signature }}"
+            signerAddress: "{{ signerAddress }}"
+          expect:
+            - statusCode: 200
+
+      - get:
+          url: "/webhooks"
+          json:
+            username: "{{ username }}"
+            signature: "{{ signature }}"
+            signerAddress: "{{ signerAddress }}"
+          expect:
+            - statusCode: 200
+
+      - delete:
+          url: "/webhooks/{{ webhookId }}"
+          json:
+            username: "{{ username }}"
+            signature: "{{ signature }}"
+            signerAddress: "{{ signerAddress }}"
+          expect:
+            - statusCode: 200

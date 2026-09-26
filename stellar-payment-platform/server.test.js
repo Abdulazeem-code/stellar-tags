@@ -1016,11 +1016,11 @@ describe('Database disconnection — 503 handling', () => {
     expect(res.body.error.message).toBe('Service Unavailable');
   });
 
-  test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {
+  test('server.js federation route returns 503 on Prisma P10 connection errors', async () => {
     prisma.user.findFirst.mockRejectedValue(makePrismaError('P1001'));
 
     const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(503);
   });
 
 });

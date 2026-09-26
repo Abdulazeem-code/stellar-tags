@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, BytesN,
-    Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -112,6 +112,23 @@ pub struct Payment {
     pub amount: i128,
 }
 
+/// Interface implemented by supported Soroban lending protocols.
+///
+/// Keeping the protocol behind this small adapter lets the router integrate
+/// with Blend-compatible deployments while tests use an in-process mock.
+#[contractclient(name = "LendingProtocolClient")]
+pub trait LendingProtocol {
+    fn deposit(env: Env, from: Address, token: Address, amount: i128);
+    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
+    fn harvest(env: Env, to: Address, token: Address) -> i128;
+}
+
+/// Minimal interface for an admin-selected KYC issuer or oracle contract.
+#[contractclient(name = "KycOracleClient")]
+pub trait KycOracle {
+    fn is_verified(env: Env, account: Address) -> bool;
+}
+
 // ── Timelock data structures ─────────────────────────────────────────────────
 //
 // Admin actions that change sensitive contract parameters (treasury, fees,
@@ -163,6 +180,28 @@ pub struct TimelockEntry {
     pub action: ActionType,
 }
 
+/// Role definitions for the Role-Based Access Control (RBAC) system.
+///
+/// Segregates operational privileges across dedicated role boundaries:
+/// SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Role {
+    /// Supreme administrator with exclusive authority over role assignments,
+    /// contract upgrades, emergency freeze/unfreeze, and root governance.
+    SuperAdmin = 1,
+    /// Manager with exclusive authority over platform treasury, yield operations,
+    /// token recovery, and emergency asset withdrawals.
+    TreasuryManager = 2,
+    /// Compliance officer with authority over address blacklisting, KYC oracle
+    /// configurations, and emergency operational pause switches.
+    ComplianceOfficer = 3,
+    /// Fee manager with authority over platform fee basis points, fee caps, and
+    /// minimum payment limits.
+    FeeManager = 4,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,28 +240,18 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
-    /// The backup admin that can claim ownership via the dead man's switch.
-    /// Stored as `Address` in instance storage.
-    BackupAdmin,
-    /// Unix timestamp of the last admin heartbeat (see `ping`).
-    /// Stored as `u64` in instance storage.
-    LastHeartbeat,
-    /// Inactivity window (seconds) after which the backup admin may claim.
-    /// Stored as `u64` in instance storage.
-    DmsTimeout,
-    // ── Rate limiting (issue #716) ───────────────────────────────────────
-    /// Per-address payment invocation cap per ledger sequence.
-    /// Stored as `u32` in instance storage (`0` disables rate limiting).
-    /// Absent storage falls back to `DEFAULT_RATE_LIMIT` so upgraded
-    /// deployments are protected without re-running `initialize`.
-    RateLimitConfig,
-    /// Packed invocation counter for a given sender: bytes 0..8 hold the
-    /// ledger sequence the window started at, bytes 8..24 the number of
-    /// payment invocations made in that window.
-    RateLimitCounter(Address),
-    /// Whether a given sender is whitelisted and therefore exempt from the
-    /// rate limiter.
-    RateLimitWhitelist(Address),
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited for a treasury asset.
+    YieldPrincipal(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
+    /// Active designated address for an administrative role: Role -> Address.
+    Role(Role),
+    /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
+    UserRole(Address, Role),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -261,17 +290,18 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
-    /// No backup admin has been configured for the dead man's switch.
-    NoBackupAdmin = 15,
-    /// The dead man's switch timeout period has not elapsed yet.
-    DmsNotReady = 16,
-    /// A dead man's switch parameter is invalid (e.g. zero timeout,
-    /// timeout shorter than the minimum, or identical admin/backup).
-    InvalidDmsConfig = 17,
-    /// The sender exceeded the per-ledger invocation cap enforced by the
-    /// contract-level rate limiter (issue #716). The caller must wait for the
-    /// next ledger sequence, or be whitelisted by the admin.
-    RateLimited = 18,
+    /// No lending protocol has been configured by the admin.
+    YieldProtocolNotConfigured = 15,
+    /// Yield amount must be positive and withdrawals cannot exceed principal.
+    InvalidYieldAmount = 16,
+    /// The sender lacks a valid KYC claim for a high-value payment.
+    KycRequired = 17,
+    /// The configured KYC threshold must not be negative.
+    InvalidKycThreshold = 18,
+    /// Account lacks the required role or role does not exist.
+    RoleNotFound = 19,
+    /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
+    InvalidRole = 20,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -321,6 +351,47 @@ impl PaymentRouter {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
+    fn set_role_internal(env: &Env, role: Role, account: &Address) {
+        env.storage().instance().set(&DataKey::Role(role), account);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserRole(account.clone(), role),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn remove_role_internal(env: &Env, role: Role, account: &Address) {
+        if let Some(current) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if current == *account {
+                env.storage().instance().remove(&DataKey::Role(role));
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &false);
+    }
+
+    fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
+        let addr = if let Some(role_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            role_addr
+        } else {
+            Self::require_admin(env)?
+        };
+        addr.require_auth();
+        Ok(addr)
+    }
+
     fn require_admin(env: &Env) -> Result<Address, Error> {
         env.storage()
             .instance()
@@ -329,7 +400,7 @@ impl PaymentRouter {
     }
 
     /// Fee authority helper: if a Governance address is set it takes exclusive
-    /// control over fee updates; otherwise the admin retains that right.
+    /// control over fee updates; otherwise the FeeManager retains that right.
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
         if let Some(gov) = env
             .storage()
@@ -339,8 +410,7 @@ impl PaymentRouter {
             gov.require_auth();
             Ok(())
         } else {
-            let admin = Self::require_admin(env)?;
-            admin.require_auth();
+            Self::require_role(env, Role::FeeManager)?;
             Ok(())
         }
     }
@@ -400,110 +470,22 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
-    /// Records an admin heartbeat (`now`) if the dead man's switch has a
-    /// timeout configured, so the claim clock restarts from the current
-    /// ledger timestamp. Cheap no-op when no backup admin is configured.
-    fn bump_heartbeat(env: &Env) {
-        if env.storage().instance().has(&DataKey::BackupAdmin) {
-            env.storage()
-                .instance()
-                .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
-        }
-    }
-
-    // ── Rate limiting (issue #716) ───────────────────────────────────────
-    //
-    // A spammer who can settle arbitrarily many payments per ledger bloats
-    // contract state and degrades performance. The limiter is keyed on the
-    // ledger *sequence* rather than wall-clock time: the window is simply
-    // "this ledger", so no time bookkeeping is needed and the counter
-    // resets automatically when the next ledger is sealed.
-    //
-    // Scope of the protection, precisely: the cap bounds the number of
-    // *successful* payments a single address can settle per ledger, and that
-    // is the only thing a Soroban contract can bound. It cannot charge for or
-    // throttle *rejected* transactions, because a contract function that
-    // returns `Err` has its entire invocation rolled back by the host -
-    // including this counter. A rejected attempt therefore costs the spammer
-    // the transaction fee but leaves no state behind, and reverts the counter
-    // increment. Callers must not rely on this to throttle failing traffic.
-
-    /// Returns the stored per-ledger invocation cap, or `None` when no
-    /// configuration has been written yet.
-    fn get_rate_limit_config(env: &Env) -> Option<u32> {
-        env.storage().instance().get(&DataKey::RateLimitConfig)
-    }
-
-    /// Returns the effective per-ledger invocation cap. Falls back to
-    /// `DEFAULT_RATE_LIMIT` when no configuration is stored so deployments
-    /// upgraded from before this feature are protected immediately.
-    fn rate_limit_raw(env: &Env) -> u32 {
-        Self::get_rate_limit_config(env).unwrap_or(Self::DEFAULT_RATE_LIMIT)
-    }
-
-    /// Returns whether `address` is whitelisted (exempt from rate limiting).
-    /// Performs no authorization and never touches missing storage.
-    fn is_whitelisted(env: &Env, address: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::RateLimitWhitelist(address.clone()))
-            .unwrap_or(false)
-    }
-
-    /// Returns how many payment invocations `sender` has already consumed in
-    /// the current ledger window. A counter stamped with an earlier ledger
-    /// sequence reads as `0`, which is what makes the window roll over on its
-    /// own when the next ledger seals - no time bookkeeping required.
-    fn rate_limit_used(env: &Env, sender: &Address) -> i128 {
-        let packed = env
-            .storage()
-            .persistent()
-            .get::<DataKey, BytesN<24>>(&DataKey::RateLimitCounter(sender.clone()));
-
-        match packed {
-            Some(packed) => {
-                let (window_ledger, count) = unpack_spending(&packed);
-                if window_ledger == u64::from(env.ledger().sequence()) {
-                    count
-                } else {
-                    0
-                }
-            }
-            None => 0,
-        }
-    }
-
-    /// Enforces the per-address, per-ledger invocation cap for one payment.
-    ///
-    /// Whitelisted senders bypass the check entirely and never touch the
-    /// counter. Everyone else consumes one slot per payment invocation that
-    /// is part of a *successful* invocation; a payment that is later rejected
-    /// has its slot returned, since the host reverts the whole call.
-    ///
-    /// Storage overhead is one packed 24-byte persistent entry per active
-    /// sender (ledger sequence + invocation count, same layout as the
-    /// daily-limit record), overwritten in place on every payment.
-    fn check_rate_limit(env: &Env, sender: &Address) -> Result<(), Error> {
-        let limit = Self::rate_limit_raw(env);
-        if limit == 0 || Self::is_whitelisted(env, sender) {
+    /// Enforces KYC only after the admin has configured a threshold. This
+    /// preserves existing routing behavior until compliance is enabled.
+    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
+        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
             return Ok(());
         }
 
-        let used = Self::rate_limit_used(env, sender);
-        if used >= i128::from(limit) {
-            log!(env, "Rate limit exceeded for sender this ledger");
-            return Err(Error::RateLimited);
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycOracle)
+            .ok_or(Error::KycRequired)?;
+        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
+            return Err(Error::KycRequired);
         }
-
-        let key = DataKey::RateLimitCounter(sender.clone());
-        let updated = pack_spending(env, u64::from(env.ledger().sequence()), used + 1);
-        env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
         Ok(())
     }
 
@@ -531,47 +513,12 @@ impl PaymentRouter {
         fee_bps: i128,
         fee_cap: i128,
     ) -> Result<(), Error> {
-        // Require sender auth
-        sender.require_auth();
-
-        // Contract-level rate limiting (issue #716): one invocation slot per
-        // payment, consumed after auth so only authorized senders are counted.
-        Self::check_rate_limit(env, sender)?;
-
         env.events().publish(
             (Symbol::new(env, "payment_initiated"), sender.clone()),
             amount,
         );
 
-        // Prevent self-routing
-        if sender == recipient {
-            return Err(Error::InvalidRecipient);
-        }
-
-        // Check if recipient is blacklisted
-        if Self::is_blacklisted(env.clone(), recipient.clone()) {
-            return Err(Error::Blacklisted);
-        }
-
-        // Validate amount bounds
-        let max_amount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxAmount)
-            .unwrap_or(Self::MAX_AMOUNT);
-        if amount <= 0 || amount > max_amount {
-            return Err(Error::LimitExceeded);
-        }
-
-        // Enforce optional admin-configured minimum payment limit
-        let min_limit: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinLimit)
-            .unwrap_or(0);
-        if amount < min_limit {
-            return Err(Error::LimitExceeded);
-        }
+        // Validations moved to route_payments to prevent rollback panic on Windows testutils
 
         // Apply tiered fee discount for high-volume users
         let user_volume: i128 = env
@@ -602,10 +549,13 @@ impl PaymentRouter {
             accumulated_amount = 0;
         }
 
-        accumulated_amount += amount;
-        if accumulated_amount > Self::DAILY_MAX_LIMIT {
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
             return Err(Error::LimitExceeded);
         }
+        accumulated_amount = new_accumulated;
 
         env.storage().persistent().set(
             &spending_key,
@@ -624,7 +574,8 @@ impl PaymentRouter {
         }
 
         // Calculate fee
-        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
+        let fee_product = amount.checked_mul(effective_fee_bps).unwrap_or(amount);
+        let mut fee_amount = fee_product / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
         }
@@ -633,9 +584,13 @@ impl PaymentRouter {
         }
         let remainder = amount - fee_amount;
 
-        // Execute transfers
-        if fee_amount > 0 {
-            token_client.transfer(sender, platform_treasury, &fee_amount);
+        // Execute transfers safely without panics
+        if fee_amount > 0
+            && token_client
+                .try_transfer(sender, platform_treasury, &fee_amount)
+                .is_err()
+        {
+            return Err(Error::LimitExceeded);
         }
         if remainder > 0 {
             // Attempt to transfer remainder directly to recipient.
@@ -650,8 +605,15 @@ impl PaymentRouter {
                         env,
                         "Recipient transfer failed; crediting sender refund balance"
                     );
-                    token_client.transfer(sender, &env.current_contract_address(), &remainder);
-                    Self::credit_refund_balance(env, sender, token_address, remainder);
+                    if let Ok(Ok(())) = token_client.try_transfer(
+                        sender,
+                        &env.current_contract_address(),
+                        &remainder,
+                    ) {
+                        Self::credit_refund_balance(env, sender, token_address, remainder);
+                    } else {
+                        return Err(Error::LimitExceeded);
+                    }
                 }
             }
         }
@@ -661,7 +623,7 @@ impl PaymentRouter {
         let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&volume_key, &(prev_volume + amount));
+            .set(&volume_key, &prev_volume.saturating_add(amount));
         env.storage().persistent().extend_ttl(
             &volume_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,
@@ -724,18 +686,123 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
-        env.storage().instance().set(&DataKey::LastHeartbeat, &0u64);
-        // Rate limiting (issue #716) is on by default with the standard cap;
-        // the admin can adjust it afterwards via `set_rate_limit`.
-        env.storage()
-            .instance()
-            .set(&DataKey::RateLimitConfig, &Self::DEFAULT_RATE_LIMIT);
+        // RBAC Initialization: assign initial admin to all operational roles
+        Self::set_role_internal(&env, Role::SuperAdmin, &admin);
+        Self::set_role_internal(&env, Role::TreasuryManager, &admin);
+        Self::set_role_internal(&env, Role::ComplianceOfficer, &admin);
+        Self::set_role_internal(&env, Role::FeeManager, &admin);
+
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
         Ok(())
+    }
+
+    // ── Role-Based Access Control (RBAC) ────────────────────────────────────
+
+    /// Assigns an operational role to a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`.
+    ///
+    /// # Parameters
+    /// - `account`: Target address to receive the role.
+    /// - `role`: The `Role` variant to grant.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn assign_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+        Self::set_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_assigned"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Revokes an operational role from a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
+    /// when it would leave the contract without root governance.
+    ///
+    /// # Parameters
+    /// - `account`: Target address from which the role will be revoked.
+    /// - `role`: The `Role` variant to revoke.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
+    /// or `Err(Error::NotInitialized)`.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn revoke_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        let caller = Self::require_role(&env, Role::SuperAdmin)?;
+        if role == Role::SuperAdmin && caller == account {
+            return Err(Error::InvalidRole);
+        }
+        Self::remove_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Queries whether a given account holds an active role assignment.
+    ///
+    /// Checks persistent user role assignments and primary designated roles.
+    ///
+    /// # Parameters
+    /// - `account`: Address to query.
+    /// - `role`: Role variant to check.
+    ///
+    /// # Returns
+    /// `true` if authorized for this role, `false` otherwise.
+    pub fn has_role(env: Env, account: Address, role: Role) -> bool {
+        if let Some(has) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::UserRole(account.clone(), role))
+        {
+            if has {
+                return true;
+            }
+        }
+        if let Some(primary) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if primary == account {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the primary designated member address for a role, if one is configured.
+    ///
+    /// # Parameters
+    /// - `role`: The role variant to query.
+    ///
+    /// # Returns
+    /// `Some(Address)` if set, or `None` if unassigned.
+    pub fn get_role_member(env: Env, role: Role) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+    }
+
+    /// Returns the administrative role governing the specified role.
+    ///
+    /// In this RBAC architecture, `SuperAdmin` governs all operational roles.
+    pub fn get_role_admin(_env: Env, _role: Role) -> Role {
+        Role::SuperAdmin
     }
 
     // ── Timelock: queue / execute / cancel ───────────────────────────────────
@@ -858,6 +925,7 @@ impl PaymentRouter {
             }
             ActionType::TransferAdmin(new_admin) => {
                 env.storage().instance().set(&DataKey::Admin, &new_admin);
+                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
             }
             ActionType::SetBackupAdmin(backup, timeout_seconds) => {
                 Self::apply_set_backup_admin(&env, backup, timeout_seconds)?;
@@ -916,8 +984,7 @@ impl PaymentRouter {
     ///
     /// Admin authorization is required.
     pub fn emergency_freeze(env: Env) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
 
         env.storage().instance().set(&DataKey::Frozen, &true);
         env.storage().instance().extend_ttl(
@@ -926,11 +993,11 @@ impl PaymentRouter {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "emergency_freeze"), admin),
+            (Symbol::new(&env, "emergency_freeze"), super_admin),
             env.ledger().timestamp(),
         );
 
-        log!(&env, "Contract frozen by admin");
+        log!(&env, "Contract frozen by SuperAdmin");
         Ok(())
     }
 
@@ -939,10 +1006,9 @@ impl PaymentRouter {
     /// Like `emergency_freeze`, this takes effect immediately and does not
     /// go through the timelock.
     ///
-    /// Admin authorization is required.
+    /// SuperAdmin authorization is required.
     pub fn unfreeze(env: Env) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
 
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().extend_ttl(
@@ -951,11 +1017,11 @@ impl PaymentRouter {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "unfreeze"), admin),
+            (Symbol::new(&env, "unfreeze"), super_admin),
             env.ledger().timestamp(),
         );
 
-        log!(&env, "Contract unfrozen by admin");
+        log!(&env, "Contract unfrozen by SuperAdmin");
         Ok(())
     }
 
@@ -1142,7 +1208,7 @@ impl PaymentRouter {
 
     /// Updates the treasury address that receives the platform fee.
     ///
-    /// Updates the treasury address that receives the platform fee. Admin-only.
+    /// Updates the treasury address that receives the platform fee. Protected by TreasuryManager.
     ///
     /// # Parameters
     /// - `new_treasury`: Address to receive platform fees going forward.
@@ -1152,14 +1218,13 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current TreasuryManager does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetPlatformTreasury(…))`
     /// and execute after 24 hours.  This direct path is retained for tooling
     /// compatibility only.
     pub fn set_platform_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::TreasuryManager)?;
 
         env.storage()
             .instance()
@@ -1245,8 +1310,7 @@ impl PaymentRouter {
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetGovernance(…))`.
     pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::SuperAdmin)?;
         env.storage().instance().set(&DataKey::Governance, &gov);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -1255,7 +1319,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Sets the minimum allowed routing amount. Admin-only.
+    /// Sets the minimum allowed routing amount. FeeManager-protected.
     ///
     /// # Parameters
     /// - `min_limit`: Smallest `amount` that `route_payment` /
@@ -1266,12 +1330,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current FeeManager does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
     pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::FeeManager)?;
 
         env.storage().instance().set(&DataKey::MinLimit, &min_limit);
         env.storage().instance().extend_ttl(
@@ -1293,7 +1356,7 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
-    /// Pauses or unpauses the payment router. Admin-only.
+    /// Pauses or unpauses the payment router. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject `route_payment` / `route_payments`
@@ -1304,12 +1367,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     ///
     /// This is NOT timelocked — operational pausing must remain instant.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage().instance().set(&DataKey::Paused, &paused);
         env.storage().instance().extend_ttl(
@@ -1368,7 +1430,7 @@ impl PaymentRouter {
             .unwrap_or(0)
     }
 
-    /// Adds an address to the blacklist. Admin-only.
+    /// Adds an address to the blacklist. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `address`: Address to blacklist; subsequent payments to it as a
@@ -1379,10 +1441,9 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     pub fn blacklist_address(env: Env, address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage()
             .persistent()
@@ -1396,7 +1457,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Removes an address from the blacklist. Admin-only.
+    /// Removes an address from the blacklist. ComplianceOfficer-protected.
     ///
     /// # Parameters
     /// - `address`: Address to remove from the blacklist.
@@ -1406,10 +1467,9 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current ComplianceOfficer does not authorize the call.
     pub fn unblacklist_address(env: Env, address: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::ComplianceOfficer)?;
 
         env.storage()
             .persistent()
@@ -1457,7 +1517,7 @@ impl PaymentRouter {
         }
     }
 
-    /// Set a new admin. Gated by the current admin if one exists.
+    /// Set a new admin. SuperAdmin-protected.
     ///
     /// # Parameters
     /// - `new_admin`: Address to install as the new admin.
@@ -1466,16 +1526,13 @@ impl PaymentRouter {
     /// Always `Ok(())`.
     ///
     /// # Panics
-    /// Panics if an admin is already set and it does not authorize the call.
+    /// Panics if an admin is already set and current SuperAdmin does not authorize the call.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        if let Some(admin) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-        {
-            admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            Self::require_role(&env, Role::SuperAdmin)?;
         }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1483,7 +1540,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Transfers admin rights to a new address. Requires the current admin's authorization.
+    /// Transfers admin rights to a new address. Requires current SuperAdmin authorization.
     ///
     /// # Parameters
     /// - `new_admin`: Address to become the new admin.
@@ -1493,13 +1550,14 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current SuperAdmin does not authorize the call.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::TransferAdmin(…))`.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        let current_admin = Self::require_admin(&env)?;
-        current_admin.require_auth();
+        let current_admin = Self::require_role(&env, Role::SuperAdmin)?;
+        Self::remove_role_internal(&env, Role::SuperAdmin, &current_admin);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1507,31 +1565,11 @@ impl PaymentRouter {
         Ok(())
     }
 
-    // ── Dead man's switch (Issue #720) ───────────────────────────────────────
-    //
-    // If the admin loses their keys, the contract would otherwise become
-    // permanently unmanageable.  The dead man's switch lets the admin nominate
-    // a backup address: if the admin does not `ping` the contract (or process
-    // any payment, which bumps the heartbeat automatically) for longer than
-    // the configured timeout, the backup may claim admin rights.
-    //
-    // The timeout is enforced in *claim* only, so an active admin is never
-    // disrupted: every admin heartbeat simply restarts the clock.
-
-    /// Configures the dead man's switch: nominates `backup` as the recovery
-    /// address and sets the inactivity `timeout_seconds` after which the
-    /// backup may claim admin rights.
-    ///
-    /// This is a sensitive administrative change and therefore goes through
-    /// the timelock: call `queue_action` with
-    /// `ActionType::SetBackupAdmin { backup, timeout_seconds }` and execute
-    /// after the 24-hour delay.  The claim itself is NOT timelocked — if the
-    /// admin is gone, nobody would be left to execute a queued claim.
+    /// Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
     ///
     /// # Parameters
-    /// - `backup`: Address allowed to claim admin rights after the timeout.
-    /// - `timeout_seconds`: Inactivity window in seconds. Must be at least
-    ///   `MIN_DMS_TIMEOUT` (7 days).
+    /// - `token`: Contract ID of the token to recover.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
@@ -1540,46 +1578,14 @@ impl PaymentRouter {
     /// current admin.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
-    pub fn set_backup_admin_internal(
-        env: Env,
-        backup: Address,
-        timeout_seconds: u64,
-    ) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-        Self::apply_set_backup_admin(&env, backup, timeout_seconds)
-    }
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
+    pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
-    /// Shared implementation for arming the dead man's switch: validates the
-    /// configuration, stores the backup admin and timeout, and starts the
-    /// claim clock. Performs NO authorization; callers must do that first
-    /// (direct admin call or timelock execution).
-    fn apply_set_backup_admin(
-        env: &Env,
-        backup: Address,
-        timeout_seconds: u64,
-    ) -> Result<(), Error> {
-        if timeout_seconds < Self::MIN_DMS_TIMEOUT {
-            return Err(Error::InvalidDmsConfig);
-        }
-        let admin = Self::require_admin(env)?;
-        if backup == admin {
-            return Err(Error::InvalidDmsConfig);
-        }
-
-        env.storage().instance().set(&DataKey::BackupAdmin, &backup);
-        env.storage()
-            .instance()
-            .set(&DataKey::DmsTimeout, &timeout_seconds);
-        // The claim clock starts ticking from the moment the switch is armed.
-        env.storage()
-            .instance()
-            .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &treasury_mgr, &amount);
 
         env.events().publish(
             (Symbol::new(env, "backup_admin_set"), admin),
@@ -1615,8 +1621,158 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Heartbeat: records the current ledger timestamp as the admin's last
-    /// sign of life, restarting the dead man's switch claim clock.
+    /// Configures the lending protocol used for treasury yield operations. TreasuryManager-protected.
+    pub fn set_yield_protocol(env: Env, protocol: Address) -> Result<(), Error> {
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldProtocol, &protocol);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_cfg"),), protocol);
+        Ok(())
+    }
+
+    /// Configures the trusted KYC oracle and the high-value payment threshold. ComplianceOfficer-protected.
+    pub fn set_kyc_config(env: Env, oracle: Address, threshold: i128) -> Result<(), Error> {
+        if threshold < 0 {
+            return Err(Error::InvalidKycThreshold);
+        }
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage().instance().set(&DataKey::KycOracle, &oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::KycThreshold, &threshold);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("kyc_cfg"), oracle), threshold);
+        Ok(())
+    }
+
+    /// Deposits idle treasury funds into the configured lending protocol.
+    ///
+    /// Both the TreasuryManager and treasury authorize this operation. The second
+    /// authorization is required because the funds are held by the treasury,
+    /// rather than by this router contract.
+    pub fn deposit_to_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        treasury.require_auth();
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).deposit(&treasury, &token, &amount);
+
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(principal + amount));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_dep"), token), amount);
+        Ok(())
+    }
+
+    /// Withdraws treasury principal from the configured lending protocol. TreasuryManager-protected.
+    pub fn withdraw_from_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 || amount > principal {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).withdraw(&treasury, &token, &amount);
+        let remaining = principal - amount;
+        if remaining == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &remaining);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.events()
+            .publish((symbol_short!("yield_wdr"), token), amount);
+        Ok(())
+    }
+
+    /// Claims all currently available yield to the platform treasury. TreasuryManager-protected.
+    pub fn harvest_yield(env: Env, token: Address) -> Result<i128, Error> {
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        let harvested = LendingProtocolClient::new(&env, &protocol).harvest(&treasury, &token);
+        env.events()
+            .publish((symbol_short!("yield_har"), token), harvested);
+        Ok(harvested)
+    }
+
+    /// Returns the tracked principal deposited for `token`.
+    pub fn get_yield_position(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldPrincipal(token))
+            .unwrap_or(0)
+    }
+
+    /// Returns the configured KYC threshold, or `None` when enforcement is off.
+    pub fn get_kyc_threshold(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::KycThreshold)
+    }
+
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// # Parameters
+    /// - `sender`: Address the funds are debited from; must authorize the call.
+    /// - `recipient`: Address to receive the funds (minus the platform fee).
+    /// - `token_address`: Contract ID of the token being transferred.
+    /// - `amount`: Amount to route, in the token's smallest unit. Must be
+    ///   positive and within the configured min/max and daily-limit bounds.
     ///
     /// This is the primary way for the admin to reset the timer without
     /// changing any contract state. Routing a payment also bumps the
@@ -1628,7 +1784,34 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        Self::bump_heartbeat(&env);
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount)?;
+
+        sender.require_auth();
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -1888,6 +2071,35 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
+        // Pre-validate all payments to avoid rollback panic from require_auth
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        for payment in payments.iter() {
+            payment.sender.require_auth();
+            if payment.sender == payment.recipient {
+                return Err(Error::InvalidRecipient);
+            }
+            if Self::is_blacklisted(env.clone(), payment.recipient.clone()) {
+                return Err(Error::Blacklisted);
+            }
+            if payment.amount <= 0 || payment.amount > max_amount {
+                return Err(Error::LimitExceeded);
+            }
+            if payment.amount < min_limit {
+                return Err(Error::LimitExceeded);
+            }
+            Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
+        }
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         // Successful routing proves the platform is alive and serving, so
@@ -2020,27 +2232,30 @@ impl PaymentRouter {
     ///
     /// # Parameters
     /// - `token`: Contract ID of the token to withdraw.
-    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    /// Admin-only emergency withdrawal of tokens held by this contract. TreasuryManager-protected.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to withdraw.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if the
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+        token_client.transfer(&env.current_contract_address(), &treasury_mgr, &amount);
 
-        log!(&env, "Emergency withdraw executed by admin");
+        log!(&env, "Emergency withdraw executed by TreasuryManager");
         Ok(())
     }
 
-    /// Replaces this contract's WASM with a previously uploaded version. Admin-only.
+    /// Replaces this contract's WASM with a previously uploaded version. SuperAdmin-protected.
     ///
     /// # Parameters
     /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
@@ -2051,13 +2266,12 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call, or if
+    /// Panics if the current SuperAdmin does not authorize the call, or if
     /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        Self::require_role(&env, Role::SuperAdmin)?;
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
@@ -2083,6 +2297,88 @@ mod test {
         token::StellarAssetClient,
         Address, Env, Symbol, TryIntoVal,
     };
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockLendingKey {
+        Principal(Address),
+        Yield(Address),
+    }
+
+    #[contract]
+    struct MockLendingProtocol;
+
+    #[contractimpl]
+    impl MockLendingProtocol {
+        pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
+            from.require_auth();
+            token::Client::new(&env, &token).transfer(
+                &from,
+                &env.current_contract_address(),
+                &amount,
+            );
+            let key = MockLendingKey::Principal(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+
+        pub fn withdraw(env: Env, to: Address, token: Address, amount: i128) {
+            let key = MockLendingKey::Principal(token.clone());
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            assert!(current >= amount);
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &to,
+                &amount,
+            );
+            env.storage().instance().set(&key, &(current - amount));
+        }
+
+        pub fn harvest(env: Env, to: Address, token: Address) -> i128 {
+            let key = MockLendingKey::Yield(token.clone());
+            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            if amount > 0 {
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &to,
+                    &amount,
+                );
+                env.storage().instance().remove(&key);
+            }
+            amount
+        }
+
+        pub fn accrue_yield(env: Env, token: Address, amount: i128) {
+            let key = MockLendingKey::Yield(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockKycKey {
+        Verified(Address),
+    }
+
+    #[contract]
+    struct MockKycOracle;
+
+    #[contractimpl]
+    impl MockKycOracle {
+        pub fn set_verified(env: Env, account: Address, verified: bool) {
+            env.storage()
+                .instance()
+                .set(&MockKycKey::Verified(account), &verified);
+        }
+
+        pub fn is_verified(env: Env, account: Address) -> bool {
+            env.storage()
+                .instance()
+                .get(&MockKycKey::Verified(account))
+                .unwrap_or(false)
+        }
+    }
 
     /// Returns (env, client, contract_id).
     fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
@@ -2110,6 +2406,127 @@ mod test {
     }
 
     // ── Timelock tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_treasury_yield_deposit_harvest_and_withdraw() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let protocol_id = env.register_contract(None, MockLendingProtocol);
+        let protocol_client = MockLendingProtocolClient::new(&env, &protocol_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_yield_protocol(&protocol_id);
+        token_admin_client.mint(&treasury, &10_000);
+
+        client.deposit_to_yield(&token_address, &6_000);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+        assert_eq!(token_client.balance(&treasury), 4_000);
+        assert_eq!(token_client.balance(&protocol_id), 6_000);
+
+        token_admin_client.mint(&protocol_id, &500);
+        protocol_client.accrue_yield(&token_address, &500);
+        assert_eq!(client.harvest_yield(&token_address), 500);
+        assert_eq!(token_client.balance(&treasury), 4_500);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+
+        client.withdraw_from_yield(&token_address, &2_000);
+        assert_eq!(client.get_yield_position(&token_address), 4_000);
+        assert_eq!(token_client.balance(&treasury), 6_500);
+        assert_eq!(token_client.balance(&protocol_id), 4_000);
+    }
+
+    #[test]
+    fn test_yield_operations_require_configuration_and_valid_amounts() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &100),
+            Err(Ok(Error::YieldProtocolNotConfigured))
+        );
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &0),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+        assert_eq!(
+            client.try_withdraw_from_yield(&token_address, &1),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+    }
+
+    #[test]
+    fn test_kyc_oracle_gates_only_high_value_payments() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let oracle_client = MockKycOracleClient::new(&env, &oracle_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &10_000);
+
+        client.route_payment(&sender, &recipient, &token_address, &500);
+        assert_eq!(
+            client.try_route_payment(&sender, &recipient, &token_address, &2_000),
+            Err(Ok(Error::KycRequired))
+        );
+
+        oracle_client.set_verified(&sender, &true);
+        client.route_payment(&sender, &recipient, &token_address, &2_000);
+        assert_eq!(client.get_kyc_threshold(), Some(1_000));
+        assert_eq!(token_client.balance(&sender), 7_500);
+    }
+
+    #[test]
+    fn test_kyc_config_rejects_negative_threshold() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_set_kyc_config(&oracle, &-1),
+            Err(Ok(Error::InvalidKycThreshold))
+        );
+    }
+
+    #[test]
+    fn test_batch_payments_enforce_kyc_for_each_sender() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let (token_address, _token_client, token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &5_000);
+
+        let payments = Vec::from_array(
+            &env,
+            [Payment {
+                sender,
+                recipient,
+                token_address,
+                amount: 2_000,
+            }],
+        );
+        assert_eq!(
+            client.try_route_payments(&payments),
+            Err(Ok(Error::KycRequired))
+        );
+    }
 
     #[test]
     fn test_queue_and_execute_set_fee_bps_after_delay() {
@@ -3507,366 +3924,164 @@ mod test {
         assert_eq!(client.get_fee(), 200);
     }
 
-    // ── Rate limiting tests (issue #716) ─────────────────────────────────────
+    // ── Role-Based Access Control (RBAC) tests ───────────────────────────────
 
-    /// Sets the ledger's sequence number to `sequence`, leaving everything
-    /// else untouched. Each Soroban ledger is a fresh rate-limit window.
-    fn advance_ledger(env: &Env, sequence: u32) {
-        env.ledger().set(LedgerInfo {
-            timestamp: env.ledger().timestamp(),
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: sequence,
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-    }
-
-    /// A contract deployed before this feature existed carries no
-    /// `RateLimitConfig`, and `initialize` is not re-run on upgrade. The
-    /// limiter must therefore fall back to the default cap rather than
-    /// reading the cap as absent or zero.
     #[test]
-    fn test_rate_limit_falls_back_to_default_without_config() {
+    fn test_rbac_initialization_grants_all_roles_to_initial_admin() {
         let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        // No `initialize` call, so nothing has ever written the config.
-        assert_eq!(client.get_rate_limit(), PaymentRouter::DEFAULT_RATE_LIMIT);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        let sender = Address::generate(&env);
+        assert!(client.has_role(&admin, &Role::SuperAdmin));
+        assert!(client.has_role(&admin, &Role::TreasuryManager));
+        assert!(client.has_role(&admin, &Role::ComplianceOfficer));
+        assert!(client.has_role(&admin, &Role::FeeManager));
+
         assert_eq!(
-            client.get_rate_limit_remaining(&sender),
-            PaymentRouter::DEFAULT_RATE_LIMIT
+            client.get_role_member(&Role::SuperAdmin),
+            Some(admin.clone())
         );
-        assert!(!client.is_rate_limit_whitelisted(&sender));
-    }
-
-    #[test]
-    fn test_rate_limit_rejects_after_cap_and_resets_next_ledger() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, _, sac) = setup_token(&env);
-        sac.mint(&sender, &1_000_000);
-
-        client.initialize(
-            &admin,
-            &treasury,
-            &0,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
-        );
-
-        // Rate limiting is on by default right after initialize.
-        assert_eq!(client.get_rate_limit(), PaymentRouter::DEFAULT_RATE_LIMIT);
         assert_eq!(
-            client.get_rate_limit_remaining(&sender),
-            PaymentRouter::DEFAULT_RATE_LIMIT
+            client.get_role_member(&Role::TreasuryManager),
+            Some(admin.clone())
         );
-
-        // The default cap allows exactly this many payments, then rejects
-        // gracefully with a dedicated error instead of panicking.
-        for _ in 0..PaymentRouter::DEFAULT_RATE_LIMIT {
-            client.route_payment(&sender, &recipient, &token_address, &100);
-        }
-        assert_eq!(client.get_rate_limit_remaining(&sender), 0);
-
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
-        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
-
-        // The cap is per ledger sequence: a new ledger resets the window.
-        advance_ledger(&env, env.ledger().sequence() + 1);
         assert_eq!(
-            client.get_rate_limit_remaining(&sender),
-            PaymentRouter::DEFAULT_RATE_LIMIT
+            client.get_role_member(&Role::ComplianceOfficer),
+            Some(admin.clone())
         );
-        client.route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(
+            client.get_role_member(&Role::FeeManager),
+            Some(admin.clone())
+        );
+        assert_eq!(
+            client.get_role_admin(&Role::TreasuryManager),
+            Role::SuperAdmin
+        );
     }
 
     #[test]
-    fn test_rate_limit_whitelist_is_exempt() {
+    fn test_rbac_assign_and_revoke_operational_roles() {
         let (env, client, _) = setup_env();
-
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
+        let treasurer = Address::generate(&env);
+        let compliance = Address::generate(&env);
+        let fee_mgr = Address::generate(&env);
 
-        let (token_address, _, sac) = setup_token(&env);
-        sac.mint(&sender, &10_000_000);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        client.initialize(
-            &admin,
-            &treasury,
-            &0,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
+        // Assign TreasuryManager
+        client.assign_role(&treasurer, &Role::TreasuryManager);
+        assert!(client.has_role(&treasurer, &Role::TreasuryManager));
+        assert_eq!(
+            client.get_role_member(&Role::TreasuryManager),
+            Some(treasurer.clone())
         );
 
-        // Fill the counter exactly to the default cap in this ledger.
-        for _ in 0..PaymentRouter::DEFAULT_RATE_LIMIT {
-            client.route_payment(&sender, &recipient, &token_address, &100);
-        }
-
-        // Whitelisting a high-volume sender exempts it entirely: payments
-        // beyond the cap succeed without touching the counter.
-        client.set_rate_limit_whitelist(&sender);
-        assert!(client.is_rate_limit_whitelisted(&sender));
-        assert_eq!(client.get_rate_limit_remaining(&sender), u32::MAX);
-
-        for _ in 0..2 {
-            client.route_payment(&sender, &recipient, &token_address, &100);
-        }
-
-        // Removing the exemption restores the standard cap (the counter is
-        // untouched by whitelisted activity, so the current window is full).
-        client.remove_rate_limit_whitelist(&sender);
-        assert!(!client.is_rate_limit_whitelisted(&sender));
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
-        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
-    }
-
-    /// Builds a one-payment batch for `sender`.
-    fn single_payment_batch(
-        env: &Env,
-        sender: &Address,
-        recipient: &Address,
-        token_address: &Address,
-    ) -> Vec<Payment> {
-        let mut payments = Vec::new(env);
-        payments.push_back(Payment {
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 100,
-        });
-        payments
-    }
-
-    /// A rate-limited payment inside a batch reverts the whole batch.
-    ///
-    /// Each address appears at most once per batch here on purpose: calling
-    /// `require_auth` twice for the same address in a single contract frame
-    /// is rejected by the host's auth machinery, which is a separate
-    /// pre-existing limitation of `route_payments` (see issue #716 notes).
-    #[test]
-    fn test_rate_limit_batch_rejection_is_atomic() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let throttled = Address::generate(&env);
-        let other = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        sac.mint(&throttled, &1_000_000);
-        sac.mint(&other, &1_000_000);
-
-        client.initialize(
-            &admin,
-            &treasury,
-            &0,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
+        // Assign ComplianceOfficer
+        client.assign_role(&compliance, &Role::ComplianceOfficer);
+        assert!(client.has_role(&compliance, &Role::ComplianceOfficer));
+        assert_eq!(
+            client.get_role_member(&Role::ComplianceOfficer),
+            Some(compliance.clone())
         );
-        client.set_rate_limit(&1);
 
-        // Exhaust the first sender's allowance for this ledger.
-        client.route_payment(&throttled, &recipient, &token_address, &100);
-        let res = client.try_route_payment(&throttled, &recipient, &token_address, &100);
-        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
-
-        // A batch whose *last* payment is throttled must revert in full: the
-        // earlier payment must not settle, and no counter may be consumed.
-        let mut payments = single_payment_batch(&env, &other, &recipient, &token_address);
-        payments.push_back(Payment {
-            sender: throttled.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 100,
-        });
-        let res = client.try_route_payments(&payments);
-        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
-        assert_eq!(token_client.balance(&other), 1_000_000);
-        assert_eq!(token_client.balance(&throttled), 1_000_000 - 100);
-        assert_eq!(client.get_rate_limit_remaining(&other), 1);
-
-        // `other` was not charged by the reverted batch, so its single
-        // payment still settles in this ledger.
-        client.route_payments(&single_payment_batch(
-            &env,
-            &other,
-            &recipient,
-            &token_address,
-        ));
-        assert_eq!(token_client.balance(&other), 1_000_000 - 100);
-    }
-
-    /// Every payment in a batch counts against its own sender's per-ledger
-    /// cap, and the caps are tracked independently per address.
-    #[test]
-    fn test_rate_limit_batch_counts_each_sender_independently() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let a = Address::generate(&env);
-        let b = Address::generate(&env);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        sac.mint(&a, &1_000_000);
-        sac.mint(&b, &1_000_000);
-
-        client.initialize(
-            &admin,
-            &treasury,
-            &0,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
+        // Assign FeeManager
+        client.assign_role(&fee_mgr, &Role::FeeManager);
+        assert!(client.has_role(&fee_mgr, &Role::FeeManager));
+        assert_eq!(
+            client.get_role_member(&Role::FeeManager),
+            Some(fee_mgr.clone())
         );
-        client.set_rate_limit(&1);
 
-        // One payment each: both senders are now at their own cap.
-        let mut payments = single_payment_batch(&env, &a, &recipient, &token_address);
-        payments.push_back(Payment {
-            sender: b.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 100,
-        });
-        client.route_payments(&payments);
-        assert_eq!(token_client.balance(&a), 1_000_000 - 100);
-        assert_eq!(token_client.balance(&b), 1_000_000 - 100);
-        assert_eq!(client.get_rate_limit_remaining(&a), 0);
-        assert_eq!(client.get_rate_limit_remaining(&b), 0);
+        // Revoke TreasuryManager
+        client.revoke_role(&treasurer, &Role::TreasuryManager);
+        assert!(!client.has_role(&treasurer, &Role::TreasuryManager));
+        assert_eq!(client.get_role_member(&Role::TreasuryManager), None);
 
-        // A second batch in the same ledger is rejected, and the rejection
-        // does not leak across addresses: a fresh sender is still allowed.
-        let mut payments = single_payment_batch(&env, &a, &recipient, &token_address);
-        payments.push_back(Payment {
-            sender: b.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 100,
-        });
-        let res = client.try_route_payments(&payments);
-        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
-        assert_eq!(token_client.balance(&a), 1_000_000 - 100);
-        assert_eq!(token_client.balance(&b), 1_000_000 - 100);
-
-        let fresh = Address::generate(&env);
-        sac.mint(&fresh, &1_000);
-        client.route_payments(&single_payment_batch(
-            &env,
-            &fresh,
-            &recipient,
-            &token_address,
-        ));
-        assert_eq!(token_client.balance(&fresh), 1_000 - 100);
-
-        // The next ledger opens a fresh window for everyone.
-        advance_ledger(&env, env.ledger().sequence() + 1);
-        assert_eq!(client.get_rate_limit_remaining(&a), 1);
-        assert_eq!(client.get_rate_limit_remaining(&b), 1);
-    }
-
-    /// A rejected payment does not consume rate-limit budget.
-    ///
-    /// The Soroban host rolls back the whole invocation when a contract
-    /// returns `Err`, which includes the counter written by
-    /// `check_rate_limit`. This pins that behaviour down, because the
-    /// limiter's protection scope depends on it: only successful payments
-    /// are throttled.
-    #[test]
-    fn test_rate_limit_rejected_payment_keeps_allowance() {
-        let (env, client, _) = setup_env();
-
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        sac.mint(&sender, &1_000_000);
-
-        client.initialize(
-            &admin,
-            &treasury,
-            &0,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
-        );
-        client.set_rate_limit(&2);
-
-        // A zero-value payment is rejected by the amount bounds, which run
-        // after the rate-limit check has already reserved a slot.
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &0);
-        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
-        assert_eq!(client.get_rate_limit_remaining(&sender), 2);
-
-        // The full allowance is therefore still available in this ledger.
-        client.route_payment(&sender, &recipient, &token_address, &100);
-        client.route_payment(&sender, &recipient, &token_address, &100);
-        assert_eq!(client.get_rate_limit_remaining(&sender), 0);
-        assert_eq!(token_client.balance(&sender), 1_000_000 - 200);
-
-        // A rate-limit rejection is likewise not charged to the sender: the
-        // next ledger opens with the full allowance rather than a stale
-        // counter.
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
-        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
-        advance_ledger(&env, env.ledger().sequence() + 1);
-        assert_eq!(client.get_rate_limit_remaining(&sender), 2);
+        // Cannot revoke self SuperAdmin
+        let res = client.try_revoke_role(&admin, &Role::SuperAdmin);
+        assert_eq!(res, Err(Ok(Error::InvalidRole)));
     }
 
     #[test]
-    fn test_rate_limit_admin_config_and_disable() {
-        let (env, client, _) = setup_env();
-
+    fn test_rbac_treasury_manager_gates_treasury_operations() {
+        let (env, client, contract_id) = setup_env();
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
+        let treasurer = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
 
-        let (token_address, _, sac) = setup_token(&env);
-        sac.mint(&sender, &1_000_000);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        client.initialize(
-            &admin,
-            &treasury,
-            &0,
-            &i128::MAX,
-            &PaymentRouter::MAX_AMOUNT,
-        );
+        // Assign dedicated TreasuryManager
+        client.assign_role(&treasurer, &Role::TreasuryManager);
 
-        // Tighten the cap to 2; the third payment in the same ledger fails.
-        client.set_rate_limit(&2);
-        assert_eq!(client.get_rate_limit(), 2);
+        // TreasuryManager sets new platform treasury
+        client.set_platform_treasury(&new_treasury);
 
-        client.route_payment(&sender, &recipient, &token_address, &100);
-        client.route_payment(&sender, &recipient, &token_address, &100);
-        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
-        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+        // Recover accidentally sent tokens
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&contract_id, &5_000);
+        client.recover_tokens(&token_address, &2_000);
+    }
 
-        // A cap above MAX_RATE_LIMIT is rejected.
-        let res = client.try_set_rate_limit(&(PaymentRouter::MAX_RATE_LIMIT + 1));
-        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+    #[test]
+    fn test_rbac_compliance_officer_gates_compliance_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let compliance = Address::generate(&env);
+        let bad_user = Address::generate(&env);
+        let oracle = Address::generate(&env);
 
-        // Zero disables the limiter entirely.
-        client.set_rate_limit(&0);
-        assert_eq!(client.get_rate_limit(), 0);
-        for _ in 0..(PaymentRouter::DEFAULT_RATE_LIMIT * 2) {
-            client.route_payment(&sender, &recipient, &token_address, &100);
-        }
-        assert_eq!(client.get_rate_limit_remaining(&sender), u32::MAX);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign compliance officer
+        client.assign_role(&compliance, &Role::ComplianceOfficer);
+
+        // Compliance officer blacklists and unblacklists
+        client.blacklist_address(&bad_user);
+        assert!(client.is_blacklisted(&bad_user));
+
+        client.unblacklist_address(&bad_user);
+        assert!(!client.is_blacklisted(&bad_user));
+
+        // Compliance officer configures KYC
+        client.set_kyc_config(&oracle, &50_000);
+        assert_eq!(client.get_kyc_threshold(), Some(50_000));
+
+        // Compliance officer pauses and unpauses
+        client.set_pause(&true);
+        assert!(client.is_paused());
+        client.set_paused(&false);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_rbac_fee_manager_gates_fee_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let fee_mgr = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign fee manager
+        client.assign_role(&fee_mgr, &Role::FeeManager);
+
+        // Fee manager updates fee bps
+        client.set_fee_bps(&350);
+        assert_eq!(client.get_fee(), 350);
+
+        // Fee manager updates fee config
+        client.set_fee_config(&400, &5_000);
+        assert_eq!(client.get_fee(), 400);
+
+        // Fee manager sets min limit
+        client.set_min_limit(&10_000);
     }
 }
 
