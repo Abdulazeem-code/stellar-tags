@@ -98,6 +98,23 @@ services:
       redis:
         condition: service_healthy
 
+  fraud-worker:
+    profiles: ["dev", "full"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    command: ["node", "fraud-worker.js"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stellar_tags?schema=public
+      REDIS_URL: redis://redis:6379
+      FRAUD_CONSUMER_GROUP: fraud-detectors
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   # Only in full, not dev: the Vite build is the slowest thing here and backend
   # work does not need it. full is dev plus this.
   frontend:
@@ -239,5 +256,4 @@ services:
 volumes:
   pgdata:
   backendlogs:
-
 

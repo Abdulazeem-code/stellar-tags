@@ -88,11 +88,36 @@ model Payment {
   assetCode       String?  @map("asset_code")
   transactionHash String?  @map("transaction_hash")
   status          String   @default("completed")
+  riskScore       Float?   @map("risk_score")
+  fraudStatus     String   @default("clear") @map("fraud_status")
+  fraudFlaggedAt  DateTime? @map("fraud_flagged_at")
 
   @@index([createdAt])
   @@index([fromAddress])
   @@index([toAddress])
   @@map("payments")
+}
+
+// Durable result of the fraud stream consumer. Keeping the raw event and the
+// model score makes decisions auditable without coupling the worker to the
+// payment ingestion path.
+model FraudAlert {
+  id              String   @id @default(uuid())
+  eventId         String   @unique @map("event_id")
+  transactionHash String?  @map("transaction_hash")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  riskScore       Float    @map("risk_score")
+  status          String   @default("open")
+  reason          String
+  rawEvent        Json     @map("raw_event")
+  createdAt       DateTime @default(now()) @map("created_at")
+  resolvedAt      DateTime? @map("resolved_at")
+
+  @@index([toAddress, createdAt])
+  @@index([status, createdAt])
+  @@map("fraud_alerts")
 }
 
 // Dead-letter queue: holds webhook delivery attempts that have permanently
