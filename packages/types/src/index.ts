@@ -46,6 +46,19 @@ export const networks = {
 
 
 /**
+ * Role definitions for the Role-Based Access Control (RBAC) system.
+ * 
+ * Segregates operational privileges across dedicated role boundaries:
+ * SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+ */
+export enum Role {
+  SuperAdmin = 1,
+  TreasuryManager = 2,
+  ComplianceOfficer = 3,
+  FeeManager = 4,
+}
+
+/**
  * Contract-level errors returned instead of panicking, so callers get a
  * specific, stable error code to branch on rather than an opaque trap.
  */
@@ -449,6 +462,44 @@ export interface Client {
   set_paused: ({paused}: {paused: boolean}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a assign_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Assigns an operational role to a specified account.
+   * 
+   * Restricted exclusively to `SuperAdmin`.
+   * 
+   * # Parameters
+   * - `account`: Target address to receive the role.
+   * - `role`: The `Role` variant to grant.
+   * 
+   * # Returns
+   * `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+   * 
+   * # Panics
+   * Panics if the current `SuperAdmin` does not authorize the call.
+   */
+  assign_role: ({account, role}: {account: string, role: Role}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a revoke_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Revokes an operational role from a specified account.
+   * 
+   * Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
+   * when it would leave the contract without root governance.
+   * 
+   * # Parameters
+   * - `account`: Target address from which the role will be revoked.
+   * - `role`: The `Role` variant to revoke.
+   * 
+   * # Returns
+   * `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
+   * or `Err(Error::NotInitialized)`.
+   * 
+   * # Panics
+   * Panics if the current `SuperAdmin` does not authorize the call.
+   */
+  revoke_role: ({account, role}: {account: string, role: Role}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a set_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Updates the fee basis points.
    * Requires governance authority if a governance address is set; otherwise admin-only.
@@ -698,6 +749,18 @@ export interface Client {
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::TransferAdmin(…))`.
    */
   transfer_admin: ({new_admin}: {new_admin: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a get_role_member transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the primary designated member address for a role, if one is configured.
+   * 
+   * # Parameters
+   * - `role`: The role variant to query.
+   * 
+   * # Returns
+   * `Some(Address)` if set, or `None` if unassigned.
+   */
+  get_role_member: ({role}: {role: Role}, options?: MethodOptions) => Promise<AssembledTransaction<Option<string>>>
 
   /**
    * Construct and simulate a get_user_volume transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -1105,6 +1168,8 @@ export class Client extends ContractClient {
         initialize: this.txFromJSON<Result<void>>,
         quote_swap: this.txFromJSON<Result<SwapQuote>>,
         set_paused: this.txFromJSON<Result<void>>,
+        assign_role: this.txFromJSON<Result<void>>,
+        revoke_role: this.txFromJSON<Result<void>>,
         set_fee_bps: this.txFromJSON<Result<void>>,
         queue_action: this.txFromJSON<Result<u64>>,
         register_dex: this.txFromJSON<Result<void>>,
@@ -1119,6 +1184,7 @@ export class Client extends ContractClient {
         set_fee_config: this.txFromJSON<Result<void>>,
         set_governance: this.txFromJSON<Result<void>>,
         transfer_admin: this.txFromJSON<Result<void>>,
+        get_role_member: this.txFromJSON<Option<string>>,
         get_user_volume: this.txFromJSON<i128>,
         withdraw_refund: this.txFromJSON<Result<void>>,
         emergency_freeze: this.txFromJSON<Result<void>>,
