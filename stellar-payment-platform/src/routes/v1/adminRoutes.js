@@ -36,7 +36,16 @@ const {
 } = require('../../pagination');
 const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
-const { PRIMARY_USERNAME_ORDER } = require('../../utils');
+const {
+  softDeletePayment,
+  restorePayment,
+  restoreUser,
+  findDeletedUser,
+  findDeletedPayment,
+  listDeletedUsers,
+  listDeletedPayments,
+} = require('../../services/softDeleteService');
+const { PRIMARY_USERNAME_ORDER, normalizeNameTag } = require('../../utils');
 
 // PAGE_SIZE for the admin export cursor-based pagination
 const EXPORT_PAGE_SIZE = 500;
@@ -120,7 +129,9 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const where = dateFilter ? { createdAt: dateFilter } : {};
+        const where = dateFilter
+          ? { createdAt: dateFilter, deletedAt: null }
+          : { deletedAt: null };
         const records = await prisma.payment.findMany({
           where,
           orderBy: { createdAt: 'asc' },
@@ -464,40 +475,114 @@ router.get(
     }),
   );
 
-  // ── GET /admin/webhooks/health ───────────────────────────────────────────
-  // Aggregates webhook delivery health so ops can spot broken merchant
-  // integrations: total/healthy/failing counts, a rolling 24h success rate,
-  // and the URLs that have been failing for more than 24h.
-  router.get('/admin/webhooks/health', adminAuth, asyncHandler(async (req, res) => {
-    const { prisma } = getPrisma();
-    const username = typeof req.query.username === 'string' ? req.query.username.trim() : '';
-    const where = username ? { username } : {};
-    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  // ── Soft delete / restore (#731) ─────────────────────────────────────────
+  // Deleting stamps `deletedAt` instead of removing the row. The matching
+  // restore endpoint clears the stamp, and the listing endpoints expose what
+  // is currently deleted so an operator can find it again.
 
-    const [total, failing, activeLast24h, failingLast24h, failingOver24h] = await Promise.all([
-      prisma.webhook.count({ where }),
-      prisma.webhook.count({ where: { ...where, failingSince: { not: null } } }),
-      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo } } }),
-      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo }, failingSince: { not: null } } }),
-      prisma.webhook.findMany({
-        where: { ...where, failingSince: { lte: dayAgo } },
-        select: { id: true, username: true, url: true, failingSince: true },
-        orderBy: { failingSince: 'asc' },
-      }),
-    ]);
+  const isoOrNull = (value) =>
+    value instanceof Date ? value.toISOString() : value || null;
+
+  const parseDeletedPage = (query) => ({
+    skip: Math.max(parseInt(query.skip, 10) || 0, 0),
+    take: parseInt(query.take, 10) || undefined,
+  });
+
+  router.get('/admin/users/deleted', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const users = await listDeletedUsers(prisma, parseDeletedPage(req.query));
 
     return res.status(200).json({
-      success: true,
-      summary: {
-        total,
-        healthy: total - failing,
-        failing,
-        successRate24h: activeLast24h
-          ? Number((((activeLast24h - failingLast24h) / activeLast24h) * 100).toFixed(2))
-          : null,
-      },
-      failingOver24h,
+      ok: true,
+      count: users.length,
+      data: users.map((user) => ({
+        username: user.username,
+        address: user.address,
+        deleted_at: isoOrNull(user.deletedAt),
+      })),
     });
+  }));
+
+  router.post('/admin/users/:username/restore', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const username = normalizeNameTag(
+      typeof req.params.username === 'string' ? req.params.username.trim() : '',
+    ).toLowerCase();
+
+    if (!username) {
+      return res.status(400).json({ error: 'Missing username parameter' });
+    }
+
+    const target = await findDeletedUser(prisma, username);
+    if (!target) {
+      return res.status(404).json({ error: 'Soft-deleted username not found' });
+    }
+
+    await restoreUser(prisma, username);
+    await invalidateFederationCache(redisClient, target.address, username);
+    await invalidateStatsCache(redisClient);
+    await recordActivity(prisma, {
+      username,
+      action: ACTIVITY_ACTIONS.USER_RESTORED,
+      metadata: { address: target.address },
+      req,
+    });
+
+    return res.status(200).json({ ok: true, username, restored: true });
+  }));
+
+  router.get('/admin/payments/deleted', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const payments = await listDeletedPayments(prisma, parseDeletedPage(req.query));
+
+    return res.status(200).json({
+      ok: true,
+      count: payments.length,
+      data: payments.map((payment) => ({
+        id: payment.id,
+        created_at: isoOrNull(payment.createdAt),
+        from_address: payment.fromAddress,
+        to_address: payment.toAddress,
+        amount: payment.amount,
+        status: payment.status,
+        deleted_at: isoOrNull(payment.deletedAt),
+      })),
+    });
+  }));
+
+  router.delete('/admin/payments/:id', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const id = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+
+    if (!id) {
+      return res.status(400).json({ error: 'Missing payment id parameter' });
+    }
+
+    const deleted = await softDeletePayment(prisma, id);
+    if (!deleted) {
+      return res.status(404).json({ error: 'Payment not found or already deleted' });
+    }
+
+    await invalidateStatsCache(redisClient);
+    return res.status(200).json({ ok: true, id, deleted: true });
+  }));
+
+  router.post('/admin/payments/:id/restore', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const id = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+
+    if (!id) {
+      return res.status(400).json({ error: 'Missing payment id parameter' });
+    }
+
+    const target = await findDeletedPayment(prisma, id);
+    if (!target) {
+      return res.status(404).json({ error: 'Soft-deleted payment not found' });
+    }
+
+    await restorePayment(prisma, id);
+    await invalidateStatsCache(redisClient);
+    return res.status(200).json({ ok: true, id, restored: true });
   }));
 
   return router;

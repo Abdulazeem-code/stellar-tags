@@ -88,10 +88,14 @@ model Payment {
   assetCode       String?  @map("asset_code")
   transactionHash String?  @map("transaction_hash")
   status          String   @default("completed")
+  deletedAt       DateTime? @map("deleted_at")
 
   @@index([createdAt])
   @@index([fromAddress])
   @@index([toAddress])
+  // Serves the soft-delete admin listings and the `deleted_at IS NULL` filter
+  // every payment read path now applies.
+  @@index([deletedAt])
   @@map("payments")
 }
 
