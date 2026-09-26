@@ -33,6 +33,39 @@ jobs:
       - name: Build contract to WASM
         run: cargo build --target wasm32-unknown-unknown --release
 
+  twap-oracle-checks:
+    name: TWAP Oracle Build & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./twap_oracle
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./twap_oracle
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run contract tests
+        run: cargo test --verbose
+
+      - name: Build contract to WASM
+        run: cargo build --target wasm32-unknown-unknown --release
+
   bindings-check:
     name: Bindings up-to-date
     runs-on: ubuntu-latest
