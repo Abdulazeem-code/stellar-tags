@@ -12,11 +12,10 @@ const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 module.exports = (redisClient) => {
   const router = express.Router();
   
-  router.use(idempotencyMiddleware(redisClient));
 
   // ── Idempotency protection for payment intent creation (POST /payments/bulk).
   // Duplicate submissions within 24h return the originally created intents. ──
-  router.use(idempotencyMiddleware(redisClient));
+  router.use(idempotencyMiddleware(redisClient, { enforce: true }));
 
   // POST /payments/bulk
 

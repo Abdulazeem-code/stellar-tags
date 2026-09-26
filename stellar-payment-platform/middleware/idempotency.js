@@ -20,7 +20,7 @@ const MUTATING_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
  * 
  * @param {import('redis').RedisClientType | null} redisClient 
  */
-const idempotencyMiddleware = (redisClient) => {
+const idempotencyMiddleware = (redisClient, options = {}) => {
   // Fallback memory cache if redis is not available
   const memoryCache = new Map();
 
@@ -32,6 +32,9 @@ const idempotencyMiddleware = (redisClient) => {
 
     const idempotencyKey = req.get(IDEMPOTENCY_HEADER);
     if (!idempotencyKey || typeof idempotencyKey !== 'string') {
+      if (options.enforce) {
+        return next(new ApiError('INVALID_INPUT', `Missing required header: ${IDEMPOTENCY_HEADER}`));
+      }
       return next();
     }
 
