@@ -3,13 +3,19 @@ const mockQueueOn = jest.fn();
 const mockQueueClose = jest.fn().mockResolvedValue(undefined);
 const mockWorkerOn = jest.fn();
 const mockWorkerClose = jest.fn().mockResolvedValue(undefined);
-const mockRedisQuit = jest.fn().mockResolvedValue(undefined);
+const mockCloseRabbitMQ = jest.fn().mockResolvedValue(undefined);
+const mockWithQueueRetry = jest.fn((operation) => operation());
+const mockRoutingKeyForEvent = jest.fn((event) =>
+  `webhook.${String(event || 'deliver').toLowerCase()}`,
+);
 
 let mockWorkerProcessor;
 let mockWorkerOptions;
 
-jest.mock('bullmq', () => ({
-  Queue: jest.fn().mockImplementation(() => ({
+jest.mock('../src/queue/rabbitmqQueue', () => ({
+  Queue: jest.fn().mockImplementation((name, options) => ({
+    name,
+    options,
     add: mockQueueAdd,
     on: mockQueueOn,
     close: mockQueueClose,
@@ -22,17 +28,12 @@ jest.mock('bullmq', () => ({
       close: mockWorkerClose,
     };
   }),
+  withQueueRetry: mockWithQueueRetry,
+  closeRabbitMQ: mockCloseRabbitMQ,
+  routingKeyForEvent: mockRoutingKeyForEvent,
 }));
 
-jest.mock('../src/config/redis', () => ({
-  createRedisConnection: jest.fn(() => ({ quit: mockRedisQuit })),
-  // Real retry behaviour is covered in tests/redis-failover.test.js; the
-  // passthrough here keeps the enqueue assertions focused on the BullMQ shape.
-  withRedisRetry: jest.fn((operation) => operation()),
-}));
-
-const { Queue, Worker } = require('bullmq');
-const { withRedisRetry } = require('../src/config/redis');
+const { Queue, Worker } = require('../src/queue/rabbitmqQueue');
 const {
   dispatchPaymentWebhooks,
   enqueueWebhookDelivery,
@@ -58,7 +59,7 @@ const payload = {
   data: { amount: '10.00' },
 };
 
-describe('webhook BullMQ delivery', () => {
+describe('webhook RabbitMQ delivery', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     global.fetch = jest.fn();
@@ -69,7 +70,7 @@ describe('webhook BullMQ delivery', () => {
     delete global.fetch;
   });
 
-  test('enqueues deliveries with five attempts and exponential backoff', async () => {
+  test('enqueues deliveries with five attempts, exponential backoff and an event routing key', async () => {
     const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
 
     await enqueueWebhookDelivery(webhook, payload, queue);
@@ -84,12 +85,13 @@ describe('webhook BullMQ delivery', () => {
           delay: WEBHOOK_BACKOFF_DELAY_MS,
         },
         jobId: expect.any(String),
+        routingKey: 'webhook.payment.received',
       }),
     );
     expect(MAX_WEBHOOK_ATTEMPTS).toBe(5);
   });
 
-  test('worker throws failed deliveries so BullMQ retries them', async () => {
+  test('worker throws failed deliveries so RabbitMQ retries them', async () => {
     global.fetch.mockResolvedValue({ ok: false, status: 503 });
     const prisma = {
       webhook: {
@@ -100,7 +102,7 @@ describe('webhook BullMQ delivery', () => {
 
     await expect(processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 0 },
-      { prisma,  },
+      { prisma },
     )).rejects.toThrow('HTTP 503');
 
     expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
@@ -119,7 +121,7 @@ describe('webhook BullMQ delivery', () => {
 
     await processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 2 },
-      { prisma,  },
+      { prisma },
     );
 
     expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
@@ -160,10 +162,9 @@ describe('webhook BullMQ delivery', () => {
     });
   });
 
-  test('configures and starts a BullMQ webhook worker', () => {
+  test('configures and starts an AMQP webhook worker', () => {
     const dependencies = {
       prisma: { webhook: {} },
-      
     };
 
     startWebhookWorker(dependencies);
@@ -173,7 +174,7 @@ describe('webhook BullMQ delivery', () => {
       expect.any(Function),
       expect.objectContaining({ concurrency: 5 }),
     );
-    expect(mockWorkerOptions.connection).toEqual(expect.objectContaining({ quit: mockRedisQuit }));
+    expect(mockWorkerOptions).not.toHaveProperty('connection');
     expect(mockWorkerProcessor).toEqual(expect.any(Function));
   });
 
@@ -190,7 +191,6 @@ describe('webhook BullMQ delivery', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      
       queue,
       payment: {
         id: 'payment-1',
@@ -216,29 +216,32 @@ describe('webhook BullMQ delivery', () => {
     );
   });
 
-  test('routes enqueues through the Redis failover retry helper', async () => {
+  test('routes enqueues through the transient-failure retry helper', async () => {
     const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
 
     await enqueueWebhookDelivery(webhook, payload, queue);
 
-    expect(withRedisRetry).toHaveBeenCalledTimes(1);
-    expect(withRedisRetry.mock.calls[0][0]).toEqual(expect.any(Function));
-    expect(withRedisRetry.mock.calls[0][1]).toEqual(
+    expect(mockWithQueueRetry).toHaveBeenCalledTimes(1);
+    expect(mockWithQueueRetry.mock.calls[0][0]).toEqual(expect.any(Function));
+    expect(mockWithQueueRetry.mock.calls[0][1]).toEqual(
       expect.objectContaining({ attempts: expect.any(Number), baseDelayMs: expect.any(Number) }),
     );
   });
 
-  test('creates a lazy queue when no queue is injected', async () => {
+  test('creates a lazy AMQP queue when no queue is injected', async () => {
     mockQueueAdd.mockResolvedValue({ id: 'job-1' });
 
     await enqueueWebhookDelivery(webhook, payload);
 
-    expect(Queue).toHaveBeenCalledWith(
-      WEBHOOK_QUEUE_NAME,
-      expect.objectContaining({ connection: expect.any(Object) }),
-    );
+    expect(Queue).toHaveBeenCalledWith(WEBHOOK_QUEUE_NAME);
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
   });
+
+  test('closeWebhookQueue closes the worker, the queue and the shared connection', async () => {
+    await closeWebhookQueue();
+
+    expect(mockWorkerClose).toHaveBeenCalled();
+    expect(mockQueueClose).toHaveBeenCalled();
+    expect(mockCloseRabbitMQ).toHaveBeenCalled();
+  });
 });
-
-

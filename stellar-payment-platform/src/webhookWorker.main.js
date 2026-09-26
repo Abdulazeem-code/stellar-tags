@@ -1,6 +1,5 @@
 ﻿const crypto = require('crypto');
-const { Queue, Worker } = require('bullmq');
-const { createRedisConnection } = require('./config/redis');
+const { Queue, Worker, closeRabbitMQ, routingKeyForEvent } = require('./queue/rabbitmqQueue');
 const { logger } = require('./logger');
 const { shouldFallbackToLocalRegistry } = require('./utils');
 
@@ -23,8 +22,6 @@ const WEBHOOK_JOB_OPTIONS = Object.freeze({
 
 let webhookQueue;
 let webhookWorker;
-let queueConnection;
-let workerConnection;
 
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
@@ -214,10 +211,9 @@ const processWebhookJob = async (job, { prisma, poolRunFn }) => {
 
 const getWebhookQueue = () => {
   if (!webhookQueue) {
-    queueConnection = createRedisConnection();
-    webhookQueue = new Queue(WEBHOOK_QUEUE_NAME, { connection: queueConnection });
+    webhookQueue = new Queue(WEBHOOK_QUEUE_NAME);
     webhookQueue.on('error', (error) => {
-      logger.error(`[webhook-queue] Redis error: ${error.message}`);
+      logger.error(`[webhook-queue] RabbitMQ error: ${error.message}`);
     });
   }
   return webhookQueue;
@@ -226,12 +222,10 @@ const getWebhookQueue = () => {
 const startWebhookWorker = ({ prisma, poolRunFn }) => {
   if (webhookWorker) return webhookWorker;
 
-  workerConnection = createRedisConnection();
   webhookWorker = new Worker(
     WEBHOOK_QUEUE_NAME,
     (job) => processWebhookJob(job, { prisma, poolRunFn }),
     {
-      connection: workerConnection,
       concurrency: WEBHOOK_WORKER_CONCURRENCY,
     },
   );
@@ -253,7 +247,7 @@ const startWebhookWorker = ({ prisma, poolRunFn }) => {
   });
 
   webhookWorker.on('error', (error) => {
-    logger.error(`[webhook-worker] Redis error: ${error.message}`);
+    logger.error(`[webhook-worker] RabbitMQ error: ${error.message}`);
   });
 
   logger.info(
@@ -274,6 +268,7 @@ const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue(
       ...WEBHOOK_JOB_OPTIONS,
       backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
       jobId: buildJobId(webhook.id, payload.event_id),
+      routingKey: routingKeyForEvent(payload.event),
     },
   );
 };
@@ -329,13 +324,10 @@ const closeWebhookQueue = async () => {
   const resources = [webhookWorker, webhookQueue].filter(Boolean);
   await Promise.all(resources.map((resource) => resource.close()));
 
-  const connections = [workerConnection, queueConnection].filter(Boolean);
-  await Promise.all(connections.map((connection) => connection.quit()));
+  await closeRabbitMQ();
 
   webhookWorker = undefined;
   webhookQueue = undefined;
-  workerConnection = undefined;
-  queueConnection = undefined;
 };
 
 // ΓöÇΓöÇ Dead Letter Queue (DLQ) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

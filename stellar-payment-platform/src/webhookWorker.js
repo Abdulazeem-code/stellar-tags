@@ -1,6 +1,11 @@
 const crypto = require('crypto');
-const { Queue, Worker } = require('bullmq');
-const { createRedisConnection, withRedisRetry } = require('./config/redis');
+const {
+  Queue,
+  Worker,
+  withQueueRetry,
+  closeRabbitMQ,
+  routingKeyForEvent,
+} = require('./queue/rabbitmqQueue');
 const { logger } = require('./logger');
 const { shouldFallbackToLocalRegistry } = require('./utils');
 
@@ -10,8 +15,8 @@ const MAX_WEBHOOK_ATTEMPTS = 5;
 const WEBHOOK_BACKOFF_DELAY_MS = 1_000;
 const WEBHOOK_WORKER_CONCURRENCY = 5;
 const MAX_RETRY_BACKLOG_DAYS = 3;
-// A cluster failover can reject an enqueue while the slot map is being
-// refreshed. Retry those transient errors so a delivery is never dropped.
+// A broker restart can reject an enqueue while the connection is being
+// re-established. Retry those transient errors so a delivery is never dropped.
 const WEBHOOK_ENQUEUE_RETRY_ATTEMPTS = 5;
 const WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS = 50;
 
@@ -27,8 +32,6 @@ const WEBHOOK_JOB_OPTIONS = Object.freeze({
 
 let webhookQueue;
 let webhookWorker;
-let queueConnection;
-let workerConnection;
 
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
@@ -175,10 +178,9 @@ const processWebhookJob = async (job, { prisma }) => {
 
 const getWebhookQueue = () => {
   if (!webhookQueue) {
-    queueConnection = createRedisConnection();
-    webhookQueue = new Queue(WEBHOOK_QUEUE_NAME, { connection: queueConnection });
+    webhookQueue = new Queue(WEBHOOK_QUEUE_NAME);
     webhookQueue.on('error', (error) => {
-      logger.error(`[webhook-queue] Redis error: ${error.message}`);
+      logger.error(`[webhook-queue] RabbitMQ error: ${error.message}`);
     });
   }
   return webhookQueue;
@@ -187,12 +189,10 @@ const getWebhookQueue = () => {
 const startWebhookWorker = ({ prisma }) => {
   if (webhookWorker) return webhookWorker;
 
-  workerConnection = createRedisConnection();
   webhookWorker = new Worker(
     WEBHOOK_QUEUE_NAME,
     (job) => processWebhookJob(job, { prisma }),
     {
-      connection: workerConnection,
       concurrency: WEBHOOK_WORKER_CONCURRENCY,
     },
   );
@@ -214,7 +214,7 @@ const startWebhookWorker = ({ prisma }) => {
   });
 
   webhookWorker.on('error', (error) => {
-    logger.error(`[webhook-worker] Redis error: ${error.message}`);
+    logger.error(`[webhook-worker] RabbitMQ error: ${error.message}`);
   });
 
   logger.info(
@@ -228,7 +228,7 @@ const buildJobId = (webhookId, eventId) => {
 };
 
 const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
-  return withRedisRetry(
+  return withQueueRetry(
     () => queue.add(
       'deliver',
       { webhook, payload },
@@ -236,6 +236,7 @@ const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue(
         ...WEBHOOK_JOB_OPTIONS,
         backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
         jobId: buildJobId(webhook.id, payload.event_id),
+        routingKey: routingKeyForEvent(payload.event),
       },
     ),
     {
@@ -243,7 +244,7 @@ const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue(
       baseDelayMs: WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS,
       onRetry: (error, attempt) => {
         logger.warn(
-          `[webhook-queue] Enqueue for webhook=${webhook.id} failed (${error.message}); retrying after transient Redis error (attempt ${attempt}/${WEBHOOK_ENQUEUE_RETRY_ATTEMPTS})`,
+          `[webhook-queue] Enqueue for webhook=${webhook.id} failed (${error.message}); retrying after transient RabbitMQ error (attempt ${attempt}/${WEBHOOK_ENQUEUE_RETRY_ATTEMPTS})`,
         );
       },
     },
@@ -301,13 +302,10 @@ const closeWebhookQueue = async () => {
   const resources = [webhookWorker, webhookQueue].filter(Boolean);
   await Promise.all(resources.map((resource) => resource.close()));
 
-  const connections = [workerConnection, queueConnection].filter(Boolean);
-  await Promise.all(connections.map((connection) => connection.quit()));
+  await closeRabbitMQ();
 
   webhookWorker = undefined;
   webhookQueue = undefined;
-  workerConnection = undefined;
-  queueConnection = undefined;
 };
 
 // ── Dead Letter Queue (DLQ) ──────────────────────────────────────────────
