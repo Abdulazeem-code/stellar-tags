@@ -5,8 +5,8 @@ const { PrismaInstrumentation } = require('@prisma/instrumentation');
 
 const sdk = new NodeSDK({
   traceExporter: new ZipkinExporter({
-    url: process.env.ZIPKIN_ENDPOINT || 'http://localhost:9411/api/v2/spans',
-    serviceName: 'stellar-tags-api',
+    url: process.env.OTEL_EXPORTER_ZIPKIN_ENDPOINT || process.env.ZIPKIN_ENDPOINT || 'http://localhost:9411/api/v2/spans',
+    serviceName: process.env.OTEL_SERVICE_NAME || 'stellar-tags-api',
   }),
   instrumentations: [
     getNodeAutoInstrumentations({

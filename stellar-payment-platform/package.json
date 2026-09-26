@@ -13,6 +13,7 @@
     "test:load": "artillery run artillery.yml",
     "test:load:webhooks": "node scripts/run-webhook-load-test.js",
     "listener": "node horizonListener.js",
+    "fraud-worker": "node fraud-worker.js",
     "db:seed": "node scripts/seed.js",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
