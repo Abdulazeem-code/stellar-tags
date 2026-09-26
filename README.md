@@ -605,6 +605,24 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
 
+### Arbitrary-token swaps
+
+`route_payment_with_swap` accepts a DEX adapter, an input/output token pair, a
+full token `path`, and `min_amount_out`. The adapter receives the input token and
+must return `[amount_received, unused_input]`; the router rejects malformed
+paths or slippage below the caller's minimum and credits unused input to the
+sender's refund balance. Existing same-token `route_payment` and
+`route_payments` calls remain unchanged.
+
+### Fee governance
+
+The contract supports token-weighted fee proposals. A SuperAdmin first calls
+`configure_governance(governance_token, quorum)`. A token holder can then call
+`propose_fee_change` and `vote_fee_proposal`; after the voting period, anyone
+can call `execute_fee_proposal` when yes votes exceed no votes and quorum is
+met. A voter can vote only once per proposal, and fee updates are applied only
+after successful finalization.
+
 ## Smart Contract Deployment & Upgrades
 
 The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts/deploy_contract.sh`) to automate WASM compilation, optimization, network deployment, contract initialization, and contract upgrades.
@@ -650,4 +668,3 @@ Upon successful deployment, the tool automatically updates the contract address 
 ## License
 
 See [LICENSE](LICENSE).
-
