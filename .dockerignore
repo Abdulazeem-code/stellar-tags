@@ -1,5 +1,6 @@
 **/node_modules
 .git
+.gitignore
 .github
 .husky
 payment_router
@@ -7,6 +8,13 @@ payment_router
 .env
 **/.env
 *.db
+**/*.sqlite
+**/*.sqlite3
+**/coverage
+**/dist
+**/logs
+**/*.log
+**/.DS_Store
 
 # Backend test files & artifacts — never needed inside an image
 # (CI runs tests on the runner; the api-test service builds from the
@@ -22,3 +30,4 @@ stellar-payment-platform/artillery.yml
 docs
 tmp_server.js
 artillery.yml
+docker-compose.yml

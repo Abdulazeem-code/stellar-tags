@@ -123,6 +123,163 @@ const isValidWebhookUrl = (url) => {
     return u.protocol === 'http:' || u.protocol === 'https:';
   } catch {
     return false;
+// Issue #727: `Stellar-Timestamp` is an ISO 8601 timestamp (the same value as
+// `payload.timestamp`). Dispatches older than 5 minutes are expired; more
+// than 1 minute in the future is rejected to bound clock skew.
+const WEBHOOK_TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000;
+const WEBHOOK_FUTURE_SKEW_MS = 60 * 1000;
+
+const resolveWebhookTimestamp = (req, payload) => {
+  if (req.get) {
+    const headerTs = req.get('Stellar-Timestamp') || req.get('X-Webhook-Timestamp');
+    if (typeof headerTs === 'string' && headerTs.trim()) return headerTs.trim();
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  if (typeof body.timestamp === 'string' && body.timestamp.trim()) return body.timestamp.trim();
+  if (typeof payload === 'string') {
+    try {
+      const parsed = JSON.parse(payload);
+      if (parsed && typeof parsed.timestamp === 'string' && parsed.timestamp.trim()) {
+        return parsed.timestamp.trim();
+      }
+    } catch {
+      return '';
+    }
+    return '';
+  }
+  if (payload && typeof payload === 'object' && typeof payload.timestamp === 'string') {
+    return payload.timestamp.trim();
+  }
+  return '';
+};
+
+const checkTimestampFreshness = (timestamp) => {
+  const ts = Date.parse(timestamp);
+  if (Number.isNaN(ts)) {
+    return { ok: false, code: 'MISSING_TIMESTAMP', message: 'Missing or invalid Stellar-Timestamp header.' };
+  }
+  const now = Date.now();
+  if (now - ts > WEBHOOK_TIMESTAMP_TOLERANCE_MS) {
+    return { ok: false, code: 'TIMESTAMP_EXPIRED', message: 'Webhook timestamp is older than 5 minutes — possible replay attack.' };
+  }
+  if (ts - now > WEBHOOK_FUTURE_SKEW_MS) {
+    return { ok: false, code: 'TIMESTAMP_TOO_FAR_IN_FUTURE', message: 'Webhook timestamp is more than 1 minute in the future — check clock synchronization.' };
+  }
+  return { ok: true };
+};
+
+router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
+  try {
+   const secret = getWebhookSecret(req);
+   if (!secret) {
+     return res.status(400).json({
+       ok: false,
+       error: {
+         code: 'MISSING_WEBHOOK_SECRET',
+         message: 'Missing required webhook secret. Provide secret or webhookSecret in the request body or X-Webhook-Secret header.',
+       },
+     });
+   }
+
+    const stellarSignatureHeader = normalizeSignature(
+      req.get ? req.get('Stellar-Signature') : ''
+    );
+    const signatureHeader = normalizeSignature(
+      stellarSignatureHeader || (req.get ? (req.get('X-Webhook-Signature') || req.get('X-Stellar-Tags-Signature') || req.body?.signature) : (req.body?.signature || ''))
+    );
+    if (!signatureHeader) {
+      return res.status(400).json({
+        ok: false,
+        error: {
+          code: 'MISSING_SIGNATURE',
+          message: 'Missing required X-Webhook-Signature or Stellar-Signature header.',
+        },
+      });
+    }
+
+    const payload = getPayloadForVerification(req.body);
+    const rawPayload = getSigningPayloadBuffer(payload);
+    const isBoundScheme = Boolean(stellarSignatureHeader);
+    const timestamp = resolveWebhookTimestamp(req, payload);
+
+    if (isBoundScheme) {
+      // `Stellar-Signature` binds the header timestamp: it is required and
+      // must be fresh, otherwise the header could be swapped in transit.
+      const freshness = checkTimestampFreshness(timestamp);
+      if (!freshness.ok) {
+        const status = freshness.code === 'MISSING_TIMESTAMP' ? 400 : 401;
+        return res.status(status).json({
+          ok: false,
+          valid: false,
+          error: { code: freshness.code, message: freshness.message },
+        });
+      }
+    } else if (timestamp) {
+      // Legacy body-only scheme: enforce expiry when a timestamp is present,
+      // skip when absent for backward compatibility with older payloads.
+      const freshness = checkTimestampFreshness(timestamp);
+      if (!freshness.ok && freshness.code !== 'MISSING_TIMESTAMP') {
+        return res.status(401).json({
+          ok: false,
+          valid: false,
+          error: { code: freshness.code, message: freshness.message },
+        });
+      }
+    }
+
+    const expectedSignature = isBoundScheme
+      ? crypto.createHmac('sha256', secret).update(`${timestamp}.${rawPayload.toString('utf8')}`).digest('hex')
+      : crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
+
+   const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+   const receivedBuffer = Buffer.from(signatureHeader, 'hex');
+
+   if (expectedBuffer.length !== receivedBuffer.length) {
+     return res.status(401).json({
+       ok: false,
+       valid: false,
+       error: {
+         code: 'INVALID_WEBHOOK_SIGNATURE',
+         message: 'The provided signature does not match the webhook secret and payload.',
+       },
+       expectedSignature,
+       receivedSignature: signatureHeader,
+     });
+   }
+
+   let valid;
+   try {
+     valid = crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+   } catch (error) {
+     valid = false;
+   }
+
+   if (!valid) {
+     return res.status(401).json({
+       ok: false,
+       valid: false,
+       error: {
+         code: 'INVALID_WEBHOOK_SIGNATURE',
+         message: 'The provided signature does not match the webhook secret and payload.',
+       },
+       expectedSignature,
+       receivedSignature: signatureHeader,
+     });
+   }
+
+   return res.status(200).json({
+     ok: true,
+     valid: true,
+     message: 'Webhook signature verification succeeded.',
+     expectedSignature,
+     receivedSignature: signatureHeader,
+   });
+  } catch (err) {
+   if (err.statusCode) return next(err);
+   logger.error('[webhooks] POST /webhooks/verify-test failed:', err.message);
+   const error = new Error(err.message || 'Failed to verify webhook signature');
+   error.statusCode = 400;
+   return next(error);
   }
 };
 

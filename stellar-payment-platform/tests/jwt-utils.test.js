@@ -64,11 +64,10 @@ describe('jwt utils (configured keys)', () => {
 
     it('rejects tampered tokens', () => {
       const token = jwtUtils.signToken({ username: 'alice' });
-      const [header, payload] = token.split('.');
-      // Replace the real signature with clearly-wrong bytes so the test never
-      // accidentally produces a valid token (the old approach of replacing the
-      // last char with 'a' could be a no-op if the char was already 'a').
-      const tampered = `${header}.${payload}.${'B'.repeat(86)}`;
+      const [header, payload, signature] = token.split('.');
+      const lastChar = signature.slice(-1);
+      const replacementChar = lastChar === 'a' ? 'b' : 'a';
+      const tampered = `${header}.${payload}.${signature.slice(0, -1)}${replacementChar}`;
       expect(() => jwtUtils.verifyToken(tampered)).toThrow();
     });
   });
