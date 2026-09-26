@@ -104,6 +104,62 @@ const redisConnectionsActive = new client.Gauge({
   },
 });
 
+// ---------------------------------------------------------------------------
+// Horizon polling metrics
+// ---------------------------------------------------------------------------
+// The listener process reports these. Because it is a separate process from the
+// API server it keeps its own registry, so the numbers are only scrapeable when
+// LISTENER_METRICS_PORT is set (see horizonListener.js). The definitions live
+// here so both processes describe the Horizon poller identically.
+
+// Counter: poll cycles by outcome. `outcome` is one of
+// success | empty | rate_limited | failure.
+const horizonPollCycles = new client.Counter({
+  name: 'stellar_tags_horizon_poll_cycles_total',
+  help: 'Horizon account-sync poll cycles by outcome',
+  labelNames: ['outcome'],
+});
+
+// Counter: HTTP 429 responses received from Horizon.
+const horizonRateLimited = new client.Counter({
+  name: 'stellar_tags_horizon_rate_limited_total',
+  help: 'HTTP 429 (rate limited) responses received from Horizon',
+});
+
+// Counter: SSE streams opened, closed and dropped by the listener.
+const horizonStreams = new client.Counter({
+  name: 'stellar_tags_horizon_streams_total',
+  help: 'Horizon payment SSE streams by event',
+  labelNames: ['event'],
+});
+
+// Histogram: wall-clock duration of a full sync cycle.
+const horizonPollDuration = new client.Histogram({
+  name: 'stellar_tags_horizon_poll_duration_seconds',
+  help: 'Duration of a Horizon account-sync poll cycle in seconds',
+  buckets: [0.05, 0.1, 0.5, 1, 2, 5, 15, 30],
+});
+
+// Gauge: the delay the poller will wait before its next cycle. Rising values
+// are the visible symptom of an unhealthy Horizon.
+const horizonPollBackoffSeconds = new client.Gauge({
+  name: 'stellar_tags_horizon_poll_backoff_seconds',
+  help: 'Delay before the next Horizon poll cycle, in seconds',
+  labelNames: ['scope'],
+});
+
+// Gauge: consecutive failed / empty poll cycles.
+const horizonPollFailures = new client.Gauge({
+  name: 'stellar_tags_horizon_poll_consecutive_failures',
+  help: 'Consecutive unsuccessful Horizon poll cycles',
+});
+
+// Gauge: Unix timestamp of the last poll cycle that talked to Horizon.
+const horizonLastSuccessTimestamp = new client.Gauge({
+  name: 'stellar_tags_horizon_poll_last_success_timestamp_seconds',
+  help: 'Unix timestamp of the last successful Horizon poll cycle',
+});
+
 /**
  * Express middleware that tracks request count and latency.
  * Attach to app BEFORE route handlers.
@@ -157,4 +213,13 @@ module.exports = {
   dbPoolConnectionsIdle,
   dbPoolQueriesWaiting,
   redisConnectionsActive,
+
+  // Horizon polling
+  horizonPollCycles,
+  horizonRateLimited,
+  horizonStreams,
+  horizonPollDuration,
+  horizonPollBackoffSeconds,
+  horizonPollFailures,
+  horizonLastSuccessTimestamp,
 };
