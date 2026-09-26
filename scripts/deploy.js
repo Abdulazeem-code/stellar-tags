@@ -462,6 +462,10 @@ const executeDeploy = async (options) => {
 const executeUpgrade = async (options) => {
   const network = NETWORKS[options.network] || NETWORKS.testnet;
   const contractId = options.contractId;
+  // The CLI always supplies an array (see parseArgs), but this function is
+  // exported and called directly by tooling and tests, so normalize rather
+  // than assume.
+  const signers = options.signers || [];
 
   if (!contractId) {
     throw new Error('Missing target contract ID for upgrade. Pass --contract-id <CONTRACT_ID>.');
@@ -472,11 +476,11 @@ const executeUpgrade = async (options) => {
 
   if (options.dryRun) {
     const mockWasmHash = 'f4c8996fb92427ae41e4649b934ca495991b7852b855e3b0c44298fc1c149afb';
-    const configured = options.signers.length > 0;
+    const configured = signers.length > 0;
     console.log(`   [Dry Run] Uploaded new WASM hash: ${mockWasmHash}`);
     if (configured) {
       console.log(
-        `   [Dry Run] Collected ${options.signers.length} approval(s) for ${mockWasmHash}`
+        `   [Dry Run] Collected ${signers.length} approval(s) for ${mockWasmHash}`
       );
       console.log(`   [Dry Run] Invoked upgrade(${mockWasmHash}) once the quorum is reached`);
     } else {
@@ -509,7 +513,7 @@ const executeUpgrade = async (options) => {
       );
     }
 
-    const available = parseSignerPairs(options.signers);
+    const available = parseSignerPairs(signers);
     const configured = new Set(config.signers);
     const usable = available.filter((s) => configured.has(s.address));
 
@@ -566,6 +570,7 @@ const executeUpgrade = async (options) => {
  */
 const executeApprove = async (options) => {
   const network = NETWORKS[options.network] || NETWORKS.testnet;
+  const signers = options.signers || [];
 
   if (!options.contractId) {
     throw new Error('Missing target contract ID. Pass --contract-id <CONTRACT_ID>.');
@@ -573,11 +578,11 @@ const executeApprove = async (options) => {
   if (!options.newWasmHash) {
     throw new Error('Missing --new-wasm-hash <HASH> to approve.');
   }
-  if (options.signers.length === 0) {
+  if (signers.length === 0) {
     throw new Error('Missing --signer <address>:<secret> for the approving key.');
   }
 
-  const [signer] = parseSignerPairs(options.signers);
+  const [signer] = parseSignerPairs(signers);
 
   if (options.dryRun) {
     console.log(
@@ -610,7 +615,7 @@ const executeSetMultisig = async (options) => {
     throw new Error('Missing --threshold <M> (an integer of at least 1).');
   }
 
-  const signers = parseSignerPairs(options.signers).map((s) => s.address);
+  const signers = parseSignerPairs(options.signers || []).map((s) => s.address);
   if (signers.length === 0) {
     throw new Error('Missing --signer <address>:<secret> entries for the group members.');
   }
