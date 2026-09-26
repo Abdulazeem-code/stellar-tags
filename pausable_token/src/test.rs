@@ -9,6 +9,7 @@ struct Fixture {
     admin: Address,
     alice: Address,
     bob: Address,
+    id: Address,
     token: PausableTokenClient<'static>,
 }
 
@@ -38,6 +39,7 @@ impl Fixture {
             admin,
             alice,
             bob,
+            id,
             token,
         }
     }
@@ -80,6 +82,102 @@ fn spenders_move_funds_under_an_allowance() {
     assert_eq!(f.token.allowance(&f.alice, &spender), 180_000);
     assert_eq!(f.token.balance(&f.alice), 880_000);
     assert_eq!(f.token.balance(&f.bob), 1_120_000);
+}
+
+// ── Issue #714: packed Allowance round trips ─────────────────────────────────
+
+/// The packed allowance must be exactly 20 bytes.
+///
+/// This is the assertion that encodes the optimization: if a future change
+/// widens the layout, the per-(owner, spender) entry stops shrinking and this
+/// fails.
+#[test]
+fn packed_allowance_is_twenty_bytes() {
+    let env = Env::default();
+    let packed = pack_allowance(&env, 1, 1);
+    assert_eq!(packed.to_array().len(), 20);
+}
+
+/// `pack_allowance` / `unpack_allowance` must be exactly inverse, including
+/// the i128 endpoints and the sign bit, which is where a naive unsigned copy
+/// would corrupt a negative value.
+#[test]
+fn packed_allowance_round_trips() {
+    let env = Env::default();
+    let cases: [(i128, u32); 8] = [
+        (0, 0),
+        (1, 1),
+        (i128::MAX, u32::MAX),
+        (i128::MAX, 0),
+        (0, u32::MAX),
+        (i128::MIN, 1),
+        (-1, u32::MAX),
+        (300_000, 1_000),
+    ];
+
+    for (amount, expiration) in cases {
+        let packed = pack_allowance(&env, amount, expiration);
+        assert_eq!(
+            unpack_allowance(&packed),
+            (amount, expiration),
+            "round trip failed for ({amount}, {expiration})"
+        );
+    }
+}
+
+/// The two halves must not bleed into each other: a large amount must not
+/// corrupt the expiry ledger, and vice versa.
+#[test]
+fn packed_allowance_fields_are_independent() {
+    let env = Env::default();
+
+    // All-ones amount with a small expiry: the amount's high bytes must not
+    // spill into the expiration field.
+    let packed = pack_allowance(&env, i128::MAX, 7);
+    assert_eq!(unpack_allowance(&packed), (i128::MAX, 7));
+
+    // Large expiry with a small amount: the expiry must not be truncated.
+    let packed = pack_allowance(&env, 42, u32::MAX);
+    assert_eq!(unpack_allowance(&packed), (42, u32::MAX));
+}
+
+/// Big-endian layout, asserted on the raw bytes so an endianness change (which
+/// would silently reinterpret every already-stored entry) is caught.
+#[test]
+fn packed_allowance_is_big_endian() {
+    let env = Env::default();
+    let buf = pack_allowance(&env, 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10, 0x1112_1314)
+        .to_array();
+    assert_eq!(&buf[0..16], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    assert_eq!(&buf[16..20], &[0x11, 0x12, 0x13, 0x14]);
+}
+
+/// The allowance actually stored on the ledger must be the packed 20-byte
+/// value, not a struct-encoded one. This ties the helper tests above to the
+/// real write path.
+#[test]
+fn allowance_is_persisted_in_packed_form() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+
+    f.token
+        .approve(&f.alice, &spender, &300_000, &(f.ledger() + 1_000));
+
+    let stored: BytesN<20> = f
+        .env
+        .as_contract(&f.id, || {
+            f.env
+                .storage()
+                .persistent()
+                .get(&DataKey::Allowance(f.alice.clone(), spender.clone()))
+        })
+        .expect("allowance entry should exist after approve");
+
+    assert_eq!(stored.to_array().len(), 20);
+    assert_eq!(unpack_allowance(&stored), (300_000, f.ledger() + 1_000));
+
+    // And the packed bytes agree with what the public getter reports.
+    assert_eq!(f.token.allowance(&f.alice, &spender), 300_000);
 }
 
 #[test]

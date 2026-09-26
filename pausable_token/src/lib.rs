@@ -3,7 +3,7 @@
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, String,
+    BytesN, Env, String,
 };
 
 #[contracttype]
@@ -21,6 +21,70 @@ pub enum DataKey {
     Allowance(Address, Address),
 }
 
+// ── Packed Allowance helpers (issue #714) ────────────────────────────────────
+//
+// Issue #714: the per-(owner, spender) allowance was stored as a two-field
+// `#[contracttype]` struct. Soroban encodes every contracttype value as an XDR
+// map, so each entry carried a struct discriminant plus a key/value pair per
+// field on top of the payload itself.
+//
+// Packing the two fields into one `BytesN<20>` removes that overhead entirely.
+//
+// Layout (big-endian):
+//   bytes  0..16 — amount            : i128 (16 bytes)
+//   bytes 16..20 — expiration_ledger : u32  (4 bytes)
+//
+// Both fields are already minimal width — an allowance is an `i128` because
+// token amounts are, and a ledger sequence is a `u32` — so 20 bytes is the
+// floor for this record. The saving is the eliminated XDR framing: one
+// persistent entry per (owner, spender) pair instead of a struct-encoded one.
+
+/// Pack an allowance amount and its expiry ledger into a 20-byte big-endian
+/// buffer.
+fn pack_allowance(env: &Env, amount: i128, expiration_ledger: u32) -> BytesN<20> {
+    let mut buf = [0u8; 20];
+
+    // Bytes 0..16 — amount (i128 big-endian, two's complement)
+    let a = amount.to_be_bytes();
+    let mut i = 0;
+    while i < 16 {
+        buf[i] = a[i];
+        i += 1;
+    }
+
+    // Bytes 16..20 — expiration_ledger (u32 big-endian)
+    let e = expiration_ledger.to_be_bytes();
+    buf[16] = e[0];
+    buf[17] = e[1];
+    buf[18] = e[2];
+    buf[19] = e[3];
+
+    BytesN::from_array(env, &buf)
+}
+
+/// Unpack a 20-byte buffer into `(amount, expiration_ledger)`.
+fn unpack_allowance(packed: &BytesN<20>) -> (i128, u32) {
+    let buf: [u8; 20] = packed.to_array();
+
+    let mut a = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        a[i] = buf[i];
+        i += 1;
+    }
+    let amount = i128::from_be_bytes(a);
+
+    let expiration_ledger = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
+
+    (amount, expiration_ledger)
+}
+
+/// Public-facing allowance record.
+///
+/// This remains a `#[contracttype]` because `allowance()` returns it to callers
+/// and it appears in the generated TS bindings. It is no longer what gets
+/// written to storage: `read_allowance` / `write_allowance` convert to and from
+/// the packed `BytesN<20>` form above.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Allowance {
@@ -248,22 +312,30 @@ impl PausableToken {
         Ok(())
     }
 
+    /// Reads the packed allowance for `(from, spender)`.
+    ///
+    /// An entry whose amount is non-zero but whose expiry has already passed
+    /// reads back as a zeroed amount, preserving the original expiration so a
+    /// later `approve` diff still sees the right baseline.
     fn read_allowance(env: &Env, from: &Address, spender: &Address) -> Allowance {
-        let stored: Allowance = env
+        let stored: Option<BytesN<20>> = env
             .storage()
             .persistent()
-            .get(&DataKey::Allowance(from.clone(), spender.clone()))
-            .unwrap_or(Allowance {
-                amount: 0,
-                expiration_ledger: 0,
-            });
-        if stored.amount > 0 && stored.expiration_ledger < env.ledger().sequence() {
+            .get(&DataKey::Allowance(from.clone(), spender.clone()));
+        let (amount, expiration_ledger) = match stored {
+            Some(packed) => unpack_allowance(&packed),
+            None => (0, 0),
+        };
+        if amount > 0 && expiration_ledger < env.ledger().sequence() {
             return Allowance {
                 amount: 0,
-                expiration_ledger: stored.expiration_ledger,
+                expiration_ledger,
             };
         }
-        stored
+        Allowance {
+            amount,
+            expiration_ledger,
+        }
     }
 
     fn write_allowance(env: &Env, from: &Address, spender: &Address, value: &Allowance) {
@@ -271,7 +343,8 @@ impl PausableToken {
         if value.amount == 0 {
             env.storage().persistent().remove(&key);
         } else {
-            env.storage().persistent().set(&key, value);
+            let packed = pack_allowance(env, value.amount, value.expiration_ledger);
+            env.storage().persistent().set(&key, &packed);
             Self::bump_user(env, &key);
         }
     }

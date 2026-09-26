@@ -2,3 +2,14 @@
 # CRLF checkout bakes `#!/bin/sh\r` into the Docker image, and the container
 # fails at startup with a confusing "./startup.sh: not found".
 *.sh text eol=lf
+
+# Husky hooks are extensionless, so the *.sh rule above does not cover them.
+# They are shell scripts all the same, and a CRLF checkout bakes a stray \r
+# into every line: `npx lint-staged\r` then fails in confusing ways, and
+# `if ...; then\r` makes the whole hook a syntax error. Force LF.
+.husky/pre-commit text eol=lf
+.husky/commit-msg text eol=lf
+.husky/post-merge text eol=lf
+.husky/post-checkout text eol=lf
+.husky/post-commit text eol=lf
+.husky/pre-push text eol=lf
