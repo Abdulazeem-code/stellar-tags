@@ -156,27 +156,19 @@ const { shouldFallbackToLocalRegistry } = require('../utils');
 
 const SERVER_START_TIME = Date.now();
 
-async function fetchAdminStats(prisma, poolGet) {
-  let totalRegisteredUsers;
-  let activeTokens;
-
-  try {
-    [totalRegisteredUsers, activeTokens] = await prisma.$transaction([
-      prisma.user.count(),
-      prisma.user.count({ where: { flaggedAt: null } }),
-    ]);
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-
-    const totalCountRow = await poolGet(
-      'SELECT COUNT(*) AS totalCount FROM username_registry',
-    );
-    const activeCountRow = await poolGet(
-      'SELECT COUNT(*) AS activeCount FROM username_registry WHERE flagged_at IS NULL',
-    );
-    totalRegisteredUsers = Number(totalCountRow?.totalCount || 0);
-    activeTokens = Number(activeCountRow?.activeCount || 0);
-  }
+/**
+ * Fetches admin statistics using Prisma exclusively.
+ * Both the total user count and active (non-flagged) count are fetched in a
+ * single atomic transaction to avoid race conditions.
+ *
+ * @param {import('@prisma/client').PrismaClient} prisma
+ * @returns {Promise<{ total_registered_users: number, active_tokens: number, platform_uptime_seconds: number, platform_uptime_started_at: string }>}
+ */
+async function fetchAdminStats(prisma) {
+  const [totalRegisteredUsers, activeTokens] = await prisma.$transaction([
+    prisma.user.count(),
+    prisma.user.count({ where: { flaggedAt: null } }),
+  ]);
 
   return {
     total_registered_users: totalRegisteredUsers,
