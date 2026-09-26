@@ -875,7 +875,7 @@ describe('Idempotency Middleware', () => {
     // First request
     const res1 = await request(app)
       .post('/register')
-      .set('X-Idempotency-Key', 'test-key-123')
+      .set('Idempotency-Key', 'test-key-123')
       .set('Content-Type', 'application/json')
       .send(payload);
     
@@ -885,7 +885,7 @@ describe('Idempotency Middleware', () => {
     // Second request with SAME key
     const res2 = await request(app)
       .post('/register')
-      .set('X-Idempotency-Key', 'test-key-123')
+      .set('Idempotency-Key', 'test-key-123')
       .set('Content-Type', 'application/json')
       .send(payload);
     

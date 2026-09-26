@@ -89,7 +89,7 @@ describe('payment intent metadata', () => {
 
     const response = await request(app)
       .post('/v1/payments/bulk')
-      .set('X-Idempotency-Key', 'test-key')
+      .set('Idempotency-Key', 'test-key')
       .send([{ ...baseIntent, metadata }]);
 
     expect(response.status).toBe(201);

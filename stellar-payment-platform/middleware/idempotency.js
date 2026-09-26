@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const { logger } = require('../src/logger');
 const { ApiError } = require('../src/errors');
 
-const IDEMPOTENCY_HEADER = 'X-Idempotency-Key';
+const IDEMPOTENCY_HEADER = 'Idempotency-Key';
 const CACHE_EXPIRATION_SECONDS = 24 * 60 * 60; // 24 hours
 
 // Methods that create or mutate server-side state and therefore benefit from
@@ -13,7 +13,7 @@ const MUTATING_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
 /**
  * Idempotency Middleware Factory
  * 
- * If an X-Idempotency-Key header is provided, this middleware:
+ * If an Idempotency-Key header is provided, this middleware:
  * 1. Checks Redis (or an in-memory Map fallback) for a cached response.
  * 2. Returns the cached response immediately if found.
  * 3. Otherwise, intercepts res.json() to save successful responses (2xx) for future identical requests.
@@ -41,7 +41,7 @@ const idempotencyMiddleware = (redisClient, options = {}) => {
     // 2. Validate the key (basic length check to prevent massive keys)
     const key = idempotencyKey.trim();
     if (!key || key.length > 128) {
-      return next(new ApiError('INVALID_INPUT', 'Invalid or too long X-Idempotency-Key'));
+      return next(new ApiError('INVALID_INPUT', 'Invalid or too long Idempotency-Key'));
     }
 
     // Include the method and path in the cache key so identical keys on
