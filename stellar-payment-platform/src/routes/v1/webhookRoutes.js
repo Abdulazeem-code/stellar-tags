@@ -284,7 +284,7 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
    error.statusCode = 400;
    return next(error);
   }
-};
+}));
 
 router.post('/webhooks', asyncHandler(async (req, res, next) => {
   try {
