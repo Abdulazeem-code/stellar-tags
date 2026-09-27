@@ -325,3 +325,45 @@ model EventCheckpoint {
   
   @@map("event_checkpoints")
 }
+
+// WebAuthn/Passkey Credentials: stores public keys and credential data
+model WebAuthnCredential {
+  id                  String   @id @default(uuid())
+  userId              String   @map("user_id") // User identifier (email, username, etc.)
+  credentialId        String   @unique @map("credential_id") // Base64URL-encoded credential ID
+  publicKey           String   @map("public_key") // Base64-encoded public key
+  counter             BigInt   @default(0) // Signature counter for replay protection
+  deviceType          String   @default("unknown") @map("device_type") // 'platform' or 'cross-platform'
+  transports          String[] @default([]) // ['usb', 'nfc', 'ble', 'internal']
+  aaguid              String?  @map("aaguid") // Authenticator AAGUID
+  credentialBackedUp  Boolean  @default(false) @map("credential_backed_up")
+  credentialDeviceType String? @map("credential_device_type")
+  friendlyName        String?  @map("friendly_name") // User-provided name for the credential
+  createdAt           DateTime @default(now()) @map("created_at")
+  lastUsedAt          DateTime @default(now()) @map("last_used_at")
+  revokedAt           DateTime? @map("revoked_at")
+  
+  @@index([userId])
+  @@index([credentialId])
+  @@index([userId, revokedAt])
+  @@map("webauthn_credentials")
+}
+
+// WebAuthn Challenges: stores temporary challenges for registration/authentication
+model WebAuthnChallenge {
+  id              String   @id @default(uuid())
+  challenge       String   @unique // Base64URL-encoded challenge
+  userId          String?  @map("user_id") // Optional for registration
+  type            String   // 'registration' or 'authentication'
+  expiresAt       DateTime @map("expires_at")
+  used            Boolean  @default(false)
+  usedAt          DateTime? @map("used_at")
+  ipAddress       String?  @map("ip_address")
+  userAgent       String?  @map("user_agent")
+  createdAt       DateTime @default(now()) @map("created_at")
+  
+  @@index([challenge])
+  @@index([expiresAt])
+  @@index([userId, type])
+  @@map("webauthn_challenges")
+}
