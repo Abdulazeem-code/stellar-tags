@@ -88,6 +88,8 @@ services:
       REDIS_CLUSTER_NODES: ${REDIS_CLUSTER_NODES:-}
       PORT: "5000"
       LOG_DIR: /app/logs
+      ANALYTICS_DATABASE_URL: postgresql://postgres:postgres@timescaledb:5432/stellar_analytics?schema=public
+      ANALYTICS_STREAM: analytics
     volumes:
       # Keep rotated logs across container restarts. The transports cap the
       # volume's growth by rotating daily / at 20MB and pruning old archives.
@@ -96,6 +98,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      timescaledb:
         condition: service_healthy
 
   fraud-worker:
@@ -113,6 +117,51 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+
+  # ── TimescaleDB (analytics read model) ────────────────────────────────────
+  # Separate PostgreSQL instance with the TimescaleDB extension for the
+  # analytics read model.  The analytics-worker consumer writes here;
+  # GET /admin/stats/routing queries here instead of the transactional DB.
+  timescaledb:
+    profiles: ["dev", "full"]
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stellar_analytics
+    ports:
+      - "5434:5432"
+    volumes:
+      - tsdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Analytics worker ──────────────────────────────────────────────────────
+  # Reads payment domain events from the Redis Streams `analytics` channel
+  # and upserts them into TimescaleDB.
+  analytics-worker:
+    profiles: ["dev", "full"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    command: ["node", "analytics-worker.js"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stellar_tags?schema=public
+      REDIS_URL: redis://redis:6379
+      ANALYTICS_DATABASE_URL: postgresql://postgres:postgres@timescaledb:5432/stellar_analytics?schema=public
+      ANALYTICS_STREAM: analytics
+      ANALYTICS_CONSUMER_GROUP: analytics-processors
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      timescaledb:
         condition: service_healthy
 
   # Only in full, not dev: the Vite build is the slowest thing here and backend
@@ -256,4 +305,5 @@ services:
 volumes:
   pgdata:
   backendlogs:
+  tsdata:
 
