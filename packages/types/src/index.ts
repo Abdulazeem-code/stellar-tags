@@ -220,6 +220,20 @@ queued_at: u64;
 
 export interface Client {
   /**
+   * Construct and simulate a ping transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Heartbeat: records the current ledger timestamp as the admin's last
+   * sign of life, restarting the dead man's switch claim clock.
+   * 
+   * This is the primary way for the admin to reset the timer without
+   * changing any contract state. Routing a payment also bumps the
+   * heartbeat automatically. A no-op when no backup admin is configured.
+   * 
+   * Admin authorization is required. Works even while the contract is
+   * frozen so the legitimate admin can keep the switch alive.
+   */
+  ping: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a get_fee transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the current protocol fee percentage in basis points.
    * 
@@ -838,6 +852,16 @@ export interface Client {
   add_supported_token: ({_token}: {_token: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a remove_backup_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Disables the dead man's switch, removing the backup admin and its
+   * claim window. The inactivity timeout is left in storage untouched so
+   * a later re-arming (via timelock) can reuse it.
+   * 
+   * Admin authorization is required.
+   */
+  remove_backup_admin: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a unblacklist_address transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Removes an address from the blacklist. ComplianceOfficer-protected.
    * 
@@ -918,6 +942,112 @@ export interface Client {
    */
   set_platform_treasury: ({new_treasury}: {new_treasury: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
+  /**
+   * Construct and simulate a get_rate_limit_remaining transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns how many more payment invocations `sender` can make in the
+   * current ledger under the active cap.
+   * 
+   * # Parameters
+   * - `sender`: Address whose remaining allowance to compute.
+   * 
+   * # Returns
+   * Remaining invocations in the current ledger window, saturating at 0
+   * once the cap is reached. Whitelisted senders (and a disabled limiter)
+   * report `u32::MAX`.
+   * 
+   * # Panics
+   * Does not panic.
+   */
+  get_rate_limit_remaining: ({sender}: {sender: string}, options?: MethodOptions) => Promise<AssembledTransaction<u32>>
+
+  /**
+   * Construct and simulate a set_rate_limit_whitelist transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Whitelists an address, exempting it from the per-ledger invocation cap
+   * so legitimate high-volume senders are never throttled. Admin-only.
+   * 
+   * # Parameters
+   * - `address`: Sender to exempt from rate limiting.
+   * 
+   * # Returns
+   * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+   * has no admin set yet.
+   * 
+   * # Panics
+   * Panics if the current admin does not authorize the call.
+   */
+  set_rate_limit_whitelist: ({address}: {address: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a is_rate_limit_whitelisted transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns whether an address is exempt from the rate limiter.
+   * 
+   * # Parameters
+   * - `address`: Address to check.
+   * 
+   * # Returns
+   * `true` if the address is on the rate-limit whitelist.
+   * 
+   * # Panics
+   * Does not panic.
+   */
+  is_rate_limit_whitelisted: ({address}: {address: string}, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>
+
+  /**
+   * Construct and simulate a set_backup_admin_internal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Configures the dead man's switch: nominates `backup` as the recovery
+   * address and sets the inactivity `timeout_seconds` after which the
+   * backup may claim admin rights.
+   * 
+   * This is a sensitive administrative change and therefore goes through
+   * the timelock: call `queue_action` with
+   * `ActionType::SetBackupAdmin { backup, timeout_seconds }` and execute
+   * after the 24-hour delay.  The claim itself is NOT timelocked — if the
+   * admin is gone, nobody would be left to execute a queued claim.
+   * 
+   * # Parameters
+   * - `backup`: Address allowed to claim admin rights after the timeout.
+   * - `timeout_seconds`: Inactivity window in seconds. Must be at least
+   * `MIN_DMS_TIMEOUT` (7 days).
+   * 
+   * # Returns
+   * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+   * has no admin set yet, or `Err(Error::InvalidDmsConfig)` if
+   * `timeout_seconds` is below the minimum or `backup` equals the
+   * current admin.
+   * 
+   * # Panics
+   * Panics if the current admin does not authorize the call.
+   */
+  set_backup_admin_internal: ({backup, timeout_seconds}: {backup: string, timeout_seconds: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a is_dead_mans_switch_expired transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns `true` if the dead man's switch is armed (a backup admin is
+   * configured) and the timeout has elapsed, i.e. `claim_admin` would
+   * currently succeed for the backup.
+   * 
+   * # Panics
+   * Does not panic.
+   */
+  is_dead_mans_switch_expired: (options?: MethodOptions) => Promise<AssembledTransaction<boolean>>
+
+  /**
+   * Construct and simulate a remove_rate_limit_whitelist transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Removes an address from the rate-limit whitelist, restoring the
+   * standard per-ledger cap for it. Admin-only.
+   * 
+   * # Parameters
+   * - `address`: Sender to remove from the whitelist.
+   * 
+   * # Returns
+   * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+   * has no admin set yet.
+   * 
+   * # Panics
+   * Panics if the current admin does not authorize the call.
+   */
+  remove_rate_limit_whitelist: ({address}: {address: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
 }
 export class Client extends ContractClient {
   static async deploy<T = Client>(
@@ -994,7 +1124,8 @@ export class Client extends ContractClient {
     )
   }
   public readonly fromJSON = {
-    get_fee: this.txFromJSON<i128>,
+    ping: this.txFromJSON<Result<void>>,
+        get_fee: this.txFromJSON<i128>,
         upgrade: this.txFromJSON<Result<void>>,
         version: this.txFromJSON<u32>,
         has_role: this.txFromJSON<boolean>,
@@ -1036,10 +1167,17 @@ export class Client extends ContractClient {
         get_yield_position: this.txFromJSON<i128>,
         set_yield_protocol: this.txFromJSON<Result<void>>,
         add_supported_token: this.txFromJSON<Result<void>>,
+        remove_backup_admin: this.txFromJSON<Result<void>>,
         unblacklist_address: this.txFromJSON<Result<void>>,
         withdraw_from_yield: this.txFromJSON<Result<void>>,
         get_effective_fee_bps: this.txFromJSON<i128>,
         set_fee_config_legacy: this.txFromJSON<Result<void>>,
-        set_platform_treasury: this.txFromJSON<Result<void>>
+        set_platform_treasury: this.txFromJSON<Result<void>>,
+        get_rate_limit_remaining: this.txFromJSON<u32>,
+        set_rate_limit_whitelist: this.txFromJSON<Result<void>>,
+        is_rate_limit_whitelisted: this.txFromJSON<boolean>,
+        set_backup_admin_internal: this.txFromJSON<Result<void>>,
+        is_dead_mans_switch_expired: this.txFromJSON<boolean>,
+        remove_rate_limit_whitelist: this.txFromJSON<Result<void>>
   }
 }
