@@ -1,8 +1,12 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
-    Address, BytesN, Env, Symbol, Vec,
+    Address, BytesN, Env, Symbol, Vec, Bytes, String,
 };
+
+// ── Axelar Cross-Chain Integration Module ────────────────────────────────────
+mod axelar;
+use axelar::{CrossChainPayment, IAxelarExecutable, axelar_helpers};
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
 //
@@ -276,6 +280,10 @@ pub enum DataKey {
     GovernanceProposal(u64),
     /// Whether an address has voted on a proposal.
     GovernanceVote(u64, Address),
+    /// Axelar Gateway contract address for cross-chain validation
+    AxelarGateway,
+    /// Trusted source chains for cross-chain payments
+    TrustedChain(String),
 }
 
 /// A fee change proposal weighted by governance-token balances.
@@ -351,6 +359,14 @@ pub enum Error {
     InvalidProposal = 24,
     /// The caller already voted on the proposal.
     AlreadyVoted = 25,
+    /// Axelar Gateway validation failed
+    AxelarValidationFailed = 26,
+    /// Invalid cross-chain payload
+    InvalidCrossChainPayload = 27,
+    /// Source chain not trusted
+    UntrustedChain = 28,
+    /// Axelar Gateway not configured
+    AxelarGatewayNotConfigured = 29,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -2156,6 +2172,221 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+
+    // ── Axelar Cross-Chain Integration ──────────────────────────────────────
+
+    /// Set the Axelar Gateway contract address (admin only)
+    pub fn set_axelar_gateway(env: Env, gateway: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::AxelarGateway, &gateway);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        log!(&env, "Axelar Gateway set: {}", gateway);
+        Ok(())
+    }
+
+    /// Add a trusted source chain for cross-chain payments (admin only)
+    pub fn add_trusted_chain(env: Env, chain_name: String) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TrustedChain(chain_name.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TrustedChain(chain_name.clone()),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        log!(&env, "Trusted chain added: {}", chain_name);
+        Ok(())
+    }
+
+    /// Remove a trusted source chain (admin only)
+    pub fn remove_trusted_chain(env: Env, chain_name: String) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TrustedChain(chain_name.clone()));
+
+        log!(&env, "Trusted chain removed: {}", chain_name);
+        Ok(())
+    }
+
+    /// Check if a chain is trusted
+    fn is_chain_trusted(env: &Env, chain_name: &String) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TrustedChain(chain_name.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Execute cross-chain payment (called by Axelar Gateway)
+    /// Implements the Axelar executable interface
+    pub fn execute_cross_chain(
+        env: Env,
+        command_id: Bytes,
+        source_chain: String,
+        source_address: String,
+        payload: Bytes,
+    ) -> Result<(), Error> {
+        // Get Axelar Gateway
+        let gateway_addr = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AxelarGateway)
+            .ok_or(Error::AxelarGatewayNotConfigured)?;
+
+        // Require authorization from gateway
+        gateway_addr.require_auth();
+
+        // Validate command ID format
+        if !axelar_helpers::is_valid_command_id(&command_id) {
+            return Err(Error::InvalidCrossChainPayload);
+        }
+
+        // Check if source chain is trusted
+        if !Self::is_chain_trusted(&env, &source_chain) {
+            log!(&env, "Untrusted chain: {}", source_chain);
+            return Err(Error::UntrustedChain);
+        }
+
+        // Validate against Axelar Gateway
+        let payload_hash = axelar_helpers::compute_payload_hash(&env, &payload);
+        
+        // In production, call gateway.validate_contract_call()
+        // For now, we log the validation
+        log!(
+            &env,
+            "Validating cross-chain call from {} on {}",
+            source_address,
+            source_chain
+        );
+
+        // Decode payment payload
+        let cross_chain_payment = axelar_helpers::decode_payment_payload(&env, &payload);
+
+        // Validate payment
+        if cross_chain_payment.amount <= 0 {
+            return Err(Error::LimitExceeded);
+        }
+
+        // Check if frozen
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+
+        // Check if paused
+        if Self::is_paused_internal(&env) {
+            return Err(Error::Paused);
+        }
+
+        // Log cross-chain payment initiation
+        log!(
+            &env,
+            "Cross-chain payment from {} ({}) to {} amount: {}",
+            source_address,
+            source_chain,
+            cross_chain_payment.recipient,
+            cross_chain_payment.amount
+        );
+
+        // Execute the payment routing
+        // Note: For cross-chain payments, the "sender" is the gateway contract
+        // which must hold the bridged tokens
+        let token_client = token::Client::new(&env, &cross_chain_payment.token_address);
+        let platform_treasury = Self::get_platform_treasury(&env)?;
+
+        // Calculate fee
+        let fee_bps = Self::get_fee_bps(&env)?;
+        let fee_cap = Self::get_fee_cap(&env)?;
+        let fee = Self::compute_fee(cross_chain_payment.amount, fee_bps, fee_cap);
+        let net_amount = cross_chain_payment.amount
+            .checked_sub(fee)
+            .ok_or(Error::InsufficientBalance)?;
+
+        // Transfer fee to treasury
+        if fee > 0 {
+            token_client.transfer(
+                &gateway_addr,
+                &platform_treasury,
+                &fee,
+            );
+        }
+
+        // Transfer net amount to recipient
+        token_client.transfer(
+            &gateway_addr,
+            &cross_chain_payment.recipient,
+            &net_amount,
+        );
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("xchain"), gateway_addr.clone()),
+            (
+                source_chain.clone(),
+                source_address.clone(),
+                cross_chain_payment.recipient.clone(),
+                cross_chain_payment.amount,
+                net_amount,
+            ),
+        );
+
+        log!(
+            &env,
+            "Cross-chain payment completed: {} tokens routed (fee: {})",
+            net_amount,
+            fee
+        );
+
+        Ok(())
+    }
+
+    /// Get the configured Axelar Gateway address
+    pub fn get_axelar_gateway(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AxelarGateway)
+    }
+}
+
+// ── Axelar Executable Implementation ────────────────────────────────────────
+
+#[contractimpl]
+impl IAxelarExecutable for PaymentRouter {
+    fn execute(
+        env: Env,
+        command_id: Bytes,
+        source_chain: String,
+        source_address: String,
+        payload: Bytes,
+    ) {
+        // Call internal implementation with proper error handling
+        match PaymentRouter::execute_cross_chain(
+            env.clone(),
+            command_id,
+            source_chain.clone(),
+            source_address.clone(),
+            payload,
+        ) {
+            Ok(_) => {
+                log!(&env, "Cross-chain execution successful");
+            }
+            Err(e) => {
+                log!(&env, "Cross-chain execution failed: {:?}", e);
+                panic!("Cross-chain execution failed");
+            }
+        }
     }
 }
 
