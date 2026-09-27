@@ -32,7 +32,8 @@ const {
   parseCursorQuery,
   paginateByKeyset,
   cursorPaginatedResponse,
-  keysetWhereDesc
+  keysetWhereDesc,
+  keysetWhereAscById
 } = require('../../pagination');
 const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
@@ -114,17 +115,23 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
 
     const { prisma } = getPrisma();
-    let skip = 0;
+    // Keyset walk (issue #677): pages seek strictly past the last row's
+    // (createdAt, id) tuple instead of skipping OFFSET rows, so deep pages
+    // cost the same as the first. The id tie-breaker also guarantees stable
+    // ordering when rows share a timestamp.
+    let cursor = null;
     let headerWritten = false;
 
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const where = dateFilter ? { createdAt: dateFilter } : {};
+        const baseWhere = dateFilter ? { createdAt: dateFilter } : {};
+        const where = cursor
+          ? { AND: [baseWhere, keysetWhereAscById(cursor)] }
+          : baseWhere;
         const records = await prisma.payment.findMany({
           where,
-          orderBy: { createdAt: 'asc' },
-          skip,
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
           take: EXPORT_PAGE_SIZE,
         });
 
@@ -152,7 +159,9 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
         }
 
         if (records.length < EXPORT_PAGE_SIZE) break;
-        skip += EXPORT_PAGE_SIZE;
+
+        const last = records[records.length - 1];
+        cursor = { createdAt: last.createdAt, id: last.id };
       }
 
       return res.end();

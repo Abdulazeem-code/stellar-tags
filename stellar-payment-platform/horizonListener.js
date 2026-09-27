@@ -12,6 +12,8 @@
 
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
+const { createRedisConnection } = require('./src/config/redis');
+const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
   scheduleWebhookRetryJob,
@@ -48,6 +50,7 @@ const healthCheckBreaker = createBreaker(
 // Stream Management
 // ---------------------------------------------------------------------------
 const activeStreams = new Map();
+const fraudStream = process.env.REDIS_URL ? createRedisConnection() : null;
 
 // ---------------------------------------------------------------------------
 // Formatting Helpers
@@ -71,6 +74,12 @@ const formatPayment = (payment, trackedAccount) => {
     `  Created:     ${payment.created_at}`,
     '  ─────────────────────────────────────────',
   ].join('\n');
+};
+
+const publishPaymentForFraudDetection = async (payment) => {
+  if (!fraudStream) return;
+  const payload = { ...payment, event_id: payment.transaction_hash || payment.paging_token };
+  await fraudStream.xadd(PAYMENT_STREAM, '*', 'payload', JSON.stringify(payload));
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +106,9 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
+          publishPaymentForFraudDetection(payment).catch((err) =>
+            logger.error({ err, transactionHash: payment.transaction_hash }, 'Failed to publish payment to fraud stream'),
+          );
           dispatchPaymentWebhooks({
             prisma,
             payment,
@@ -183,6 +195,7 @@ const shutdown = async () => {
     logger.info(`  Closed stream for ${address}`);
   }
   activeStreams.clear();
+  if (fraudStream) await fraudStream.quit();
   await prisma.$disconnect();
   process.exit(0);
 };
