@@ -266,3 +266,62 @@ model WalletBalance {
   @@index([username])
   @@map("wallet_balances")
 }
+
+// Event Sourcing: Payment Events Store
+// Immutable append-only log of all payment-related events
+model PaymentEvent {
+  id              String   @id @default(uuid())
+  paymentId       String   @map("payment_id")
+  eventType       String   @map("event_type") // PAYMENT_CREATED, PAYMENT_ROUTED, PAYMENT_COMPLETED, PAYMENT_FAILED, etc.
+  eventVersion    Int      @default(1) @map("event_version")
+  aggregateId     String   @map("aggregate_id") // Aggregate root identifier (same as paymentId for grouping)
+  sequence        Int      // Sequential order within the aggregate
+  timestamp       DateTime @default(now())
+  userId          String?  @map("user_id")
+  eventData       Json     @map("event_data") // Full event payload
+  metadata        Json?    // Additional context (IP, user agent, correlation ID, etc.)
+  
+  @@unique([aggregateId, sequence])
+  @@index([paymentId])
+  @@index([eventType])
+  @@index([timestamp])
+  @@index([aggregateId, sequence])
+  @@map("payment_events")
+}
+
+// Read Model: Denormalized payment state derived from events
+// Updated asynchronously by event processors
+model PaymentReadModel {
+  id              String   @id // Same as payment aggregate ID
+  currentState    String   @map("current_state")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  fee             Float    @default(0)
+  assetCode       String?  @map("asset_code")
+  transactionHash String?  @map("transaction_hash")
+  riskScore       Float?   @map("risk_score")
+  fraudStatus     String   @default("clear") @map("fraud_status")
+  createdAt       DateTime @map("created_at")
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
+  lastEventSeq    Int      @default(0) @map("last_event_seq") // Last processed event sequence
+  version         Int      @default(1) // Optimistic locking version
+  
+  @@index([currentState])
+  @@index([fromAddress])
+  @@index([toAddress])
+  @@index([createdAt])
+  @@map("payment_read_models")
+}
+
+// Event Processing Checkpoint: tracks last processed event for each consumer
+model EventCheckpoint {
+  id              String   @id @default(uuid())
+  consumerName    String   @unique @map("consumer_name")
+  lastEventId     String   @map("last_event_id")
+  lastSequence    Int      @map("last_sequence")
+  lastTimestamp   DateTime @map("last_timestamp")
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
+  
+  @@map("event_checkpoints")
+}
