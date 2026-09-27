@@ -8,19 +8,52 @@ const CONSUMER_GROUP = process.env.FRAUD_CONSUMER_GROUP || 'fraud-detectors';
 const CONSUMER_NAME = process.env.FRAUD_CONSUMER_NAME || `fraud-${process.pid}`;
 const HIGH_RISK_THRESHOLD = Number(process.env.FRAUD_HIGH_RISK_THRESHOLD || 0.8);
 
+// Rolling window used to measure per-sender burst velocity.
+const BURST_WINDOW_MS = 60_000;
+// Upper bound on the number of distinct senders retained by a single scorer.
+// The scorer lives for the whole process; without a cap the sender map grows
+// by one entry per unique sender forever, which is the leak behind #683.
+const DEFAULT_MAX_TRACKED_SENDERS = 10_000;
+
 // A dependency-free, bounded anomaly scorer for the stream worker. It uses
 // robust rolling statistics for amount magnitude and combines them with burst
 // velocity, which keeps the worker small and explainable for compliance staff.
-const createFraudScorer = ({ windowSize = 100 } = {}) => {
+const createFraudScorer = ({
+  windowSize = 100,
+  maxTrackedSenders = DEFAULT_MAX_TRACKED_SENDERS,
+} = {}) => {
   const amounts = [];
   const recentSenders = new Map();
-  return (payment) => {
+
+  const scorer = (payment) => {
     const amount = Math.max(0, Number(payment.amount) || 0);
     const now = Date.now();
     const sender = payment.from || 'unknown';
-    const recent = (recentSenders.get(sender) || []).filter((timestamp) => now - timestamp < 60_000);
+    const recent = (recentSenders.get(sender) || []).filter(
+      (timestamp) => now - timestamp < BURST_WINDOW_MS,
+    );
     recent.push(now);
+
+    // Re-insert so Map iteration order approximates least-recently-used and
+    // the eviction pass below can drop the coldest senders first.
+    recentSenders.delete(sender);
     recentSenders.set(sender, recent);
+
+    // Keep the sender map bounded: first drop senders whose burst window has
+    // fully expired, then hard-evict the least-recently-seen entries when a
+    // burst of unique senders still exceeds the cap.
+    if (recentSenders.size > maxTrackedSenders) {
+      for (const [key, timestamps] of recentSenders) {
+        const lastSeen = timestamps[timestamps.length - 1] ?? 0;
+        if (now - lastSeen >= BURST_WINDOW_MS) recentSenders.delete(key);
+      }
+      while (recentSenders.size > maxTrackedSenders) {
+        const oldestKey = recentSenders.keys().next().value;
+        if (oldestKey === undefined) break;
+        recentSenders.delete(oldestKey);
+      }
+    }
+
     amounts.push(amount);
     if (amounts.length > windowSize) amounts.shift();
 
@@ -31,6 +64,15 @@ const createFraudScorer = ({ windowSize = 100 } = {}) => {
     const score = Math.min(1, amountSignal * 0.65 + velocitySignal * 0.35);
     return { score: Number(score.toFixed(4)), reason: `amount=${amountSignal.toFixed(2)}, velocity=${velocitySignal.toFixed(2)}` };
   };
+
+  // Exposed so the memory regression test can assert the internal state is
+  // bounded regardless of how many distinct senders are seen.
+  scorer.stats = () => ({
+    trackedSenders: recentSenders.size,
+    amountWindow: amounts.length,
+  });
+
+  return scorer;
 };
 
 const parseStreamEntry = (entry) => {
@@ -99,9 +141,26 @@ const startFraudDetectionWorker = async ({ prisma, redis = createRedisConnection
   await ensureGroup(redis);
   const scorer = createFraudScorer();
   let running = true;
+  let stopped = false;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
   const run = async () => {
     while (running) {
-      const batches = await redis.xreadgroup('GROUP', CONSUMER_GROUP, CONSUMER_NAME, 'COUNT', 10, 'BLOCK', 5000, 'STREAMS', PAYMENT_STREAM, '>');
+      let batches;
+      try {
+        batches = await redis.xreadgroup(
+          'GROUP', CONSUMER_GROUP, CONSUMER_NAME,
+          'COUNT', 10, 'BLOCK', 5000,
+          'STREAMS', PAYMENT_STREAM, '>',
+        );
+      } catch (error) {
+        if (!running) break;
+        // A transient Redis blip must not kill (or hot-spin) the worker.
+        logger.error({ err: error, stream: PAYMENT_STREAM }, 'Fraud stream read failed; retrying');
+        await sleep(1000);
+        continue;
+      }
       for (const [, entries] of batches || []) {
         for (const entry of entries || []) {
           try {
@@ -116,7 +175,23 @@ const startFraudDetectionWorker = async ({ prisma, redis = createRedisConnection
     }
   };
   run().catch((error) => logger.error({ err: error }, 'Fraud worker stopped unexpectedly'));
-  return { stop: async () => { running = false; await redis.quit(); } };
+
+  return {
+    stop: async () => {
+      if (stopped) return;
+      stopped = true;
+      running = false;
+      await redis.quit();
+    },
+  };
 };
 
-module.exports = { PAYMENT_STREAM, HIGH_RISK_THRESHOLD, createFraudScorer, handlePayment, startFraudDetectionWorker };
+module.exports = {
+  PAYMENT_STREAM,
+  HIGH_RISK_THRESHOLD,
+  BURST_WINDOW_MS,
+  DEFAULT_MAX_TRACKED_SENDERS,
+  createFraudScorer,
+  handlePayment,
+  startFraudDetectionWorker,
+};
