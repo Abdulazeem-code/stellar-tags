@@ -165,6 +165,23 @@ pub struct SwapQuote {
     pub max_slippage_bps: i128,
 }
 
+/// Adapter interface implemented by the DEX used for an arbitrary token swap.
+/// The router transfers the input asset to the adapter. The result must contain
+/// `[amount_received, unused_input]`; the adapter must send the output asset to
+/// `recipient` and return any unused input to the router.
+#[contractclient(name = "DexRouterClient")]
+pub trait DexRouter {
+    fn swap_exact_tokens_for_tokens(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        path: Vec<Address>,
+        recipient: Address,
+    ) -> Vec<i128>;
+}
+
 // ── Timelock data structures ─────────────────────────────────────────────────
 //
 // Admin actions that change sensitive contract parameters (treasury, fees,
@@ -649,6 +666,23 @@ impl PaymentRouter {
         } else {
             floor
         }
+    }
+
+    fn validate_swap_path(
+        token_in: &Address,
+        token_out: &Address,
+        path: &Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if min_amount_out <= 0 || path.len() < 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.get(0) != Some(token_in.clone())
+            || path.get(path.len() - 1) != Some(token_out.clone())
+        {
+            return Err(Error::InvalidSwapPath);
+        }
+        Ok(())
     }
 
     /// Allocates and returns the next timelock nonce, incrementing the counter.
@@ -1285,6 +1319,148 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
         Ok(())
+    }
+
+    /// Configures the DAO token and minimum voting weight for fee proposals.
+    /// This administrative bootstrap does not itself change fees; subsequent
+    /// fee changes can be made through the proposal lifecycle.
+    pub fn configure_governance(
+        env: Env,
+        governance_token: Address,
+        quorum: i128,
+    ) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+        if quorum <= 0 {
+            return Err(Error::InvalidProposal);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceToken, &governance_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceQuorum, &quorum);
+        Ok(())
+    }
+
+    /// Creates a fee proposal weighted by governance-token balances.
+    pub fn propose_fee_change(
+        env: Env,
+        proposer: Address,
+        fee_bps: i128,
+        fee_cap: i128,
+        voting_period: u64,
+    ) -> Result<u64, Error> {
+        proposer.require_auth();
+        let governance_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceToken)
+            .ok_or(Error::GovernanceNotConfigured)?;
+        if token::Client::new(&env, &governance_token).balance(&proposer) <= 0 {
+            return Err(Error::GovernanceNotConfigured);
+        }
+        if !(0..=10_000).contains(&fee_bps) || fee_cap < 0 || voting_period == 0 {
+            return Err(Error::InvalidProposal);
+        }
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceNonce)
+            .unwrap_or(0);
+        let id = nonce.saturating_add(1);
+        env.storage().instance().set(&DataKey::GovernanceNonce, &id);
+        let quorum = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceQuorum)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::GovernanceProposal(id),
+            &FeeProposal {
+                proposer,
+                fee_bps,
+                fee_cap,
+                created_at: env.ledger().timestamp(),
+                voting_ends_at: env.ledger().timestamp().saturating_add(voting_period),
+                yes_votes: 0,
+                no_votes: 0,
+                quorum,
+                executed: false,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Casts one weighted vote on an open fee proposal.
+    pub fn vote_fee_proposal(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<(), Error> {
+        voter.require_auth();
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceToken)
+            .ok_or(Error::GovernanceNotConfigured)?;
+        let key = DataKey::GovernanceProposal(proposal_id);
+        let mut proposal: FeeProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::InvalidProposal)?;
+        if proposal.executed || env.ledger().timestamp() >= proposal.voting_ends_at {
+            return Err(Error::InvalidProposal);
+        }
+        let vote_key = DataKey::GovernanceVote(proposal_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::AlreadyVoted);
+        }
+        let weight = token::Client::new(&env, &token_address).balance(&voter);
+        if weight <= 0 {
+            return Err(Error::InvalidProposal);
+        }
+        if support {
+            proposal.yes_votes = proposal.yes_votes.saturating_add(weight);
+        } else {
+            proposal.no_votes = proposal.no_votes.saturating_add(weight);
+        }
+        env.storage().persistent().set(&key, &proposal);
+        env.storage().persistent().set(&vote_key, &true);
+        Ok(())
+    }
+
+    /// Finalizes a successful fee proposal after its voting period ends.
+    pub fn execute_fee_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
+        let key = DataKey::GovernanceProposal(proposal_id);
+        let mut proposal: FeeProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::InvalidProposal)?;
+        if proposal.executed
+            || env.ledger().timestamp() < proposal.voting_ends_at
+            || proposal.yes_votes <= proposal.no_votes
+            || proposal.yes_votes.saturating_add(proposal.no_votes) < proposal.quorum
+        {
+            return Err(Error::InvalidProposal);
+        }
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeBps, &proposal.fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCap, &proposal.fee_cap);
+        Ok(())
+    }
+
+    pub fn get_fee_proposal(env: Env, proposal_id: u64) -> Option<FeeProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovernanceProposal(proposal_id))
     }
 
     /// Sets the minimum allowed routing amount. FeeManager-protected.

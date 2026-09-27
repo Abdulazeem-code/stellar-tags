@@ -2,6 +2,7 @@ const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
+const { getBalances } = require('../../services/ledgerService');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { transferAccount } = require('../../services/registrationService');
@@ -45,10 +46,11 @@ const buildUserSearchWhere = (search) => {
   };
 };
 
-const serializeUser = (user) => ({
+const serializeUser = (user, balances = {}) => ({
   username: user.username,
   address: user.address,
   created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+  balances,
 });
 
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
@@ -260,7 +262,9 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
           where: { address, deletedAt: null },
           select: { username: true },
         });
-        return row ? { username: row.username, address } : null;
+        if (!row) return null;
+        const balances = await getBalances(row.username);
+        return { username: row.username, address, balances };
       });
 
       if (!result) {
@@ -298,10 +302,14 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt.toISOString(),
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt.toISOString(),
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -320,10 +328,14 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
     ]);
 
     const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt.toISOString(),
+        balances,
+      };
     }));
 
     return res.json({ data, totalCount, totalPages, currentPage: page });
@@ -356,10 +368,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -378,10 +394,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
     ]);
 
     const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+        balances,
+      };
     }));
 
     res.json({
