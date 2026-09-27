@@ -16,6 +16,9 @@ jest.mock('../prismaClient', () => ({
       findMany: jest.fn(),
       count: jest.fn(),
     },
+    walletBalance: {
+      findMany: jest.fn().mockResolvedValue([]),
+    },
     $transaction: jest.fn((ops) => Promise.all(ops)),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   }
