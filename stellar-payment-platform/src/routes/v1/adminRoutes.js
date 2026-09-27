@@ -32,7 +32,8 @@ const {
   parseCursorQuery,
   paginateByKeyset,
   cursorPaginatedResponse,
-  keysetWhereDesc
+  keysetWhereDesc,
+  keysetWhereAscById
 } = require('../../pagination');
 const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
@@ -114,17 +115,23 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
 
     const { prisma } = getPrisma();
-    let skip = 0;
+    // Keyset walk (issue #677): pages seek strictly past the last row's
+    // (createdAt, id) tuple instead of skipping OFFSET rows, so deep pages
+    // cost the same as the first. The id tie-breaker also guarantees stable
+    // ordering when rows share a timestamp.
+    let cursor = null;
     let headerWritten = false;
 
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const where = dateFilter ? { createdAt: dateFilter } : {};
+        const baseWhere = dateFilter ? { createdAt: dateFilter } : {};
+        const where = cursor
+          ? { AND: [baseWhere, keysetWhereAscById(cursor)] }
+          : baseWhere;
         const records = await prisma.payment.findMany({
           where,
-          orderBy: { createdAt: 'asc' },
-          skip,
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
           take: EXPORT_PAGE_SIZE,
         });
 
@@ -152,7 +159,9 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
         }
 
         if (records.length < EXPORT_PAGE_SIZE) break;
-        skip += EXPORT_PAGE_SIZE;
+
+        const last = records[records.length - 1];
+        cursor = { createdAt: last.createdAt, id: last.id };
       }
 
       return res.end();
@@ -463,6 +472,42 @@ router.get(
       });
     }),
   );
+
+  // ── GET /admin/webhooks/health ───────────────────────────────────────────
+  // Aggregates webhook delivery health so ops can spot broken merchant
+  // integrations: total/healthy/failing counts, a rolling 24h success rate,
+  // and the URLs that have been failing for more than 24h.
+  router.get('/admin/webhooks/health', adminAuth, asyncHandler(async (req, res) => {
+    const { prisma } = getPrisma();
+    const username = typeof req.query.username === 'string' ? req.query.username.trim() : '';
+    const where = username ? { username } : {};
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const [total, failing, activeLast24h, failingLast24h, failingOver24h] = await Promise.all([
+      prisma.webhook.count({ where }),
+      prisma.webhook.count({ where: { ...where, failingSince: { not: null } } }),
+      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo } } }),
+      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo }, failingSince: { not: null } } }),
+      prisma.webhook.findMany({
+        where: { ...where, failingSince: { lte: dayAgo } },
+        select: { id: true, username: true, url: true, failingSince: true },
+        orderBy: { failingSince: 'asc' },
+      }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      summary: {
+        total,
+        healthy: total - failing,
+        failing,
+        successRate24h: activeLast24h
+          ? Number((((activeLast24h - failingLast24h) / activeLast24h) * 100).toFixed(2))
+          : null,
+      },
+      failingOver24h,
+    });
+  }));
 
   return router;
 };

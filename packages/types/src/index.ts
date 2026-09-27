@@ -46,6 +46,19 @@ export const networks = {
 
 
 /**
+ * Role definitions for the Role-Based Access Control (RBAC) system.
+ * 
+ * Segregates operational privileges across dedicated role boundaries:
+ * SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+ */
+export enum Role {
+  SuperAdmin = 1,
+  TreasuryManager = 2,
+  ComplianceOfficer = 3,
+  FeeManager = 4,
+}
+
+/**
  * Contract-level errors returned instead of panicking, so callers get a
  * specific, stable error code to branch on rather than an opaque trap.
  */
@@ -169,6 +182,12 @@ last_reset_time: u64;
 volume: i128;
 }
 
+/**
+ * Describes which administrative parameter change a timelock entry represents.
+ * Each variant carries all the arguments needed to apply that change when the
+ * delay period is over.
+ */
+export type ActionType = {tag: "SetPlatformTreasury", values: readonly [string]} | {tag: "SetFeeConfig", values: readonly [i128, i128]} | {tag: "SetFeeBps", values: readonly [i128]} | {tag: "SetGovernance", values: readonly [string]} | {tag: "SetMinLimit", values: readonly [i128]} | {tag: "TransferAdmin", values: readonly [string]} | {tag: "Upgrade", values: readonly [Buffer]};
 
 /**
  * A user's rolling 24-hour spending record.
@@ -350,6 +369,44 @@ export interface Client {
    * Panics if the current admin does not authorize the call.
    */
   set_paused: ({paused}: {paused: boolean}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a assign_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Assigns an operational role to a specified account.
+   * 
+   * Restricted exclusively to `SuperAdmin`.
+   * 
+   * # Parameters
+   * - `account`: Target address to receive the role.
+   * - `role`: The `Role` variant to grant.
+   * 
+   * # Returns
+   * `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+   * 
+   * # Panics
+   * Panics if the current `SuperAdmin` does not authorize the call.
+   */
+  assign_role: ({account, role}: {account: string, role: Role}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a revoke_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Revokes an operational role from a specified account.
+   * 
+   * Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
+   * when it would leave the contract without root governance.
+   * 
+   * # Parameters
+   * - `account`: Target address from which the role will be revoked.
+   * - `role`: The `Role` variant to revoke.
+   * 
+   * # Returns
+   * `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
+   * or `Err(Error::NotInitialized)`.
+   * 
+   * # Panics
+   * Panics if the current `SuperAdmin` does not authorize the call.
+   */
+  revoke_role: ({account, role}: {account: string, role: Role}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a set_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -767,6 +824,12 @@ export interface Client {
   unblacklist_address: ({address}: {address: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a withdraw_from_yield transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Withdraws treasury principal from the configured lending protocol. TreasuryManager-protected.
+   */
+  withdraw_from_yield: ({token, amount}: {token: string, amount: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a get_effective_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the effective fee_bps for a sender after applying any
    * volume-based tiered discount.
@@ -901,6 +964,8 @@ export class Client extends ContractClient {
         set_pause: this.txFromJSON<Result<void>>,
         initialize: this.txFromJSON<Result<void>>,
         set_paused: this.txFromJSON<Result<void>>,
+        assign_role: this.txFromJSON<Result<void>>,
+        revoke_role: this.txFromJSON<Result<void>>,
         set_fee_bps: this.txFromJSON<Result<void>>,
         queue_action: this.txFromJSON<Result<u64>>,
         cancel_action: this.txFromJSON<Result<void>>,
@@ -925,6 +990,7 @@ export class Client extends ContractClient {
         add_supported_token: this.txFromJSON<Result<void>>,
         migrate_user_record: this.txFromJSON<boolean>,
         unblacklist_address: this.txFromJSON<Result<void>>,
+        withdraw_from_yield: this.txFromJSON<Result<void>>,
         get_effective_fee_bps: this.txFromJSON<i128>,
         set_fee_config_legacy: this.txFromJSON<Result<void>>,
         set_platform_treasury: this.txFromJSON<Result<void>>

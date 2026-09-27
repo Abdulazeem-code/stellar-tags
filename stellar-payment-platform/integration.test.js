@@ -124,7 +124,7 @@ jest.mock('./prismaClient', () => {
         for (const entry of mockDb.values()) {
           if (entry.username === data.username) {
             const err = new Error('Unique constraint failed on the fields: (`username`)');
-            err.code = 'SQLITE_CONSTRAINT';
+            err.code = 'P2002';
             throw err;
           }
         }
@@ -138,6 +138,10 @@ jest.mock('./prismaClient', () => {
         mockDb.set(data.address, row);
         return row;
       }),
+    },
+    walletBalance: {
+      findMany: jest.fn(async () => []),
+      upsert: jest.fn(),
     },
     $transaction: jest.fn(async (ops) => Promise.all(ops)),
     $disconnect: jest.fn().mockResolvedValue(undefined),

@@ -1,4 +1,4 @@
-require("./src/utils/tracing");
+﻿require("./src/utils/tracing");
 require("./config/envCheck");
 const express = require("express");
 const pinoHttp = require("pino-http");
@@ -7,10 +7,12 @@ const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
 const crypto = require("crypto");
-const rateLimit = require("express-rate-limit");
-const { RedisStore } = require("rate-limit-redis");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
+const {
+  createSlidingWindowRateLimiter,
+} = require("./src/middleware/slidingWindowRateLimit");
+const { createGraphQLMiddleware } = require("./src/graphql");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
@@ -22,7 +24,6 @@ const dotenv = require("dotenv");
 const timeout = require("connect-timeout");
 const compression = require("compression");
 const { verifyMultiSignerThreshold } = require("./src/multisigner-verifier");
-const { poolGet, poolRun, poolAll } = require("./src/db");
 const { logger, httpLogger } = require("./src/logger");
 const xss = require("xss");
 const { Keypair, StrKey } = require("@stellar/stellar-sdk");
@@ -75,13 +76,12 @@ const {
   MAX_USERNAMES_PER_ADDRESS,
   PRIMARY_USERNAME_ORDER,
   USER_DATABASE,
-  shouldFallbackToLocalRegistry,
 } = require("./src/utils");
 const { getCachedApprovedOrigins } = require("./src/originCache");
 
 dotenv.config();
 
-// #295 — Only report to Sentry when a DSN is configured, so local/dev/test
+// #295 ΓÇö Only report to Sentry when a DSN is configured, so local/dev/test
 // runs without SENTRY_DSN never try to reach out to Sentry.
 if (process.env.SENTRY_DSN) {
   Sentry.init({ dsn: process.env.SENTRY_DSN });
@@ -108,7 +108,7 @@ const swaggerOptions = {
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-// #31 — Attach a correlation ID to every request before anything else runs so
+// #31 ΓÇö Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
@@ -215,19 +215,13 @@ setMetricsSources({ prisma, redisClient });
 
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
+const graphQLMiddleware = createGraphQLMiddleware({ prismaClient: prisma });
 
-const limiter = rateLimit({
+const limiter = createSlidingWindowRateLimiter({
+  redisClient,
   windowMs: 15 * 60 * 1000,
   max: 100,
-  // Use Redis-backed store when available
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  // Return the standard RateLimit-* headers only
-  standardHeaders: true,
-  legacyHeaders: false,
+  prefix: "global-rl:",
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -265,7 +259,7 @@ const limiter = rateLimit({
         if (typeof req.query.address === "string" && req.query.address.trim()) {
           return req.query.address.trim();
         }
-        // Some endpoints use q for lookup by name; not an account id — skip.
+        // Some endpoints use q for lookup by name; not an account id ΓÇö skip.
       }
 
       // 4) URL path pattern: /v1/accounts/:account
@@ -285,16 +279,11 @@ const limiter = rateLimit({
 // Per-IP limiter specifically for sensitive, unauthenticated endpoints.
 // Keys strictly by client IP so brute-force/spam from a single source is
 // blocked regardless of how many account ids are rotated in the payload.
-const ipLimiter = rateLimit({
+const ipLimiter = createSlidingWindowRateLimiter({
+  redisClient,
   windowMs: 15 * 60 * 1000,
   max: 100,
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  standardHeaders: true,
-  legacyHeaders: false,
+  prefix: "ip-rl:",
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -307,7 +296,7 @@ const signatureRateLimiter = createSignatureRateLimiter(redisClient);
 
 app.use(cors(corsOptions));
 
-// #588 — Per-route request body size limits. A single JSON parser enforces a
+// #588 ΓÇö Per-route request body size limits. A single JSON parser enforces a
 // cap that depends on the endpoint type (auth 1kb / standard 10kb / bulk 100kb)
 // instead of the previous uniform 10kb, and answers oversized payloads with 413.
 app.use(bodySizeLimit);
@@ -317,13 +306,17 @@ const isPrimitive = (v) =>
   v === null || v === undefined || typeof v !== "object";
 
 const rejectNestedObjects = (req, res, next) => {
+  // GraphQL variables are intentionally nested; field-level schema validation
+  // replaces the flat-input guard used by the REST API.
+  if (req.path === "/graphql") return next();
+
   const sources = [req.query, req.body];
   for (const source of sources) {
     if (source && typeof source === "object") {
       for (const val of Object.values(source)) {
         if (!isPrimitive(val)) {
           // Responds directly rather than delegating, so the middleware stays
-          // usable on its own — the same way validateSchema behaves.
+          // usable on its own ΓÇö the same way validateSchema behaves.
           return res
             .status(400)
             .json(
@@ -344,6 +337,7 @@ app.use(rejectNestedObjects);
 
 // Enable HTTP response compression for responses exceeding 1KB (1024 bytes)
 app.use(compression({ threshold: 1024 }));
+app.use("/graphql", graphQLMiddleware);
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
@@ -360,7 +354,7 @@ const RESERVED_USERNAMES = [
 ];
 
 // ---------------------------------------------------------------------------
-// #51 — ETag Caching Middleware for Federation Endpoint
+// #51 ΓÇö ETag Caching Middleware for Federation Endpoint
 // ---------------------------------------------------------------------------
 const etagCache = (req, res, next) => {
   const originalJson = res.json.bind(res);
@@ -383,110 +377,11 @@ const etagCache = (req, res, next) => {
   next();
 };
 
-const getLocalUserByAddress = async (address) =>
-  poolGet(
-    "SELECT username, address FROM username_registry WHERE address = $1 AND deleted_at IS NULL LIMIT 1",
-    [address],
-  );
-
 const getLocalUserByUsername = async (username) =>
   poolGet(
     "SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1",
     [username],
   );
-
-const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
-  const searchPattern = `%${search}%`;
-  const LIKE_FILTER =
-    "WHERE (username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE)";
-
-  if (cursorPoint) {
-    // Keyset mode for the fallback path as well. created_at is stored as an
-    // ISO-8601 string, so lexicographic comparison matches chronological
-    // ordering and the tuple predicate seeks straight past the cursor row.
-    const rows = await poolAll(
-      `SELECT username, address, created_at
-      FROM username_registry
-      ${LIKE_FILTER}
-      AND (created_at < ? OR (created_at = ? AND username < ?))
-      ORDER BY created_at DESC, username DESC
-      LIMIT ?`,
-      [
-        searchPattern,
-        searchPattern,
-        String(cursorPoint.createdAt),
-        String(cursorPoint.createdAt),
-        String(cursorPoint.username),
-        limit + 1,
-      ],
-    );
-    const normalized = rows.map((row) => ({
-      username: row.username,
-      address: row.address,
-      createdAt: row.created_at,
-    }));
-    const {
-      rows: pageRows,
-      hasMore,
-      nextCursor,
-    } = paginateByKeyset(normalized, limit);
-    return cursorPaginatedResponse(
-      pageRows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt,
-      })),
-      { limit, nextCursor, hasMore },
-    );
-  }
-
-  const skip = (page - 1) * limit;
-  const rows = await poolAll(
-    `SELECT username, address, created_at
-     FROM username_registry
-     WHERE username ILIKE $1 OR address ILIKE $1
-     ORDER BY created_at DESC
-     LIMIT $2 OFFSET $3`,
-    [searchPattern, limit, skip],
-  );
-
-  const countRow = await poolGet(
-    `SELECT COUNT(*) AS "totalCount"
-     FROM username_registry
-     WHERE username ILIKE $1 OR address ILIKE $1`,
-    [searchPattern],
-  );
-
-  const totalCount = Number(countRow?.totalCount || 0);
-  return paginatedResponse(
-    rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.created_at,
-    })),
-    totalCount,
-    { page, limit },
-  );
-};
-
-const registerLocalUser = async ({ username, address, isPrimary = false }) => {
-  // #613 — several usernames may share an address, so an existing address is
-  // no longer a conflict; only a duplicate username is.
-  const existingByUsername = await getLocalUserByUsername(username);
-  if (existingByUsername) {
-    const conflictError = new Error(
-      "Username is already taken. Please choose another.",
-    );
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  await poolRun(
-    `INSERT INTO username_registry (username, address, created_at)
-     VALUES ($1, $2, $3)`,
-    [username, address, new Date().toISOString()],
-  );
-};
 
 // Expose /metrics endpoint for Prometheus to scrape
 
@@ -535,7 +430,7 @@ app.get(
       if (type === "id") {
         const cacheKey = federationIdKey(queryValue);
         const cached = await federationLookupCached(cacheKey, async () => {
-          // #613 — an address can have several usernames; a reverse lookup
+          // #613 ΓÇö an address can have several usernames; a reverse lookup
           // resolves to the primary one.
           const row = await prisma.user.findFirst({
             where: {
@@ -583,33 +478,20 @@ app.get(
         const cacheKey = federationNameKey(queryName);
 
         const cached = await federationLookupCached(cacheKey, async () => {
-          let row;
-          try {
-            row = await prisma.user.findFirst({
-              where: { username: queryName, deletedAt: null },
-              select: {
-                address: true,
-                memoType: true,
-                memo: true,
-                flaggedAt: true,
-              },
-            });
+          let row = await prisma.user.findFirst({
+            where: { username: queryName, deletedAt: null },
+            select: {
+              address: true,
+              memoType: true,
+              memo: true,
+              flaggedAt: true,
+            },
+          });
 
-            if (row && row.flaggedAt) {
-              const forbiddenError = new Error("Address is blocked");
-              forbiddenError.statusCode = 403;
-              throw forbiddenError;
-            }
-          } catch (error) {
-            if (error.statusCode === 403) throw error;
-            if (!shouldFallbackToLocalRegistry(error)) {
-              throw error;
-            }
-
-            const localRow = await getLocalUserByUsername(queryName);
-            row = localRow
-              ? { address: localRow.address, memoType: null, memo: null }
-              : null;
+          if (row && row.flaggedAt) {
+            const forbiddenError = new Error("Address is blocked");
+            forbiddenError.statusCode = 403;
+            throw forbiddenError;
           }
 
           const address = row?.address || USER_DATABASE[queryName];
@@ -824,24 +706,13 @@ app.post(
     }
 
     try {
-      // #613 — an address may carry several usernames (aliases). Registration
+      // #613 ΓÇö an address may carry several usernames (aliases). Registration
       // adds another while the address is under the cap; the first username
       // registered for an address becomes its primary. Reverse (type=id)
       // federation lookups resolve to that primary.
-      let usernameCount = 0;
-      try {
-        usernameCount = await prisma.user.count({
-          where: { address, deletedAt: null },
-        });
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
-        }
-
-        // Degraded path: the exact alias count is unavailable, so fall back to
-        // a presence check. The 5-username cap is enforced best-effort here.
-        usernameCount = (await getLocalUserByAddress(address)) ? 1 : 0;
-      }
+      let usernameCount = await prisma.user.count({
+        where: { address, deletedAt: null },
+      });
 
       if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
         return next(
@@ -909,28 +780,16 @@ app.post(
         }
       }
 
-      try {
-        await prisma.user.create({
-          data: {
-            username: normalizedUsername,
-            address,
-            isPrimary,
-            ...(memoType && { memoType, memo }),
-          },
-        });
-        // Invalidate any stale federation cache entries for this username/address
-        invalidateFederationCache(normalizedUsername, address);
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
-        }
-
-        await registerLocalUser({
+      await prisma.user.create({
+        data: {
           username: normalizedUsername,
           address,
           isPrimary,
-        });
-      }
+          ...(memoType && { memoType, memo }),
+        },
+      });
+      // Invalidate any stale federation cache entries for this username/address
+      invalidateFederationCache(normalizedUsername, address);
 
       await recordActivity(prisma, {
         username: normalizedUsername,
@@ -1023,20 +882,12 @@ app.get(
     if (address) {
       try {
         const result = await lookupCached(address, async () => {
-          let row;
-          try {
-            // #613 — an address can have several usernames; return the primary.
-            row = await prisma.user.findFirst({
-              where: { address, deletedAt: null },
-              select: { username: true },
-              orderBy: PRIMARY_USERNAME_ORDER,
-            });
-          } catch (error) {
-            if (!shouldFallbackToLocalRegistry(error)) {
-              throw error;
-            }
-            row = await getLocalUserByAddress(address);
-          }
+          // #613 — an address can have several usernames; return the primary.
+          let row = await prisma.user.findFirst({
+            where: { address, deletedAt: null },
+            select: { username: true },
+            orderBy: PRIMARY_USERNAME_ORDER,
+          });
           return row ? { username: row.username, address } : null;
         });
 
@@ -1050,7 +901,7 @@ app.get(
 
         return res.json(result);
       } catch (err) {
-        logger.error(err, "🚨 ACTUAL PRISMA ERROR:");
+        logger.error(err, "≡ƒÜ¿ ACTUAL PRISMA ERROR:");
 
         const dbError = new Error("Database lookup failed", { cause: err });
         dbError.statusCode = 500;
@@ -1078,7 +929,6 @@ app.get(
 
     try {
       let response = null;
-      try {
         if (cursor) {
           // Keyset mode: seek straight past the cursor row instead of skipping
           // every preceding row, so deep pages cost the same as page one.
@@ -1120,13 +970,7 @@ app.get(
             { page, limit },
           );
         }
-      } catch (error) {
-        if (!shouldFallbackToLocalRegistry(error)) {
-          throw error;
-        }
 
-        response = await listLocalUsers(search, page, limit, cursor);
-      }
 
       return res.json(response);
     } catch (error) {
@@ -1251,20 +1095,15 @@ app.use("/api/v2", v2Router);
 // Explicit v1 mount, then /api (no version) and the legacy unversioned root
 // both resolve to v1 so existing clients keep working unchanged.
 app.use("/api/v1", v1Router);
-// #492 — Strict rate limiter for auth/login endpoints. These are prime
+// #492 ΓÇö Strict rate limiter for auth/login endpoints. These are prime
 // brute-force targets, so they get a much tighter budget than the global
 // limiter. Uses the same Redis-backed store so the limit is shared across
 // all distributed nodes.
-const authLimiter = rateLimit({
+const authLimiter = createSlidingWindowRateLimiter({
+  redisClient,
   windowMs: 15 * 60 * 1000,
   max: 20,
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  standardHeaders: true,
-  legacyHeaders: false,
+  prefix: "auth-rl:",
   message: errorBody(
     "RATE_LIMITED",
     "Too many requests, please try again later.",
@@ -1285,7 +1124,7 @@ app.use(
 // API key management endpoints (rotation, invalidation, listing)
 app.use("/auth/api-keys", require("./src/routes/v1/apiKeyRoutes")(redisClient));
 
-// #497 — Expose RSA public key as a JWKS document so external services can
+// #497 ΓÇö Expose RSA public key as a JWKS document so external services can
 // verify RS256-signed tokens without sharing a secret.
 
 /**
@@ -1304,7 +1143,7 @@ app.get("/.well-known/jwks.json", (_req, res) => {
     const { getJwks } = require("./src/utils/jwt");
     const jwks = getJwks();
     res.setHeader("Content-Type", "application/json");
-    // Cache for 1 hour — key rotations are infrequent and consumers should
+    // Cache for 1 hour ΓÇö key rotations are infrequent and consumers should
     // re-fetch on verification failure anyway.
     res.setHeader("Cache-Control", "public, max-age=3600");
     return res.json(jwks);
@@ -1352,7 +1191,7 @@ app.get("/api/v1/time", (_req, res) => {
 
 app.use(require("./src/routes/v1/healthRoutes")(redisClient));
 
-// #295 — Report 5xx errors to Sentry (via defaultShouldHandleError) before
+// #295 ΓÇö Report 5xx errors to Sentry (via defaultShouldHandleError) before
 // they reach our own JSON error handler below.
 if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
@@ -1447,7 +1286,7 @@ if (require.main === module) {
       startServer();
     })
     .catch((err) => {
-      // Unexpected failure running the check itself — refuse to start deceptively
+      // Unexpected failure running the check itself ΓÇö refuse to start deceptively
       // healthy when we couldn't validate schema parity.
       logger.error(
         err,

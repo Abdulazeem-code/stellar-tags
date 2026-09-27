@@ -12,11 +12,11 @@
 
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
-const { poolGet, poolRun } = require('./src/db');
+const { createRedisConnection } = require('./src/config/redis');
+const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
-  startWebhookWorker,
-  closeWebhookQueue,
+  scheduleWebhookRetryJob,
 } = require('./src/webhookWorker');
 const {
   horizon,
@@ -50,6 +50,7 @@ const healthCheckBreaker = createBreaker(
 // Stream Management
 // ---------------------------------------------------------------------------
 const activeStreams = new Map();
+const fraudStream = process.env.REDIS_URL ? createRedisConnection() : null;
 
 // ---------------------------------------------------------------------------
 // Formatting Helpers
@@ -73,6 +74,12 @@ const formatPayment = (payment, trackedAccount) => {
     `  Created:     ${payment.created_at}`,
     '  ─────────────────────────────────────────',
   ].join('\n');
+};
+
+const publishPaymentForFraudDetection = async (payment) => {
+  if (!fraudStream) return;
+  const payload = { ...payment, event_id: payment.transaction_hash || payment.paging_token };
+  await fraudStream.xadd(PAYMENT_STREAM, '*', 'payload', JSON.stringify(payload));
 };
 
 // ---------------------------------------------------------------------------
@@ -99,10 +106,11 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
+          publishPaymentForFraudDetection(payment).catch((err) =>
+            logger.error({ err, transactionHash: payment.transaction_hash }, 'Failed to publish payment to fraud stream'),
+          );
           dispatchPaymentWebhooks({
             prisma,
-            poolGetFn: poolGet,
-            poolRunFn: poolRun,
             payment,
           }).catch((err) =>
             logger.error(
@@ -187,7 +195,7 @@ const shutdown = async () => {
     logger.info(`  Closed stream for ${address}`);
   }
   activeStreams.clear();
-  await closeWebhookQueue();
+  if (fraudStream) await fraudStream.quit();
   await prisma.$disconnect();
   process.exit(0);
 };
@@ -209,8 +217,12 @@ const main = async () => {
   // Initial sync
   await syncWatchedAccounts();
 
-  // Start the durable Redis-backed webhook delivery worker.
-  startWebhookWorker({ prisma, poolRunFn: poolRun });
+  // Schedule webhook retry / liveness pings
+  try {
+    scheduleWebhookRetryJob({ prisma });
+  } catch (err) {
+    logger.error('Failed to schedule webhook retry job:', err.message);
+  }
 
   // Periodically check for newly registered accounts
   setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
