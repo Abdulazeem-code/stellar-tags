@@ -86,6 +86,10 @@
     "repo",
     "libc",
     "noout",
-    "keyid"
+    "keyid",
+    "mtls",
+    "MTLS",
+    "POSIX",
+    "ZIPKIN"
   ]
 }
