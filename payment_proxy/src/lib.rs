@@ -329,7 +329,7 @@ mod tests {
     /// Second initialize on the same proxy instance is rejected.
     #[test]
     fn initialize_rejects_second_call() {
-        let (env, admin, logic, client) = make_proxy();
+        let (_env, admin, logic, client) = make_proxy();
 
         let result = client.try_initialize(&admin, &logic);
         assert_eq!(result, Err(Ok(ProxyError::AlreadyInitialized)));
@@ -449,7 +449,12 @@ mod tests {
 
         let result =
             client.try_forward(&Symbol::new(&env, "get_admin"), &vec![&env]);
-        assert_eq!(result, Err(Ok(ProxyError::NotInitialized)));
+        // Val does not implement PartialEq, so we cannot use assert_eq! on the
+        // full return type.  Match on only the error branch instead.
+        assert!(
+            matches!(result, Err(Ok(ProxyError::NotInitialized))),
+            "expected NotInitialized error",
+        );
     }
 
     /// forward delegates to the logic contract (uses PaymentProxy as mock
