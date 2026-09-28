@@ -2109,6 +2109,11 @@ impl PaymentRouter {
     /// resulting `token_out` to the recipient. The DEX adapter must return the
     /// received output and any unused input as `[received, unused]`; unused
     /// input is credited to the sender's refund balance.
+    ///
+    /// # Panics
+    /// Panics if the DEX adapter returns a malformed result tuple or a
+    /// token transfer traps.
+    #[allow(clippy::too_many_arguments)]
     pub fn route_payment_with_swap(
         env: Env,
         sender: Address,
@@ -2210,7 +2215,7 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
-        // Pre-validate all payments to avoid rollback panic from require_auth
+        // Pre-validate the whole batch before recording any authorization. An Err returned after require_auths exist aborts the host with a non-unwinding panic instead of a catchable error (fuzz crashes: [valid, amount-0] and [2.3e13, 1] batches), so every fallible check must precede every auth.
         // Pass 1 performs pure checks only (no authorization recorded), so a
         // batch containing an invalid payment returns `Err` before any auth
         // exists that the host would have to roll back: recording 2+
@@ -2228,7 +2233,11 @@ impl PaymentRouter {
             .get(&DataKey::MinLimit)
             .unwrap_or(0);
 
-        for payment in payments.iter() {
+        let current_time = env.ledger().timestamp();
+
+        // Pass 1: pure checks only. Besides the per-payment rules, simulate per-sender daily-limit accumulation and per-(sender, token) debit totals across the batch prefix, mirroring process_single_payment, so processing cannot fail after authorizations are recorded.
+        for i in 0..payments.len() {
+            let payment = payments.get(i).ok_or(Error::LimitExceeded)?;
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
             }
@@ -2242,15 +2251,63 @@ impl PaymentRouter {
                 return Err(Error::LimitExceeded);
             }
             Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
-        }
 
-        // Pass 2: authorize every sender. All payments are known-valid here,
-        // so this cannot be followed by a validation `Err`.
-        for payment in payments.iter() {
-            payment.sender.require_auth();
+            // Prefix sums over payments[0..=i]: same-sender daily accumulation (across all tokens) and same-(sender, token) debit totals for balance sufficiency.
+            let mut sender_accumulated: i128 = 0;
+            let mut pair_total: i128 = 0;
+            for j in 0..=i {
+                let other = payments.get(j).ok_or(Error::LimitExceeded)?;
+                if other.sender == payment.sender {
+                    sender_accumulated = sender_accumulated
+                        .checked_add(other.amount)
+                        .ok_or(Error::LimitExceeded)?;
+                    if other.token_address == payment.token_address {
+                        pair_total = pair_total
+                            .checked_add(other.amount)
+                            .ok_or(Error::LimitExceeded)?;
+                    }
+                }
+            }
+            let spending_key = DataKey::UserSpending(payment.sender.clone());
+            let (stored_reset, stored_amount): (u64, i128) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BytesN<24>>(&spending_key)
+                .map(|packed| unpack_spending(&packed))
+                .unwrap_or((current_time, 0));
+            let base_amount = if current_time.saturating_sub(stored_reset) >= Self::SECONDS_IN_24H {
+                0
+            } else {
+                stored_amount
+            };
+            let projected = base_amount
+                .checked_add(sender_accumulated)
+                .ok_or(Error::LimitExceeded)?;
+            if projected > Self::DAILY_MAX_LIMIT {
+                return Err(Error::LimitExceeded);
+            }
+            let token_client = token::Client::new(&env, &payment.token_address);
+            if token_client.balance(&payment.sender) < pair_total {
+                return Err(Error::InsufficientBalance);
+            }
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        // Pass 2: authorize each unique sender once. Authorizing the same address twice in one invocation aborts the host under some runners.
+        for i in 0..payments.len() {
+            let sender = payments.get(i).ok_or(Error::LimitExceeded)?.sender;
+            let mut seen = false;
+            for j in 0..i {
+                if payments.get(j).ok_or(Error::LimitExceeded)?.sender == sender {
+                    seen = true;
+                    break;
+                }
+            }
+            if !seen {
+                sender.require_auth();
+            }
+        }
 
         for payment in payments.iter() {
             Self::process_single_payment(

@@ -29,6 +29,18 @@ if (typeof window !== "undefined") {
   //@ts-ignore Buffer exists
   window.Buffer = window.Buffer || Buffer;
 }
+/**
+ * Known deployments of the payment_router contract. The WASM-based generator
+ * cannot emit these (it has no network context), so scripts/generate-bindings.sh
+ * injects them after generation.
+ */
+export const networks = {
+  testnet: {
+    networkPassphrase: "Test SDF Network ; September 2015",
+    contractId: "CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER",
+  },
+} as const;
+
 
 
 
@@ -1160,14 +1172,3 @@ export class Client extends ContractClient {
         route_payment_with_swap: this.txFromJSON<Result<void>>
   }
 }
-/**
- * Known deployments of the payment_router contract. The WASM-based generator
- * cannot emit these (it has no network context), so scripts/generate-bindings.sh
- * injects them after generation.
- */
-export const networks = {
-  testnet: {
-    networkPassphrase: "Test SDF Network ; September 2015",
-    contractId: "CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER",
-  },
-} as const;
