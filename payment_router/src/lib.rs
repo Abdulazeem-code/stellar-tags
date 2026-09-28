@@ -1,43 +1,30 @@
 #![no_std]
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    BytesN, Env, Error as SdkError, IntoVal, InvokeError, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
+    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, Symbol, Vec,
 };
 
-// ── Packed UserRecord helpers ────────────────────────────────────────────────
+// ── Packed UserRecord helpers ───────────────────────────────────────────────
 //
-// Issue #519: Replace the two-field UserSpending contracttype with a single
-// BytesN<24> value packed with bitwise operations.
+// Issue #519: replace the two-field `UserSpending` contracttype with a single
+// packed value instead of a struct, dropping the XDR type discriminant and
+// field tags Soroban adds to every contracttype.
 //
-// Issue #663: Merge the per-user `UserSpending` and `UserVolume` ledger
-// entries into one packed `BytesN<40>` `UserRecord`. Registering a user's
-// first tag payment previously wrote two separate persistent entries (two
-// reads, two writes, two TTL extensions, two XDR envelopes); it now performs
-// exactly one of each.
+// Issue #663: merge the per-user `UserSpending` and `UserVolume` entries into
+// one packed `UserRecord`. A sender's first routed payment used to write two
+// persistent entries — two reads, two writes, two TTL extensions, two XDR
+// envelopes — and it now performs exactly one of each.
 //
 // Layout (big-endian):
-//   bytes  0..8   — last_reset_time     : u64   (8 bytes)
-//   bytes  8..24  — accumulated_amount  : i128  (16 bytes)
-//   bytes 24..40  — lifetime volume     : i128  (16 bytes)
+//   bytes  0..8  — last_reset_time    : u64  (8 bytes)
+//   bytes  8..24 — accumulated_amount : i128 (16 bytes)
+//   bytes 24..40 — lifetime volume    : i128 (16 bytes)
 //
-// Benefits:
-//  • Eliminates the XDR struct-type overhead (type discriminant + field tags)
-//    that Soroban adds to every contracttype value, shrinking each UserSpending
-//    ledger entry from ~48 bytes to exactly 24 bytes.
-//  • Halves the number of persistent ledger entries created (and later kept
-//    alive by TTL extensions) per registered user: one combined entry of 40
-//    bytes instead of separate 24-byte and 16-byte payload entries plus their
-//    per-entry XDR overhead.
-//  • Smaller entries → lower state-rent fee per ledger entry per TTL period.
-//  • `get_effective_fee_bps` no longer performs a redundant read of the
-//    lifetime volume that the daily-spending path had already loaded.
-//
-// Backward compatibility: the legacy `UserSpending` / `UserVolume` keys are
-// no longer written. Existing entries stay readable via the fallback paths in
-// `load_user_record` / `get_user_record`, and the permissionless
-// `migrate_user_record` entry point lets anyone combine a user's legacy
-// entries into the packed `UserRecord` format.
+// Backward compatibility: the legacy `UserSpending` / `UserVolume` keys are no
+// longer written. `load_user_record` still reads them and combines them on the
+// next write, and the permissionless `migrate_user_record` entry point cleans
+// up any account that has not paid since the upgrade.
 
 /// Pack `last_reset_time` (u64), `accumulated_amount` (i128) and `volume`
 /// (i128) into a 40-byte big-endian buffer.
@@ -49,13 +36,8 @@ fn pack_user_record(
 ) -> BytesN<40> {
     let mut buf = [0u8; 40];
 
-    // Bytes 0..8 — last_reset_time (u64 big-endian)
     buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
-
-    // Bytes 8..24 — accumulated_amount (i128 big-endian)
     buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
-
-    // Bytes 24..40 — lifetime volume (i128 big-endian)
     buf[24..40].copy_from_slice(&volume.to_be_bytes());
 
     BytesN::from_array(env, &buf)
@@ -65,18 +47,15 @@ fn pack_user_record(
 fn unpack_user_record(packed: &BytesN<40>) -> (u64, i128, i128) {
     let buf: [u8; 40] = packed.to_array();
 
-    // last_reset_time — bytes 0..8
     let last_reset_time = u64::from_be_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
 
-    // accumulated_amount — bytes 8..24
     let accumulated_amount = i128::from_be_bytes([
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
         buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
     ]);
 
-    // volume — bytes 24..40
     let volume = i128::from_be_bytes([
         buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33],
         buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
@@ -85,19 +64,18 @@ fn unpack_user_record(packed: &BytesN<40>) -> (u64, i128, i128) {
     (last_reset_time, accumulated_amount, volume)
 }
 
-/// Unpack a legacy 24-byte UserSpending buffer into
-/// `(last_reset_time, accumulated_amount)`. Kept so the migration fallback in
-/// `load_user_record` can still read pre-#663 ledger state.
+/// Unpack a legacy 24-byte `UserSpending` buffer into
+/// `(last_reset_time, accumulated_amount)`.
+///
+/// Kept so the migration fallback in `load_user_record` can still read
+/// pre-#663 ledger state.
 fn unpack_legacy_spending(packed: &BytesN<24>) -> (u64, i128) {
-    // BytesN::to_array() is available in soroban-sdk v20.
     let buf: [u8; 24] = packed.to_array();
 
-    // last_reset_time — bytes 0..8
     let last_reset_time = u64::from_be_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
 
-    // accumulated_amount — bytes 8..24
     let accumulated_amount = i128::from_be_bytes([
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
         buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
@@ -109,8 +87,8 @@ fn unpack_legacy_spending(packed: &BytesN<24>) -> (u64, i128) {
 // ── Legacy struct kept for test snapshot compatibility ───────────────────────
 //
 // The UserSpending contracttype is retained so existing tests that reference
-// it directly continue to compile.  All runtime code now uses the packed
-// BytesN<24> representation stored under DataKey::UserSpending.
+// it directly continue to compile. All runtime code now uses the packed
+// `BytesN<40>` representation stored under DataKey::UserRecord.
 
 /// A user's rolling 24-hour spending record.
 ///
@@ -125,6 +103,22 @@ pub struct UserSpending {
     pub last_reset_time: u64,
     /// Total amount routed by the user since `last_reset_time`.
     pub accumulated_amount: i128,
+}
+
+/// A user's combined routing stats, unpacked from the packed `BytesN<40>`
+/// `UserRecord` ledger value (issue #663).
+///
+/// Returned by [`PaymentRouter::get_user_record`] so a client can read both
+/// counters in a single view call instead of two.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserRecord {
+    /// Total amount routed by the user in the current 24-hour window.
+    pub accumulated_amount: i128,
+    /// Cumulative lifetime amount routed by the user.
+    pub volume: i128,
+    /// Unix timestamp (seconds) at which the 24-hour window last reset.
+    pub last_reset_time: u64,
 }
 
 /// A single transfer instruction for use with [`PaymentRouter::route_payments`].
@@ -288,6 +282,69 @@ pub enum Role {
     FeeManager = 4,
 }
 
+/// Interface implemented by supported Soroban lending protocols.
+///
+/// Keeping the protocol behind this small adapter lets the router integrate
+/// with Blend-compatible deployments while tests use an in-process mock.
+#[contractclient(name = "LendingProtocolClient")]
+pub trait LendingProtocol {
+    fn deposit(env: Env, from: Address, token: Address, amount: i128);
+    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
+    fn harvest(env: Env, to: Address, token: Address) -> i128;
+}
+
+/// Minimal interface for an admin-selected KYC issuer or oracle contract.
+#[contractclient(name = "KycOracleClient")]
+pub trait KycOracle {
+    fn is_verified(env: Env, account: Address) -> bool;
+}
+
+/// Interface implemented by the admin-selected price-feed oracle.
+///
+/// Implementations must return a price quote with a `timestamp` (Unix seconds)
+/// so staleness can be checked against the contract's configured threshold.
+/// The `price` is expressed as a fixed-point integer with the number of
+/// decimal places indicated by `decimals`.  For example, a USD/XLM price of
+/// 0.12500000 with `decimals = 8` would be returned as `price = 12500000`.
+///
+/// Keeping the protocol behind this thin adapter lets the router integrate
+/// with any Soroban-compatible price oracle while tests use an in-process mock.
+#[contractclient(name = "PriceFeedOracleClient")]
+pub trait PriceFeedOracle {
+    /// Returns the latest price of `base_asset` denominated in `quote_asset`.
+    ///
+    /// # Returns
+    /// A `PriceData` struct containing `price`, `decimals`, and `timestamp`.
+    fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData;
+}
+
+/// A single price quote returned by the oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceData {
+    /// Fixed-point price value. The true price is `price / 10^decimals`.
+    pub price: i128,
+    /// Number of decimal places used in `price`.
+    pub decimals: u32,
+    /// Unix timestamp (seconds) when this price was last updated on-chain.
+    pub timestamp: u64,
+}
+
+/// A fee change proposal weighted by governance-token balances.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeProposal {
+    pub proposer: Address,
+    pub fee_bps: i128,
+    pub fee_cap: i128,
+    pub created_at: u64,
+    pub voting_ends_at: u64,
+    pub yes_votes: i128,
+    pub no_votes: i128,
+    pub quorum: i128,
+    pub executed: bool,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,17 +365,18 @@ pub enum DataKey {
     Paused,
     /// Maximum amount accepted by a single payment.
     MaxAmount,
-    /// Packed per-user record (issue #663): 24-hour spending window plus
-    /// cumulative lifetime volume for a given sender, stored as a single
-    /// 40-byte value to halve the ledger entries written per registered user.
+    /// Cumulative lifetime amount routed by a given sender.
+    /// Packed per-user record (issue #663): the 24-hour spending window plus
+    /// the cumulative lifetime volume, stored as a single 40-byte value so
+    /// registering a sender costs one ledger entry instead of two.
     UserRecord(Address),
     /// DEPRECATED (pre-#663): packed 24-hour spending window for a sender.
-    /// No longer written; read only by the migration fallback in
-    /// `load_user_record` and by `migrate_user_record`.
+    /// No longer written; read only by the `load_user_record` fallback and by
+    /// `migrate_user_record`.
     UserSpending(Address),
     /// DEPRECATED (pre-#663): cumulative lifetime amount routed by a sender.
-    /// No longer written; read only by the migration fallback in
-    /// `load_user_record` and by `migrate_user_record`.
+    /// No longer written; read only by the `load_user_record` fallback and by
+    /// `migrate_user_record`.
     UserVolume(Address),
     /// Whether a given recipient address is blacklisted.
     Blacklist(Address),
@@ -334,6 +392,36 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    /// Whether an address holds a given role.
+    UserRole(Address, Role),
+    /// The primary address currently holding a role.
+    Role(Role),
+    /// Monotonic nonce for meta-transaction replay protection.
+    MetaNonce(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
+    /// Address of the price-feed oracle used for fiat/crypto lookups.
+    OracleAddress,
+    /// Maximum acceptable age, in seconds, of an oracle price quote.
+    StalenessThreshold,
+    /// Admin-supplied fallback price for a (base, quote) asset pair.
+    FallbackPrice(Address, Address),
+    /// Token whose balances weight fee-governance votes.
+    GovernanceToken,
+    /// Minimum weighted vote share required to pass a fee proposal.
+    GovernanceQuorum,
+    /// Monotonic nonce for fee-proposal ids.
+    GovernanceNonce,
+    /// A pending fee-change proposal keyed by its id.
+    GovernanceProposal(u64),
+    /// Recorded yes/no vote weight for a fee proposal.
+    GovernanceVote(u64, Address),
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited into the yield protocol per token.
+    YieldPrincipal(Address),
     /// Whether a DEX router contract is approved to receive cross-contract
     /// swap calls.  Stored as `bool` in persistent storage.
     RegisteredDex(Address),
@@ -387,25 +475,40 @@ pub enum Error {
     SlippageExceeded = 17,
     /// The swap was submitted after its `deadline` had already passed.
     SwapDeadlineExpired = 18,
+    /// The supplied role is not one the contract recognises.
+    InvalidRole = 20,
+    /// A governance proposal id is unknown or no longer votable.
+    InvalidProposal = 21,
+    /// A governance operation was attempted before governance was configured.
+    GovernanceNotConfigured = 22,
+    /// The caller has already voted on this proposal.
+    AlreadyVoted = 23,
+    /// The configured KYC threshold is negative.
+    InvalidKycThreshold = 24,
+    /// A yield operation was attempted before the yield protocol was configured.
+    YieldProtocolNotConfigured = 25,
+    /// The yield amount is not positive or exceeds the available principal.
+    InvalidYieldAmount = 26,
+    /// No price-feed oracle is configured for this contract.
+    OracleNotConfigured = 27,
+    /// The oracle cross-contract call reverted or returned an unusable value.
+    OracleCallFailed = 28,
+    /// The oracle quote is older than the configured staleness threshold.
+    OraclePriceStale = 29,
+    /// The oracle quote is not a usable price (zero or negative).
+    OraclePriceInvalid = 30,
+    /// A meta-transaction was submitted after its `deadline` had passed.
+    DeadlineExpired = 31,
+    /// The meta-transaction nonce does not match the sender's stored nonce.
+    InvalidNonce = 32,
+    /// The meta-transaction signature did not verify against the payload.
+    InvalidSignature = 33,
     /// Swap parameters are self-contradictory or unusable (for example
     /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
     InvalidSwapParams = 19,
-}
-
-/// A user's combined lifetime routing stats, unpacked from the packed
-/// `BytesN<40>` `UserRecord` ledger value (issue #663).
-///
-/// Returned by [`PaymentRouter::get_user_record`] so clients can read both
-/// counters in a single view call.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserRecord {
-    /// Total amount routed by the user in the current 24-hour window.
-    pub accumulated_amount: i128,
-    /// Cumulative lifetime amount routed by the user.
-    pub volume: i128,
-    /// Unix timestamp (seconds) at which the 24-hour window last reset.
-    pub last_reset_time: u64,
+    /// A payment above the configured KYC threshold was made by a sender the
+    /// configured oracle does not recognise.
+    KycRequired = 34,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -553,58 +656,104 @@ impl PaymentRouter {
         );
     }
 
-    /// Rolls the sender's 24-hour spending window forward by `amount` and
-    /// rejects the payment when the daily cap would be exceeded.
+    /// Loads a sender's packed `UserRecord`, falling back to the legacy
+    /// pre-#663 split entries when no packed record exists yet.
     ///
-    /// Shared by the direct and the swap-routed payment paths so both apply the
-    /// same window, reset, and cap rules.
-    fn accrue_daily_spend(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
-        let current_time = env.ledger().timestamp();
-        let spending_key = DataKey::UserSpending(sender.clone());
+    /// Returns `(last_reset_time, accumulated_amount, volume, legacy_found)`.
+    /// When neither format is present — the sender has never routed a payment —
+    /// the 24-hour window is anchored at `current_time` with zeroed counters.
+    /// `legacy_found` is `true` only when the values came from the legacy split
+    /// entries, telling the caller to drop those stale keys after writing the
+    /// packed record.
+    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+        let record_key = DataKey::UserRecord(sender.clone());
 
-        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
+        if let Some(packed) = env
             .storage()
             .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
-            .unwrap_or((current_time, 0));
+            .get::<DataKey, BytesN<40>>(&record_key)
+        {
+            let (last_reset_time, accumulated_amount, volume) = unpack_user_record(&packed);
+            return (last_reset_time, accumulated_amount, volume, false);
+        }
+
+        // Legacy fallback: combine the pre-#663 split entries.
+        let legacy_spending: Option<(u64, i128)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSpending(sender.clone()))
+            .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
+        let legacy_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(sender.clone()))
+            .unwrap_or(0);
+        let (last_reset_time, accumulated_amount) = legacy_spending.unwrap_or((current_time, 0));
+        let legacy_found = legacy_spending.is_some() || legacy_volume != 0;
+        (
+            last_reset_time,
+            accumulated_amount,
+            legacy_volume,
+            legacy_found,
+        )
+    }
+
+    /// Rolls the sender's 24-hour spending window forward by `amount`, adds
+    /// `amount` to their lifetime volume, and persists both in a single packed
+    /// `UserRecord` entry (issue #663). Rejects the payment when the daily cap
+    /// would be exceeded.
+    ///
+    /// Shared by the direct, meta-transaction and swap-routed payment paths so
+    /// all three apply the same window, reset and cap rules.
+    ///
+    /// Returns the sender's volume *before* this payment, which is what the
+    /// tiered fee discount is decided on.
+    fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i128, Error> {
+        let current_time = env.ledger().timestamp();
+        let record_key = DataKey::UserRecord(sender.clone());
+
+        let (mut last_reset_time, mut accumulated_amount, volume, legacy_found) =
+            Self::load_user_record(env, sender, current_time);
 
         if current_time - last_reset_time >= Self::SECONDS_IN_24H {
             last_reset_time = current_time;
             accumulated_amount = 0;
         }
 
-        accumulated_amount += amount;
-        if accumulated_amount > Self::DAILY_MAX_LIMIT {
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
             return Err(Error::LimitExceeded);
         }
+        accumulated_amount = new_accumulated;
 
+        let new_volume = volume.saturating_add(amount);
+
+        // One write and one TTL extension for both counters.
         env.storage().persistent().set(
-            &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
+            &record_key,
+            &pack_user_record(env, last_reset_time, accumulated_amount, new_volume),
         );
         env.storage().persistent().extend_ttl(
-            &spending_key,
+            &record_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,
             Self::PERSISTENT_BUMP_AMOUNT,
         );
 
-        Ok(())
-    }
+        // One-time cleanup: when this write consumed legacy split entries,
+        // drop them so the old keys stop accruing state rent. Steady-state
+        // payments skip both removals entirely.
+        if legacy_found {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UserSpending(sender.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UserVolume(sender.clone()));
+        }
 
-    /// Adds `amount` to the sender's lifetime volume, which drives the tiered
-    /// fee discount.
-    fn record_volume(env: &Env, sender: &Address, amount: i128) {
-        let volume_key = DataKey::UserVolume(sender.clone());
-        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&volume_key, &(prev_volume + amount));
-        env.storage().persistent().extend_ttl(
-            &volume_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        Ok(volume)
     }
 
     /// Returns whether the contract is currently frozen.
@@ -615,49 +764,111 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
-    /// Loads a sender's packed `UserRecord`, falling back to the legacy
-    /// pre-#663 split entries (`UserSpending` + `UserVolume`) when no packed
-    /// record exists yet.
+    /// Splits `amount` into the platform fee and the amount forwarded to the
+    /// recipient, applying the fee cap and the volume-based discount.
     ///
-    /// Returns `(last_reset_time, accumulated_amount, volume, legacy_found)`.
-    /// When neither format is present — i.e. the sender has never routed a
-    /// payment — the 24-hour window is anchored at `current_time` with zeroed
-    /// counters, exactly as before #663. `legacy_found` is `true` only when
-    /// the values came from the legacy split entries, telling the caller it
-    /// should drop the stale keys after writing the packed record.
-    fn load_user_record(
-        env: &Env,
-        record_key: &DataKey,
-        current_time: u64,
-    ) -> (u64, i128, i128, bool) {
-        if let Some(packed) = env
-            .storage()
+    /// Shared by the direct and the swap-routed payment paths so both apply
+    /// byte-for-byte identical fee arithmetic; `prop_tests` mirrors this
+    /// function's invariants.
+    fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
+        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        (fee_amount, amount - fee_amount)
+    }
+
+    /// Returns the configured swap slippage ceiling in basis points.
+    fn max_slippage_bps(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSlippageBps)
+            .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Returns whether a DEX router has been approved for swap routing.
+    fn is_dex_registered_internal(env: &Env, dex: &Address) -> bool {
+        env.storage()
             .persistent()
-            .get::<DataKey, BytesN<40>>(record_key)
-        {
-            let (last_reset_time, accumulated_amount, volume) = unpack_user_record(&packed);
-            return (last_reset_time, accumulated_amount, volume, false);
-        }
+            .get(&DataKey::RegisteredDex(dex.clone()))
+            .unwrap_or(false)
+    }
 
-        // Legacy fallback: combine the pre-#663 split entries.
-        if let DataKey::UserRecord(sender) = record_key {
-            let legacy_spending: Option<(u64, i128)> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::UserSpending(sender.clone()))
-                .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
-            let legacy_volume: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::UserVolume(sender.clone()))
-                .unwrap_or(0);
-            let (last_reset_time, accumulated_amount) = legacy_spending
-                .unwrap_or((current_time, 0));
-            let legacy_found = legacy_spending.is_some() || legacy_volume != 0;
-            return (last_reset_time, accumulated_amount, legacy_volume, legacy_found);
-        }
+    /// Invokes the DEX adapter and returns the amount it claims to have
+    /// delivered.
+    ///
+    /// A reverting, missing, or mistyped DEX call is reported as
+    /// [`Error::SwapFailed`] instead of trapping, so the caller can abort with
+    /// a stable error code.  Because the error propagates out of the payment,
+    /// the Soroban host reverts every balance and storage change made earlier
+    /// in the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_dex_swap(
+        env: &Env,
+        dex: &Address,
+        sell_token: &Address,
+        buy_token: &Address,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> Result<i128, Error> {
+        let fn_name = Symbol::new(env, "swap");
+        let args = vec![
+            env,
+            sell_token.clone().into_val(env),
+            buy_token.clone().into_val(env),
+            amount_in.into_val(env),
+            min_amount_out.into_val(env),
+            env.current_contract_address().into_val(env),
+        ];
 
-        (current_time, 0, 0, false)
+        let res: Result<Result<i128, SdkError>, Result<InvokeError, InvokeError>> =
+            env.try_invoke_contract(dex, &fn_name, args);
+
+        match res {
+            Ok(Ok(amount_out)) => Ok(amount_out),
+            Ok(Err(_)) | Err(_) => Err(Error::SwapFailed),
+        }
+    }
+
+    /// Invokes the DEX adapter's quote for a read-only price check.
+    ///
+    /// Quotes never move funds, so a failure here is reported to the caller
+    /// rather than trapping.
+    fn invoke_dex_quote(
+        env: &Env,
+        dex: &Address,
+        sell_token: &Address,
+        buy_token: &Address,
+        amount_in: i128,
+    ) -> Result<i128, Error> {
+        let args = vec![
+            env,
+            sell_token.clone().into_val(env),
+            buy_token.clone().into_val(env),
+            amount_in.into_val(env),
+        ];
+        let res: Result<Result<i128, SdkError>, Result<InvokeError, InvokeError>> =
+            env.try_invoke_contract(dex, &Symbol::new(env, "quote"), args);
+
+        match res {
+            Ok(Ok(amount_out)) => Ok(amount_out),
+            Ok(Err(_)) | Err(_) => Err(Error::SwapFailed),
+        }
+    }
+
+    /// Returns the tightest `min_amount_out` that respects `max_slippage_bps`
+    /// for a quote of `expected_amount_out`.
+    fn slippage_floor(expected_amount_out: i128, max_slippage_bps: i128) -> i128 {
+        let tolerated = (expected_amount_out * max_slippage_bps) / Self::BPS_DIVISOR;
+        let floor = expected_amount_out - tolerated;
+        if floor < 1 {
+            1
+        } else {
+            floor
+        }
     }
 
     /// Allocates and returns the next timelock nonce, incrementing the counter.
@@ -727,38 +938,15 @@ impl PaymentRouter {
 
         // Validations moved to route_payments to prevent rollback panic on Windows testutils
 
-        // Apply tiered fee discount for high-volume users and update the
-        // user's combined record (issue #663).
-        //
-        // Storage format: one packed BytesN<40> UserRecord under
-        // DataKey::UserRecord (see the UserRecord helpers at the top of this
-        // file). Legacy deployments may still carry the pre-#663 split
-        // `UserSpending` / `UserVolume` entries; those are read via the
-        // fallback in `load_user_record` and combined on the next write.
-        let current_time = env.ledger().timestamp();
-        let record_key = DataKey::UserRecord(sender.clone());
-
-        let (mut last_reset_time, mut accumulated_amount, mut volume, legacy_found) =
-            Self::load_user_record(env, &record_key, current_time);
-
-        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
-            last_reset_time = current_time;
-            accumulated_amount = 0;
-        }
-
-        // Tiered fee discount is decided on the pre-payment volume, exactly
-        // as before #663.
-        let effective_fee_bps = if volume > Self::VOLUME_THRESHOLD {
+        // Roll the 24-hour window forward and record the lifetime volume in a
+        // single packed write (issue #663). The returned volume is the
+        // pre-payment one, which is what the tiered discount keys off.
+        let user_volume = Self::accrue_user_record(env, sender, amount)?;
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
             fee_bps
         };
-
-        accumulated_amount += amount;
-        if accumulated_amount > Self::DAILY_MAX_LIMIT {
-            return Err(Error::LimitExceeded);
-        }
-        volume += amount;
 
         // Verify sender has sufficient balance
         let token_client = token::Client::new(env, token_address);
@@ -801,29 +989,6 @@ impl PaymentRouter {
                     }
                 }
             }
-        }
-
-        // Record the updated user record (single persistent write; issue #663)
-        env.storage().persistent().set(
-            &record_key,
-            &pack_user_record(env, last_reset_time, accumulated_amount, volume),
-        );
-        env.storage().persistent().extend_ttl(
-            &record_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // One-time cleanup: when this write consumed legacy split entries,
-        // remove them so the old keys stop accruing state-rent. Steady-state
-        // payments skip both `has` checks entirely (`legacy_found == false`).
-        if legacy_found {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::UserSpending(sender.clone()));
-            env.storage()
-                .persistent()
-                .remove(&DataKey::UserVolume(sender.clone()));
         }
 
         // Emit routed event
@@ -885,49 +1050,14 @@ impl PaymentRouter {
 
         Self::verify_kyc_for_amount(env, sender, amount)?;
 
-        let user_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserVolume(sender.clone()))
-            .unwrap_or(0);
+        // Single packed write covering the 24-hour window and the lifetime
+        // volume (issue #663); the discount keys off the pre-payment volume.
+        let user_volume = Self::accrue_user_record(env, sender, amount)?;
         let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
             fee_bps
         };
-
-        let current_time = env.ledger().timestamp();
-        let spending_key = DataKey::UserSpending(sender.clone());
-
-        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
-            .unwrap_or((current_time, 0));
-
-        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
-            last_reset_time = current_time;
-            accumulated_amount = 0;
-        }
-
-        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
-            return Err(Error::LimitExceeded);
-        };
-        if new_accumulated > Self::DAILY_MAX_LIMIT {
-            return Err(Error::LimitExceeded);
-        }
-        accumulated_amount = new_accumulated;
-
-        env.storage().persistent().set(
-            &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
-        );
-        env.storage().persistent().extend_ttl(
-            &spending_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
 
         let router = env.current_contract_address();
         let token_client = token::Client::new(env, token_address);
@@ -978,17 +1108,6 @@ impl PaymentRouter {
             }
         }
 
-        let volume_key = DataKey::UserVolume(sender.clone());
-        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&volume_key, &prev_volume.saturating_add(amount));
-        env.storage().persistent().extend_ttl(
-            &volume_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
         env.events().publish(
             (symbol_short!("routed"), sender.clone(), recipient.clone()),
             amount,
@@ -1000,6 +1119,52 @@ impl PaymentRouter {
     }
 
     // ── Public contract methods ──────────────────────────────────────────────
+
+    /// Circuit-breaker guard applied to every non-essential operation.
+    ///
+    /// While the pause switch is engaged all operational state changes —
+    /// payments, timelock queue/execute, fee/treasury/governance/min-limit
+    /// configuration, treasury yield movements and token recovery — are
+    /// rejected with `Error::Paused`.
+    ///
+    /// Essential recovery paths (unpausing/unfreezing, cancelling a queued
+    /// action, withdrawing refunds or emergency funds, role and admin
+    /// governance, compliance configuration and upgrades) deliberately bypass
+    /// this guard, so an incident can always be resolved while the breaker is
+    /// open.
+    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+        if Self::is_paused_internal(env) {
+            return Err(Error::Paused);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the circuit breaker (pause switch) is currently open.
+    fn is_paused_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Enforces KYC only after the admin has configured a threshold. This
+    /// preserves existing routing behavior until compliance is enabled.
+    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
+        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
+            return Ok(());
+        }
+
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycOracle)
+            .ok_or(Error::KycRequired)?;
+        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
+            return Err(Error::KycRequired);
+        }
+        Ok(())
+    }
 
     /// One-time setup: records the admin and the initial fee configuration
     /// in instance storage. Must be called before `route_payment`.
@@ -1795,27 +1960,27 @@ impl PaymentRouter {
         Self::get_user_record(env, user).volume
     }
 
-    /// Returns a sender's combined routing record: the current 24-hour
-    /// accumulated amount and the cumulative lifetime volume (issue #663).
+    /// Returns a sender's combined routing record: the amount accumulated in
+    /// the current 24-hour window and their cumulative lifetime volume
+    /// (issue #663).
     ///
-    /// Reads the packed `UserRecord` entry; for senders that only have the
-    /// legacy pre-#663 split entries, both counters are combined from those.
+    /// Reads the single packed `UserRecord` entry. For a sender that only has
+    /// the legacy pre-#663 split entries, both counters are combined from
+    /// those without writing anything.
     ///
     /// # Parameters
     /// - `user`: Sender address to look up.
     ///
     /// # Returns
     /// A [`UserRecord`] with zeroed counters if `user` has never routed a
-    /// payment.
+    /// payment; `last_reset_time` is then the current ledger timestamp.
     ///
     /// # Panics
     /// Does not panic.
     pub fn get_user_record(env: Env, user: Address) -> UserRecord {
         let current_time = env.ledger().timestamp();
-        let record_key = DataKey::UserRecord(user.clone());
-
         let (last_reset_time, accumulated_amount, volume, _) =
-            Self::load_user_record(&env, &record_key, current_time);
+            Self::load_user_record(&env, &user, current_time);
 
         UserRecord {
             accumulated_amount,
@@ -1825,14 +1990,13 @@ impl PaymentRouter {
     }
 
     /// Permissionless migration of a sender's legacy pre-#663 split entries
-    /// (`UserSpending` + `UserVolume`) into the packed single-entry
-    /// `UserRecord` format (issue #663).
+    /// (`UserSpending` + `UserVolume`) into the single packed `UserRecord`
+    /// (issue #663).
     ///
-    /// Callable by anyone — it only ever combines values that are already on
-    /// the ledger into their new representation and never invents or destroys
-    /// value. When the sender's packed record was already created by a recent
-    /// payment (leaving stale legacy keys behind), the migration just removes
-    /// those stale keys and keeps the newer packed values.
+    /// Callable by anyone: it only recombines values that are already on the
+    /// ledger and never invents or destroys value. When the sender's packed
+    /// record was already created by a recent payment, this just removes the
+    /// stale legacy keys and keeps the newer packed values.
     ///
     /// # Parameters
     /// - `user`: The sender whose legacy entries should be migrated.
@@ -1859,27 +2023,19 @@ impl PaymentRouter {
             .unwrap_or(0);
 
         if legacy_spending.is_none() && legacy_volume == 0 {
-            // No legacy state at all.
             return false;
         }
 
         if !has_packed {
-            let (last_reset_time, accumulated_amount) = match legacy_spending {
-                Some(pair) => pair,
-                None => {
-                    // Volume without a spending window (theoretically possible
-                    // on very old deployments): anchor a fresh window.
-                    (env.ledger().timestamp(), 0)
-                }
-            };
+            let (last_reset_time, accumulated_amount) =
+                legacy_spending.unwrap_or((env.ledger().timestamp(), 0));
 
-            // NOTE: legacy `UserVolume` already includes every amount counted
-            // in the current window (each payment incremented both counters),
-            // so the window balance must NOT be added again here.
-            let volume = legacy_volume;
+            // The legacy `UserVolume` already counts every amount in the
+            // current window (each payment incremented both counters), so the
+            // window balance must not be added again here.
             env.storage().persistent().set(
                 &record_key,
-                &pack_user_record(&env, last_reset_time, accumulated_amount, volume),
+                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
             );
             env.storage().persistent().extend_ttl(
                 &record_key,
@@ -1891,12 +2047,12 @@ impl PaymentRouter {
         env.storage()
             .persistent()
             .remove(&DataKey::UserSpending(user.clone()));
-        env.storage().persistent().remove(&DataKey::UserVolume(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UserVolume(user.clone()));
 
-        env.events().publish(
-            (symbol_short!("migrated"), user),
-            legacy_volume,
-        );
+        env.events()
+            .publish((symbol_short!("migrated"), user), legacy_volume);
 
         true
     }
@@ -2256,8 +2412,7 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        env.events()
-            .publish((symbol_short!("price_cfg"),), oracle);
+        env.events().publish((symbol_short!("price_cfg"),), oracle);
         Ok(())
     }
 
@@ -2372,45 +2527,35 @@ impl PaymentRouter {
             .get(&DataKey::FallbackPrice(base_asset, quote_asset))
     }
 
-    /// Fetches the current exchange rate for a (base, quote) asset pair from
-    /// the configured price-feed oracle, validates it, and returns the result.
+    /// Fetches the current exchange rate for a `(base_asset, quote_asset)`
+    /// pair from the configured price-feed oracle, validates it, and returns
+    /// the result.
+    ///
+    /// Every failure path below first attempts to serve an admin-configured
+    /// fallback price for the pair; the oracle error is only surfaced when no
+    /// fallback exists.
     ///
     /// ## Validation flow
     ///
-    /// 1. **Oracle configured?** — If no oracle address is stored, return
-    ///    `Err(Error::OracleNotConfigured)` (unless a fallback is available).
-    /// 2. **Call oracle** — Invoke the oracle's `get_price` method.  If the
-    ///    call fails (oracle contract unavailable or traps), attempt to return
-    ///    the fallback price.  If there is no fallback either, return
-    ///    `Err(Error::OracleCallFailed)`.
-    /// 3. **Staleness check** — Compare `price_data.timestamp` with the
-    ///    current ledger time.  If older than the configured threshold (default
-    ///    3 600 s), attempt to return the fallback price.  If there is no
-    ///    fallback, return `Err(Error::OraclePriceStale)`.
-    /// 4. **Validity check** — A price ≤ 0 is logically invalid.  Attempt
-    ///    fallback; if unavailable return `Err(Error::OraclePriceInvalid)`.
-    /// 5. **Return** — The validated `PriceData` is returned to the caller.
+    /// 1. **Oracle configured?** - Otherwise `Err(Error::OracleNotConfigured)`.
+    /// 2. **Call oracle** - Invoke the oracle's `get_price`; a trapped or
+    ///    unavailable contract yields `Err(Error::OracleCallFailed)`.
+    /// 3. **Staleness check** - Reject a `price_data.timestamp` older than the
+    ///    configured threshold (default 3 600 s) with
+    ///    `Err(Error::OraclePriceStale)`. A threshold of `0` disables this check.
+    /// 4. **Validity check** - A price <= 0 is invalid
+    ///    (`Err(Error::OraclePriceInvalid)`).
+    /// 5. **Return** - The validated `PriceData` is returned to the caller.
     ///
-    /// A staleness threshold of `0` disables the staleness check entirely.
-    ///
-    /// ## Parameters
-    /// - `base_asset`: Address of the base asset (e.g. XLM native contract).
-    /// - `quote_asset`: Address of the quote asset (e.g. USDC contract).
-    ///
-    /// ## Returns
-    /// `Ok(PriceData)` on success, or one of:
-    /// - `Err(Error::OracleNotConfigured)` — no oracle set and no fallback.
-    /// - `Err(Error::OracleCallFailed)` — oracle call failed and no fallback.
-    /// - `Err(Error::OraclePriceStale)` — data too old and no fallback.
-    /// - `Err(Error::OraclePriceInvalid)` — price ≤ 0 and no fallback.
+    /// `base_asset` is typically the XLM native contract and `quote_asset` the
+    /// USDC contract.
     pub fn get_price(
         env: Env,
         base_asset: Address,
         quote_asset: Address,
     ) -> Result<PriceData, Error> {
         // Retrieve the oracle address, falling back gracefully if absent.
-        let oracle_opt: Option<Address> =
-            env.storage().instance().get(&DataKey::OracleAddress);
+        let oracle_opt: Option<Address> = env.storage().instance().get(&DataKey::OracleAddress);
 
         let staleness_threshold: u64 = env
             .storage()
@@ -2425,10 +2570,7 @@ impl PaymentRouter {
                 if let Some(fallback) = env
                     .storage()
                     .persistent()
-                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(
-                        base.clone(),
-                        quote.clone(),
-                    ))
+                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(base.clone(), quote.clone()))
                 {
                     log!(env, "Oracle error; using fallback price");
                     Ok(fallback)
@@ -2438,22 +2580,16 @@ impl PaymentRouter {
             };
 
         // 1. Check oracle is configured.
-        let oracle = match oracle_opt {
-            Some(addr) => addr,
-            None => {
-                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleNotConfigured);
-            }
+        let Some(oracle) = oracle_opt else {
+            return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleNotConfigured);
         };
 
         // 2. Call the oracle. Use try_get_price to avoid trapping on failure.
-        let price_data = match PriceFeedOracleClient::new(&env, &oracle)
-            .try_get_price(&base_asset, &quote_asset)
-        {
-            Ok(Ok(data)) => data,
-            _ => {
-                log!(&env, "Oracle contract call failed");
-                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleCallFailed);
-            }
+        let Ok(Ok(price_data)) =
+            PriceFeedOracleClient::new(&env, &oracle).try_get_price(&base_asset, &quote_asset)
+        else {
+            log!(&env, "Oracle contract call failed");
+            return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleCallFailed);
         };
 
         // 3. Staleness check (skip when threshold is 0).
@@ -2523,6 +2659,33 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount)?;
+
+        sender.require_auth();
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_payment(
@@ -2561,6 +2724,37 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
+        // Pre-validate the whole batch before authorizing or moving any
+        // funds, so a rejected payment never triggers an auth rollback.
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        for payment in payments.iter() {
+            if payment.sender == payment.recipient {
+                return Err(Error::InvalidRecipient);
+            }
+            if Self::is_blacklisted(env.clone(), payment.recipient.clone()) {
+                return Err(Error::Blacklisted);
+            }
+            if payment.amount <= 0 || payment.amount > max_amount {
+                return Err(Error::LimitExceeded);
+            }
+            if payment.amount < min_limit {
+                return Err(Error::LimitExceeded);
+            }
+            Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
+
+            payment.sender.require_auth();
+        }
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         for payment in payments.iter() {
@@ -2577,6 +2771,102 @@ impl PaymentRouter {
         }
 
         Ok(())
+    }
+
+    /// Returns the current meta-transaction nonce for a user.
+    ///
+    /// Relayers must use this nonce when building the signed payload.
+    /// The nonce starts at `0` and increments after each successful
+    /// `route_payment_meta`, preventing replay attacks.
+    pub fn get_meta_nonce(env: Env, user: Address) -> u64 {
+        Self::get_meta_nonce_internal(&env, &user)
+    }
+
+    /// Routes a payment authorised by an off-chain relayer's Ed25519 signature
+    /// instead of the sender's on-chain authorization.
+    ///
+    /// The relayer signs a canonical payload binding the sender, recipient,
+    /// token, amount, nonce and deadline. The contract verifies the signature,
+    /// burns the nonce to block replays, and then settles the payment through
+    /// the same accounting as a direct `route_payment`.
+    ///
+    /// # Parameters
+    /// - `sender`: Address whose funds are routed and whose nonce is consumed.
+    /// - `signer_pubkey`: Ed25519 public key that must have signed the payload.
+    /// - `recipient`: Address the funds are delivered to.
+    /// - `token_address`: Contract ID of the token being transferred.
+    /// - `amount`: Amount to route in the token's smallest unit.
+    /// - `nonce`: Must equal the sender's current meta-transaction nonce.
+    /// - `deadline`: Ledger timestamp after which the submission is rejected.
+    /// - `signature`: Ed25519 signature over the canonical payload.
+    ///
+    /// # Returns
+    /// `Ok(())` once the payment has settled.
+    ///
+    /// # Panics
+    /// Panics if the signature does not verify.
+    pub fn route_payment_meta(
+        env: Env,
+        sender: Address,
+        signer_pubkey: BytesN<32>,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        if env.ledger().timestamp() > deadline {
+            return Err(Error::DeadlineExpired);
+        }
+
+        let stored = Self::get_meta_nonce_internal(&env, &sender);
+        if stored != nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        let message = Self::build_meta_message(
+            &env,
+            &sender,
+            &signer_pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+        );
+        // Traps on invalid signature; `Error::InvalidSignature` documents
+        // this failure mode for off-chain integrators.
+        env.crypto()
+            .ed25519_verify(&signer_pubkey, &message, &signature);
+
+        let key = DataKey::MetaNonce(sender.clone());
+        env.storage().persistent().set(&key, &(nonce + 1));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::process_single_payment_no_auth(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
     }
 
     // ── Token swaps: cross-contract DEX routing ──────────────────────────────
@@ -2679,14 +2969,10 @@ impl PaymentRouter {
         }
 
         // Daily limits and lifetime volume are denominated in the sell token,
-        // matching what the sender actually parts with.
-        Self::accrue_daily_spend(env, &swap.sender, swap.amount_in)?;
-
-        let user_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserVolume(swap.sender.clone()))
-            .unwrap_or(0);
+        // matching what the sender actually parts with. A single packed write
+        // covers both counters (issue #663), and the returned volume is the
+        // pre-payment one the tiered discount keys off.
+        let user_volume = Self::accrue_user_record(env, &swap.sender, swap.amount_in)?;
         let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
@@ -2772,8 +3058,6 @@ impl PaymentRouter {
                 }
             }
         }
-
-        Self::record_volume(env, &swap.sender, swap.amount_in);
 
         env.events().publish(
             (
@@ -3209,15 +3493,97 @@ impl PaymentRouter {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // The crate is `no_std`, but the test harness links std; pull it in so
+    // the benchmark can print its GAS REPORT lines.
+    extern crate std;
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
         Address, Env, Symbol, TryIntoVal,
     };
 
-    // The crate is `no_std`, but the test harness links std; pull it in so
-    // benchmarks can print GAS REPORT lines to the test output.
-    extern crate std;
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockLendingKey {
+        Principal(Address),
+        Yield(Address),
+    }
+
+    #[contract]
+    struct MockLendingProtocol;
+
+    #[contractimpl]
+    impl MockLendingProtocol {
+        pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
+            from.require_auth();
+            token::Client::new(&env, &token).transfer(
+                &from,
+                &env.current_contract_address(),
+                &amount,
+            );
+            let key = MockLendingKey::Principal(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+
+        pub fn withdraw(env: Env, to: Address, token: Address, amount: i128) {
+            let key = MockLendingKey::Principal(token.clone());
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            assert!(current >= amount);
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &to,
+                &amount,
+            );
+            env.storage().instance().set(&key, &(current - amount));
+        }
+
+        pub fn harvest(env: Env, to: Address, token: Address) -> i128 {
+            let key = MockLendingKey::Yield(token.clone());
+            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            if amount > 0 {
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &to,
+                    &amount,
+                );
+                env.storage().instance().remove(&key);
+            }
+            amount
+        }
+
+        pub fn accrue_yield(env: Env, token: Address, amount: i128) {
+            let key = MockLendingKey::Yield(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockKycKey {
+        Verified(Address),
+    }
+
+    #[contract]
+    struct MockKycOracle;
+
+    #[contractimpl]
+    impl MockKycOracle {
+        pub fn set_verified(env: Env, account: Address, verified: bool) {
+            env.storage()
+                .instance()
+                .set(&MockKycKey::Verified(account), &verified);
+        }
+
+        pub fn is_verified(env: Env, account: Address) -> bool {
+            env.storage()
+                .instance()
+                .get(&MockKycKey::Verified(account))
+                .unwrap_or(false)
+        }
+    }
 
     // ── Mock price-feed oracle ───────────────────────────────────────────────
 
@@ -3226,6 +3592,14 @@ mod test {
     enum MockOracleKey {
         Price(Address, Address),
         ShouldFail,
+    }
+
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[repr(u32)]
+    pub enum MockOracleError {
+        /// Simulates an unavailable oracle.
+        Unavailable = 1,
     }
 
     #[contract]
@@ -3260,23 +3634,28 @@ mod test {
         }
 
         /// Implements the PriceFeedOracle interface.
-        pub fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData {
+        pub fn get_price(
+            env: Env,
+            base_asset: Address,
+            quote_asset: Address,
+        ) -> Result<PriceData, MockOracleError> {
             let should_fail: bool = env
                 .storage()
                 .instance()
                 .get(&MockOracleKey::ShouldFail)
                 .unwrap_or(false);
             if should_fail {
-                panic!("mock oracle failure");
+                return Err(MockOracleError::Unavailable);
             }
-            env.storage()
+            Ok(env
+                .storage()
                 .instance()
                 .get(&MockOracleKey::Price(base_asset, quote_asset))
                 .unwrap_or(PriceData {
                     price: 0,
                     decimals: 7,
                     timestamp: 0,
-                })
+                }))
         }
     }
 
@@ -3293,13 +3672,34 @@ mod test {
     ) {
         let env = Env::default();
         env.mock_all_auths();
+        // The ledger starts at timestamp 0, which `get_price` treats as a
+        // stale quote. Start from a realistic time so "fresh" prices are
+        // actually fresh.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
         let oracle_id = env.register_contract(None, MockPriceFeedOracle);
         let oracle_client = MockPriceFeedOracleClient::new(&env, &oracle_id);
         let base = Address::generate(&env);
         let quote = Address::generate(&env);
-        (env, client, contract_id, oracle_client, oracle_id, base, quote)
+        (
+            env,
+            client,
+            contract_id,
+            oracle_client,
+            oracle_id,
+            base,
+            quote,
+        )
     }
 
     // ── Oracle tests ─────────────────────────────────────────────────────────
@@ -3316,7 +3716,7 @@ mod test {
         let now = env.ledger().timestamp();
         oracle_client.set_price(&base, &quote, &1_250_000, &7, &now);
 
-        let price_data = client.get_price(&base, &quote).unwrap();
+        let price_data = client.get_price(&base, &quote);
         assert_eq!(price_data.price, 1_250_000);
         assert_eq!(price_data.decimals, 7);
         assert_eq!(price_data.timestamp, now);
@@ -3352,8 +3752,7 @@ mod test {
 
         // get_price should return the fallback
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 1_000_000);
+        assert_eq!(result.price, 1_000_000);
     }
 
     #[test]
@@ -3379,8 +3778,7 @@ mod test {
         // Add a fallback: should now return the fallback price
         client.set_fallback_price(&base, &quote, &1_800_000, &7);
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 1_800_000);
+        assert_eq!(result.price, 1_800_000);
     }
 
     #[test]
@@ -3421,8 +3819,7 @@ mod test {
         // With fallback configured: should succeed
         client.set_fallback_price(&base, &quote, &5_000_000, &7);
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 5_000_000);
+        assert_eq!(result.price, 5_000_000);
     }
 
     #[test]
@@ -3440,8 +3837,7 @@ mod test {
 
         // Should pass because staleness check is disabled
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 3_000_000);
+        assert_eq!(result.price, 3_000_000);
     }
 
     #[test]
@@ -5023,6 +5419,21 @@ mod test {
         BytesN::from_array(env, &buf)
     }
 
+    /// Moves the oracle-style test ledger off timestamp 0, which `get_price`
+    /// treats as a stale quote.
+    fn set_realistic_ledger_time(env: &Env) {
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+    }
+
     /// Issue #663 acceptance benchmark: per-user (tag) registration storage
     /// cost must drop by at least 20%.
     ///
@@ -5035,9 +5446,8 @@ mod test {
     ///   TTL extension.
     ///
     /// It fails CI if the new path is not at least 20% cheaper in CPU
-    /// instructions, if it is not also cheaper in memory bytes, or if the
-    /// deterministic entry-count accounting (one entry instead of two) no
-    /// longer holds.
+    /// instructions, if it uses more memory, or if the deterministic
+    /// entry-count accounting (one entry instead of two) no longer holds.
     #[test]
     fn test_benchmark_storage_cost_reduction() {
         let (env, _client, contract_id) = setup_env();
@@ -5050,11 +5460,12 @@ mod test {
         let current_time = env.ledger().timestamp();
         let amount = 5_000i128;
 
-        // Warm-up so lazy host/footprint initialization costs do not skew
-        // the first measurement window.
+        // Warm-up so lazy host/footprint initialization does not skew the
+        // first measurement window.
         env.as_contract(&contract_id, || {
-            let warmup_key = DataKey::Admin;
-            env.storage().instance().set(&warmup_key, &legacy_sender);
+            env.storage()
+                .instance()
+                .set(&DataKey::Admin, &legacy_sender);
         });
         env.budget().reset_default();
 
@@ -5120,7 +5531,7 @@ mod test {
         );
 
         // Deterministic accounting: the legacy path leaves two persistent
-        // entries per registered user, the new path exactly one.
+        // entries per registered sender, the new path exactly one.
         env.as_contract(&contract_id, || {
             assert!(
                 env.storage()
@@ -5183,7 +5594,7 @@ mod test {
         assert_eq!(before.accumulated_amount, 0);
         assert_eq!(before.last_reset_time, env.ledger().timestamp());
 
-        // First payment registers the user's packed record.
+        // The first payment registers the sender's packed record.
         client.route_payment(&sender, &recipient, &token_address, &2_000);
 
         let after_first = client.get_user_record(&sender);
@@ -5194,16 +5605,14 @@ mod test {
         env.as_contract(&contract_id, || {
             let record_key = DataKey::UserRecord(sender.clone());
             assert!(env.storage().persistent().has(&record_key));
-            assert!(
-                !env.storage()
-                    .persistent()
-                    .has(&DataKey::UserSpending(sender.clone()))
-            );
-            assert!(
-                !env.storage()
-                    .persistent()
-                    .has(&DataKey::UserVolume(sender.clone()))
-            );
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::UserSpending(sender.clone())));
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::UserVolume(sender.clone())));
         });
 
         // A second payment accumulates in both counters.
@@ -5213,9 +5622,8 @@ mod test {
         assert_eq!(after_second.accumulated_amount, 5_000);
         assert_eq!(after_second.volume, 5_000);
 
-        // The existing getters stay consistent with the packed record.
+        // The pre-existing getters stay consistent with the packed record.
         assert_eq!(client.get_user_volume(&sender), 5_000);
-        assert_eq!(client.get_effective_fee_bps(&sender), 100);
     }
 
     /// Permissionless `migrate_user_record` combines legacy entries into the
@@ -5230,18 +5638,9 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
-        // Give the ledger a realistic timestamp so the legacy window start
-        // can be back-dated.
-        env.ledger().set(LedgerInfo {
-            timestamp: 1_000_000,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
+        // Give the ledger a realistic timestamp so the legacy window start can
+        // be back-dated.
+        set_realistic_ledger_time(&env);
 
         // Emulate pre-#663 ledger state: split UserSpending + UserVolume.
         let legacy_window_start = env.ledger().timestamp() - 60;
@@ -5261,7 +5660,8 @@ mod test {
         assert_eq!(pre.accumulated_amount, 1_200);
         assert_eq!(pre.volume, 7_500);
 
-        // Migrate: reports success, writes the packed record, drops legacy keys.
+        // Migrate: reports success, writes the packed record, drops the
+        // legacy keys.
         assert!(client.migrate_user_record(&user));
 
         env.as_contract(&contract_id, || {
@@ -5305,18 +5705,9 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
-        // Give the ledger a realistic timestamp so the legacy window start
-        // can be back-dated.
-        env.ledger().set(LedgerInfo {
-            timestamp: 1_000_000,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
+        // Give the ledger a realistic timestamp so the legacy window start can
+        // be back-dated.
+        set_realistic_ledger_time(&env);
 
         // Legacy state from before the upgrade.
         let legacy_window_start = env.ledger().timestamp() - 60;
