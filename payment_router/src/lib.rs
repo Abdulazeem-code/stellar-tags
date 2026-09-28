@@ -399,7 +399,7 @@ impl PaymentRouter {
         } else if multiplier > Self::MAX_FEE_MULTIPLIER {
             multiplier = Self::MAX_FEE_MULTIPLIER;
         }
-        let effective_fee_bps = base_fee_bps * (multiplier as i128);
+        let effective_fee_bps = base_fee_bps.saturating_mul(multiplier as i128);
 
         // Check time-based daily spending limits.
         // Storage format: packed BytesN<24> (see pack_spending / unpack_spending).
@@ -440,7 +440,7 @@ impl PaymentRouter {
         }
 
         // Calculate fee
-        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
+        let mut fee_amount = amount.saturating_mul(effective_fee_bps) / Self::BPS_DIVISOR;
         if fee_amount > fee_cap {
             fee_amount = fee_cap;
         }

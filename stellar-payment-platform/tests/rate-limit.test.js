@@ -138,8 +138,6 @@ describe('Rate Limiting — express-rate-limit', () => {
       expect(res.headers['x-ratelimit-limit']).toBe('10');
     });
 
-      expect(res.headers).toHaveProperty('ratelimit-limit');
-      expect(res.headers).toHaveProperty('ratelimit-remaining');
   });
 
   // ── 429 Too Many Requests ────────────────────────────────────────────────
