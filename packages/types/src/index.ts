@@ -693,6 +693,11 @@ export interface Client {
   emergency_freeze: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a get_fee_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_fee_proposal: ({proposal_id}: {proposal_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Option<FeeProposal>>>
+
+  /**
    * Construct and simulate a blacklist_address transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Adds an address to the blacklist. Admin-only.
    * 
@@ -733,6 +738,12 @@ export interface Client {
    * it does not exist.
    */
   get_queued_action: ({nonce}: {nonce: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TimelockEntry>>>
+
+  /**
+   * Construct and simulate a vote_fee_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Casts one weighted vote on an open fee proposal.
+   */
+  vote_fee_proposal: ({voter, proposal_id, support}: {voter: string, proposal_id: u64, support: boolean}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a emergency_withdraw transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -830,6 +841,20 @@ export interface Client {
   withdraw_from_yield: ({token, amount}: {token: string, amount: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a configure_governance transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Configures the DAO token and minimum voting weight for fee proposals.
+   * This administrative bootstrap does not itself change fees; subsequent
+   * fee changes can be made through the proposal lifecycle.
+   */
+  configure_governance: ({governance_token, quorum}: {governance_token: string, quorum: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a execute_fee_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Finalizes a successful fee proposal after its voting period ends.
+   */
+  execute_fee_proposal: ({proposal_id}: {proposal_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a get_effective_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the effective fee_bps for a sender after applying any
    * volume-based tiered discount.
@@ -887,6 +912,15 @@ export interface Client {
    * compatibility only.
    */
   set_platform_treasury: ({new_treasury}: {new_treasury: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a route_payment_with_swap transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Swaps `token_in` through a caller-supplied DEX path and routes the
+   * resulting `token_out` to the recipient. The DEX adapter must return the
+   * received output and any unused input as `[received, unused]`; unused
+   * input is credited to the sender's refund balance.
+   */
+  route_payment_with_swap: ({sender, recipient, dex_router, token_in, token_out, amount_in, path, min_amount_out}: {sender: string, recipient: string, dex_router: string, token_in: string, token_out: string, amount_in: i128, path: Array<string>, min_amount_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
 }
 export class Client extends ContractClient {
@@ -982,17 +1016,22 @@ export class Client extends ContractClient {
         get_user_volume: this.txFromJSON<i128>,
         withdraw_refund: this.txFromJSON<Result<void>>,
         emergency_freeze: this.txFromJSON<Result<void>>,
+        get_fee_proposal: this.txFromJSON<Option<FeeProposal>>,
         blacklist_address: this.txFromJSON<Result<void>>,
         claim_all_refunds: this.txFromJSON<Result<i128>>,
         get_queued_action: this.txFromJSON<Result<TimelockEntry>>,
+        vote_fee_proposal: this.txFromJSON<Result<void>>,
         emergency_withdraw: this.txFromJSON<Result<void>>,
         get_refund_balance: this.txFromJSON<i128>,
         add_supported_token: this.txFromJSON<Result<void>>,
         migrate_user_record: this.txFromJSON<boolean>,
         unblacklist_address: this.txFromJSON<Result<void>>,
         withdraw_from_yield: this.txFromJSON<Result<void>>,
+        configure_governance: this.txFromJSON<Result<void>>,
+        execute_fee_proposal: this.txFromJSON<Result<void>>,
         get_effective_fee_bps: this.txFromJSON<i128>,
         set_fee_config_legacy: this.txFromJSON<Result<void>>,
-        set_platform_treasury: this.txFromJSON<Result<void>>
+        set_platform_treasury: this.txFromJSON<Result<void>>,
+        route_payment_with_swap: this.txFromJSON<Result<void>>
   }
 }
