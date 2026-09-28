@@ -70,7 +70,7 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
       const id = keyGenerator(req);
       if (!id) return next();
 
-      const key = \`\${prefix}\${id}\`;
+      const key = `${prefix}${id}`;
       const now = Math.floor(Date.now() / 1000); // Current time in seconds
       const requested = 1;
 
@@ -101,6 +101,7 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
         );
       }
     } catch (err) {
+      console.error("TOKEN BUCKET ERROR:", err);
       // On error, let the request pass through to avoid blocking legitimate traffic
       req.log?.error(err, 'Token bucket rate limiter failed');
       return next();

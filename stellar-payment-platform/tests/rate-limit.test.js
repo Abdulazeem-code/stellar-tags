@@ -17,9 +17,43 @@ jest.mock('@stellar/stellar-sdk', () => ({
 
 jest.mock('pdfkit', () => jest.fn());
 
-jest.mock('redis', () => ({
-  createClient: jest.fn(() => null),
-}));
+jest.mock('redis', () => {
+  return {
+    createClient: jest.fn(() => {
+      const store = new Map();
+      return {
+        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue(),
+        eval: jest.fn(async (script, numkeys, key, capacityStr, refillRateStr, nowStr, requestedStr) => {
+          const capacity = Number(capacityStr);
+          const refillRate = Number(refillRateStr);
+          const now = Number(nowStr);
+          const requested = Number(requestedStr);
+          
+          let state = store.get(key) || { tokens: capacity, lastRefill: now };
+          
+          const timePassed = Math.max(0, now - state.lastRefill);
+          const refillAmount = Math.floor(timePassed * refillRate);
+          
+          if (refillAmount > 0) {
+            state.tokens = Math.min(capacity, state.tokens + refillAmount);
+            state.lastRefill = now;
+          }
+          
+          let allowed = 0;
+          if (state.tokens >= requested) {
+            state.tokens -= requested;
+            allowed = 1;
+          }
+          
+          store.set(key, state);
+          
+          return [allowed, state.tokens, capacity, state.lastRefill];
+        })
+      };
+    }),
+  };
+});
 
 jest.mock('rate-limit-redis', () => jest.fn());
 
@@ -106,6 +140,7 @@ describe('Rate Limiting — express-rate-limit', () => {
 
   beforeEach(() => {
     jest.resetModules();
+    process.env.REDIS_URL = 'redis://localhost:6379'; // Ensure redisClient is instantiated
     ({ app } = require('../server'));
   });
 
