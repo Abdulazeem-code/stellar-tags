@@ -152,12 +152,83 @@ sender: string;
 token_address: string;
 }
 
+
+/**
+ * The result of a DEX quote, returned by [`PaymentRouter::quote_swap`].
+ */
+export interface SwapQuote {
+  /**
+ * Amount of `buy_token` the DEX expects to deliver for the quoted input.
+ */
+amount_out: i128;
+  /**
+ * Configured maximum slippage, in basis points, that produced
+ * `min_amount_out`.
+ */
+max_slippage_bps: i128;
+  /**
+ * Tightest `min_amount_out` that still respects the contract's
+ * `max_slippage_bps` for this quote.
+ */
+min_amount_out: i128;
+}
+
 /**
  * Describes which administrative parameter change a timelock entry represents.
  * Each variant carries all the arguments needed to apply that change when the
  * delay period is over.
  */
-export type ActionType = {tag: "SetPlatformTreasury", values: readonly [string]} | {tag: "SetFeeConfig", values: readonly [i128, i128]} | {tag: "SetFeeBps", values: readonly [i128]} | {tag: "SetGovernance", values: readonly [string]} | {tag: "SetMinLimit", values: readonly [i128]} | {tag: "TransferAdmin", values: readonly [string]} | {tag: "Upgrade", values: readonly [Buffer]};
+export type ActionType = {tag: "SetPlatformTreasury", values: readonly [string]} | {tag: "SetFeeConfig", values: readonly [i128, i128]} | {tag: "SetFeeBps", values: readonly [i128]} | {tag: "SetGovernance", values: readonly [string]} | {tag: "SetMinLimit", values: readonly [i128]} | {tag: "TransferAdmin", values: readonly [string]} | {tag: "Upgrade", values: readonly [Buffer]} | {tag: "RegisterDex", values: readonly [string]} | {tag: "DeregisterDex", values: readonly [string]} | {tag: "SetMaxSlippageBps", values: readonly [i128]};
+
+
+/**
+ * A single swap-routed transfer instruction for use with
+ * [`PaymentRouter::route_payment_with_swap`] and
+ * [`PaymentRouter::route_payments_with_swap`].
+ */
+export interface SwapPayment {
+  /**
+ * Amount of `sell_token` to pull from the sender and swap.
+ */
+amount_in: i128;
+  /**
+ * Token the recipient is paid in. Must differ from `sell_token`.
+ */
+buy_token: string;
+  /**
+ * Unix timestamp (seconds) after which the swap must not execute. `0`
+ * disables the deadline, letting the DEX apply its own.
+ */
+deadline: u64;
+  /**
+ * Contract ID of the DEX adapter to invoke. Must be registered by the
+ * admin, which keeps the cross-contract call pointed at audited code.
+ */
+dex: string;
+  /**
+ * Amount of `buy_token` the caller expected from a prior `quote_swap`
+ * call. `0` disables the ceiling check; otherwise the realised output
+ * must stay within the contract's `max_slippage_bps` of this figure.
+ */
+expected_amount_out: i128;
+  /**
+ * Minimum amount of `buy_token` the swap must deliver. This is the
+ * slippage floor: if the DEX returns less, the whole payment reverts.
+ */
+min_amount_out: i128;
+  /**
+ * Address the swapped funds (minus the platform fee) are credited to.
+ */
+recipient: string;
+  /**
+ * Token the sender pays with, in that token's smallest unit.
+ */
+sell_token: string;
+  /**
+ * Address the funds are debited from. Must authorize the call.
+ */
+sender: string;
+}
 
 
 /**
@@ -356,6 +427,33 @@ export interface Client {
   initialize: ({admin, platform_treasury, fee_bps, fee_cap, max_amount}: {admin: string, platform_treasury: string, fee_bps: i128, fee_cap: i128, max_amount: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a quote_swap transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Asks a registered DEX how much `buy_token` a swap would return, and
+   * derives the `min_amount_out` the sender should use from the contract's
+   * configured slippage ceiling.
+   * 
+   * This is a read-only cross-contract call: it moves no funds and changes no
+   * state, so it is safe to call off-chain before building a
+   * [`SwapPayment`].
+   * 
+   * # Parameters
+   * - `dex`: Contract ID of a registered DEX adapter.
+   * - `sell_token`: Token the sender would pay with.
+   * - `buy_token`: Token the recipient would be paid in.
+   * - `amount_in`: Amount of `sell_token` to price, in its smallest unit.
+   * 
+   * # Returns
+   * A [`SwapQuote`] with the quoted output, the slippage-adjusted
+   * `min_amount_out`, and the slippage ceiling used. Returns
+   * `Err(Error::DexNotRegistered)` if `dex` was never registered or
+   * `Err(Error::SwapFailed)` if the DEX quote call reverts.
+   * 
+   * # Panics
+   * Does not panic.
+   */
+  quote_swap: ({dex, sell_token, buy_token, amount_in}: {dex: string, sell_token: string, buy_token: string, amount_in: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<SwapQuote>>>
+
+  /**
    * Construct and simulate a set_paused transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Alias for `set_pause`. Admin-only.
    * 
@@ -448,6 +546,28 @@ export interface Client {
   queue_action: ({action}: {action: ActionType}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
 
   /**
+   * Construct and simulate a register_dex transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Allows swap routing to invoke a DEX router contract. Admin-only.
+   * 
+   * Restricting cross-contract calls to a registered allowlist is what keeps
+   * swap routing pointed at audited code.
+   * 
+   * # Parameters
+   * - `dex`: Contract ID of the DEX router to approve.
+   * 
+   * # Returns
+   * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
+   * no admin set yet.
+   * 
+   * # Panics
+   * Panics if the current admin does not authorize the call.
+   * 
+   * DEPRECATED for direct use.  Queue via `queue_action(ActionType::RegisterDex(…))`
+   * and execute after 24 hours.
+   */
+  register_dex: ({dex}: {dex: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a cancel_action transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Cancels a pending timelock entry before it can be executed.
    * 
@@ -504,6 +624,25 @@ export interface Client {
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
    */
   set_min_limit: ({min_limit}: {min_limit: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a deregister_dex transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Stops swap routing from invoking a DEX router contract. Admin-only.
+   * 
+   * # Parameters
+   * - `dex`: Contract ID of the DEX router to revoke.
+   * 
+   * # Returns
+   * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
+   * no admin set yet.
+   * 
+   * # Panics
+   * Panics if the current admin does not authorize the call.
+   * 
+   * DEPRECATED for direct use.  Queue via `queue_action(ActionType::DeregisterDex(…))`
+   * and execute after 24 hours.
+   */
+  deregister_dex: ({dex}: {dex: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a execute_action transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -740,10 +879,20 @@ export interface Client {
   get_queued_action: ({nonce}: {nonce: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TimelockEntry>>>
 
   /**
-   * Construct and simulate a vote_fee_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Casts one weighted vote on an open fee proposal.
+   * Construct and simulate a is_dex_registered transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns whether a DEX router is approved for swap routing.
+   * 
+   * # Parameters
+   * - `dex`: Contract ID to check.
+   * 
+   * # Returns
+   * `true` if the DEX may be used by `route_payment_with_swap`, `false`
+   * otherwise.
+   * 
+   * # Panics
+   * Does not panic.
    */
-  vote_fee_proposal: ({voter, proposal_id, support}: {voter: string, proposal_id: u64, support: boolean}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  is_dex_registered: ({dex}: {dex: string}, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>
 
   /**
    * Construct and simulate a emergency_withdraw transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -835,10 +984,41 @@ export interface Client {
   unblacklist_address: ({address}: {address: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
-   * Construct and simulate a withdraw_from_yield transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Withdraws treasury principal from the configured lending protocol. TreasuryManager-protected.
+   * Construct and simulate a get_max_slippage_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the maximum tolerated swap slippage in basis points.
+   * 
+   * # Returns
+   * The configured `max_slippage_bps`, or the 1 000 bps (10%) default if
+   * the contract has not been initialized.
+   * 
+   * # Panics
+   * Does not panic.
    */
-  withdraw_from_yield: ({token, amount}: {token: string, amount: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  get_max_slippage_bps: (options?: MethodOptions) => Promise<AssembledTransaction<i128>>
+
+  /**
+   * Construct and simulate a set_max_slippage_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Sets the maximum tolerated swap slippage. Admin-only.
+   * 
+   * Applied against the `expected_amount_out` a caller supplies alongside a
+   * quote, as a second guard on top of the per-payment `min_amount_out`
+   * floor.
+   * 
+   * # Parameters
+   * - `max_slippage_bps`: New ceiling in basis points; `0` to `10_000`.
+   * 
+   * # Returns
+   * `Ok(())` on success, `Err(Error::InvalidSwapParams)` if the value is
+   * outside `0..=10_000`, or `Err(Error::NotInitialized)` if the contract has
+   * no admin set yet.
+   * 
+   * # Panics
+   * Panics if the current admin does not authorize the call.
+   * 
+   * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMaxSlippageBps(…))`
+   * and execute after 24 hours.
+   */
+  set_max_slippage_bps: ({max_slippage_bps}: {max_slippage_bps: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a configure_governance transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -915,12 +1095,52 @@ export interface Client {
 
   /**
    * Construct and simulate a route_payment_with_swap transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Swaps `token_in` through a caller-supplied DEX path and routes the
-   * resulting `token_out` to the recipient. The DEX adapter must return the
-   * received output and any unused input as `[received, unused]`; unused
-   * input is credited to the sender's refund balance.
+   * Routes a payment in any token, swapping it into the recipient's
+   * preferred token on the way.
+   * 
+   * The swap-routed counterpart of [`PaymentRouter::route_payment`]: the same
+   * fee, limit, blacklist, and freeze rules apply, with the conversion
+   * inserted between pulling the funds and delivering them. The platform fee
+   * is taken on the `buy_token` output, so `fee_cap` applies in `buy_token`
+   * units for this route.
+   * 
+   * # Parameters
+   * - `payment`: The swap-routed transfer (see [`SwapPayment`]).
+   * 
+   * # Returns
+   * The amount of `buy_token` delivered to the recipient, after the
+   * platform fee. Otherwise the payment is abandoned whole, with:
+   * - `Err(Error::InvalidSwapParams)`, `Err(Error::SwapDeadlineExpired)`,
+   * `Err(Error::DexNotRegistered)`, `Err(Error::SwapFailed)`, or
+   * `Err(Error::SlippageExceeded)` for swap-specific problems,
+   * - the same `Err` variants as `route_payment` otherwise.
+   * 
+   * # Panics
+   * Panics if `payment.sender` does not authorize the call, or if a token
+   * transfer out of this contract fails.
    */
-  route_payment_with_swap: ({sender, recipient, dex_router, token_in, token_out, amount_in, path, min_amount_out}: {sender: string, recipient: string, dex_router: string, token_in: string, token_out: string, amount_in: i128, path: Array<string>, min_amount_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  route_payment_with_swap: ({payment}: {payment: SwapPayment}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
+
+  /**
+   * Construct and simulate a route_payments_with_swap transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Routes several swap-routed payments in a single transaction. If any
+   * payment fails, the entire batch is reverted atomically, including any
+   * swaps that already executed earlier in the batch.
+   * 
+   * # Parameters
+   * - `payments`: Batch of swap-routed transfers to apply in order. See
+   * [`SwapPayment`] for per-item constraints.
+   * 
+   * # Returns
+   * The total amount of `buy_token` delivered across the batch, or the
+   * first error encountered (see `route_payment_with_swap` for the
+   * possible variants and their causes).
+   * 
+   * # Panics
+   * Panics if any payment's `sender` does not authorize the call, or if a
+   * token transfer out of this contract fails.
+   */
+  route_payments_with_swap: ({payments}: {payments: Array<SwapPayment>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
 
 }
 export class Client extends ContractClient {
@@ -952,8 +1172,10 @@ export class Client extends ContractClient {
         "AAAAAgAAADtTdG9yYWdlIGtleXMgZm9yIGFsbCBjb250cmFjdCBpbnN0YW5jZSBhbmQgcGVyc2lzdGVudCBkYXRhLgAAAAAAAAAAB0RhdGFLZXkAAAAAEAAAAAAAAAAaVGhlIGN1cnJlbnQgYWRtaW4gYWRkcmVzcy4AAAAAAAVBZG1pbgAAAAAAAAAAAABQR292ZXJuYW5jZSBjb250cmFjdCBhZGRyZXNzOyBpZiBzZXQsIGl0IHRha2VzIG92ZXIgZmVlLWF1dGhvcml0eSBmcm9tIHRoZSBhZG1pbi4AAAAKR292ZXJuYW5jZQAAAAAAAAAAAC5BZGRyZXNzIHRoYXQgcmVjZWl2ZXMgY29sbGVjdGVkIHBsYXRmb3JtIGZlZXMuAAAAAAAQUGxhdGZvcm1UcmVhc3VyeQAAAAAAAAA6UGxhdGZvcm0gZmVlIHJhdGUsIGluIGJhc2lzIHBvaW50cyAoMS8xMDB0aCBvZiBhIHBlcmNlbnQpLgAAAAAABkZlZUJwcwAAAAAAAAAAADNVcHBlciBib3VuZCBvbiB0aGUgZmVlIHRha2VuIGZyb20gYSBzaW5nbGUgcGF5bWVudC4AAAAABkZlZUNhcAAAAAAAAAAAAEZNaW5pbXVtIGFtb3VudCBhY2NlcHRlZCBieSBgcm91dGVfcGF5bWVudGAgLyBgcm91dGVfcGF5bWVudHNgLCBpZiBzZXQuAAAAAAAITWluTGltaXQAAAAAAAAAJFdoZXRoZXIgcm91dGluZyBpcyBjdXJyZW50bHkgcGF1c2VkLgAAAAZQYXVzZWQAAAAAAAAAAAAsTWF4aW11bSBhbW91bnQgYWNjZXB0ZWQgYnkgYSBzaW5nbGUgcGF5bWVudC4AAAAJTWF4QW1vdW50AAAAAAAAAQAAAMpQYWNrZWQgcGVyLXVzZXIgcmVjb3JkIChpc3N1ZSAjNjYzKTogMjQtaG91ciBzcGVuZGluZyB3aW5kb3cgcGx1cwpjdW11bGF0aXZlIGxpZmV0aW1lIHZvbHVtZSBmb3IgYSBnaXZlbiBzZW5kZXIsIHN0b3JlZCBhcyBhIHNpbmdsZQo0MC1ieXRlIHZhbHVlIHRvIGhhbHZlIHRoZSBsZWRnZXIgZW50cmllcyB3cml0dGVuIHBlciByZWdpc3RlcmVkIHVzZXIuAAAAAAAKVXNlclJlY29yZAAAAAAAAQAAABMAAAABAAAArkRFUFJFQ0FURUQgKHByZS0jNjYzKTogcGFja2VkIDI0LWhvdXIgc3BlbmRpbmcgd2luZG93IGZvciBhIHNlbmRlci4KTm8gbG9uZ2VyIHdyaXR0ZW47IHJlYWQgb25seSBieSB0aGUgbWlncmF0aW9uIGZhbGxiYWNrIGluCmBsb2FkX3VzZXJfcmVjb3JkYCBhbmQgYnkgYG1pZ3JhdGVfdXNlcl9yZWNvcmRgLgAAAAAADFVzZXJTcGVuZGluZwAAAAEAAAATAAAAAQAAALBERVBSRUNBVEVEIChwcmUtIzY2Myk6IGN1bXVsYXRpdmUgbGlmZXRpbWUgYW1vdW50IHJvdXRlZCBieSBhIHNlbmRlci4KTm8gbG9uZ2VyIHdyaXR0ZW47IHJlYWQgb25seSBieSB0aGUgbWlncmF0aW9uIGZhbGxiYWNrIGluCmBsb2FkX3VzZXJfcmVjb3JkYCBhbmQgYnkgYG1pZ3JhdGVfdXNlcl9yZWNvcmRgLgAAAApVc2VyVm9sdW1lAAAAAAABAAAAEwAAAAEAAAAxV2hldGhlciBhIGdpdmVuIHJlY2lwaWVudCBhZGRyZXNzIGlzIGJsYWNrbGlzdGVkLgAAAAAAAAlCbGFja2xpc3QAAAAAAAABAAAAEwAAAAEAAABpSW50ZXJuYWwgcmVmdW5kIGJhbGFuY2UgZm9yIGEgKHVzZXIsIHRva2VuKSBwYWlyLCBjcmVkaXRlZCB3aGVuIGEKZGlyZWN0IHRyYW5zZmVyIHRvIHRoZSByZWNpcGllbnQgZmFpbHMuAAAAAAAADVJlZnVuZEJhbGFuY2UAAAAAAAACAAAAEwAAABMAAAAAAAAAfk1vbm90b25pY2FsbHktaW5jcmVhc2luZyBub25jZSBjb3VudGVyIHVzZWQgdG8gZ2VuZXJhdGUgdW5pcXVlIElEcyBmb3IKdGltZWxvY2sgZW50cmllcy4gIFN0b3JlZCBhcyBgdTY0YCBpbiBpbnN0YW5jZSBzdG9yYWdlLgAAAAAADVRpbWVsb2NrTm9uY2UAAAAAAAABAAAAbkEgcGVuZGluZyB0aW1lbG9jayBlbnRyeSBrZXllZCBieSBpdHMgbm9uY2UgSUQuClN0b3JlZCBpbiBwZXJzaXN0ZW50IHN0b3JhZ2Ugc28gaXQgc3Vydml2ZXMgaW5zdGFuY2UgZXZpY3Rpb24uAAAAAAANVGltZWxvY2tFbnRyeQAAAAAAAAEAAAAGAAAAAAAAAHhXaGVuIGB0cnVlYCB0aGUgY29udHJhY3QgaXMgZnJvemVuOiBwYXltZW50cyBhbmQgdGltZWxvY2sgZXhlY3V0aW9ucwphcmUgYmxvY2tlZC4gIFN0b3JlZCBhcyBgYm9vbGAgaW4gaW5zdGFuY2Ugc3RvcmFnZS4AAAAGRnJvemVuAAA=",
         "AAAAAQAAAE1BIHNpbmdsZSB0cmFuc2ZlciBpbnN0cnVjdGlvbiBmb3IgdXNlIHdpdGggW2BQYXltZW50Um91dGVyOjpyb3V0ZV9wYXltZW50c2BdLgAAAAAAAAAAAAAHUGF5bWVudAAAAAAEAAAAgEFtb3VudCB0byByb3V0ZSwgZGVub21pbmF0ZWQgaW4gdGhlIHRva2VuJ3Mgc21hbGxlc3QgdW5pdC4gTXVzdCBiZQpwb3NpdGl2ZSBhbmQgd2l0aGluIHRoZSBjb250cmFjdCdzIGNvbmZpZ3VyZWQgbWluL21heCBib3VuZHMuAAAABmFtb3VudAAAAAAACwAAADtBZGRyZXNzIHRoZSBmdW5kcyAobWludXMgdGhlIHBsYXRmb3JtIGZlZSkgYXJlIGNyZWRpdGVkIHRvLgAAAAAJcmVjaXBpZW50AAAAAAAAEwAAADxBZGRyZXNzIHRoZSBmdW5kcyBhcmUgZGViaXRlZCBmcm9tLiBNdXN0IGF1dGhvcml6ZSB0aGUgY2FsbC4AAAAGc2VuZGVyAAAAAAATAAAAR0NvbnRyYWN0IElEIG9mIHRoZSB0b2tlbiAob3IgU3RlbGxhciBBc3NldCBDb250cmFjdCkgYmVpbmcgdHJhbnNmZXJyZWQuAAAAAA10b2tlbl9hZGRyZXNzAAAAAAAAEw==",
         "AAAAAAAAApJPbmUtdGltZSBzZXR1cDogcmVjb3JkcyB0aGUgYWRtaW4gYW5kIHRoZSBpbml0aWFsIGZlZSBjb25maWd1cmF0aW9uCmluIGluc3RhbmNlIHN0b3JhZ2UuIE11c3QgYmUgY2FsbGVkIGJlZm9yZSBgcm91dGVfcGF5bWVudGAuCgojIFBhcmFtZXRlcnMKLSBgYWRtaW5gOiBBZGRyZXNzIGdyYW50ZWQgYWRtaW4gcmlnaHRzIG92ZXIgdGhlIGNvbnRyYWN0OyBtdXN0CmF1dGhvcml6ZSB0aGlzIGNhbGwuCi0gYHBsYXRmb3JtX3RyZWFzdXJ5YDogQWRkcmVzcyB0aGF0IHJlY2VpdmVzIGNvbGxlY3RlZCBwbGF0Zm9ybSBmZWVzLgotIGBmZWVfYnBzYDogUGxhdGZvcm0gZmVlIHJhdGUsIGluIGJhc2lzIHBvaW50cy4KLSBgZmVlX2NhcGA6IE1heGltdW0gZmVlIChpbiB0aGUgdG9rZW4ncyBzbWFsbGVzdCB1bml0KSB0YWtlbiBmcm9tIGEKc2luZ2xlIHBheW1lbnQuCi0gYG1heF9hbW91bnRgOiBNYXhpbXVtIGFtb3VudCBhY2NlcHRlZCBieSBhIHNpbmdsZSBwYXltZW50LgoKIyBSZXR1cm5zCmBPaygoKSlgIG9uIHN1Y2Nlc3MsIG9yIGBFcnIoRXJyb3I6OkFscmVhZHlJbml0aWFsaXplZClgIGlmIHRoZQpjb250cmFjdCBhbHJlYWR5IGhhcyBhbiBhZG1pbiBzZXQuCgojIFBhbmljcwpQYW5pY3MgaWYgYGFkbWluYCBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwuAAAAAAAKaW5pdGlhbGl6ZQAAAAAABQAAAAAAAAAFYWRtaW4AAAAAAAATAAAAAAAAABFwbGF0Zm9ybV90cmVhc3VyeQAAAAAAABMAAAAAAAAAB2ZlZV9icHMAAAAACwAAAAAAAAAHZmVlX2NhcAAAAAALAAAAAAAAAAptYXhfYW1vdW50AAAAAAALAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
+        "AAAAAAAAAzxBc2tzIGEgcmVnaXN0ZXJlZCBERVggaG93IG11Y2ggYGJ1eV90b2tlbmAgYSBzd2FwIHdvdWxkIHJldHVybiwgYW5kCmRlcml2ZXMgdGhlIGBtaW5fYW1vdW50X291dGAgdGhlIHNlbmRlciBzaG91bGQgdXNlIGZyb20gdGhlIGNvbnRyYWN0J3MKY29uZmlndXJlZCBzbGlwcGFnZSBjZWlsaW5nLgoKVGhpcyBpcyBhIHJlYWQtb25seSBjcm9zcy1jb250cmFjdCBjYWxsOiBpdCBtb3ZlcyBubyBmdW5kcyBhbmQgY2hhbmdlcyBubwpzdGF0ZSwgc28gaXQgaXMgc2FmZSB0byBjYWxsIG9mZi1jaGFpbiBiZWZvcmUgYnVpbGRpbmcgYQpbYFN3YXBQYXltZW50YF0uCgojIFBhcmFtZXRlcnMKLSBgZGV4YDogQ29udHJhY3QgSUQgb2YgYSByZWdpc3RlcmVkIERFWCBhZGFwdGVyLgotIGBzZWxsX3Rva2VuYDogVG9rZW4gdGhlIHNlbmRlciB3b3VsZCBwYXkgd2l0aC4KLSBgYnV5X3Rva2VuYDogVG9rZW4gdGhlIHJlY2lwaWVudCB3b3VsZCBiZSBwYWlkIGluLgotIGBhbW91bnRfaW5gOiBBbW91bnQgb2YgYHNlbGxfdG9rZW5gIHRvIHByaWNlLCBpbiBpdHMgc21hbGxlc3QgdW5pdC4KCiMgUmV0dXJucwpBIFtgU3dhcFF1b3RlYF0gd2l0aCB0aGUgcXVvdGVkIG91dHB1dCwgdGhlIHNsaXBwYWdlLWFkanVzdGVkCmBtaW5fYW1vdW50X291dGAsIGFuZCB0aGUgc2xpcHBhZ2UgY2VpbGluZyB1c2VkLiBSZXR1cm5zCmBFcnIoRXJyb3I6OkRleE5vdFJlZ2lzdGVyZWQpYCBpZiBgZGV4YCB3YXMgbmV2ZXIgcmVnaXN0ZXJlZCBvcgpgRXJyKEVycm9yOjpTd2FwRmFpbGVkKWAgaWYgdGhlIERFWCBxdW90ZSBjYWxsIHJldmVydHMuCgojIFBhbmljcwpEb2VzIG5vdCBwYW5pYy4AAAAKcXVvdGVfc3dhcAAAAAAABAAAAAAAAAADZGV4AAAAABMAAAAAAAAACnNlbGxfdG9rZW4AAAAAABMAAAAAAAAACWJ1eV90b2tlbgAAAAAAABMAAAAAAAAACWFtb3VudF9pbgAAAAAAAAsAAAABAAAD6QAAB9AAAAAJU3dhcFF1b3RlAAAAAAAAAw==",
         "AAAAAAAAANJBbGlhcyBmb3IgYHNldF9wYXVzZWAuIEFkbWluLW9ubHkuCgojIFBhcmFtZXRlcnMKLSBgcGF1c2VkYDogYHRydWVgIHRvIHJlamVjdCByb3V0aW5nIGNhbGxzLCBgZmFsc2VgIHRvIGFsbG93IHRoZW0uCgojIFJldHVybnMKU2VlIGBzZXRfcGF1c2VgLgoKIyBQYW5pY3MKUGFuaWNzIGlmIHRoZSBjdXJyZW50IGFkbWluIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbC4AAAAAAApzZXRfcGF1c2VkAAAAAAABAAAAAAAAAAZwYXVzZWQAAAAAAAEAAAABAAAD6QAAA+0AAAAAAAAAAw==",
         "AAAAAAAAAa1VcGRhdGVzIHRoZSBmZWUgYmFzaXMgcG9pbnRzLgpSZXF1aXJlcyBnb3Zlcm5hbmNlIGF1dGhvcml0eSBpZiBhIGdvdmVybmFuY2UgYWRkcmVzcyBpcyBzZXQ7IG90aGVyd2lzZSBhZG1pbi1vbmx5LgoKIyBQYXJhbWV0ZXJzCi0gYG5ld19mZWVfYnBzYDogTmV3IHBsYXRmb3JtIGZlZSByYXRlLCBpbiBiYXNpcyBwb2ludHMuCgojIFJldHVybnMKYE9rKCgpKWAgb24gc3VjY2Vzcywgb3IgYEVycihFcnJvcjo6Tm90SW5pdGlhbGl6ZWQpYCBpZiB0aGUgY29udHJhY3QKaGFzIG5vIGFkbWluIHNldCB5ZXQuCgojIFBhbmljcwpQYW5pY3MgaWYgdGhlIGNhbGxlciBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwuCgpERVBSRUNBVEVEIGZvciBkaXJlY3QgdXNlLiAgUXVldWUgdmlhIGBxdWV1ZV9hY3Rpb24oQWN0aW9uVHlwZTo6U2V0RmVlQnBzKOKApikpYC4AAAAAAAALc2V0X2ZlZV9icHMAAAAAAQAAAAAAAAALbmV3X2ZlZV9icHMAAAAACwAAAAEAAAPpAAAD7QAAAAAAAAAD",
+        "AAAAAQAAAEVUaGUgcmVzdWx0IG9mIGEgREVYIHF1b3RlLCByZXR1cm5lZCBieSBbYFBheW1lbnRSb3V0ZXI6OnF1b3RlX3N3YXBgXS4AAAAAAAAAAAAACVN3YXBRdW90ZQAAAAAAAAMAAABGQW1vdW50IG9mIGBidXlfdG9rZW5gIHRoZSBERVggZXhwZWN0cyB0byBkZWxpdmVyIGZvciB0aGUgcXVvdGVkIGlucHV0LgAAAAAACmFtb3VudF9vdXQAAAAAAAsAAABNQ29uZmlndXJlZCBtYXhpbXVtIHNsaXBwYWdlLCBpbiBiYXNpcyBwb2ludHMsIHRoYXQgcHJvZHVjZWQKYG1pbl9hbW91bnRfb3V0YC4AAAAAAAAQbWF4X3NsaXBwYWdlX2JwcwAAAAsAAABfVGlnaHRlc3QgYG1pbl9hbW91bnRfb3V0YCB0aGF0IHN0aWxsIHJlc3BlY3RzIHRoZSBjb250cmFjdCdzCmBtYXhfc2xpcHBhZ2VfYnBzYCBmb3IgdGhpcyBxdW90ZS4AAAAADm1pbl9hbW91bnRfb3V0AAAAAAAL",
         "AAAAAAAAAsdRdWV1ZXMgYW4gYWRtaW4gYWN0aW9uIHRvIGJlIGV4ZWN1dGVkIGFmdGVyIGEgMjQtaG91ciBkZWxheS4KClRoZSBhZG1pbiBwcm92aWRlcyB0aGUgZGVzaXJlZCBgQWN0aW9uVHlwZWAgdmFyaWFudCBhbmQgcmVjZWl2ZXMgYQpudW1lcmljIG5vbmNlIHRoYXQgdW5pcXVlbHkgaWRlbnRpZmllcyB0aGlzIHBlbmRpbmcgZW50cnkuICBQYXNzIHRoaXMKbm9uY2UgdG8gYGV4ZWN1dGVfYWN0aW9uYCBhZnRlciAyNCBob3Vycywgb3IgdG8gYGNhbmNlbF9hY3Rpb25gIHRvCmFib3J0IHRoZSBpbnRlbnQuCgpTZW5zaXRpdmUgcGFyYW1ldGVyIGNoYW5nZXMgKGBzZXRfcGxhdGZvcm1fdHJlYXN1cnlgLCBgc2V0X2ZlZV9jb25maWdgLApgc2V0X2ZlZV9icHNgLCBgc2V0X2dvdmVybmFuY2VgLCBgc2V0X21pbl9saW1pdGAsIGB0cmFuc2Zlcl9hZG1pbmAsCmB1cGdyYWRlYCkgbXVzdCBnbyB0aHJvdWdoIHRoZSB0aW1lbG9jay4gIFVzZSB0aGUgZGlyZWN0IHNldHRlcgpmdW5jdGlvbnMgb25seSBmb3IgYWN0aW9ucyB0aGF0IGFyZSBub3Qgc2Vuc2l0aXZlIChlLmcuIGBzZXRfcGF1c2VgCndoaWNoIGNhbiBhbHNvIGJlIGNhbGxlZCBkaXJlY3RseSBmb3IgaW1tZWRpYXRlIG9wZXJhdGlvbmFsIHBhdXNlcykuCgpUaGUgY29udHJhY3QgbXVzdCBub3QgYmUgZnJvemVuIHdoZW4gcXVldWluZywgYW5kIHRoZSBhZG1pbiBtdXN0CmF1dGhvcml6ZSB0aGUgY2FsbC4AAAAADHF1ZXVlX2FjdGlvbgAAAAEAAAAAAAAABmFjdGlvbgAAAAAH0AAAAApBY3Rpb25UeXBlAAAAAAABAAAD6QAAAAYAAAAD",
         "AAAAAgAAAK5EZXNjcmliZXMgd2hpY2ggYWRtaW5pc3RyYXRpdmUgcGFyYW1ldGVyIGNoYW5nZSBhIHRpbWVsb2NrIGVudHJ5IHJlcHJlc2VudHMuCkVhY2ggdmFyaWFudCBjYXJyaWVzIGFsbCB0aGUgYXJndW1lbnRzIG5lZWRlZCB0byBhcHBseSB0aGF0IGNoYW5nZSB3aGVuIHRoZQpkZWxheSBwZXJpb2QgaXMgb3Zlci4AAAAAAAAAAAAKQWN0aW9uVHlwZQAAAAAABwAAAAEAAAAlQ2hhbmdlIHRoZSBwbGF0Zm9ybSB0cmVhc3VyeSBhZGRyZXNzLgAAAAAAABNTZXRQbGF0Zm9ybVRyZWFzdXJ5AAAAAAEAAAATAAAAAQAAAEhVcGRhdGUgZmVlIGJhc2lzLXBvaW50cyBhbmQgZmVlIGNhcCB0b2dldGhlciAobGVnYWN5IC8gY29tYmluZWQgc2V0dGVyKS4AAAAMU2V0RmVlQ29uZmlnAAAAAgAAAAsAAAALAAAAAQAAAB1VcGRhdGUgZmVlIGJhc2lzLXBvaW50cyBvbmx5LgAAAAAAAAlTZXRGZWVCcHMAAAAAAAABAAAACwAAAAEAAAAkU2V0IHRoZSBnb3Zlcm5hbmNlIGNvbnRyYWN0IGFkZHJlc3MuAAAADVNldEdvdmVybmFuY2UAAAAAAAABAAAAEwAAAAEAAAAhQ2hhbmdlIHRoZSBtaW5pbXVtIHJvdXRpbmcgbGltaXQuAAAAAAAAC1NldE1pbkxpbWl0AAAAAAEAAAALAAAAAQAAACdUcmFuc2ZlciBhZG1pbiByaWdodHMgdG8gYSBuZXcgYWRkcmVzcy4AAAAADVRyYW5zZmVyQWRtaW4AAAAAAAABAAAAEwAAAAEAAAAaVXBncmFkZSB0aGUgY29udHJhY3QgV0FTTS4AAAAAAAdVcGdyYWRlAAAAAAEAAAPuAAAAIA==",
         "AAAAAQAAAOBBIHVzZXIncyBjb21iaW5lZCBsaWZldGltZSByb3V0aW5nIHN0YXRzLCB1bnBhY2tlZCBmcm9tIHRoZSBwYWNrZWQKYEJ5dGVzTjw0MD5gIGBVc2VyUmVjb3JkYCBsZWRnZXIgdmFsdWUgKGlzc3VlICM2NjMpLgoKUmV0dXJuZWQgYnkgW2BQYXltZW50Um91dGVyOjpnZXRfdXNlcl9yZWNvcmRgXSBzbyBjbGllbnRzIGNhbiByZWFkIGJvdGgKY291bnRlcnMgaW4gYSBzaW5nbGUgdmlldyBjYWxsLgAAAAAAAAAKVXNlclJlY29yZAAAAAAAAwAAAD5Ub3RhbCBhbW91bnQgcm91dGVkIGJ5IHRoZSB1c2VyIGluIHRoZSBjdXJyZW50IDI0LWhvdXIgd2luZG93LgAAAAAAEmFjY3VtdWxhdGVkX2Ftb3VudAAAAAAACwAAAEBVbml4IHRpbWVzdGFtcCAoc2Vjb25kcykgYXQgd2hpY2ggdGhlIDI0LWhvdXIgd2luZG93IGxhc3QgcmVzZXQuAAAAD2xhc3RfcmVzZXRfdGltZQAAAAAGAAAALkN1bXVsYXRpdmUgbGlmZXRpbWUgYW1vdW50IHJvdXRlZCBieSB0aGUgdXNlci4AAAAAAAZ2b2x1bWUAAAAAAAs=",
@@ -997,14 +1219,17 @@ export class Client extends ContractClient {
         set_admin: this.txFromJSON<Result<void>>,
         set_pause: this.txFromJSON<Result<void>>,
         initialize: this.txFromJSON<Result<void>>,
+        quote_swap: this.txFromJSON<Result<SwapQuote>>,
         set_paused: this.txFromJSON<Result<void>>,
         assign_role: this.txFromJSON<Result<void>>,
         revoke_role: this.txFromJSON<Result<void>>,
         set_fee_bps: this.txFromJSON<Result<void>>,
         queue_action: this.txFromJSON<Result<u64>>,
+        register_dex: this.txFromJSON<Result<void>>,
         cancel_action: this.txFromJSON<Result<void>>,
         route_payment: this.txFromJSON<Result<void>>,
         set_min_limit: this.txFromJSON<Result<void>>,
+        deregister_dex: this.txFromJSON<Result<void>>,
         execute_action: this.txFromJSON<Result<void>>,
         is_blacklisted: this.txFromJSON<boolean>,
         recover_tokens: this.txFromJSON<Result<void>>,
@@ -1020,18 +1245,18 @@ export class Client extends ContractClient {
         blacklist_address: this.txFromJSON<Result<void>>,
         claim_all_refunds: this.txFromJSON<Result<i128>>,
         get_queued_action: this.txFromJSON<Result<TimelockEntry>>,
-        vote_fee_proposal: this.txFromJSON<Result<void>>,
+        is_dex_registered: this.txFromJSON<boolean>,
         emergency_withdraw: this.txFromJSON<Result<void>>,
         get_refund_balance: this.txFromJSON<i128>,
         add_supported_token: this.txFromJSON<Result<void>>,
         migrate_user_record: this.txFromJSON<boolean>,
         unblacklist_address: this.txFromJSON<Result<void>>,
-        withdraw_from_yield: this.txFromJSON<Result<void>>,
-        configure_governance: this.txFromJSON<Result<void>>,
-        execute_fee_proposal: this.txFromJSON<Result<void>>,
+        get_max_slippage_bps: this.txFromJSON<i128>,
+        set_max_slippage_bps: this.txFromJSON<Result<void>>,
         get_effective_fee_bps: this.txFromJSON<i128>,
         set_fee_config_legacy: this.txFromJSON<Result<void>>,
         set_platform_treasury: this.txFromJSON<Result<void>>,
-        route_payment_with_swap: this.txFromJSON<Result<void>>
+        route_payment_with_swap: this.txFromJSON<Result<i128>>,
+        route_payments_with_swap: this.txFromJSON<Result<i128>>
   }
 }
