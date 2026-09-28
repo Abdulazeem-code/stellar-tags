@@ -85,6 +85,7 @@ jest.mock('../src/metrics', () => ({
   getMetrics: jest.fn().mockResolvedValue(''),
   getContentType: jest.fn(() => 'text/plain'),
   setMetricsSources: jest.fn(),
+  setDlqDepthSource: jest.fn(),
 }));
 
 jest.mock('@sentry/node', () => ({
