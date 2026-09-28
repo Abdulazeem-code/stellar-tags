@@ -218,6 +218,29 @@ cd payment_router
 cargo build
 ```
 
+### Token swaps (cross-contract DEX routing)
+
+A sender can pay in any token they hold and have it swapped into the merchant's
+preferred token during routing. The swap is a cross-contract call into a
+registered DEX adapter, runs inside the same Soroban transaction as the
+transfer, and reverts as a whole if anything goes wrong: the fee, the payment,
+and the state changes are all rolled back together.
+
+```text
+route_payment_with_swap   one swap-routed payment
+route_payments_with_swap  a batch, reverted atomically if any leg fails
+quote_swap                price a swap and derive a slippage floor
+```
+
+Slippage is enforced twice: a per-payment `min_amount_out` floor, and a
+contract-level `max_slippage_bps` ceiling against the caller's own quote. Both
+are checked against the tokens the router actually receives, not the number the
+DEX reports. Only DEXes the admin registers through the 24-hour timelock can be
+called.
+
+See [docs/dex-token-swaps.md](docs/dex-token-swaps.md) for the adapter
+interface, the full call list, and an end-to-end example.
+
 ### Contract TypeScript bindings
 
 The TypeScript client for the `payment_router` contract lives in
