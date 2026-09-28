@@ -14,17 +14,20 @@ module.exports = (redisClient) => {
   const router = express.Router();
 
   const adminRoutes = require('./adminRoutes')(redisClient);
+  const routingRuleRoutes = require('./routingRuleRoutes')();
 
   router.use('/', userRoutes);
   router.use('/', receiptRoutes);
   router.use('/', contractRoutes);
   router.use('/', historyRoutes);
   router.use('/', exportRoutes);
+  router.use('/', routingRuleRoutes);
 
   router.use('/', webhookRoutes(redisClient));
   router.use('/', paymentRoutes(redisClient));
   router.use('/', statsRoutes(redisClient));
   router.use('/', federationRoutes(redisClient));
+
   router.use('/', adminRoutes);
 
   return router;
