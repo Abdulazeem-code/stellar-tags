@@ -1,7 +1,8 @@
 #![no_std]
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
-    Address, BytesN, Env, Symbol, Vec,
+    Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -266,6 +267,19 @@ pub enum DataKey {
     Role(Role),
     /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
     UserRole(Address, Role),
+    /// Per-user meta-transaction nonce for replay protection.
+    /// Stored as `u64` in persistent storage, incremented on each
+    /// successful `route_payment_meta`.
+    MetaNonce(Address),
+    /// Address of the configured price-feed oracle contract.
+    OracleAddress,
+    /// Maximum age (in seconds) a price reading may have before it is
+    /// considered stale and rejected.  Defaults to 3 600 s (1 hour).
+    StalenessThreshold,
+    /// Administrator-supplied fallback price for a (base, quote) asset pair.
+    /// Used when the live oracle is unavailable or returns a stale value.
+    /// Keyed by `(base_asset, quote_asset)`.
+    FallbackPrice(Address, Address),
     /// Governance token used to weight fee proposals.
     GovernanceToken,
     /// Minimum token voting weight required to execute a fee proposal.
@@ -341,6 +355,18 @@ pub enum Error {
     RoleNotFound = 19,
     /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
     InvalidRole = 20,
+    /// No price-feed oracle has been configured by the admin.
+    OracleNotConfigured = 21,
+    /// The price reading returned by the oracle is older than the configured
+    /// staleness threshold and cannot be used.
+    OraclePriceStale = 22,
+    /// The price returned by the oracle is zero or negative, which is
+    /// logically invalid for an asset price.
+    OraclePriceInvalid = 23,
+    /// The call to the external oracle contract failed (e.g. the oracle
+    /// contract is unavailable or returned an unexpected error), and no
+    /// fallback price has been configured for the requested asset pair.
+    OracleCallFailed = 24,
     /// A swap path is empty, malformed, or does not connect the requested assets.
     InvalidSwapPath = 21,
     /// The DEX returned less than the caller's minimum acceptable output.
@@ -351,6 +377,14 @@ pub enum Error {
     InvalidProposal = 24,
     /// The caller already voted on the proposal.
     AlreadyVoted = 25,
+    /// Off-chain ed25519 signature failed verification.
+    /// Note: `env.crypto().ed25519_verify` traps on invalid signatures,
+    /// so this variant documents the failure mode for integrators.
+    InvalidSignature = 26,
+    /// Supplied meta-transaction nonce does not match stored nonce.
+    InvalidNonce = 27,
+    /// Meta-transaction deadline has passed (`ledger.timestamp() > deadline`).
+    DeadlineExpired = 28,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -574,6 +608,42 @@ impl PaymentRouter {
         next
     }
 
+    /// Returns the current meta-transaction nonce for a user (`0` if never used).
+    fn get_meta_nonce_internal(env: &Env, user: &Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetaNonce(user.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Builds the domain-separated message for meta-transactions.
+    /// Binds `current_contract_address` + all call args + `signer_pubkey` +
+    /// `nonce` + `deadline`, then returns `SHA256(payload)` as `Bytes`
+    /// for `ed25519_verify`. Off-chain signers must sign these exact bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn build_meta_message(
+        env: &Env,
+        sender: &Address,
+        signer_pubkey: &BytesN<32>,
+        recipient: &Address,
+        token_address: &Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+    ) -> Bytes {
+        let mut payload = Bytes::new(env);
+        payload.append(&env.current_contract_address().to_xdr(env));
+        payload.append(&sender.to_xdr(env));
+        payload.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
+        payload.append(&recipient.to_xdr(env));
+        payload.append(&token_address.to_xdr(env));
+        payload.append(&amount.to_xdr(env));
+        payload.append(&nonce.to_xdr(env));
+        payload.append(&deadline.to_xdr(env));
+        let hash = env.crypto().sha256(&payload);
+        Bytes::from(&hash)
+    }
+
     /// Core payment logic shared by `route_payment` and `route_payments`.
     #[allow(clippy::too_many_arguments)]
     fn process_single_payment(
@@ -704,6 +774,168 @@ impl PaymentRouter {
         );
 
         // Emit routed event
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            amount,
+        );
+
+        log!(env, "Platform fee routed to treasury");
+
+        Ok(())
+    }
+
+    /// Allowance-based variant for meta-transactions.
+    /// Skips `sender.require_auth()`; funds move via `transfer_from` using
+    /// allowance previously granted to the router contract, so a relayer
+    /// can submit on the user's behalf after signature verification.
+    #[allow(clippy::too_many_arguments)]
+    fn process_single_payment_no_auth(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token_address: &Address,
+        amount: i128,
+        platform_treasury: &Address,
+        fee_bps: i128,
+        fee_cap: i128,
+    ) -> Result<(), Error> {
+        env.events().publish(
+            (Symbol::new(env, "payment_initiated"), sender.clone()),
+            amount,
+        );
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+
+        Self::verify_kyc_for_amount(env, sender, amount)?;
+
+        let user_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(sender.clone()))
+            .unwrap_or(0);
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+
+        let current_time = env.ledger().timestamp();
+        let spending_key = DataKey::UserSpending(sender.clone());
+
+        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<24>>(&spending_key)
+            .map(|packed| unpack_spending(&packed))
+            .unwrap_or((current_time, 0));
+
+        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
+            last_reset_time = current_time;
+            accumulated_amount = 0;
+        }
+
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
+            return Err(Error::LimitExceeded);
+        }
+        accumulated_amount = new_accumulated;
+
+        env.storage().persistent().set(
+            &spending_key,
+            &pack_spending(env, last_reset_time, accumulated_amount),
+        );
+        env.storage().persistent().extend_ttl(
+            &spending_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let router = env.current_contract_address();
+        let token_client = token::Client::new(env, token_address);
+        if token_client.balance(sender) < amount {
+            return Err(Error::InsufficientBalance);
+        }
+        if token_client.allowance(sender, &router) < amount {
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Calculate fee
+        let fee_product = amount.checked_mul(effective_fee_bps).unwrap_or(amount);
+        let mut fee_amount = fee_product / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        let remainder = amount - fee_amount;
+
+        // Execute transfers via allowance without panics
+        if fee_amount > 0
+            && token_client
+                .try_transfer_from(&router, sender, platform_treasury, &fee_amount)
+                .is_err()
+        {
+            return Err(Error::LimitExceeded);
+        }
+        if remainder > 0 {
+            match token_client.try_transfer_from(&router, sender, recipient, &remainder) {
+                Ok(Ok(())) => {
+                    log!(env, "Remaining balance routed to recipient");
+                }
+                _ => {
+                    log!(
+                        env,
+                        "Recipient transfer failed; crediting sender refund balance"
+                    );
+                    if let Ok(Ok(())) =
+                        token_client.try_transfer_from(&router, sender, &router, &remainder)
+                    {
+                        Self::credit_refund_balance(env, sender, token_address, remainder);
+                    } else {
+                        return Err(Error::LimitExceeded);
+                    }
+                }
+            }
+        }
+
+        let volume_key = DataKey::UserVolume(sender.clone());
+        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&volume_key, &prev_volume.saturating_add(amount));
+        env.storage().persistent().extend_ttl(
+            &volume_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
         env.events().publish(
             (symbol_short!("routed"), sender.clone(), recipient.clone()),
             amount,
@@ -1817,6 +2049,266 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::KycThreshold)
     }
 
+    // ── Price-feed oracle ────────────────────────────────────────────────────
+
+    /// Configures the price-feed oracle contract address. ComplianceOfficer-protected.
+    ///
+    /// The oracle contract must implement the [`PriceFeedOracle`] interface:
+    /// it must expose a `get_price(base_asset, quote_asset) -> PriceData`
+    /// method that returns the latest price together with a Unix timestamp so
+    /// staleness can be validated against the configured threshold.
+    ///
+    /// # Parameters
+    /// - `oracle`: Address of the oracle contract to use for price lookups.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has not been initialized.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn set_price_oracle(env: Env, oracle: Address) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAddress, &oracle);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("price_cfg"),), oracle);
+        Ok(())
+    }
+
+    /// Sets the maximum age (in seconds) a price reading may have before it is
+    /// considered stale. ComplianceOfficer-protected.
+    ///
+    /// When a price timestamp is older than `(current_ledger_time - threshold)`
+    /// the reading is rejected with [`Error::OraclePriceStale`] and the
+    /// fallback price (if configured) is used instead.
+    ///
+    /// # Parameters
+    /// - `threshold_secs`: Maximum allowed age in seconds. A value of `0`
+    ///   disables the staleness check entirely (every price is accepted).
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn set_staleness_threshold(env: Env, threshold_secs: u64) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::StalenessThreshold, &threshold_secs);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("stale_cfg"),), threshold_secs);
+        Ok(())
+    }
+
+    /// Stores an admin-supplied fallback price for a (base, quote) asset pair.
+    /// ComplianceOfficer-protected.
+    ///
+    /// The fallback is used by [`get_price`] when the live oracle is
+    /// unavailable or returns data that fails validation (stale or invalid).
+    /// Setting a fallback price to `0` effectively removes the fallback,
+    /// meaning that oracle failures will propagate as errors rather than
+    /// silently using a stale cached value.
+    ///
+    /// # Parameters
+    /// - `base_asset`: Address of the base asset (e.g. XLM contract).
+    /// - `quote_asset`: Address of the quote asset (e.g. USDC contract).
+    /// - `fallback_price`: Price expressed in the same fixed-point format as
+    ///   the oracle (`price / 10^decimals`). Pass `0` to clear the fallback.
+    /// - `decimals`: Decimal precision of `fallback_price`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn set_fallback_price(
+        env: Env,
+        base_asset: Address,
+        quote_asset: Address,
+        fallback_price: i128,
+        decimals: u32,
+    ) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        let key = DataKey::FallbackPrice(base_asset.clone(), quote_asset.clone());
+        if fallback_price == 0 {
+            // A zero fallback means "no fallback configured": remove the entry.
+            env.storage().persistent().remove(&key);
+        } else {
+            let data = PriceData {
+                price: fallback_price,
+                decimals,
+                // Timestamp 0 signals "static fallback — staleness does not apply".
+                timestamp: 0,
+            };
+            env.storage().persistent().set(&key, &data);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("fall_cfg"), base_asset, quote_asset),
+            fallback_price,
+        );
+        Ok(())
+    }
+
+    /// Returns the stored fallback price for a (base, quote) asset pair, if any.
+    ///
+    /// # Parameters
+    /// - `base_asset`: Address of the base asset.
+    /// - `quote_asset`: Address of the quote asset.
+    ///
+    /// # Returns
+    /// `Some(PriceData)` if a fallback has been configured, `None` otherwise.
+    pub fn get_fallback_price(
+        env: Env,
+        base_asset: Address,
+        quote_asset: Address,
+    ) -> Option<PriceData> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FallbackPrice(base_asset, quote_asset))
+    }
+
+    /// Fetches the current exchange rate for a (base, quote) asset pair from
+    /// the configured price-feed oracle, validates it, and returns the result.
+    ///
+    /// ## Validation flow
+    ///
+    /// 1. **Oracle configured?** — If no oracle address is stored, return
+    ///    `Err(Error::OracleNotConfigured)` (unless a fallback is available).
+    /// 2. **Call oracle** — Invoke the oracle's `get_price` method.  If the
+    ///    call fails (oracle contract unavailable or traps), attempt to return
+    ///    the fallback price.  If there is no fallback either, return
+    ///    `Err(Error::OracleCallFailed)`.
+    /// 3. **Staleness check** — Compare `price_data.timestamp` with the
+    ///    current ledger time.  If older than the configured threshold (default
+    ///    3 600 s), attempt to return the fallback price.  If there is no
+    ///    fallback, return `Err(Error::OraclePriceStale)`.
+    /// 4. **Validity check** — A price ≤ 0 is logically invalid.  Attempt
+    ///    fallback; if unavailable return `Err(Error::OraclePriceInvalid)`.
+    /// 5. **Return** — The validated `PriceData` is returned to the caller.
+    ///
+    /// A staleness threshold of `0` disables the staleness check entirely.
+    ///
+    /// ## Parameters
+    /// - `base_asset`: Address of the base asset (e.g. XLM native contract).
+    /// - `quote_asset`: Address of the quote asset (e.g. USDC contract).
+    ///
+    /// ## Returns
+    /// `Ok(PriceData)` on success, or one of:
+    /// - `Err(Error::OracleNotConfigured)` — no oracle set and no fallback.
+    /// - `Err(Error::OracleCallFailed)` — oracle call failed and no fallback.
+    /// - `Err(Error::OraclePriceStale)` — data too old and no fallback.
+    /// - `Err(Error::OraclePriceInvalid)` — price ≤ 0 and no fallback.
+    pub fn get_price(
+        env: Env,
+        base_asset: Address,
+        quote_asset: Address,
+    ) -> Result<PriceData, Error> {
+        // Retrieve the oracle address, falling back gracefully if absent.
+        let oracle_opt: Option<Address> =
+            env.storage().instance().get(&DataKey::OracleAddress);
+
+        let staleness_threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StalenessThreshold)
+            .unwrap_or(3_600u64); // default: 1 hour
+
+        // Helper closure: return the fallback price if one is configured,
+        // otherwise propagate the supplied error.
+        let fallback_or_err =
+            |env: &Env, base: &Address, quote: &Address, err: Error| -> Result<PriceData, Error> {
+                if let Some(fallback) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(
+                        base.clone(),
+                        quote.clone(),
+                    ))
+                {
+                    log!(env, "Oracle error; using fallback price");
+                    Ok(fallback)
+                } else {
+                    Err(err)
+                }
+            };
+
+        // 1. Check oracle is configured.
+        let oracle = match oracle_opt {
+            Some(addr) => addr,
+            None => {
+                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleNotConfigured);
+            }
+        };
+
+        // 2. Call the oracle. Use try_get_price to avoid trapping on failure.
+        let price_data = match PriceFeedOracleClient::new(&env, &oracle)
+            .try_get_price(&base_asset, &quote_asset)
+        {
+            Ok(Ok(data)) => data,
+            _ => {
+                log!(&env, "Oracle contract call failed");
+                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleCallFailed);
+            }
+        };
+
+        // 3. Staleness check (skip when threshold is 0).
+        if staleness_threshold > 0 {
+            let current_time = env.ledger().timestamp();
+            if price_data.timestamp == 0
+                || current_time.saturating_sub(price_data.timestamp) > staleness_threshold
+            {
+                log!(&env, "Oracle price is stale");
+                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OraclePriceStale);
+            }
+        }
+
+        // 4. Validity check.
+        if price_data.price <= 0 {
+            log!(&env, "Oracle price is invalid (<=0)");
+            return fallback_or_err(&env, &base_asset, &quote_asset, Error::OraclePriceInvalid);
+        }
+
+        // 5. Emit event and return the validated price.
+        env.events().publish(
+            (
+                symbol_short!("price_ok"),
+                base_asset.clone(),
+                quote_asset.clone(),
+            ),
+            price_data.price,
+        );
+
+        log!(&env, "Oracle price fetched and validated");
+        Ok(price_data)
+    }
+
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
     ///
     /// # Parameters
@@ -1898,6 +2390,11 @@ impl PaymentRouter {
     /// resulting `token_out` to the recipient. The DEX adapter must return the
     /// received output and any unused input as `[received, unused]`; unused
     /// input is credited to the sender's refund balance.
+    ///
+    /// # Panics
+    /// Panics if the DEX adapter returns a malformed result tuple or a
+    /// token transfer traps.
+    #[allow(clippy::too_many_arguments)]
     pub fn route_payment_with_swap(
         env: Env,
         sender: Address,
@@ -1999,7 +2496,13 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
-        // Pre-validate all payments to avoid rollback panic from require_auth
+        // Pre-validate the whole batch before recording any authorization. An Err returned after require_auths exist aborts the host with a non-unwinding panic instead of a catchable error (fuzz crashes: [valid, amount-0] and [2.3e13, 1] batches), so every fallible check must precede every auth.
+        // Pass 1 performs pure checks only (no authorization recorded), so a
+        // batch containing an invalid payment returns `Err` before any auth
+        // exists that the host would have to roll back: recording 2+
+        // `require_auth`s and then failing aborts the host with a
+        // non-unwinding panic instead of returning a catchable error
+        // (see fuzz crash: [valid, amount-0] batch).
         let max_amount: i128 = env
             .storage()
             .instance()
@@ -2011,8 +2514,11 @@ impl PaymentRouter {
             .get(&DataKey::MinLimit)
             .unwrap_or(0);
 
-        for payment in payments.iter() {
-            payment.sender.require_auth();
+        let current_time = env.ledger().timestamp();
+
+        // Pass 1: pure checks only. Besides the per-payment rules, simulate per-sender daily-limit accumulation and per-(sender, token) debit totals across the batch prefix, mirroring process_single_payment, so processing cannot fail after authorizations are recorded.
+        for i in 0..payments.len() {
+            let payment = payments.get(i).ok_or(Error::LimitExceeded)?;
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
             }
@@ -2026,9 +2532,63 @@ impl PaymentRouter {
                 return Err(Error::LimitExceeded);
             }
             Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
+
+            // Prefix sums over payments[0..=i]: same-sender daily accumulation (across all tokens) and same-(sender, token) debit totals for balance sufficiency.
+            let mut sender_accumulated: i128 = 0;
+            let mut pair_total: i128 = 0;
+            for j in 0..=i {
+                let other = payments.get(j).ok_or(Error::LimitExceeded)?;
+                if other.sender == payment.sender {
+                    sender_accumulated = sender_accumulated
+                        .checked_add(other.amount)
+                        .ok_or(Error::LimitExceeded)?;
+                    if other.token_address == payment.token_address {
+                        pair_total = pair_total
+                            .checked_add(other.amount)
+                            .ok_or(Error::LimitExceeded)?;
+                    }
+                }
+            }
+            let spending_key = DataKey::UserSpending(payment.sender.clone());
+            let (stored_reset, stored_amount): (u64, i128) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BytesN<24>>(&spending_key)
+                .map(|packed| unpack_spending(&packed))
+                .unwrap_or((current_time, 0));
+            let base_amount = if current_time.saturating_sub(stored_reset) >= Self::SECONDS_IN_24H {
+                0
+            } else {
+                stored_amount
+            };
+            let projected = base_amount
+                .checked_add(sender_accumulated)
+                .ok_or(Error::LimitExceeded)?;
+            if projected > Self::DAILY_MAX_LIMIT {
+                return Err(Error::LimitExceeded);
+            }
+            let token_client = token::Client::new(&env, &payment.token_address);
+            if token_client.balance(&payment.sender) < pair_total {
+                return Err(Error::InsufficientBalance);
+            }
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        // Pass 2: authorize each unique sender once. Authorizing the same address twice in one invocation aborts the host under some runners.
+        for i in 0..payments.len() {
+            let sender = payments.get(i).ok_or(Error::LimitExceeded)?.sender;
+            let mut seen = false;
+            for j in 0..i {
+                if payments.get(j).ok_or(Error::LimitExceeded)?.sender == sender {
+                    seen = true;
+                    break;
+                }
+            }
+            if !seen {
+                sender.require_auth();
+            }
+        }
 
         for payment in payments.iter() {
             Self::process_single_payment(
@@ -2044,6 +2604,87 @@ impl PaymentRouter {
         }
 
         Ok(())
+    }
+
+    /// Returns the current meta-transaction nonce for a user.
+    ///
+    /// Relayers must use this nonce when building the signed payload.
+    /// The nonce starts at `0` and increments after each successful
+    /// `route_payment_meta`, preventing replay attacks.
+    pub fn get_meta_nonce(env: Env, user: Address) -> u64 {
+        Self::get_meta_nonce_internal(&env, &user)
+    }
+
+    /// Relays a user-signed payment on behalf of the user.
+    ///
+    /// The user signs `SHA256(contract || sender || pubkey || recipient ||
+    /// token || amount || nonce || deadline)` off-chain with Ed25519.
+    /// Any relayer holding XLM for fees submits the payload; the contract
+    /// verifies the signature, checks `nonce` and `deadline`, then moves
+    /// funds via prior token allowance (`approve` + `transfer_from`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_payment_meta(
+        env: Env,
+        sender: Address,
+        signer_pubkey: BytesN<32>,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        if env.ledger().timestamp() > deadline {
+            return Err(Error::DeadlineExpired);
+        }
+
+        let stored = Self::get_meta_nonce_internal(&env, &sender);
+        if stored != nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        let message = Self::build_meta_message(
+            &env,
+            &sender,
+            &signer_pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+        );
+        // Traps on invalid signature; `Error::InvalidSignature` documents
+        // this failure mode for off-chain integrators.
+        env.crypto()
+            .ed25519_verify(&signer_pubkey, &message, &signature);
+
+        let key = DataKey::MetaNonce(sender.clone());
+        env.storage().persistent().set(&key, &(nonce + 1));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::process_single_payment_no_auth(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
     }
 
     /// Returns the available internal refund balance for a user and token.
@@ -2298,6 +2939,264 @@ mod test {
                 .get(&MockKycKey::Verified(account))
                 .unwrap_or(false)
         }
+    }
+
+    // ── Mock price-feed oracle ───────────────────────────────────────────────
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockOracleKey {
+        Price(Address, Address),
+        ShouldFail,
+    }
+
+    #[contract]
+    struct MockPriceFeedOracle;
+
+    #[contractimpl]
+    impl MockPriceFeedOracle {
+        /// Store a price for a given (base, quote) pair.
+        pub fn set_price(
+            env: Env,
+            base_asset: Address,
+            quote_asset: Address,
+            price: i128,
+            decimals: u32,
+            timestamp: u64,
+        ) {
+            let data = PriceData {
+                price,
+                decimals,
+                timestamp,
+            };
+            env.storage()
+                .instance()
+                .set(&MockOracleKey::Price(base_asset, quote_asset), &data);
+        }
+
+        /// Configure the mock to trap on the next `get_price` call.
+        pub fn set_should_fail(env: Env, fail: bool) {
+            env.storage()
+                .instance()
+                .set(&MockOracleKey::ShouldFail, &fail);
+        }
+
+        /// Implements the PriceFeedOracle interface.
+        pub fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData {
+            let should_fail: bool = env
+                .storage()
+                .instance()
+                .get(&MockOracleKey::ShouldFail)
+                .unwrap_or(false);
+            if should_fail {
+                panic!("mock oracle failure");
+            }
+            env.storage()
+                .instance()
+                .get(&MockOracleKey::Price(base_asset, quote_asset))
+                .unwrap_or(PriceData {
+                    price: 0,
+                    decimals: 7,
+                    timestamp: 0,
+                })
+        }
+    }
+
+    // ── Oracle helper ────────────────────────────────────────────────────────
+
+    fn setup_oracle_env() -> (
+        Env,
+        PaymentRouterClient<'static>,
+        Address,
+        MockPriceFeedOracleClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+        let oracle_id = env.register_contract(None, MockPriceFeedOracle);
+        let oracle_client = MockPriceFeedOracleClient::new(&env, &oracle_id);
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        (env, client, contract_id, oracle_client, oracle_id, base, quote)
+    }
+
+    // ── Oracle tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_price_returns_valid_oracle_price() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+
+        // Populate mock: 0.125 USD/XLM with 7 decimals = 1_250_000, fresh timestamp
+        let now = env.ledger().timestamp();
+        oracle_client.set_price(&base, &quote, &1_250_000, &7, &now);
+
+        let price_data = client.get_price(&base, &quote).unwrap();
+        assert_eq!(price_data.price, 1_250_000);
+        assert_eq!(price_data.decimals, 7);
+        assert_eq!(price_data.timestamp, now);
+    }
+
+    #[test]
+    fn test_get_price_fails_when_oracle_not_configured() {
+        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // No oracle set, no fallback
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OracleNotConfigured))
+        );
+    }
+
+    #[test]
+    fn test_get_price_uses_fallback_when_oracle_not_configured() {
+        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Set a fallback price but no live oracle
+        client.set_fallback_price(&base, &quote, &1_000_000, &7);
+
+        let fallback = client.get_fallback_price(&base, &quote);
+        assert!(fallback.is_some());
+        assert_eq!(fallback.unwrap().price, 1_000_000);
+
+        // get_price should return the fallback
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 1_000_000);
+    }
+
+    #[test]
+    fn test_get_price_rejects_stale_data_and_uses_fallback() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+        // Threshold of 3600 seconds (default)
+        client.set_staleness_threshold(&3_600u64);
+
+        // Oracle returns a price with a very old timestamp (2 hours ago)
+        let stale_timestamp = env.ledger().timestamp().saturating_sub(7_200);
+        oracle_client.set_price(&base, &quote, &2_000_000, &7, &stale_timestamp);
+
+        // Without fallback: should return OraclePriceStale
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OraclePriceStale))
+        );
+
+        // Add a fallback: should now return the fallback price
+        client.set_fallback_price(&base, &quote, &1_800_000, &7);
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 1_800_000);
+    }
+
+    #[test]
+    fn test_get_price_rejects_invalid_price() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+
+        // Oracle returns price = 0 with a fresh timestamp
+        let now = env.ledger().timestamp();
+        oracle_client.set_price(&base, &quote, &0, &7, &now);
+
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OraclePriceInvalid))
+        );
+    }
+
+    #[test]
+    fn test_get_price_falls_back_when_oracle_call_fails() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+
+        // Configure mock to fail
+        oracle_client.set_should_fail(&true);
+
+        // No fallback: should error
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OracleCallFailed))
+        );
+
+        // With fallback configured: should succeed
+        client.set_fallback_price(&base, &quote, &5_000_000, &7);
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 5_000_000);
+    }
+
+    #[test]
+    fn test_staleness_threshold_zero_disables_staleness_check() {
+        let (env, client, _, oracle_client, oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        client.set_price_oracle(&oracle_id);
+        // Set threshold to 0 = staleness check disabled
+        client.set_staleness_threshold(&0u64);
+
+        // Oracle returns a price with timestamp 0 (would normally be stale)
+        oracle_client.set_price(&base, &quote, &3_000_000, &7, &0);
+
+        // Should pass because staleness check is disabled
+        let result = client.get_price(&base, &quote);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().price, 3_000_000);
+    }
+
+    #[test]
+    fn test_set_fallback_price_zero_clears_fallback() {
+        let (env, client, _, _oracle_client, _oracle_id, base, quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Set then clear fallback
+        client.set_fallback_price(&base, &quote, &1_000_000, &7);
+        assert!(client.get_fallback_price(&base, &quote).is_some());
+
+        client.set_fallback_price(&base, &quote, &0, &7);
+        assert!(client.get_fallback_price(&base, &quote).is_none());
+    }
+
+    #[test]
+    fn test_set_price_oracle_requires_compliance_officer_role() {
+        let (env, client, _, _oracle_client, oracle_id, _base, _quote) = setup_oracle_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Only ComplianceOfficer (admin in this test via mock_all_auths) can set the oracle.
+        // Verify auth is recorded for admin.
+        client.set_price_oracle(&oracle_id);
+        let auths = env.auths();
+        let admin_auth_present = auths.iter().any(|(addr, _)| *addr == admin);
+        assert!(
+            admin_auth_present,
+            "set_price_oracle must require admin/ComplianceOfficer authorization"
+        );
     }
 
     /// Returns (env, client, contract_id).
@@ -3184,6 +4083,218 @@ mod test {
         // Route payment of 500 when balance is only 100
         let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
         assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
+    }
+
+    // ── Meta-transaction tests ─────────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_meta_payload(
+        env: &Env,
+        contract_id: &Address,
+        sender: &Address,
+        signer_pubkey: &BytesN<32>,
+        recipient: &Address,
+        token: &Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> BytesN<64> {
+        use ed25519_dalek::Signer;
+        use soroban_sdk::xdr::ToXdr;
+        let mut payload = soroban_sdk::Bytes::new(env);
+        payload.append(&contract_id.to_xdr(env));
+        payload.append(&sender.to_xdr(env));
+        payload.append(&soroban_sdk::Bytes::from_slice(
+            env,
+            &signer_pubkey.to_array(),
+        ));
+        payload.append(&recipient.to_xdr(env));
+        payload.append(&token.to_xdr(env));
+        payload.append(&amount.to_xdr(env));
+        payload.append(&nonce.to_xdr(env));
+        payload.append(&deadline.to_xdr(env));
+        let hash = env.crypto().sha256(&payload);
+        let msg = soroban_sdk::Bytes::from(&hash);
+        let mut buf = [0u8; 32];
+        msg.copy_into_slice(&mut buf);
+        let sig = signing_key.sign(&buf);
+        BytesN::from_array(env, &sig.to_bytes())
+    }
+
+    #[test]
+    fn test_meta_payment_success_and_nonce_increments() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+
+        let amount = 2000i128;
+        let nonce = client.get_meta_nonce(&sender);
+        assert_eq!(nonce, 0);
+        let deadline = env.ledger().timestamp() + 100_000;
+
+        token_client.approve(&sender, &contract_id, &amount, &1_000_000);
+
+        let sig = sign_meta_payload(
+            &env,
+            &contract_id,
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+            &signing_key,
+        );
+
+        client.route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+
+        assert_eq!(client.get_meta_nonce(&sender), 1);
+        assert_eq!(token_client.balance(&treasury), 20);
+        assert_eq!(token_client.balance(&recipient), 1980);
+        assert_eq!(token_client.balance(&sender), 10_000 - amount);
+    }
+
+    #[test]
+    fn test_meta_payment_replay_rejected() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+
+        let amount = 1000i128;
+        let nonce = client.get_meta_nonce(&sender);
+        let deadline = env.ledger().timestamp() + 100_000;
+
+        token_client.approve(&sender, &contract_id, &(amount * 2), &1_000_000);
+
+        let sig = sign_meta_payload(
+            &env,
+            &contract_id,
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+            &signing_key,
+        );
+
+        client.route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+
+        let res = client.try_route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidNonce);
+    }
+
+    #[test]
+    fn test_meta_payment_expired_rejected() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+
+        let amount = 1000i128;
+        let nonce = client.get_meta_nonce(&sender);
+        let deadline = env.ledger().timestamp() + 10;
+
+        token_client.approve(&sender, &contract_id, &amount, &1_000_000);
+
+        let sig = sign_meta_payload(
+            &env,
+            &contract_id,
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+            &signing_key,
+        );
+
+        let ts = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: ts + 100_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        let res = client.try_route_payment_meta(
+            &sender,
+            &pubkey,
+            &recipient,
+            &token_address,
+            &amount,
+            &nonce,
+            &deadline,
+            &sig,
+        );
+        assert_eq!(res.unwrap_err().unwrap(), Error::DeadlineExpired);
     }
 
     #[test]
