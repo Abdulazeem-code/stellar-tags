@@ -100,6 +100,40 @@ function keysetWhereDesc({ createdAt, username }) {
 }
 
 /**
+ * Prisma `where` fragment selecting rows strictly after `point` for a
+ * `(createdAt DESC, id DESC)` ordering. Using the unique row id as the
+ * tie-breaker (unlike `keysetWhereDesc`) guarantees progress even when many
+ * rows share a timestamp, which is the common case for append-heavy tables
+ * such as `payments`. Intended for internal keyset streaming (exporters),
+ * where the cursor stays in memory instead of round-tripping through the API.
+ */
+function keysetWhereDescById({ createdAt, id }) {
+  const timestamp = new Date(createdAt);
+  return {
+    OR: [
+      { createdAt: { lt: timestamp } },
+      { AND: [{ createdAt: { equals: timestamp } }, { id: { lt: String(id) } }] },
+    ],
+  };
+}
+
+/**
+ * Prisma `where` fragment selecting rows strictly after `point` for an
+ * ascending `(createdAt ASC, id ASC)` ordering — the same seek as
+ * `keysetWhereDescById`, walked the other way. Used by the admin export,
+ * which streams oldest-first.
+ */
+function keysetWhereAscById({ createdAt, id }) {
+  const timestamp = new Date(createdAt);
+  return {
+    OR: [
+      { createdAt: { gt: timestamp } },
+      { AND: [{ createdAt: { equals: timestamp } }, { id: { gt: String(id) } }] },
+    ],
+  };
+}
+
+/**
  * Split a fetch of `limit + 1` candidate rows into a page plus continuation
  * info. An extra row is requested so "has more" is exact; it is trimmed here.
  * @returns {{ rows: object[], hasMore: boolean, nextCursor: string|null }}
@@ -133,6 +167,8 @@ module.exports = {
   decodeCursor,
   parseCursorQuery,
   keysetWhereDesc,
+  keysetWhereDescById,
+  keysetWhereAscById,
   paginateByKeyset,
   cursorPaginatedResponse,
 };

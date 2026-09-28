@@ -21,8 +21,6 @@ jest.mock('redis', () => ({
   createClient: jest.fn(() => null),
 }));
 
-jest.mock('rate-limit-redis', () => jest.fn());
-
 jest.mock('bad-words', () =>
   jest.fn().mockImplementation(() => ({
     isProfane: jest.fn(() => false),
@@ -101,7 +99,7 @@ global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
 
 const VALID_ADDRESS = 'GBCDEFGHIJKLMNOPQRSTUVWXYZ';
 
-describe('Rate Limiting — express-rate-limit', () => {
+describe('Rate Limiting - sliding window', () => {
   let app;
 
   beforeEach(() => {

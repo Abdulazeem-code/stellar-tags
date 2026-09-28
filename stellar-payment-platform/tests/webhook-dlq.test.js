@@ -88,7 +88,7 @@ describe('moveToDLQ', () => {
     });
     prisma.webhook.update.mockResolvedValue({});
 
-    await moveToDLQ(prisma, async () => {}, webhook);
+    await moveToDLQ(prisma, webhook);
 
     expect(prisma.webhookDLQ.create).toHaveBeenCalled();
     const createData = prisma.webhookDLQ.create.mock.calls[0][0].data;
@@ -106,7 +106,7 @@ describe('listDLQEntries', () => {
     ]);
     prisma.webhookDLQ.count.mockResolvedValue(1);
 
-    const { entries, total } = await listDLQEntries(prisma, async () => []);
+    const { entries, total } = await listDLQEntries(prisma);
 
     expect(total).toBe(1);
     expect(entries).toHaveLength(1);
@@ -117,7 +117,7 @@ describe('listDLQEntries', () => {
     prisma.webhookDLQ.findMany.mockResolvedValue([]);
     prisma.webhookDLQ.count.mockResolvedValue(0);
 
-    await listDLQEntries(prisma, async () => [], { username: 'alice' });
+    await listDLQEntries(prisma, { username: 'alice' });
 
     const findManyCall = prisma.webhookDLQ.findMany.mock.calls[0][0];
     expect(findManyCall.where.username.equals).toBe('alice');
@@ -140,7 +140,7 @@ describe('replayFromDLQ', () => {
     prisma.webhookDLQ.findUnique.mockResolvedValue(entry);
     prisma.webhookDLQ.update.mockResolvedValue({ ...entry, replayed: true });
 
-    const result = await replayFromDLQ(prisma, async () => {}, 'dlq-1');
+    const result = await replayFromDLQ(prisma, 'dlq-1');
 
     expect(result.ok).toBe(true);
     expect(global.fetch).toHaveBeenCalledWith(
@@ -155,7 +155,7 @@ describe('replayFromDLQ', () => {
   it('returns error for non-existent DLQ entry', async () => {
     prisma.webhookDLQ.findUnique.mockResolvedValue(null);
 
-    const result = await replayFromDLQ(prisma, async () => {}, 'nonexistent');
+    const result = await replayFromDLQ(prisma, 'nonexistent');
 
     expect(result.ok).toBe(false);
     expect(result.error).toBe('DLQ entry not found');
@@ -166,7 +166,7 @@ describe('replayFromDLQ', () => {
       id: 'dlq-1', replayed: true,
     });
 
-    const result = await replayFromDLQ(prisma, async () => {}, 'dlq-1');
+    const result = await replayFromDLQ(prisma, 'dlq-1');
 
     expect(result.ok).toBe(false);
     expect(result.error).toContain('already been replayed');
@@ -189,7 +189,7 @@ describe('replayFromDLQ', () => {
     // Make fetch fail to simulate a delivery failure
     global.fetch.mockRejectedValue(new Error('Connection refused'));
 
-    const result = await replayFromDLQ(prisma, async () => {}, 'dlq-1');
+    const result = await replayFromDLQ(prisma, 'dlq-1');
 
     expect(result.ok).toBe(false);
     expect(result.error).toContain('Connection refused');

@@ -89,6 +89,7 @@ describe('payment intent metadata', () => {
 
     const response = await request(app)
       .post('/v1/payments/bulk')
+      .set('Idempotency-Key', 'test-key')
       .send([{ ...baseIntent, metadata }]);
 
     expect(response.status).toBe(201);
@@ -113,7 +114,7 @@ describe('payment intent metadata', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-1',
@@ -148,7 +149,7 @@ describe('payment intent metadata', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-2',
@@ -182,7 +183,7 @@ describe('payment intent metadata', () => {
 
     await dispatchPaymentWebhooks({
       prisma,
-      poolGetFn: jest.fn(),
+      
       queue,
       payment: {
         id: 'payment-3',
