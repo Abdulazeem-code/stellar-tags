@@ -12,8 +12,17 @@ members = [
     "payment_proxy",
 ]
 
-# Keep each crate's individual release profile; workspace-level settings
-# apply as defaults but are overridden by per-crate [profile.release].
+# Edition 2021 members require resolver v2.
+resolver = "2"
+
+# The ethnum-patch is a local fork that fixes a transmute-size mismatch in
+# ethnum v1.5.0 when compiled with recent Rust toolchains.  Patch entries
+# must live at the workspace root, not in individual member Cargo.toml files.
+[patch.crates-io]
+ethnum = { path = "payment_router/ethnum-patch" }
+
+# Workspace-level release profile.  Individual crates may override specific
+# settings in their own [profile.release] tables.
 [profile.release]
 opt-level = "z"
 overflow-checks = true
