@@ -32,7 +32,9 @@ const {
   getMetrics,
   getContentType,
   setMetricsSources,
+  setDlqDepthSource,
 } = require("./src/metrics");
+const { closeDlqQueue, getDlqDepth, hasOpenDlqQueues } = require("./src/dlq");
 const { validateSchema } = require("./src/middleware/validateSchema");
 const {
   buildErrorHandler,
@@ -225,6 +227,8 @@ if (redisClient) {
 }
 
 setMetricsSources({ prisma, redisClient });
+// Lets /metrics report DLQ depth without the metrics module importing BullMQ.
+setDlqDepthSource(getDlqDepth);
 
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
@@ -389,12 +393,6 @@ const etagCache = (req, res, next) => {
 
   next();
 };
-
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    "SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1",
-    [username],
-  );
 
 // Expose /metrics endpoint for Prometheus to scrape
 
@@ -1247,6 +1245,15 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
         await redis.quit();
       } catch (err) {
         logger.error(err, "Error disconnecting Redis during shutdown:");
+      }
+    }
+    // Only await when the DLQ was actually used, so a process that never
+    // opened it does not pay for an extra async hop during shutdown.
+    if (hasOpenDlqQueues()) {
+      try {
+        await closeDlqQueue();
+      } catch (err) {
+        logger.error(err, "Error closing the DLQ queues during shutdown:");
       }
     }
     process.exit(0);

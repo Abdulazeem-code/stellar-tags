@@ -254,6 +254,22 @@ sender: string;
 
 
 /**
+ * A fee change proposal weighted by governance-token balances.
+ */
+export interface FeeProposal {
+  created_at: u64;
+  executed: boolean;
+  fee_bps: i128;
+  fee_cap: i128;
+  no_votes: i128;
+  proposer: string;
+  quorum: i128;
+  voting_ends_at: u64;
+  yes_votes: i128;
+}
+
+
+/**
  * A user's rolling 24-hour spending record.
  * 
  * Retained purely so existing test snapshots that reference this type by
@@ -817,6 +833,11 @@ export interface Client {
   emergency_freeze: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a get_fee_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_fee_proposal: ({proposal_id}: {proposal_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Option<FeeProposal>>>
+
+  /**
    * Construct and simulate a blacklist_address transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Adds an address to the blacklist. Admin-only.
    * 
@@ -975,6 +996,20 @@ export interface Client {
    * and execute after 24 hours.
    */
   set_max_slippage_bps: ({max_slippage_bps}: {max_slippage_bps: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a configure_governance transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Configures the DAO token and minimum voting weight for fee proposals.
+   * This administrative bootstrap does not itself change fees; subsequent
+   * fee changes can be made through the proposal lifecycle.
+   */
+  configure_governance: ({governance_token, quorum}: {governance_token: string, quorum: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a execute_fee_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Finalizes a successful fee proposal after its voting period ends.
+   */
+  execute_fee_proposal: ({proposal_id}: {proposal_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a get_effective_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -1188,6 +1223,7 @@ export class Client extends ContractClient {
         get_user_volume: this.txFromJSON<i128>,
         withdraw_refund: this.txFromJSON<Result<void>>,
         emergency_freeze: this.txFromJSON<Result<void>>,
+        get_fee_proposal: this.txFromJSON<Option<FeeProposal>>,
         blacklist_address: this.txFromJSON<Result<void>>,
         claim_all_refunds: this.txFromJSON<Result<i128>>,
         get_queued_action: this.txFromJSON<Result<TimelockEntry>>,
