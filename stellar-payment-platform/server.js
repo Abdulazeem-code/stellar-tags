@@ -390,12 +390,6 @@ const etagCache = (req, res, next) => {
   next();
 };
 
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    "SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1",
-    [username],
-  );
-
 // Expose /metrics endpoint for Prometheus to scrape
 
 /**
