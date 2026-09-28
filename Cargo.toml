@@ -1,0 +1,25 @@
+[workspace]
+# Workspace members are all Soroban / Rust crates in this repository.
+# Each crate retains its own Cargo.toml; the workspace just provides a shared
+# dependency resolver and lets `cargo` commands work from the repo root.
+#
+# The integration test crate is excluded from the default build because it
+# pulls in network-only dependencies (tokio, reqwest, soroban-client) that
+# require a live Stellar node.
+members = [
+    "payment_router",
+    "pausable_token",
+    "payment_proxy",
+]
+
+# Keep each crate's individual release profile; workspace-level settings
+# apply as defaults but are overridden by per-crate [profile.release].
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
