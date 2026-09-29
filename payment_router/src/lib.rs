@@ -116,6 +116,18 @@ pub struct Payment {
     pub amount: i128,
 }
 
+/// Structured payload for meta-transactions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaPayment {
+    pub nonce: u64,
+    pub deadline: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
+    pub amount: i128,
+}
+
 // ── Token swap types ─────────────────────────────────────────────────────────
 //
 // Issue #665: allow a sender to pay in an arbitrary token and have it swapped
@@ -726,30 +738,17 @@ impl PaymentRouter {
     }
 
     /// Builds the domain-separated message for meta-transactions.
-    /// Binds `current_contract_address` + all call args + `signer_pubkey` +
-    /// `nonce` + `deadline`, then returns `SHA256(payload)` as `Bytes`
-    /// for `ed25519_verify`. Off-chain signers must sign these exact bytes.
-    #[allow(clippy::too_many_arguments)]
+    /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
     fn build_meta_message(
         env: &Env,
-        sender: &Address,
+        payload: &MetaPayment,
         signer_pubkey: &BytesN<32>,
-        recipient: &Address,
-        token_address: &Address,
-        amount: i128,
-        nonce: u64,
-        deadline: u64,
     ) -> Bytes {
-        let mut payload = Bytes::new(env);
-        payload.append(&env.current_contract_address().to_xdr(env));
-        payload.append(&sender.to_xdr(env));
-        payload.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
-        payload.append(&recipient.to_xdr(env));
-        payload.append(&token_address.to_xdr(env));
-        payload.append(&amount.to_xdr(env));
-        payload.append(&nonce.to_xdr(env));
-        payload.append(&deadline.to_xdr(env));
-        let hash = env.crypto().sha256(&payload);
+        let mut msg = Bytes::new(env);
+        msg.append(&env.current_contract_address().to_xdr(env));
+        msg.append(&payload.to_xdr(env));
+        msg.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
+        let hash = env.crypto().sha256(&msg);
         Bytes::from(&hash)
     }
 
