@@ -6,74 +6,14 @@ use soroban_sdk::{
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
-//
-// Issue #519: Replace the two-field UserSpending contracttype with a single
-// BytesN<24> value packed with bitwise operations.
-//
-// Layout (big-endian):
-//   bytes  0..8  — last_reset_time  : u64   (8 bytes)
-//   bytes  8..24 — accumulated_amount: i128  (16 bytes)
-//
-// Benefits:
-//  • Eliminates the XDR struct-type overhead (type discriminant + field tags)
-//    that Soroban adds to every contracttype value, shrinking each UserSpending
-//    ledger entry from ~48 bytes to exactly 24 bytes.
-//  • Smaller entries → lower state-rent fee per ledger entry per TTL period.
 
-/// Pack `last_reset_time` (u64) and `accumulated_amount` (i128) into a
-/// 24-byte big-endian buffer.
-fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> BytesN<24> {
-    let mut buf = [0u8; 24];
-
-    // Bytes 0..8 — last_reset_time (u64 big-endian)
-    let t_bytes = last_reset_time.to_be_bytes();
-    buf[0] = t_bytes[0];
-    buf[1] = t_bytes[1];
-    buf[2] = t_bytes[2];
-    buf[3] = t_bytes[3];
-    buf[4] = t_bytes[4];
-    buf[5] = t_bytes[5];
-    buf[6] = t_bytes[6];
-    buf[7] = t_bytes[7];
-
-    // Bytes 8..24 — accumulated_amount (i128 big-endian)
-    let a_bytes = accumulated_amount.to_be_bytes();
-    buf[8] = a_bytes[0];
-    buf[9] = a_bytes[1];
-    buf[10] = a_bytes[2];
-    buf[11] = a_bytes[3];
-    buf[12] = a_bytes[4];
-    buf[13] = a_bytes[5];
-    buf[14] = a_bytes[6];
-    buf[15] = a_bytes[7];
-    buf[16] = a_bytes[8];
-    buf[17] = a_bytes[9];
-    buf[18] = a_bytes[10];
-    buf[19] = a_bytes[11];
-    buf[20] = a_bytes[12];
-    buf[21] = a_bytes[13];
-    buf[22] = a_bytes[14];
-    buf[23] = a_bytes[15];
-
-    BytesN::from_array(env, &buf)
+fn pack_spending(last_reset_time: u64, accumulated_amount: i128) -> u128 {
+    ((last_reset_time as u128) << 64) | ((accumulated_amount as u128) & 0xFFFF_FFFF_FFFF_FFFF)
 }
 
-/// Unpack a 24-byte buffer into `(last_reset_time, accumulated_amount)`.
-fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
-    // BytesN::to_array() is available in soroban-sdk v20.
-    let buf: [u8; 24] = packed.to_array();
-
-    // last_reset_time — bytes 0..8
-    let last_reset_time = u64::from_be_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-
-    // accumulated_amount — bytes 8..24
-    let accumulated_amount = i128::from_be_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
-        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-    ]);
-
+fn unpack_spending(packed: u128) -> (u64, i128) {
+    let last_reset_time = (packed >> 64) as u64;
+    let accumulated_amount = (packed & 0xFFFF_FFFF_FFFF_FFFF) as i128;
     (last_reset_time, accumulated_amount)
 }
 
@@ -87,7 +27,7 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
 ///
 /// Retained purely so existing test snapshots that reference this type by
 /// name keep compiling. Live contract state is stored as a packed
-/// `BytesN<24>` (see `pack_spending` / `unpack_spending`); this struct is not
+/// `u128` (see `pack_spending` / `unpack_spending`); this struct is not
 /// read from or written to storage at runtime.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,6 +243,9 @@ pub enum DataKey {
     /// Maximum tolerated swap slippage in basis points, applied against a
     /// caller-supplied quote.  Stored as `i128` in instance storage.
     MaxSlippageBps,
+    MerkleRoot,
+    RebateToken,
+    MerkleClaimed(Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -353,6 +296,8 @@ pub enum Error {
     /// Swap parameters are self-contradictory or unusable (for example
     /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
     InvalidSwapParams = 19,
+    InvalidMerkleProof = 20,
+    RebateAlreadyClaimed = 21,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -512,8 +457,8 @@ impl PaymentRouter {
         let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
             .storage()
             .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
+            .get::<DataKey, u128>(&spending_key)
+            .map(|packed| unpack_spending(packed))
             .unwrap_or((current_time, 0));
 
         if current_time - last_reset_time >= Self::SECONDS_IN_24H {
@@ -528,7 +473,7 @@ impl PaymentRouter {
 
         env.storage().persistent().set(
             &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
+            &pack_spending(last_reset_time, accumulated_amount),
         );
         env.storage().persistent().extend_ttl(
             &spending_key,
@@ -890,8 +835,8 @@ impl PaymentRouter {
         let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
             .storage()
             .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
+            .get::<DataKey, u128>(&spending_key)
+            .map(|packed| unpack_spending(packed))
             .unwrap_or((current_time, 0));
 
         if current_time - last_reset_time >= Self::SECONDS_IN_24H {
@@ -909,7 +854,7 @@ impl PaymentRouter {
 
         env.storage().persistent().set(
             &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
+            &pack_spending(last_reset_time, accumulated_amount),
         );
         env.storage().persistent().extend_ttl(
             &spending_key,
@@ -3088,6 +3033,71 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+
+    pub fn set_merkle_root(env: Env, root: BytesN<32>, token: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::MerkleRoot, &root);
+        env.storage().instance().set(&DataKey::RebateToken, &token);
+        Ok(())
+    }
+
+    pub fn claim_rebate(
+        env: Env,
+        user: Address,
+        amount: i128,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<(), Error> {
+        user.require_auth();
+
+        let root: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerkleRoot)
+            .ok_or(Error::NotInitialized)?;
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RebateToken)
+            .ok_or(Error::NotInitialized)?;
+
+        let claimed_key = DataKey::MerkleClaimed(user.clone());
+        if env.storage().persistent().has(&claimed_key) {
+            return Err(Error::RebateAlreadyClaimed);
+        }
+
+        let mut payload = Bytes::new(&env);
+        payload.append(&user.to_xdr(&env));
+        payload.append(&amount.to_xdr(&env));
+        let leaf = env.crypto().sha256(&payload);
+
+        let mut computed_hash = leaf;
+        for i in 0..proof.len() {
+            let node = proof.get(i).unwrap();
+            let mut node_payload = Bytes::new(&env);
+            if computed_hash < node {
+                node_payload.append(&Bytes::from_slice(&env, &computed_hash.to_array()));
+                node_payload.append(&Bytes::from_slice(&env, &node.to_array()));
+            } else {
+                node_payload.append(&Bytes::from_slice(&env, &node.to_array()));
+                node_payload.append(&Bytes::from_slice(&env, &computed_hash.to_array()));
+            }
+            computed_hash = env.crypto().sha256(&node_payload);
+        }
+
+        if computed_hash != root {
+            return Err(Error::InvalidMerkleProof);
+        }
+
+        env.storage().persistent().set(&claimed_key, &true);
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &user, &amount);
+
+        Ok(())
     }
 }
 
