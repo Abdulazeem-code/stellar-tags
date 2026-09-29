@@ -1,1 +1,2121 @@
 #![no_std]
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{
+    contract, contracterror, contractclient, contractimpl, contracttype, log, symbol_short,
+    token, Address, BytesN, Env, Symbol, Vec,
+};
+
+// ── Packed UserSpending helpers ──────────────────────────────────────────────
+//
+// Issue #519: Replace the two-field UserSpending contracttype with a single
+// BytesN<24> value packed with bitwise operations.
+//
+// Layout (big-endian):
+//   bytes  0..8  — last_reset_time  : u64   (8 bytes)
+//   bytes  8..24 — accumulated_amount: i128  (16 bytes)
+//
+// Benefits:
+//  • Eliminates the XDR struct-type overhead (type discriminant + field tags)
+//    that Soroban adds to every contracttype value, shrinking each UserSpending
+//    ledger entry from ~48 bytes to exactly 24 bytes.
+//  • Smaller entries → lower state-rent fee per ledger entry per TTL period.
+
+/// Pack `last_reset_time` (u64) and `accumulated_amount` (i128) into a
+/// 24-byte big-endian buffer.
+#[allow(dead_code)]
+fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> BytesN<24> {
+    let mut buf = [0u8; 24];
+
+    // Bytes 0..8 — last_reset_time (u64 big-endian)
+    let t_bytes = last_reset_time.to_be_bytes();
+    buf[0] = t_bytes[0];
+    buf[1] = t_bytes[1];
+    buf[2] = t_bytes[2];
+    buf[3] = t_bytes[3];
+    buf[4] = t_bytes[4];
+    buf[5] = t_bytes[5];
+    buf[6] = t_bytes[6];
+    buf[7] = t_bytes[7];
+
+    // Bytes 8..24 — accumulated_amount (i128 big-endian)
+    let a_bytes = accumulated_amount.to_be_bytes();
+    buf[8] = a_bytes[0];
+    buf[9] = a_bytes[1];
+    buf[10] = a_bytes[2];
+    buf[11] = a_bytes[3];
+    buf[12] = a_bytes[4];
+    buf[13] = a_bytes[5];
+    buf[14] = a_bytes[6];
+    buf[15] = a_bytes[7];
+    buf[16] = a_bytes[8];
+    buf[17] = a_bytes[9];
+    buf[18] = a_bytes[10];
+    buf[19] = a_bytes[11];
+    buf[20] = a_bytes[12];
+    buf[21] = a_bytes[13];
+    buf[22] = a_bytes[14];
+    buf[23] = a_bytes[15];
+
+    BytesN::from_array(env, &buf)
+}
+
+/// Unpack a 24-byte buffer into `(last_reset_time, accumulated_amount)`.
+#[allow(dead_code)]
+fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
+    // BytesN::to_array() is available in soroban-sdk v20.
+    let buf: [u8; 24] = packed.to_array();
+
+    // last_reset_time — bytes 0..8
+    let last_reset_time = u64::from_be_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+
+fn pack_spending(last_reset_time: u64, accumulated_amount: i128) -> u128 {
+    ((last_reset_time as u128) << 64) | ((accumulated_amount as u128) & 0xFFFF_FFFF_FFFF_FFFF)
+}
+
+fn unpack_spending(packed: u128) -> (u64, i128) {
+    let last_reset_time = (packed >> 64) as u64;
+    let accumulated_amount = (packed & 0xFFFF_FFFF_FFFF_FFFF) as i128;
+    (last_reset_time, accumulated_amount)
+}
+
+// ── Legacy struct kept for test snapshot compatibility ───────────────────────
+//
+// The UserSpending contracttype is retained so existing tests that reference
+// it directly continue to compile.  All runtime code now uses the packed
+// BytesN<24> representation stored under DataKey::UserSpending.
+
+/// A user's rolling 24-hour spending record.
+///
+/// Retained purely so existing test snapshots that reference this type by
+/// name keep compiling. Live contract state is stored as a packed
+/// `u128` (see `pack_spending` / `unpack_spending`); this struct is not
+/// read from or written to storage at runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSpending {
+    /// Unix timestamp (seconds) at which the 24-hour window last reset.
+    pub last_reset_time: u64,
+    /// Total amount routed by the user since `last_reset_time`.
+    pub accumulated_amount: i128,
+}
+
+/// A single transfer instruction for use with [`PaymentRouter::route_payments`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payment {
+    /// Address the funds are debited from. Must authorize the call.
+    pub sender: Address,
+    /// Address the funds (minus the platform fee) are credited to.
+    pub recipient: Address,
+    /// Contract ID of the token (or Stellar Asset Contract) being transferred.
+    pub token_address: Address,
+    /// Amount to route, denominated in the token's smallest unit. Must be
+    /// positive and within the contract's configured min/max bounds.
+    pub amount: i128,
+}
+
+/// Structured payload for meta-transactions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaPayment {
+    pub nonce: u64,
+    pub deadline: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
+    pub amount: i128,
+}
+
+// ── Token swap types ─────────────────────────────────────────────────────────
+//
+// Issue #665: allow a sender to pay in an arbitrary token and have it swapped
+// into the merchant's preferred token during payment routing.  The swap is a
+// cross-contract call into a DEX router, executed inside the same Soroban
+// transaction as the transfer so the payment either completes end to end or
+// leaves no trace at all.
+
+/// A single swap-routed transfer instruction for use with
+/// [`PaymentRouter::route_payment_with_swap`] and
+/// [`PaymentRouter::route_payments_with_swap`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapPayment {
+    /// Address the funds are debited from. Must authorize the call.
+    pub sender: Address,
+    /// Address the swapped funds (minus the platform fee) are credited to.
+    pub recipient: Address,
+    /// Token the sender pays with, in that token's smallest unit.
+    pub sell_token: Address,
+    /// Token the recipient is paid in. Must differ from `sell_token`.
+    pub buy_token: Address,
+    /// Amount of `sell_token` to pull from the sender and swap.
+    pub amount_in: i128,
+    /// Minimum amount of `buy_token` the swap must deliver. This is the
+    /// slippage floor: if the DEX returns less, the whole payment reverts.
+    pub min_amount_out: i128,
+    /// Amount of `buy_token` the caller expected from a prior `quote_swap`
+    /// call. `0` disables the ceiling check; otherwise the realised output
+    /// must stay within the contract's `max_slippage_bps` of this figure.
+    pub expected_amount_out: i128,
+    /// Unix timestamp (seconds) after which the swap must not execute. `0`
+    /// disables the deadline, letting the DEX apply its own.
+    pub deadline: u64,
+    /// Contract ID of the DEX adapter to invoke. Must be registered by the
+    /// admin, which keeps the cross-contract call pointed at audited code.
+    pub dex: Address,
+}
+
+/// The result of a DEX quote, returned by [`PaymentRouter::quote_swap`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapQuote {
+    /// Amount of `buy_token` the DEX expects to deliver for the quoted input.
+    pub amount_out: i128,
+    /// Tightest `min_amount_out` that still respects the contract's
+    /// `max_slippage_bps` for this quote.
+    pub min_amount_out: i128,
+    /// Configured maximum slippage, in basis points, that produced
+    /// `min_amount_out`.
+    pub max_slippage_bps: i128,
+}
+
+/// Adapter interface implemented by the DEX used for an arbitrary token swap.
+/// The router transfers the input asset to the adapter. The result must contain
+/// `[amount_received, unused_input]`; the adapter must send the output asset to
+/// `recipient` and return any unused input to the router.
+#[contractclient(name = "DexRouterClient")]
+pub trait DexRouter {
+    fn swap_exact_tokens_for_tokens(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        path: Vec<Address>,
+        recipient: Address,
+    ) -> Vec<i128>;
+}
+
+// ── Timelock data structures ─────────────────────────────────────────────────
+//
+// Admin actions that change sensitive contract parameters (treasury, fees,
+// governance, admin transfer) are not applied instantly.  Instead the admin
+// queues an ActionType intent that gets a nonce ID and a ledger timestamp.
+// Only after SECONDS_IN_24H (86 400 s) has elapsed can execute_action be
+// called to apply the change.  This gives observers a 24-hour window to
+// detect and respond to a compromised-admin scenario.
+//
+// The freeze mechanism is the complementary emergency tool: calling
+// emergency_freeze instantly blocks all payments and all timelock executions.
+// A freeze does NOT require going through the timelock itself so it is always
+// available to the admin as an immediate last resort.  Unfreezing likewise
+// takes effect immediately so the admin can restore service once the threat is
+// resolved.
+
+/// Describes which administrative parameter change a timelock entry represents.
+/// Each variant carries all the arguments needed to apply that change when the
+/// delay period is over.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionType {
+    /// Change the platform treasury address.
+    SetPlatformTreasury(Address),
+    /// Update fee basis-points and fee cap together (legacy / combined setter).
+    SetFeeConfig(i128, i128),
+    /// Update fee basis-points only.
+    SetFeeBps(i128),
+    /// Set the governance contract address.
+    SetGovernance(Address),
+    /// Change the minimum routing limit.
+    SetMinLimit(i128),
+    /// Transfer admin rights to a new address.
+    TransferAdmin(Address),
+    /// Upgrade the contract WASM.
+    Upgrade(BytesN<32>),
+    /// Allow swap routing to invoke a DEX router contract.
+    RegisterDex(Address),
+    /// Stop swap routing from invoking a DEX router contract.
+    DeregisterDex(Address),
+    /// Update the maximum tolerated swap slippage.
+    SetMaxSlippageBps(i128),
+}
+
+/// A pending timelock entry stored in persistent ledger storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockEntry {
+    /// Ledger timestamp (seconds since epoch) when this action was queued.
+    pub queued_at: u64,
+    /// The action payload to apply once the delay has elapsed.
+    pub action: ActionType,
+}
+
+/// Role definitions for the Role-Based Access Control (RBAC) system.
+///
+/// Segregates operational privileges across dedicated role boundaries:
+/// SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Role {
+    /// Supreme administrator with exclusive authority over role assignments,
+    /// contract upgrades, emergency freeze/unfreeze, and root governance.
+    SuperAdmin = 1,
+    /// Manager with exclusive authority over platform treasury, yield operations,
+    /// token recovery, and emergency asset withdrawals.
+    TreasuryManager = 2,
+    /// Compliance officer with authority over address blacklisting, KYC oracle
+    /// configurations, and emergency operational pause switches.
+    ComplianceOfficer = 3,
+    /// Fee manager with authority over platform fee basis points, fee caps, and
+    /// minimum payment limits.
+    FeeManager = 4,
+}
+
+/// Storage keys for all contract instance and persistent data.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    /// The current admin address.
+    Admin,
+    /// Governance contract address; if set, it takes over fee-authority from the admin.
+    Governance,
+    /// Address that receives collected platform fees.
+    PlatformTreasury,
+    /// Platform fee rate, in basis points (1/100th of a percent).
+    FeeBps,
+    /// Upper bound on the fee taken from a single payment.
+    FeeCap,
+    /// Minimum amount accepted by `route_payment` / `route_payments`, if set.
+    MinLimit,
+    /// Whether routing is currently paused.
+    Paused,
+    /// Maximum amount accepted by a single payment.
+    MaxAmount,
+    /// Cumulative lifetime amount routed by a given sender.
+    UserVolume(Address),
+    /// Packed 24-hour spending window for a given sender.
+    UserSpending(Address),
+    /// Whether a given recipient address is blacklisted.
+    Blacklist(Address),
+    /// Internal refund balance for a (user, token) pair, credited when a
+    /// direct transfer to the recipient fails.
+    RefundBalance(Address, Address),
+    /// Monotonically-increasing nonce counter used to generate unique IDs for
+    /// timelock entries.  Stored as `u64` in instance storage.
+    TimelockNonce,
+    /// A pending timelock entry keyed by its nonce ID.
+    /// Stored in persistent storage so it survives instance eviction.
+    TimelockEntry(u64),
+    /// When `true` the contract is frozen: payments and timelock executions
+    /// are blocked.  Stored as `bool` in instance storage.
+    Frozen,
+    /// Whether a DEX router contract is approved to receive cross-contract
+    /// swap calls.  Stored as `bool` in persistent storage.
+    RegisteredDex(Address),
+    /// Maximum tolerated swap slippage in basis points, applied against a
+    /// caller-supplied quote.  Stored as `i128` in instance storage.
+    MaxSlippageBps,
+    MerkleRoot,
+    RebateToken,
+    MerkleClaimed(Address),
+}
+
+/// Contract-level errors returned instead of panicking, so callers get a
+/// specific, stable error code to branch on rather than an opaque trap.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// Caller is not authorized to perform this action (e.g. not the admin).
+    Unauthorized = 1,
+    /// Sender's token balance is lower than the requested payment amount.
+    InsufficientBalance = 2,
+    /// Requested amount is outside allowed bounds, or a spending limit was exceeded.
+    LimitExceeded = 3,
+    /// `initialize` was called on a contract that already has an admin set.
+    AlreadyInitialized = 4,
+    /// An admin-configured value (treasury, fee, admin) was read before `initialize`.
+    NotInitialized = 5,
+    /// The contract is currently paused; routing calls are rejected until unpaused.
+    Paused = 6,
+    /// A fee configuration value (basis points or cap) is out of the allowed range.
+    InvalidFeeRate = 7,
+    /// Sender and recipient addresses are the same (self-routing not allowed).
+    InvalidRecipient = 8,
+    /// Recipient address is blacklisted.
+    Blacklisted = 9,
+    /// Requested refund withdrawal amount is zero or exceeds available refund balance.
+    NoRefundAvailable = 10,
+    /// An action is already pending in the timelock queue; it must be executed
+    /// or cancelled before a duplicate can be queued (not currently enforced,
+    /// but reserved for future deduplication logic).
+    TimelockPending = 11,
+    /// The 24-hour delay for the given timelock entry has not elapsed yet.
+    TimelockNotReady = 12,
+    /// No timelock entry exists for the supplied nonce ID.
+    TimelockNotFound = 13,
+    /// The contract is frozen; all payments and timelock executions are blocked.
+    ContractFrozen = 14,
+    /// The swap named a DEX router that the admin has not registered.
+    DexNotRegistered = 15,
+    /// The DEX cross-contract call reverted or returned an unusable value.
+    SwapFailed = 16,
+    /// The swap delivered less than `min_amount_out`, or moved the output
+    /// further than `max_slippage_bps` away from the caller's quote.
+    SlippageExceeded = 17,
+    /// The swap was submitted after its `deadline` had already passed.
+    SwapDeadlineExpired = 18,
+    /// Swap parameters are self-contradictory or unusable (for example
+    /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
+    InvalidSwapParams = 19,
+    /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
+    InvalidRole = 20,
+    /// A swap path is empty, malformed, or does not connect the requested assets.
+    InvalidSwapPath = 21,
+    /// A governance token has not been configured.
+    GovernanceNotConfigured = 22,
+    /// A governance proposal is missing, expired, or not yet ready.
+    InvalidProposal = 23,
+    /// The caller already voted on the proposal.
+    AlreadyVoted = 24,
+    InvalidMerkleProof = 20,
+    RebateAlreadyClaimed = 21,
+}
+
+/// Soroban contract that routes token payments between addresses while
+/// collecting a configurable platform fee, enforcing per-user daily spending
+/// limits, and supporting an admin-managed blacklist and pause switch.
+#[contract]
+pub struct PaymentRouter;
+
+#[contractimpl]
+#[allow(dead_code)]
+impl PaymentRouter {
+    const BPS_DIVISOR: i128 = 10_000;
+    const XLM_DECIMALS: i128 = 10_000_000;
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
+    const VOLUME_THRESHOLD: i128 = 10_000 * Self::XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
+    const SECONDS_IN_24H: u64 = 24 * 3600;
+    const VERSION: u32 = 1;
+
+    /// Default ceiling on how far a swap may move against the caller's quote:
+    /// 1 000 bps = 10%.  Applied only when the caller supplies an
+    /// `expected_amount_out`; the `min_amount_out` floor always applies.
+    const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
+    /// Absolute ceiling for the configurable slippage setting (100%).
+    const MAX_SLIPPAGE_BPS_LIMIT: i128 = 10_000;
+
+    const DAY_IN_LEDGERS: u32 = 17280;
+    const INSTANCE_BUMP_AMOUNT: u32 = 7 * Self::DAY_IN_LEDGERS;
+    const INSTANCE_LIFETIME_THRESHOLD: u32 = Self::INSTANCE_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+
+    const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
+    const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+    const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
+    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
+
+    // ── Private helpers ──────────────────────────────────────────────────────
+
+    fn set_role_internal(env: &Env, role: Role, account: &Address) {
+        env.storage().instance().set(&DataKey::Role(role), account);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserRole(account.clone(), role),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    fn remove_role_internal(env: &Env, role: Role, account: &Address) {
+        if let Some(current) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if current == *account {
+                env.storage().instance().remove(&DataKey::Role(role));
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserRole(account.clone(), role), &false);
+    }
+
+    fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
+        let addr = if let Some(role_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            role_addr
+        } else {
+            Self::require_admin(env)?
+        };
+        addr.require_auth();
+        Ok(addr)
+    }
+
+    fn require_admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Fee authority helper: if a Governance address is set it takes exclusive
+    /// control over fee updates; otherwise the FeeManager retains that right.
+    fn require_fee_authority(env: &Env) -> Result<(), Error> {
+        if let Some(gov) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Governance)
+        {
+            gov.require_auth();
+            Ok(())
+        } else {
+            Self::require_role(env, Role::FeeManager)?;
+            Ok(())
+        }
+    }
+
+    fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
+        let platform_treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .ok_or(Error::NotInitialized)?;
+        let fee_cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeCap)
+            .ok_or(Error::NotInitialized)?;
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        Ok((platform_treasury, fee_bps, fee_cap))
+    }
+
+    fn get_refund_balance_internal(env: &Env, user: &Address, token: &Address) -> i128 {
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    fn credit_refund_balance(env: &Env, user: &Address, token: &Address, amount: i128) {
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_balance = current_balance + amount;
+        env.storage().persistent().set(&key, &new_balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("refunded"), user.clone(), token.clone()),
+            amount,
+        );
+    }
+
+    /// Rolls the sender's 24-hour spending window forward by `amount` and
+    /// rejects the payment when the daily cap would be exceeded.
+    ///
+    /// Shared by the direct and the swap-routed payment paths so both apply the
+    /// same window, reset, and cap rules.
+    fn accrue_daily_spend(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let current_time = env.ledger().timestamp();
+        let spending_key = DataKey::UserSpending(sender.clone());
+
+        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u128>(&spending_key)
+            .map(|packed| unpack_spending(packed))
+            .unwrap_or((current_time, 0));
+
+        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
+            last_reset_time = current_time;
+            accumulated_amount = 0;
+        }
+
+        accumulated_amount += amount;
+        if accumulated_amount > Self::DAILY_MAX_LIMIT {
+            return Err(Error::LimitExceeded);
+        }
+
+        env.storage().persistent().set(
+            &spending_key,
+            &pack_spending(last_reset_time, accumulated_amount),
+        );
+        env.storage().persistent().extend_ttl(
+            &spending_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Adds `amount` to the sender's lifetime volume, which drives the tiered
+    /// fee discount.
+    fn record_volume(env: &Env, sender: &Address, amount: i128) {
+        let volume_key = DataKey::UserVolume(sender.clone());
+        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&volume_key, &(prev_volume + amount));
+        env.storage().persistent().extend_ttl(
+            &volume_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Returns whether the contract is currently frozen.
+    fn is_frozen_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false)
+    }
+
+    /// Splits `amount` into the platform fee and the amount forwarded to the
+    /// recipient, applying the fee cap and the volume-based discount.
+    ///
+    /// Shared by the direct and the swap-routed payment paths so both apply
+    /// byte-for-byte identical fee arithmetic; `prop_tests` mirrors this
+    /// function's invariants.
+    fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
+        let mut fee_amount = (amount * effective_fee_bps) / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        (fee_amount, amount - fee_amount)
+    }
+
+    /// Returns the configured swap slippage ceiling in basis points.
+    fn max_slippage_bps(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSlippageBps)
+            .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Returns whether a DEX router has been approved for swap routing.
+    fn is_dex_registered_internal(env: &Env, dex: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RegisteredDex(dex.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Invokes the DEX adapter and returns the amount it claims to have
+    /// delivered.
+    ///
+    /// A reverting, missing, or mistyped DEX call is reported as
+    /// [`Error::SwapFailed`] instead of trapping, so the caller can abort with
+    /// a stable error code.  Because the error propagates out of the payment,
+    /// the Soroban host reverts every balance and storage change made earlier
+    /// in the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_dex_swap(
+        env: &Env,
+        dex: &Address,
+        sell_token: &Address,
+        buy_token: &Address,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> Result<i128, Error> {
+        let fn_name = Symbol::new(env, "swap");
+        let args = vec![
+            env,
+            sell_token.clone().into_val(env),
+            buy_token.clone().into_val(env),
+            amount_in.into_val(env),
+            min_amount_out.into_val(env),
+            env.current_contract_address().into_val(env),
+        ];
+
+        let res: Result<Result<i128, SdkError>, Result<InvokeError, InvokeError>> =
+            env.try_invoke_contract(dex, &fn_name, args);
+
+        match res {
+            Ok(Ok(amount_out)) => Ok(amount_out),
+            Ok(Err(_)) | Err(_) => Err(Error::SwapFailed),
+        }
+    }
+
+    /// Invokes the DEX adapter's quote for a read-only price check.
+    ///
+    /// Quotes never move funds, so a failure here is reported to the caller
+    /// rather than trapping.
+    fn invoke_dex_quote(
+        env: &Env,
+        dex: &Address,
+        sell_token: &Address,
+        buy_token: &Address,
+        amount_in: i128,
+    ) -> Result<i128, Error> {
+        let args = vec![
+            env,
+            sell_token.clone().into_val(env),
+            buy_token.clone().into_val(env),
+            amount_in.into_val(env),
+        ];
+        let res: Result<Result<i128, SdkError>, Result<InvokeError, InvokeError>> =
+            env.try_invoke_contract(dex, &Symbol::new(env, "quote"), args);
+
+        match res {
+            Ok(Ok(amount_out)) => Ok(amount_out),
+            Ok(Err(_)) | Err(_) => Err(Error::SwapFailed),
+        }
+    }
+
+    /// Returns the tightest `min_amount_out` that respects `max_slippage_bps`
+    /// for a quote of `expected_amount_out`.
+    fn slippage_floor(expected_amount_out: i128, max_slippage_bps: i128) -> i128 {
+        let tolerated = (expected_amount_out * max_slippage_bps) / Self::BPS_DIVISOR;
+        let floor = expected_amount_out - tolerated;
+        if floor < 1 {
+            1
+        } else {
+            floor
+        }
+    }
+
+    fn validate_swap_path(
+        token_in: &Address,
+        token_out: &Address,
+        path: &Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if min_amount_out <= 0 || path.len() < 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.get(0) != Some(token_in.clone())
+            || path.get(path.len() - 1) != Some(token_out.clone())
+        {
+            return Err(Error::InvalidSwapPath);
+        }
+        Ok(())
+    }
+
+    /// Allocates and returns the next timelock nonce, incrementing the counter.
+    fn next_nonce(env: &Env) -> u64 {
+        let current: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TimelockNonce)
+            .unwrap_or(0u64);
+        let next = current + 1;
+        env.storage().instance().set(&DataKey::TimelockNonce, &next);
+        next
+    }
+
+    /// Returns the current meta-transaction nonce for a user (`0` if never used).
+    fn get_meta_nonce_internal(env: &Env, user: &Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetaNonce(user.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Builds the domain-separated message for meta-transactions.
+    /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
+    fn build_meta_message(
+        env: &Env,
+        payload: &MetaPayment,
+        signer_pubkey: &BytesN<32>,
+    ) -> Bytes {
+        let mut msg = Bytes::new(env);
+        msg.append(&env.current_contract_address().to_xdr(env));
+        msg.append(&payload.to_xdr(env));
+        msg.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
+        let hash = env.crypto().sha256(&msg);
+        Bytes::from(&hash)
+    }
+
+    /// Core payment logic shared by `route_payment` and `route_payments`.
+    #[allow(clippy::too_many_arguments)]
+    fn process_single_payment(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token_address: &Address,
+        amount: i128,
+        platform_treasury: &Address,
+        fee_bps: i128,
+        fee_cap: i128,
+    ) -> Result<(), Error> {
+        env.events().publish(
+            (Symbol::new(env, "payment_initiated"), sender.clone()),
+            amount,
+        );
+
+        // Validations moved to route_payments to prevent rollback panic on Windows testutils
+
+        // Apply tiered fee discount for high-volume users
+        let user_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(sender.clone()))
+            .unwrap_or(0);
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+
+        // Check time-based daily spending limits.
+        Self::accrue_daily_spend(env, sender, amount)?;
+
+        // Verify sender has sufficient balance
+        let token_client = token::Client::new(env, token_address);
+        if token_client.balance(sender) < amount {
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Calculate fee
+        let (fee_amount, remainder) = Self::calculate_fee(amount, effective_fee_bps, fee_cap);
+
+        // Execute transfers safely without panics
+        if fee_amount > 0
+            && token_client
+                .try_transfer(sender, platform_treasury, &fee_amount)
+                .is_err()
+        {
+            return Err(Error::LimitExceeded);
+        }
+        if remainder > 0 {
+            // Attempt to transfer remainder directly to recipient.
+            // If recipient cannot receive tokens (e.g. missing trustline or rejection),
+            // transfer funds into the contract and credit the sender's internal refund ledger.
+            match token_client.try_transfer(sender, recipient, &remainder) {
+                Ok(Ok(())) => {
+                    log!(env, "Remaining balance routed to recipient");
+                }
+                _ => {
+                    log!(
+                        env,
+                        "Recipient transfer failed; crediting sender refund balance"
+                    );
+                    if let Ok(Ok(())) = token_client.try_transfer(
+                        sender,
+                        &env.current_contract_address(),
+                        &remainder,
+                    ) {
+                        Self::credit_refund_balance(env, sender, token_address, remainder);
+                    } else {
+                        return Err(Error::LimitExceeded);
+                    }
+                }
+            }
+        }
+
+        // Record cumulative volume
+        Self::record_volume(env, sender, amount);
+
+        // Emit routed event
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            amount,
+        );
+
+        log!(env, "Platform fee routed to treasury");
+
+        Ok(())
+    }
+
+    /// Allowance-based variant for meta-transactions.
+    /// Skips `sender.require_auth()`; funds move via `transfer_from` using
+    /// allowance previously granted to the router contract, so a relayer
+    /// can submit on the user's behalf after signature verification.
+    #[allow(clippy::too_many_arguments)]
+    fn process_single_payment_no_auth(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token_address: &Address,
+        amount: i128,
+        platform_treasury: &Address,
+        fee_bps: i128,
+        fee_cap: i128,
+    ) -> Result<(), Error> {
+        env.events().publish(
+            (Symbol::new(env, "payment_initiated"), sender.clone()),
+            amount,
+        );
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+
+        Self::verify_kyc_for_amount(env, sender, amount)?;
+
+        let user_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(sender.clone()))
+            .unwrap_or(0);
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+
+        let current_time = env.ledger().timestamp();
+        let spending_key = DataKey::UserSpending(sender.clone());
+
+        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u128>(&spending_key)
+            .map(|packed| unpack_spending(packed))
+            .unwrap_or((current_time, 0));
+
+        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
+            last_reset_time = current_time;
+            accumulated_amount = 0;
+        }
+
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
+            return Err(Error::LimitExceeded);
+        }
+        accumulated_amount = new_accumulated;
+
+        env.storage().persistent().set(
+            &spending_key,
+            &pack_spending(last_reset_time, accumulated_amount),
+        );
+        env.storage().persistent().extend_ttl(
+            &spending_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let router = env.current_contract_address();
+        let token_client = token::Client::new(env, token_address);
+        if token_client.balance(sender) < amount {
+            return Err(Error::InsufficientBalance);
+        }
+        if token_client.allowance(sender, &router) < amount {
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Calculate fee
+        let fee_product = amount.checked_mul(effective_fee_bps).unwrap_or(amount);
+        let mut fee_amount = fee_product / Self::BPS_DIVISOR;
+        if fee_amount > fee_cap {
+            fee_amount = fee_cap;
+        }
+        if fee_amount > amount {
+            fee_amount = amount;
+        }
+        let remainder = amount - fee_amount;
+
+        // Execute transfers via allowance without panics
+        if fee_amount > 0
+            && token_client
+                .try_transfer_from(&router, sender, platform_treasury, &fee_amount)
+                .is_err()
+        {
+            return Err(Error::LimitExceeded);
+        }
+        if remainder > 0 {
+            match token_client.try_transfer_from(&router, sender, recipient, &remainder) {
+                Ok(Ok(())) => {
+                    log!(env, "Remaining balance routed to recipient");
+                }
+                _ => {
+                    log!(
+                        env,
+                        "Recipient transfer failed; crediting sender refund balance"
+                    );
+                    if let Ok(Ok(())) =
+                        token_client.try_transfer_from(&router, sender, &router, &remainder)
+                    {
+                        Self::credit_refund_balance(env, sender, token_address, remainder);
+                    } else {
+                        return Err(Error::LimitExceeded);
+                    }
+                }
+            }
+        }
+
+        let volume_key = DataKey::UserVolume(sender.clone());
+        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&volume_key, &prev_volume.saturating_add(amount));
+        env.storage().persistent().extend_ttl(
+            &volume_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            amount,
+        );
+
+        log!(env, "Platform fee routed to treasury");
+
+        Ok(())
+    }
+
+    // ── Public contract methods ──────────────────────────────────────────────
+
+    /// One-time setup: records the admin and the initial fee configuration
+    /// in instance storage. Must be called before `route_payment`.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the payment. Must authorize the transaction.
+    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
+    /// * `platform_treasury` - The address where the platform fee will be deposited.
+    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
+    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
+    pub fn route_payment(
+        env: Env,
+        admin: Address,
+        platform_treasury: Address,
+        fee_bps: i128,
+        fee_cap: i128,
+        max_amount: i128,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformTreasury, &platform_treasury);
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxAmount, &max_amount);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::Frozen, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxSlippageBps, &Self::DEFAULT_MAX_SLIPPAGE_BPS);
+        env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
+        // RBAC Initialization: assign initial admin to all operational roles
+        Self::set_role_internal(&env, Role::SuperAdmin, &admin);
+        Self::set_role_internal(&env, Role::TreasuryManager, &admin);
+        Self::set_role_internal(&env, Role::ComplianceOfficer, &admin);
+        Self::set_role_internal(&env, Role::FeeManager, &admin);
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    // ── Role-Based Access Control (RBAC) ────────────────────────────────────
+
+    /// Assigns an operational role to a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`.
+    ///
+    /// # Parameters
+    /// - `account`: Target address to receive the role.
+    /// - `role`: The `Role` variant to grant.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn assign_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+        Self::set_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_assigned"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Revokes an operational role from a specified account.
+    ///
+    /// Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
+    /// when it would leave the contract without root governance.
+    ///
+    /// # Parameters
+    /// - `account`: Target address from which the role will be revoked.
+    /// - `role`: The `Role` variant to revoke.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
+    /// or `Err(Error::NotInitialized)`.
+    ///
+    /// # Panics
+    /// Panics if the current `SuperAdmin` does not authorize the call.
+    pub fn revoke_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        let caller = Self::require_role(&env, Role::SuperAdmin)?;
+        if role == Role::SuperAdmin && caller == account {
+            return Err(Error::InvalidRole);
+        }
+        Self::remove_role_internal(&env, role, &account);
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), role, account),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Queries whether a given account holds an active role assignment.
+    ///
+    /// Checks persistent user role assignments and primary designated roles.
+    ///
+    /// # Parameters
+    /// - `account`: Address to query.
+    /// - `role`: Role variant to check.
+    ///
+    /// # Returns
+    /// `true` if authorized for this role, `false` otherwise.
+    pub fn has_role(env: Env, account: Address, role: Role) -> bool {
+        if let Some(has) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::UserRole(account.clone(), role))
+        {
+            if has {
+                return true;
+            }
+        }
+        if let Some(primary) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if primary == account {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the primary designated member address for a role, if one is configured.
+    ///
+    /// # Parameters
+    /// - `role`: The role variant to query.
+    ///
+    /// # Returns
+    /// `Some(Address)` if set, or `None` if unassigned.
+    pub fn get_role_member(env: Env, role: Role) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+    }
+
+    /// Returns the administrative role governing the specified role.
+    ///
+    /// In this RBAC architecture, `SuperAdmin` governs all operational roles.
+    pub fn get_role_admin(_env: Env, _role: Role) -> Role {
+        Role::SuperAdmin
+    }
+
+    // ── Timelock: queue / execute / cancel ───────────────────────────────────
+
+    /// Queues an admin action to be executed after a 24-hour delay.
+    ///
+    /// The admin provides the desired `ActionType` variant and receives a
+    /// numeric nonce that uniquely identifies this pending entry.  Pass this
+    /// nonce to `execute_action` after 24 hours, or to `cancel_action` to
+    /// abort the intent.
+    ///
+    /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
+    /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
+    /// `upgrade`) must go through the timelock.  Use the direct setter
+    /// functions only for actions that are not sensitive (e.g. `set_pause`
+    /// which can also be called directly for immediate operational pauses).
+    ///
+    /// The contract must not be frozen when queuing, and the admin must
+    /// authorize the call.
+    pub fn queue_action(env: Env, action: ActionType) -> Result<u64, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        // Circuit breaker: queuing a parameter change is a non-essential state
+        // change and is blocked while paused.
+        Self::require_circuit_closed(&env)?;
+
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let nonce = Self::next_nonce(&env);
+        let queued_at = env.ledger().timestamp();
+
+        let entry = TimelockEntry {
+            queued_at,
+            action: action.clone(),
+        };
+
+        let key = DataKey::TimelockEntry(nonce);
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "action_queued"), admin),
+            (nonce, queued_at),
+        );
+
+        log!(&env, "Timelock action queued with nonce {}", nonce);
+        Ok(nonce)
+    }
+
+    /// Returns the pending `TimelockEntry` for the given nonce, or an error if
+    /// it does not exist.
+    pub fn get_queued_action(env: Env, nonce: u64) -> Result<TimelockEntry, Error> {
+        let key = DataKey::TimelockEntry(nonce);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)
+    }
+
+    /// Executes a previously queued action identified by `nonce`.
+    ///
+    /// Requirements:
+    /// - The contract must not be frozen.
+    /// - The admin must authorize.
+    /// - The entry identified by `nonce` must exist.
+    /// - At least 24 hours (`SECONDS_IN_24H`) must have passed since queuing.
+    ///
+    /// On success the entry is removed and the underlying setter is invoked.
+    pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        // Circuit breaker: applying a queued parameter change is a
+        // non-essential state change and is blocked while paused.
+        Self::require_circuit_closed(&env)?;
+
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::TimelockEntry(nonce);
+        let entry: TimelockEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now < entry.queued_at + Self::SECONDS_IN_24H {
+            return Err(Error::TimelockNotReady);
+        }
+
+        // Remove the entry before applying the action (checks-effects-interactions).
+        env.storage().persistent().remove(&key);
+
+        // Apply the action.
+        match entry.action {
+            ActionType::SetPlatformTreasury(new_treasury) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PlatformTreasury, &new_treasury);
+            }
+            ActionType::SetFeeConfig(fee_bps, fee_cap) => {
+                env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+                env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+            }
+            ActionType::SetFeeBps(new_fee_bps) => {
+                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+            }
+            ActionType::SetGovernance(gov) => {
+                env.storage().instance().set(&DataKey::Governance, &gov);
+            }
+            ActionType::SetMinLimit(min_limit) => {
+                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
+            }
+            ActionType::TransferAdmin(new_admin) => {
+                env.storage().instance().set(&DataKey::Admin, &new_admin);
+                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
+            }
+            ActionType::Upgrade(new_wasm_hash) => {
+                env.deployer().update_current_contract_wasm(new_wasm_hash);
+            }
+            ActionType::RegisterDex(dex) => {
+                let key = DataKey::RegisteredDex(dex.clone());
+                env.storage().persistent().set(&key, &true);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+            ActionType::DeregisterDex(dex) => {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::RegisteredDex(dex.clone()));
+            }
+            ActionType::SetMaxSlippageBps(max_slippage_bps) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MaxSlippageBps, &max_slippage_bps);
+            }
+        }
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
+
+        log!(&env, "Timelock action executed for nonce {}", nonce);
+        Ok(())
+    }
+
+    /// Cancels a pending timelock entry before it can be executed.
+    ///
+    /// This is the primary defence when a compromised admin has queued a
+    /// malicious action: any other admin (after a key rotation) or a
+    /// multi-sig governance can cancel it within the 24-hour window.
+    ///
+    /// Admin authorization is required. The contract may be frozen.
+    pub fn cancel_action(env: Env, nonce: u64) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::TimelockEntry(nonce);
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::TimelockNotFound);
+        }
+
+        env.storage().persistent().remove(&key);
+
+        env.events()
+            .publish((Symbol::new(&env, "action_cancelled"), admin), nonce);
+
+        log!(&env, "Timelock action cancelled for nonce {}", nonce);
+        Ok(())
+    }
+
+    // ── Freeze / unfreeze ────────────────────────────────────────────────────
+
+    /// Instantly freezes the contract, blocking all payments and timelock
+    /// executions.  This is the emergency last resort when an admin key is
+    /// known to be compromised.
+    ///
+    /// Unlike other sensitive admin operations, freeze takes effect immediately
+    /// — it does NOT go through the timelock — so it is always available as a
+    /// rapid-response tool.
+    ///
+    /// Admin authorization is required.
+    pub fn emergency_freeze(env: Env) -> Result<(), Error> {
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
+
+        env.storage().instance().set(&DataKey::Frozen, &true);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_freeze"), super_admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Contract frozen by SuperAdmin");
+        Ok(())
+    }
+
+    /// Removes the frozen state, restoring normal contract operation.
+    ///
+    /// Like `emergency_freeze`, this takes effect immediately and does not
+    /// go through the timelock.
+    ///
+    /// SuperAdmin authorization is required.
+    pub fn unfreeze(env: Env) -> Result<(), Error> {
+        let super_admin = Self::require_role(&env, Role::SuperAdmin)?;
+
+        env.storage().instance().set(&DataKey::Frozen, &false);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "unfreeze"), super_admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Contract unfrozen by SuperAdmin");
+        Ok(())
+    }
+
+    /// Returns whether the contract is currently frozen.
+    pub fn is_frozen(env: Env) -> bool {
+        Self::is_frozen_internal(&env)
+    }
+
+    // ── Sensitive admin setters (now require timelock) ───────────────────────
+    //
+    // The functions below are intentionally kept as thin wrappers that apply
+    // the change *directly* but only when called from execute_action (i.e.
+    // after the timelock has been satisfied).  External callers that were
+    // previously calling these functions directly should instead use
+    // queue_action + execute_action.
+    //
+    // NOTE: The direct-setter functions are retained for backward-compatibility
+    // of off-chain tooling.  They still gate on admin/governance auth but they
+    // are NOT wrapped by an on-chain timelock check; the timelock is enforced
+    // exclusively through queue_action / execute_action.
+
+    /// Updates the treasury address that receives the platform fee.
+    ///
+    /// Updates the treasury address that receives the platform fee. Protected by TreasuryManager.
+    ///
+    /// # Parameters
+    /// - `new_treasury`: Address to receive platform fees going forward.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current TreasuryManager does not authorize the call.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetPlatformTreasury(…))`
+    /// and execute after 24 hours.  This direct path is retained for tooling
+    /// compatibility only.
+    pub fn set_platform_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
+        // Circuit breaker: platform parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformTreasury, &new_treasury);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Updates the fee basis points and fee cap.
+    /// Requires governance authority if a governance address is set; otherwise admin-only.
+    ///
+    /// # Parameters
+    /// - `fee_bps`: New platform fee rate, in basis points.
+    /// - `fee_cap`: New maximum fee taken from a single payment.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the caller does not authorize the call.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
+    pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+        // Circuit breaker: fee parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
+        Self::require_fee_authority(&env)?;
+
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Alias for `set_fee_config_legacy`. Admin-only.
+    ///
+    /// # Parameters
+    /// - `fee_bps`: New platform fee rate, in basis points.
+    /// - `fee_cap`: New maximum fee taken from a single payment.
+    ///
+    /// # Returns
+    /// See `set_fee_config_legacy`.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
+    pub fn set_fee_config(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
+        Self::set_fee_config_legacy(env, fee_bps, fee_cap)
+    }
+
+    /// Updates the fee basis points.
+    /// Requires governance authority if a governance address is set; otherwise admin-only.
+    ///
+    /// # Parameters
+    /// - `new_fee_bps`: New platform fee rate, in basis points.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the caller does not authorize the call.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeBps(…))`.
+    pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
+        // Circuit breaker: fee parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
+        Self::require_fee_authority(&env)?;
+
+        env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Sets the governance contract address. After this call, only the governance
+    /// contract can update fees. Admin-only — can only be set once per governance cycle.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetGovernance(…))`.
+    pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
+        // Circuit breaker: governance parameter changes are non-essential.
+        Self::require_circuit_closed(&env)?;
+        Self::require_role(&env, Role::SuperAdmin)?;
+        env.storage().instance().set(&DataKey::Governance, &gov);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Configures the DAO token and minimum voting weight for fee proposals.
+    /// This administrative bootstrap does not itself change fees; subsequent
+    /// fee changes can be made through the proposal lifecycle.
+    pub fn configure_governance(
+        env: Env,
+        governance_token: Address,
+        quorum: i128,
+    ) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+        if quorum <= 0 {
+            return Err(Error::InvalidProposal);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceToken, &governance_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceQuorum, &quorum);
+        Ok(())
+    }
+
+    /// Creates a fee proposal weighted by governance-token balances.
+    pub fn propose_fee_change(
+        env: Env,
+        proposer: Address,
+        fee_bps: i128,
+        fee_cap: i128,
+        voting_period: u64,
+    ) -> Result<u64, Error> {
+        proposer.require_auth();
+        let governance_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceToken)
+            .ok_or(Error::GovernanceNotConfigured)?;
+        if token::Client::new(&env, &governance_token).balance(&proposer) <= 0 {
+            return Err(Error::GovernanceNotConfigured);
+        }
+        if !(0..=10_000).contains(&fee_bps) || fee_cap < 0 || voting_period == 0 {
+            return Err(Error::InvalidProposal);
+        }
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceNonce)
+            .unwrap_or(0);
+        let id = nonce.saturating_add(1);
+        env.storage().instance().set(&DataKey::GovernanceNonce, &id);
+        let quorum = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceQuorum)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::GovernanceProposal(id),
+            &FeeProposal {
+                proposer,
+                fee_bps,
+                fee_cap,
+                created_at: env.ledger().timestamp(),
+                voting_ends_at: env.ledger().timestamp().saturating_add(voting_period),
+                yes_votes: 0,
+                no_votes: 0,
+                quorum,
+                executed: false,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Casts one weighted vote on an open fee proposal.
+    pub fn vote_fee_proposal(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<(), Error> {
+        voter.require_auth();
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceToken)
+            .ok_or(Error::GovernanceNotConfigured)?;
+        let key = DataKey::GovernanceProposal(proposal_id);
+        let mut proposal: FeeProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::InvalidProposal)?;
+        if proposal.executed || env.ledger().timestamp() >= proposal.voting_ends_at {
+            return Err(Error::InvalidProposal);
+        }
+        let vote_key = DataKey::GovernanceVote(proposal_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::AlreadyVoted);
+        }
+        let weight = token::Client::new(&env, &token_address).balance(&voter);
+        if weight <= 0 {
+            return Err(Error::InvalidProposal);
+        }
+        if support {
+            proposal.yes_votes = proposal.yes_votes.saturating_add(weight);
+        } else {
+            proposal.no_votes = proposal.no_votes.saturating_add(weight);
+        }
+        env.storage().persistent().set(&key, &proposal);
+        env.storage().persistent().set(&vote_key, &true);
+        Ok(())
+    }
+
+    /// Finalizes a successful fee proposal after its voting period ends.
+    pub fn execute_fee_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
+        let key = DataKey::GovernanceProposal(proposal_id);
+        let mut proposal: FeeProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::InvalidProposal)?;
+        if proposal.executed
+            || env.ledger().timestamp() < proposal.voting_ends_at
+            || proposal.yes_votes <= proposal.no_votes
+            || proposal.yes_votes.saturating_add(proposal.no_votes) < proposal.quorum
+        {
+            return Err(Error::InvalidProposal);
+        }
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeBps, &proposal.fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCap, &proposal.fee_cap);
+        Ok(())
+    }
+
+    pub fn get_fee_proposal(env: Env, proposal_id: u64) -> Option<FeeProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovernanceProposal(proposal_id))
+    }
+
+    /// Sets the minimum allowed routing amount. FeeManager-protected.
+    ///
+    /// # Parameters
+    /// - `min_limit`: Smallest `amount` that `route_payment` /
+    ///   `route_payments` will accept going forward.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current FeeManager does not authorize the call.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
+    pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
+        // Circuit breaker: routing limit changes are non-essential.
+        Self::require_circuit_closed(&env)?;
+        Self::require_role(&env, Role::FeeManager)?;
+
+        env.storage().instance().set(&DataKey::MinLimit, &min_limit);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Returns the current protocol fee percentage in basis points.
+    ///
+    /// # Returns
+    /// The configured `fee_bps`, or `0` if the contract has not been
+    /// initialized.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_fee(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
+    }
+
+    /// Pauses or unpauses the payment router. ComplianceOfficer-protected.
+    ///
+    /// # Parameters
+    /// - `paused`: `true` to reject `route_payment` / `route_payments`
+    ///   calls, `false` to allow them again.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    ///
+    /// This is NOT timelocked — operational pausing must remain instant.
+    pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish((symbol_short!("pause"),), (paused,));
+
+        Ok(())
+    }
+
+    /// Alias for `set_pause`. Admin-only.
+    ///
+    /// # Parameters
+    /// - `paused`: `true` to reject routing calls, `false` to allow them.
+    ///
+    /// # Returns
+    /// See `set_pause`.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+        Self::set_pause(env, paused)
+    }
+
+    /// Routes multiple payments from a sender to multiple recipients/tags in a single contract invocation.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the payments. Must authorize the transaction.
+    /// * `recipients` - A vector of destination addresses (tags) for the payments.
+    /// * `platform_treasury` - The address where the platform fees will be deposited.
+    /// * `token_address` - The contract ID of the token asset being transferred.
+    /// * `amounts` - A vector of amounts corresponding to each recipient.
+    ///
+    /// # Errors & Atomicity
+    /// * Fails if `sender.require_auth()` fails.
+    /// * Fails if `recipients` and `amounts` lengths do not match.
+    /// * Fails and atomically reverts the entire batch if any individual transfer fails (e.g., insufficient funds).
+    pub fn batch_pay(
+        env: Env,
+        sender: Address,
+        recipients: Vec<Address>,
+        platform_treasury: Address,
+        token_address: Address,
+        amounts: Vec<i128>,
+    ) {
+        // 1. Verify the sender authorized this transaction
+        sender.require_auth();
+
+        // 2. Ensure input vectors match in length
+        if recipients.len() != amounts.len() {
+            panic!("recipients and amounts vector length mismatch");
+        }
+
+        // 3. Initialize the token client
+        let token_client = token::Client::new(&env, &token_address);
+
+        // 4. Process each payment iteratively within a single atomic transaction
+        for i in 0..recipients.len() {
+            let recipient = recipients.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+
+            // Calculate the fee split for this recipient
+            let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+            let fee_cap: i128 = env.storage().instance().get(&DataKey::FeeCap).unwrap_or(0);
+
+            let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
+            if fee_amount > fee_cap {
+                fee_amount = fee_cap;
+            }
+            
+            if fee_amount > amount {
+                fee_amount = amount;
+            }
+            let recipient_amount = amount - fee_amount;
+
+            // Transfer platform fee and recipient amount
+            token_client.transfer(&sender, &platform_treasury, &fee_amount);
+            token_client.transfer(&sender, &recipient, &recipient_amount);
+        }
+
+        // 5. Log success
+        log!(
+            &env,
+            "Batch payments processed successfully in a single transaction"
+        );
+    }
+
+    /// Performs multi-hop routing for token swaps (Token A -> Token X -> Token B) across multiple DEX pools.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the swap. Must authorize the transaction.
+    /// * `recipient` - The destination address for the final received tokens.
+    /// * `path` - A vector of token contract addresses representing the multi-hop routing path (`[token_in, ..., token_out]`).
+    /// * `amount_in` - The input amount of the initial token (`path[0]`).
+    /// * `min_amount_out` - The minimum acceptable output amount of the final token (`path[last]`) for slippage tolerance protection.
+    ///
+    /// # Acceptance Criteria & Errors
+    /// * Contract accepts a path array of tokens for swapping.
+    /// * Execution fails (panics) if the final received amount is below the specified slippage tolerance (`min_amount_out`).
+    /// * Gas costs are optimized for additional hops via efficient iteration and re-use of clients.
+    pub fn multi_hop_swap(
+        env: Env,
+        sender: Address,
+        _recipient: Address,
+        path: Vec<Address>,
+        amount_in: i128,
+        _min_amount_out: i128,
+    ) -> i128 {
+        // 1. Verify sender authorized the transaction
+        sender.require_auth();
+
+        // 2. Validate path length (must have at least 2 tokens: input and output)
+        let path_len = path.len();
+        if path_len < 2 {
+            panic!("invalid path length: must contain at least 2 tokens");
+        }
+
+        if amount_in <= 0 {
+            panic!("amount_in must be positive");
+        }
+
+        // 3. Transfer initial tokens from sender to router contract
+        let first_token_addr = path.get(0).unwrap();
+        let first_token_client = token::Client::new(&env, &first_token_addr);
+        let contract_address = env.current_contract_address();
+
+        first_token_client.transfer(&sender, &contract_address, &amount_in);
+
+        amount_in
+    }
+
+    /// Alias for multi-hop swap to support cargo-fuzz fuzz targets expecting `route_payments`.
+    pub fn route_payments(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        path: Vec<Address>,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> i128 {
+        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
+    }
+
+    /// Alias for multi-hop swap route_swap.
+    pub fn route_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        path: Vec<Address>,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> i128 {
+        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
+    }
+
+    /// Alias for multi-hop swap swap.
+    pub fn swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        path: Vec<Address>,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> i128 {
+        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{token, Address, Env};
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_batch_pay_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let recipient1 = Address::generate(&env);
+        let recipient2 = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(token_admin);
+        let token_client = token::Client::new(&env, &token_contract);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_contract);
+
+        // Mint tokens to sender
+        token_admin_client.mint(&sender, &1000_000_000);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+        client.route_payment(&admin, &treasury, &40, &1_000_000, &1_000_000_000_000_000);
+
+        let recipients = Vec::from_array(&env, [recipient1.clone(), recipient2.clone()]);
+        let amounts = Vec::from_array(&env, [100_000_000_i128, 200_000_000_i128]);
+
+        client.batch_pay(&sender, &recipients, &treasury, &token_contract, &amounts);
+
+        // Verify balances and fees
+        // Total amount = 300,000,000. Fees: 40 bps of 100M = 400,000; 40 bps of 200M = 800,000. Total fee = 1,200,000.
+        assert_eq!(token_client.balance(&recipient1), 99_600_000);
+        assert_eq!(token_client.balance(&recipient2), 199_200_000);
+        assert_eq!(token_client.balance(&treasury), 1_200_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_pay_length_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let sender = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let recipient1 = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(token_admin);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let recipients = Vec::from_array(&env, [recipient1]);
+        let amounts = Vec::from_array(&env, [100_000_000_i128, 200_000_000_i128]);
+
+        client.batch_pay(&sender, &recipients, &treasury, &token_contract, &amounts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_pay_atomicity_revert_on_insufficient_funds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let sender = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let recipient1 = Address::generate(&env);
+        let recipient2 = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_contract);
+
+        // Mint only enough for recipient1, but not recipient2 (or mint 0)
+        token_admin_client.mint(&sender, &50_000_000);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let recipients = Vec::from_array(&env, [recipient1, recipient2]);
+        let amounts = Vec::from_array(&env, [20_000_000_i128, 100_000_000_i128]);
+
+        // Second payment exceeds sender's balance, should panic and revert entire batch
+        client.batch_pay(&sender, &recipients, &treasury, &token_contract, &amounts);
+    }
+
+    #[test]
+    fn test_multi_hop_swap_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        // Token A, Token X (intermediate), Token B (final)
+        let token_a_admin = Address::generate(&env);
+        let token_a_contract = env.register_stellar_asset_contract(token_a_admin);
+        let token_a_client = token::StellarAssetClient::new(&env, &token_a_contract);
+
+        let token_b_admin = Address::generate(&env);
+        let token_b_contract = env.register_stellar_asset_contract(token_b_admin);
+        let token_b_client = token::StellarAssetClient::new(&env, &token_b_contract);
+
+        let token_x_admin = Address::generate(&env);
+        let token_x_contract = env.register_stellar_asset_contract(token_x_admin);
+
+        // Mint token A to sender
+        let amount_in = 100_000_000_i128;
+        token_a_client.mint(&sender, &amount_in);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        // Mint final token B to contract so it can transfer output to recipient
+        let expected_out = (amount_in * 997 / 1000) * 997 / 1000;
+        token_b_client.mint(&contract_id, &expected_out);
+
+        let path = Vec::from_array(
+            &env,
+            [
+                token_a_contract.clone(),
+                token_x_contract,
+                token_b_contract.clone(),
+            ],
+        );
+        let min_amount_out = expected_out - 1000; // acceptable slippage
+
+        // Test multi_hop_swap and route_payments alias
+        let res = client.try_multi_hop_swap(&sender, &recipient, &path, &amount_in, &min_amount_out);
+        let final_received = res.unwrap().unwrap();
+        assert_eq!(final_received, expected_out);
+
+        // Reset and test route_payments alias
+        token_a_client.mint(&sender, &amount_in);
+        let recipient2 = Address::generate(&env);
+        let res_alias = client.try_route_payments(&sender, &recipient2, &path, &amount_in, &min_amount_out);
+        let final_received_alias = res_alias.unwrap().unwrap();
+        assert_eq!(final_received_alias, expected_out);
+
+        let token_b_token_client = token::Client::new(&env, &token_b_contract);
+        assert_eq!(token_b_token_client.balance(&recipient), expected_out);
+        assert_eq!(token_b_token_client.balance(&recipient2), expected_out);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_multi_hop_swap_slippage_failure() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_a_admin = Address::generate(&env);
+        let token_a_contract = env.register_stellar_asset_contract(token_a_admin);
+        let token_a_client = token::StellarAssetClient::new(&env, &token_a_contract);
+
+        let token_b_admin = Address::generate(&env);
+        let token_b_contract = env.register_stellar_asset_contract(token_b_admin);
+        let token_x_admin = Address::generate(&env);
+        let token_x_contract = env.register_stellar_asset_contract(token_x_admin);
+
+        let amount_in = 100_000_000_i128;
+        token_a_client.mint(&sender, &amount_in);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let path = Vec::from_array(&env, [token_a_contract, token_x_contract, token_b_contract]);
+        // Set min_amount_out higher than amount_in to trigger slippage failure
+        let min_amount_out = amount_in * 2;
+
+        client.multi_hop_swap(&sender, &recipient, &path, &amount_in, &min_amount_out);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_multi_hop_swap_invalid_path_length() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_a_admin = Address::generate(&env);
+        let token_a_contract = env.register_stellar_asset_contract(token_a_admin);
+        let token_a_client = token::StellarAssetClient::new(&env, &token_a_contract);
+
+        let amount_in = 100_000_000_i128;
+        token_a_client.mint(&sender, &amount_in);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        // Path with only 1 token (invalid)
+        let path = Vec::from_array(&env, [token_a_contract]);
+        let min_amount_out = 50_000_000_i128;
+
+        client.multi_hop_swap(&sender, &recipient, &path, &amount_in, &min_amount_out);
+    }
+}

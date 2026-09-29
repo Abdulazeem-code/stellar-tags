@@ -12,6 +12,7 @@ jest.mock('../prismaClient', () => ({
     user: {
       findUnique: jest.fn().mockResolvedValue(null),
       findFirst: jest.fn().mockResolvedValue(null),
+      count: jest.fn().mockResolvedValue(0),
       create: jest.fn().mockResolvedValue({
         username: 'alice123',
         address: 'GABC123',
@@ -22,11 +23,11 @@ jest.mock('../prismaClient', () => ({
   },
 }));
 
-// Mock the pool functions
+// Mock db.js (now only exports etagCache and utility re-exports after Prisma migration)
 jest.mock('../src/db', () => ({
-  poolGet: jest.fn().mockResolvedValue(null),
-  poolRun: jest.fn().mockResolvedValue({ changes: 1 }),
-  poolAll: jest.fn().mockResolvedValue([]),
+  normalizeNameTag: (v) => v,
+  USER_DATABASE: {},
+  etagCache: (_req, _res, next) => next(),
 }));
 
 // Mock the v1 routes (factory function since v1/index.js now exports a function)

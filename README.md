@@ -64,6 +64,47 @@ The following diagram maps exactly how data flows between the user, Render, and 
 
 > These steps are split by module so you can run only what you need.
 
+### Docker Compose profiles
+
+Every service in `docker-compose.yml` belongs to a profile, so
+`docker compose up` on its own starts nothing and you always say which stack
+you want:
+
+| Command | Starts |
+| --- | --- |
+| `docker compose --profile dev up` | backend, postgres, redis |
+| `docker compose --profile full up` | the same, plus the built frontend on :3000 |
+| `docker compose --profile test up` | the API under test on :5001 and its own database |
+| `docker compose --profile integration up` | a local standalone Stellar network on :8000 |
+
+`dev` is the everyday one. `full` adds the frontend, which is the slowest
+thing in the file to build and is not needed for backend work.
+
+The dev and test stacks use separate databases on separate host ports (5432
+and 5433), so you can run both at once:
+
+```bash
+docker compose --profile dev --profile test up -d
+```
+
+`COMPOSE_PROFILES` works too, if you would rather not repeat the flag:
+
+```bash
+export COMPOSE_PROFILES=dev
+docker compose up -d
+```
+
+Stop a stack with the same profile you started it with, otherwise Compose
+will not know which services it is meant to remove:
+
+```bash
+docker compose --profile dev down
+```
+
+The `integration` profile pulls `stellar/quickstart`, a multi-gigabyte image
+used only by the Soroban contract tests in `tests/integration/`. It is kept
+out of `test` so the API tests do not drag it in.
+
 ### Frontend dashboard
 
 ```bash
@@ -89,7 +130,10 @@ cp .env.example .env
 # 2. Apply the schema to your database
 npm run prisma:migrate
 
-# 3. Start the server
+# 3. Fill the database with test data
+npm run db:seed
+
+# 4. Start the server
 npm run dev
 ```
 
@@ -108,7 +152,14 @@ For a typical local install that becomes, for example:
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/stellar_tags?schema=public"
 ```
 
-The quickest way to get a local database is Docker:
+The quickest way to get a local database is the dev profile, which also
+brings up Redis:
+
+```bash
+docker compose --profile dev up -d postgres redis
+```
+
+Or a single container, if you want nothing else:
 
 ```bash
 docker run --name stellar-postgres -e POSTGRES_PASSWORD=postgres \
@@ -123,9 +174,36 @@ Useful Prisma commands (run from `stellar-payment-platform/`):
 | `npm run prisma:deploy` | Apply existing migrations (CI / production) |
 | `npm run prisma:generate` | Regenerate the Prisma Client after schema changes |
 | `npm run prisma:studio` | Open Prisma Studio to browse the data |
+| `npm run db:seed` | Populate the database with test data (see below) |
 
 > `.env` is gitignored — never commit real credentials. Each contributor keeps
 > their own local `DATABASE_URL`.
+
+#### Seed data
+
+`npm run db:seed` populates an empty database with 50 users, 10 webhooks,
+20 payment intents and 2 API keys, so the API has something to answer with
+before you have registered anything by hand. `prisma migrate reset` runs it
+automatically.
+
+The data covers the cases the endpoints branch on: usernames with every memo
+type, several addresses carrying aliases alongside their primary username,
+flagged and soft-deleted users, webhooks that are healthy, never delivered,
+and failing on both sides of the retry cutoff, and payment intents in each
+status.
+
+Re-running is safe. Every record is upserted on its natural key and the
+identities are derived from a fixed seed, so a second run updates the same
+rows rather than adding a set. Pass `--reset` to delete the seeded rows first:
+
+```bash
+npm run db:seed -- --reset
+```
+
+Both API keys are printed on each run, since only their hashes are stored.
+Use the active one as `X-Api-Key`; the revoked one is there to exercise the
+rejection path. The script refuses to run against a non-local `DATABASE_URL`
+unless `SEED_ALLOW_REMOTE=1` is set.
 
 ### Render deployment
 
@@ -140,6 +218,49 @@ cd payment_router
 cargo build
 ```
 
+### Token swaps (cross-contract DEX routing)
+
+A sender can pay in any token they hold and have it swapped into the merchant's
+preferred token during routing. The swap is a cross-contract call into a
+registered DEX adapter, runs inside the same Soroban transaction as the
+transfer, and reverts as a whole if anything goes wrong: the fee, the payment,
+and the state changes are all rolled back together.
+
+```text
+route_payment_with_swap   one swap-routed payment
+route_payments_with_swap  a batch, reverted atomically if any leg fails
+quote_swap                price a swap and derive a slippage floor
+```
+
+Slippage is enforced twice: a per-payment `min_amount_out` floor, and a
+contract-level `max_slippage_bps` ceiling against the caller's own quote. Both
+are checked against the tokens the router actually receives, not the number the
+DEX reports. Only DEXes the admin registers through the 24-hour timelock can be
+called.
+
+See [docs/dex-token-swaps.md](docs/dex-token-swaps.md) for the adapter
+interface, the full call list, and an end-to-end example.
+
+### Contract TypeScript bindings
+
+The TypeScript client for the `payment_router` contract lives in
+[`packages/types`](packages/types) and is **auto-generated** from the contract
+ABI, so the React dashboard gets end-to-end type safety with the Rust contract
+instead of manually copying contract IDs and argument shapes.
+
+Regenerate the bindings after any change to the contract's public interface
+(the contract must build with the `wasm32-unknown-unknown` target, and the
+`stellar` CLI must be on your PATH):
+
+```bash
+npm run generate:bindings
+```
+
+The result is committed to `packages/types` and consumed by the frontend as
+`@stellar-tags/payment-router` (a `file:` dependency). The `bindings-check` CI
+job fails the build if the checked-in bindings ever drift from the contract
+ABI.
+
 ## Webhook signature verification
 
 Every webhook delivery includes an HMAC-SHA256 signature in the
@@ -149,6 +270,22 @@ trusting the payload.
 
 See [docs/webhook-signature-verification.md](docs/webhook-signature-verification.md)
 for step-by-step verification examples in Node.js, Python, and Go.
+
+## Internal service-to-service mTLS
+
+Service-to-service calls are encrypted and mutually authenticated: the API
+requires a client certificate signed by an internal CA before a request is
+routed, and a peer with no valid certificate never reaches a handler. An
+internal CA issues, rotates and retires the certificates, including a
+zero-downtime cutover to a new issuing CA. Off by default, so local development
+and CI keep using plain HTTP.
+
+```sh
+MTLS_ENABLED=true docker compose --profile dev --profile mtls up --build
+```
+
+See [docs/mtls.md](docs/mtls.md) for the PKI layout, rotation runbook and
+configuration reference.
 
 ## Tests
 
@@ -166,6 +303,16 @@ cd ../payment_router
 cargo test
 ```
 
+### Coverage
+
+The server runs with coverage in CI via `npm run test:coverage` (same as
+`npm test` plus `--coverage`). Minimum coverage thresholds are set in
+`stellar-payment-platform/package.json` under `jest.coverageThreshold` — CI
+fails the build when coverage drops below the floor, and the `lcov`/HTML report
+is uploaded as a build artifact. Raise the thresholds as coverage improves so
+the floor keeps pace with the suite.
+
+
 ## Environment variables
 
 To ensure a seamless local developer installation requiring zero guesswork, please configure the following environment variables in their respective directories:
@@ -182,6 +329,13 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
 - `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
 - `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
+- `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). `warn` (default) logs a clear warning and continues; `strict` logs an error and exits non-zero before the server binds a port; `off` skips the check. Set to `strict` where you want deploys to fail fast on schema drift instead of failing on the first query.
+- `REDIS_URL` / `REDIS_CLUSTER_NODES` - (Optional) Redis connection for rate limiting and the BullMQ queues. The dead letter queue is only enabled when one of these is set; see [Dead letter queue](#dead-letter-queue-admindlq).
+- `MAX_RETRY_ATTEMPTS` - (Optional) Total delivery attempts before a webhook job is parked on the dead letter queue. Defaults to `5`.
+- `RETRY_BACKOFF_MS` - (Optional) Base delay in milliseconds for the exponential backoff between retry attempts. Defaults to `1000`.
+- `DLQ_ALERT_THRESHOLD` - (Optional) Log an error once the dead letter queue holds this many messages. Defaults to `10`.
+- `DLQ_ALERT_COOLDOWN_MS` - (Optional) Minimum gap in milliseconds between two depth alerts, so a queue that stays deep does not log on every job. Defaults to `300000`.
+- `DLQ_REPLAY_BATCH_LIMIT` - (Optional) Largest number of messages one `POST /admin/dlq/replay` call replays. Defaults to `100`.
 
 For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
 
@@ -237,7 +391,7 @@ when the failure is field-level. `correlation_id` is on every error;
 | `FORBIDDEN` | 403 | Reserved name, blocked address |
 | `NOT_FOUND` | 404 | No such tag, address, or route |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
-| `CONFLICT` | 409 | Username or address already registered |
+| `CONFLICT` | 409 | Username already taken, or an address is at its 5-username limit |
 | `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
 | `VALIDATION_FAILED` | 422 | Body failed its schema |
@@ -252,7 +406,7 @@ turns an error into a response:
 ```js
 const { ApiError } = require('./src/errors');
 
-return next(new ApiError('CONFLICT', 'Address already registered'));
+return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
 ```
 
 A `5xx` from an unexpected throw always reports the generic message so
@@ -260,7 +414,7 @@ internals are never leaked; the real error goes to the log under
 `reference_id`. A message passed deliberately to `ApiError` is sent as written.
 
 `GET /health` is exempt: it reports component status (`{ status, database,
-redis }`) rather than an API error.
+redis, horizon }`) rather than an API error.
 
 ## Request validation
 
@@ -310,19 +464,23 @@ Resolves a given username tag to a Stellar address.
   - `500 Internal Server Error`: Database lookup failed.
 
 ### `POST /register`
-Registers a new username and associates it with a Stellar address.
+Registers a new username and associates it with a Stellar address. An address
+may hold up to 5 usernames (aliases), e.g. `payments*domain` and
+`support*domain` for one business account. The first username registered for an
+address is its primary; reverse (`type=id`) federation lookups resolve to it.
 - **Body Parameters (JSON):** 
   - `username` (string) - The desired username.
   - `address` (string) - The user's Stellar address.
-- **Returns:** A JSON object with registration details `{ ok: true, username, address }`.
+- **Returns:** A JSON object with registration details `{ ok: true, username, address, is_primary }`.
 - **Status Codes:**
   - `200 OK`: Registration successful.
   - `400 Bad Request`: Missing `username` or `address`.
-  - `409 Conflict`: Address or username already registered.
+  - `409 Conflict`: Username already taken, or the address already has the maximum of 5 usernames.
   - `500 Internal Server Error`: Database lookup or insertion failed.
 
 ### `GET /lookup`
-Resolves a given Stellar address to its registered username.
+Resolves a given Stellar address to its registered username. When an address has
+several usernames, the primary one is returned.
 - **Query Parameter:** `address` (string) - The Stellar address to lookup.
 - **Returns:** A JSON object with `username` and `address`.
 - **Status Codes:**
@@ -331,10 +489,55 @@ Resolves a given Stellar address to its registered username.
   - `404 Not Found`: Username not found for this address.
   - `500 Internal Server Error`: Database lookup failed.
 
+### `GET /users/:username/activity`
+Returns the caller's own activity trail: registrations, transfers,
+unregistrations, webhook creation and deletion, and blocks applied to their
+address.
+
+Ownership is proven the same way the webhook endpoints prove it. Sign the
+message `activity:<username>` with the account key and send the base64
+signature:
+
+```bash
+curl "http://localhost:5000/users/ada*localhost/activity?limit=20" \
+  -H "X-Stellar-Signature: <base64 signature>" \
+  -H "X-Stellar-Signer: <G... public key>"
+```
+
+The signature may also be sent in the request body as `signature` /
+`signerAddress`, matching `GET /webhooks`.
+
+- **Query Parameters:**
+  - `page` (optional) - 1-based page number, default 1.
+  - `limit` (optional) - rows per page, default 10, capped at 100.
+  - `startDate` / `endDate` (optional) - inclusive bounds on `created_at`.
+- **Returns:** `{ data, meta: { total, page, limit, totalPages } }`, newest
+  first. Each row carries `id`, `action`, `metadata`, `ip_address` and
+  `created_at`.
+- **Status Codes:**
+  - `200 OK`: Trail returned.
+  - `400 Bad Request`: Missing signature, or an unparseable/inverted date range.
+  - `401 Unauthorized`: The signature does not belong to the account behind the
+    username.
+  - `404 Not Found`: Username not registered.
+
+Actions are namespaced: `user.registered`, `user.unregistered`,
+`user.transferred`, `user.blocked`, `webhook.created`, `webhook.deleted`. Rows
+are removed with the user, so a purge does not leave a trail behind.
+
 ### `GET /health`
-A simple health check endpoint.
-- **Returns:** `{ status: 'ok' }`
-- **Status Codes:** `200 OK`.
+Aggregates the status of every external dependency: PostgreSQL (a `SELECT 1`
+through Prisma), Redis (`PING`) and Stellar Horizon (an HTTP request to
+`HORIZON_BASE`). The three probes run in parallel.
+- **Returns:** `{ status, timestamp, database, redis, horizon }`, where each
+  dependency is `up`, `down`, or `not configured` (Redis, when `REDIS_URL` is
+  unset). A `DOWN` response also carries a `message` naming the failures.
+- **Status Codes:**
+  - `200 OK`: Every configured dependency responded.
+  - `503 Service Unavailable`: At least one dependency is down.
+
+`HEALTH_HORIZON_TIMEOUT_MS` (default 3000) bounds the Horizon probe so a
+hanging Horizon cannot hold the response open.
 
 ### `GET /transactions/export`
 Streams the account's payment history as a CSV download.
@@ -375,7 +578,100 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
 
 Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
 
+### `GET /admin/stats/routing`
+Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
+- **Query Parameters:**
+  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
+  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
+  - `groupBy` (optional) – `'day'` (default), `'week'`, or `'month'`.
+  - `interval` (optional) – Alias for `groupBy`.
+  - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
+- **Status Codes:**
+  - `200 OK`: Statistics retrieved successfully.
+  - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, or invalid `groupBy`.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+### `GET /admin/audit-logs`
+Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
+- **Query Parameters:**
+  - `limit` (optional) – Maximum number of records to return (1-100, default 50).
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
+- **Status Codes:**
+  - `200 OK`: Audit logs retrieved successfully.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
+
+### `GET /admin/webhooks/health`
+Aggregates webhook delivery health so operators can spot broken merchant integrations.
+- **Query Parameters:**
+  - `username` (optional) – Scope the aggregates to one merchant's webhooks.
+- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
+- **Returns:** JSON object with `success: true`, a `summary` (`total`, `healthy`, `failing`, `successRate24h`), and `failingOver24h` — the webhooks that have been failing continuously for more than 24 hours.
+- **Status Codes:**
+  - `200 OK`: Health snapshot retrieved successfully.
+  - `401 Unauthorized`: Missing or invalid API key.
+
+A webhook is "failing" while its `failingSince` timestamp is set (cleared on the next successful delivery). `successRate24h` is the share of webhooks with a delivery attempt in the last 24h that are currently healthy; it is `null` when nothing has been active in that window.
+
+### Dead letter queue: `/admin/dlq`
+
+Webhook deliveries that exhaust `MAX_RETRY_ATTEMPTS` are parked on the
+`payment-retries-dlq` BullMQ queue instead of being retried forever, so they can
+be inspected and replayed by hand. Parked jobs keep their original payload,
+attempt count, failure reason, and a truncated stack trace, and are never retried
+or removed on their own.
+
+The dead letter queue needs Redis. With neither `REDIS_URL` nor
+`REDIS_CLUSTER_NODES` set, the worker logs a warning and falls back to the legacy
+database-backed dead letter handling; `GET /admin/dlq` then reports
+`available: false` with an empty list, and the per-message endpoints below return
+`503`.
+
+All endpoints below require `x-api-key` matching `ADMIN_API_KEY`. The mutating
+ones (`POST`, `DELETE`) additionally require an `Idempotency-Key` header, as with
+every other mutating `/api/v1` request, so a retried or double-clicked call
+cannot replay a message twice. Webhook secrets are redacted from every payload
+before it is returned.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /admin/dlq` | List parked messages |
+| `GET /admin/dlq/:id` | Read one message |
+| `POST /admin/dlq/:id/replay` | Replay one message |
+| `POST /admin/dlq/replay` | Replay a batch |
+| `DELETE /admin/dlq/:id` | Discard one message |
+
+**`GET /admin/dlq`**
+- **Query Parameters:** `limit` (optional, 1-100, default `20`), `page` (optional, default `1`), `username` (optional) to scope the listing to one merchant. A non-numeric `limit` or `page` falls back to the default rather than failing.
+- **Returns:** `success: true`, `available`, `messages`, and `meta` (`total`, `page`, `limit`, `totalPages`). `total` always describes the same set as `messages`: unfiltered, BullMQ counts the queue directly; filtered, the queue is walked in full so the page and the count stay consistent.
+- **Status Codes:** `200 OK`, `401 Unauthorized`.
+
+**`GET /admin/dlq/:id`**
+- **Returns:** `success: true` and the `message`, with `failureReason`, `stack`, `attemptsMade`, and the redacted `payload`.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable` (no Redis).
+
+**`POST /admin/dlq/:id/replay`**
+- **Headers:** `x-api-key`, `Idempotency-Key`.
+- **Returns:** `success: true`, `replayed: true`, `replayedJobId`, and the `queue` the job went back to. The attempt budget is reset, so a replayed job gets a fresh set of retries.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`.
+
+**`POST /admin/dlq/replay`**
+- **Headers:** `x-api-key`, `Idempotency-Key`.
+- **Body (optional):** `limit` (capped at `DLQ_REPLAY_BATCH_LIMIT`) and `username` to narrow the batch. An empty body replays the whole queue up to that cap.
+- **Returns:** `success: true`, counts of `replayed` and `failed`, a `failed` array of `{ id, error }` for messages that could not be replayed, and `capped` when the queue held more messages than the batch limit allowed. Per-message failures are reported without failing the whole batch.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `503 Service Unavailable`.
+
+**`DELETE /admin/dlq/:id`**
+- **Headers:** `x-api-key`, `Idempotency-Key`.
+- **Returns:** `success: true`, `id`, `discarded: true`. The message is dropped without being replayed, which is permanent.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`.
+
 ### `GET /metrics`
+
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
 rate limiter so a scraper on a fixed interval is never throttled.
 - **Returns:** all metrics below, prefixed `stellar_tags_`.
@@ -386,16 +682,24 @@ rate limiter so a scraper on a fixed interval is never throttled.
 | `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
 | `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
 | `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
-| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code` |
+| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code`; buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s |
 | `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
 | `db_pool_connections_busy` | gauge | Connections executing a query |
 | `db_pool_connections_idle` | gauge | Connections open but unused |
 | `db_pool_queries_waiting` | gauge | Queries queued waiting for a connection |
 | `redis_connections_active` | gauge | `1` while Redis is ready for commands, else `0` |
+| `stellar_tags_dlq_depth` | gauge | Messages currently parked on `payment-retries-dlq`; reads `0` when Redis is unavailable |
+| `stellar_tags_dlq_messages_total` | counter | Messages ever routed to the dead letter queue |
 
 Memory and CPU come from `prom-client`'s default collectors. The pool gauges read
 Prisma's `$metrics` (which requires the `metrics` preview feature in
-`schema.prisma`) and report `0` when it is unavailable.
+`schema.prisma`) and report `0` when it is unavailable. The dead letter queue
+depth is read at scrape time, so a restart does not reset it and no work happens
+unless something asks for the value.
+
+`monitoring/prometheus-dlq-alerts.yml` contains ready-to-load rules that fire when
+the backlog grows past `DLQ_ALERT_THRESHOLD`, and when it keeps rising for 15
+minutes.
 
 ## Smart Contract Refund Mechanism
 
@@ -406,6 +710,24 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 - `get_refund_balance(user: Address, token: Address) -> i128`: Query available internal refund balance.
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
+
+### Arbitrary-token swaps
+
+`route_payment_with_swap` accepts a DEX adapter, an input/output token pair, a
+full token `path`, and `min_amount_out`. The adapter receives the input token and
+must return `[amount_received, unused_input]`; the router rejects malformed
+paths or slippage below the caller's minimum and credits unused input to the
+sender's refund balance. Existing same-token `route_payment` and
+`route_payments` calls remain unchanged.
+
+### Fee governance
+
+The contract supports token-weighted fee proposals. A SuperAdmin first calls
+`configure_governance(governance_token, quorum)`. A token holder can then call
+`propose_fee_change` and `vote_fee_proposal`; after the voting period, anyone
+can call `execute_fee_proposal` when yes votes exceed no votes and quorum is
+met. A voter can vote only once per proposal, and fee updates are applied only
+after successful finalization.
 
 ## Smart Contract Deployment & Upgrades
 
@@ -430,7 +752,7 @@ The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts
 ./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
 
 # Upgrade an existing contract to newly compiled WASM
-./scripts/deploy_contract.sh upgrade --contract-id CDNQ7... --network testnet --source S...
+./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S...
 
 # Compile and optimize WASM only
 ./scripts/deploy_contract.sh build
@@ -449,7 +771,70 @@ Upon successful deployment, the tool automatically updates the contract address 
 - The dashboard calls the Node.js API at `http://localhost:5000` via `VITE_API_BASE` and a `/api` proxy.
 - The Soroban contract handles on-chain payment routing logic.
 
+## CQRS Analytics Architecture
+
+Complex aggregation queries for the admin analytics dashboard are separated from the primary transactional database using Command Query Responsibility Segregation (CQRS).
+
+### How it works
+
+```text
+[ Payment Write Path ]
+  POST /payments → Prisma → PostgreSQL (write model)
+         │
+         │  Redis Streams XADD  (async, non-blocking)
+         ▼
+[ Message Broker: Redis Streams `analytics` ]
+         │
+         │  XREADGROUP (analytics-processors group)
+         ▼
+[ Analytics Consumer: analytics-worker.js ]
+         │
+         │  INSERT / ON CONFLICT UPDATE
+         ▼
+[ Analytics Read Model: TimescaleDB ]
+  payment_analytics        (raw events, hypertable)
+  payment_analytics_daily  (pre-aggregated daily rollup)
+         │
+         │  SQL query
+         ▼
+[ GET /admin/stats/routing ]  ← reads from TimescaleDB, not PostgreSQL
+```
+
+### Components
+
+| Component | File | Description |
+|---|---|---|
+| Event Publisher | `src/analytics/eventPublisher.js` | Publishes `payment.created` / `payment.updated` events to the `analytics` Redis stream |
+| Analytics Consumer | `src/analytics/analyticsConsumer.js` | XREADGROUP consumer that reads from the stream and writes to TimescaleDB |
+| Analytics Repository | `src/analytics/analyticsRepository.js` | Pool, DDL bootstrap, upsert, and aggregation query against TimescaleDB |
+| Analytics Worker | `analytics-worker.js` | Standalone worker process entry point (mirrors `fraud-worker.js`) |
+| Publisher Middleware | `src/middleware/analyticsPublisher.js` | Express middleware for fire-and-forget event publishing on response |
+
+### Fallback behaviour
+
+When `ANALYTICS_DATABASE_URL` is not set (e.g. local development without TimescaleDB), `GET /admin/stats/routing` automatically falls back to querying the primary PostgreSQL database via Prisma, preserving backward compatibility.
+
+### Running the analytics stack locally
+
+```bash
+# Start with TimescaleDB and the analytics worker
+docker compose --profile dev up
+
+# The analytics-worker starts automatically in the dev profile.
+# It initialises the TimescaleDB schema on startup and begins
+# consuming from the Redis Streams analytics channel.
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANALYTICS_DATABASE_URL` | _(unset)_ | TimescaleDB connection string |
+| `ANALYTICS_STREAM` | `analytics` | Redis stream name for payment events |
+| `ANALYTICS_CONSUMER_GROUP` | `analytics-processors` | Redis consumer group |
+| `ANALYTICS_STREAM_MAX_LEN` | `10000` | Approximate max entries kept in the stream |
+| `ANALYTICS_POOL_MAX` | `5` | Max connections in the TimescaleDB pool |
+
 ## License
 
 See [LICENSE](LICENSE).
-

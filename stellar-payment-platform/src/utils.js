@@ -8,6 +8,15 @@ const MEMO_HASH_RE = /^[0-9a-fA-F]{64}$/;
 
 const RESERVED_NAMES = ['admin', 'root', 'support', 'system', 'stellar', 'api', 'help'];
 
+// #613 — an address may carry at most this many federation usernames
+// (one primary plus up to four aliases).
+const MAX_USERNAMES_PER_ADDRESS = 5;
+
+// #613 — Prisma orderBy that resolves an address to its primary username:
+// the row flagged primary wins, with oldest-registered as the tiebreak so
+// the result stays stable if no row is flagged (e.g. legacy data).
+const PRIMARY_USERNAME_ORDER = [{ isPrimary: 'desc' }, { createdAt: 'asc' }];
+
 function normalizeNameTag(value) {
   const trimmed = typeof value === 'string' ? value.trim() : '';
   if (!trimmed) return '';
@@ -54,6 +63,8 @@ module.exports = {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  MAX_USERNAMES_PER_ADDRESS,
+  PRIMARY_USERNAME_ORDER,
   VALID_MEMO_TYPES,
   USER_DATABASE,
   shouldFallbackToLocalRegistry,

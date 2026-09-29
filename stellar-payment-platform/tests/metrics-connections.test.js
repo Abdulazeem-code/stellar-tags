@@ -2,6 +2,7 @@ const client = require('prom-client');
 
 jest.mock('../src/logger', () => ({
   logger: { warn: jest.fn(), info: jest.fn(), error: jest.fn() },
+  httpLogger: (req, res, next) => next(),
 }));
 
 const { getMetrics, setMetricsSources } = require('../src/metrics');

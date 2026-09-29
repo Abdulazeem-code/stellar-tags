@@ -119,13 +119,13 @@ describe('GET /api/v1/receipts/:txHash', () => {
     expect(res.body.error.message).toBe('Transaction not found');
   });
 
-  test('SDK network failure returns 500', async () => {
+  test('SDK network failure returns 502', async () => {
     mockTxImpl = () => Promise.reject(new Error('Network timeout'));
 
     const res = await request(app).get(`/api/v1/receipts/${VALID_HASH}`);
 
-    expect(res.status).toBe(500);
-    expect(res.body.error.message).toBe('Failed to fetch transaction');
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe('UPSTREAM_ERROR');
   });
 
   test('Soroban tx with no native payment op falls back gracefully', async () => {

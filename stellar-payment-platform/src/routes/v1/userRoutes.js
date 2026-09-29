@@ -2,9 +2,10 @@ const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
+const { getBalances } = require('../../services/ledgerService');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { poolGet, poolRun, poolAll } = require('../../db');
 const { logger } = require('../../logger');
+const { transferAccount } = require('../../services/registrationService');
 const { lookupCached, invalidateFederationCache } = require('../../cache');
 const {
   paginatedResponse,
@@ -14,12 +15,13 @@ const {
   paginateByKeyset,
   cursorPaginatedResponse,
 } = require('../../pagination');
+const { authenticateUsernameOwner } = require('../../services/ownershipService');
+const { listActivity, serializeActivity, ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
-  shouldFallbackToLocalRegistry,
 } = require('../../utils');
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
@@ -28,6 +30,7 @@ const {
   registerBodySchema,
   lookupQuerySchema,
   usersQuerySchema,
+  activityQuerySchema,
 } = require('../../schemas');
 
 const router = express.Router();
@@ -43,76 +46,12 @@ const buildUserSearchWhere = (search) => {
   };
 };
 
-const serializeUser = (user) => ({
+const serializeUser = (user, balances = {}) => ({
   username: user.username,
   address: user.address,
   created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+  balances,
 });
-
-const getLocalUserByAddress = async (address) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
-    [address],
-  );
-
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
-    [username],
-  );
-
-const listLocalUsers = async (search, page, limit) => {
-  const searchPattern = `%${search}%`;
-  const skip = (page - 1) * limit;
-  const rows = await poolAll(
-    `SELECT username, address, created_at
-     FROM username_registry
-     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE
-     ORDER BY created_at DESC
-     LIMIT ? OFFSET ?`,
-    [searchPattern, searchPattern, limit, skip],
-  );
-
-  const countRow = await poolGet(
-    `SELECT COUNT(*) AS totalCount
-     FROM username_registry
-     WHERE username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE`,
-    [searchPattern, searchPattern],
-  );
-
-  const totalCount = Number(countRow?.totalCount || 0);
-  return paginatedResponse(
-    rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.created_at,
-    })),
-    totalCount,
-    { page, limit },
-  );
-};
-
-const registerLocalUser = async ({ username, address }) => {
-  const existingByAddress = await getLocalUserByAddress(address);
-  if (existingByAddress) {
-    const conflictError = new Error('Address already registered');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  const existingByUsername = await getLocalUserByUsername(username);
-  if (existingByUsername) {
-    const conflictError = new Error('Username is already taken. Please choose another.');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  await poolRun(
-    `INSERT INTO username_registry (username, address, created_at)
-     VALUES (?, ?, ?)`,
-    [username, address, new Date().toISOString()],
-  );
-};
 
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
@@ -158,8 +97,6 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     return next(new ApiError('INVALID_INPUT', memoError));
   }
 
-
-
   const normalizedUsername = username.toLowerCase();
 
   if (RESERVED_NAMES.includes(normalizedUsername)) {
@@ -167,14 +104,12 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   }
 
   try {
-    const existing = await prisma.user.findFirst({
+    const existingCount = await prisma.user.count({
       where: { address, deletedAt: null }
     });
 
-    if (existing) {
-      const conflictError = new Error('Address already registered');
-      conflictError.statusCode = 409;
-      return next(conflictError);
+    if (existingCount >= 5) {
+      return next(new ApiError('CONFLICT', 'Address already registered - maximum of 5 usernames allowed per address'));
     }
 
     let verificationResult = null;
@@ -197,6 +132,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       data: {
         username: normalizedUsername,
         address,
+        isPrimary: existingCount === 0,
         ...(memoType && { memoType, memo }),
       },
     });
@@ -208,6 +144,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       username: normalizedUsername,
       address,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      is_primary: existingCount === 0,
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,
@@ -220,7 +157,8 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       ...(memoType && { memo_type: memoType, memo }),
     });
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || (error.message && error.message.includes('UNIQUE'))) {
+    // Prisma unique constraint violation (PostgreSQL error code 23505)
+    if (error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
@@ -240,6 +178,36 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     return next(registrationError);
   }
 }));
+
+router.post('/users/:username/transfer', async (req, res, next) => {
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: "Unsupported Media Type. Please send application/json" });
+  }
+
+  const { username } = req.params;
+  const { oldAddress, newAddress, oldSignature, newSignature } = req.body;
+
+  try {
+    const normalizedUsername = typeof username === 'string' ? username.toLowerCase().trim() : '';
+    const updatedUser = await transferAccount(
+      normalizedUsername,
+      oldAddress,
+      newAddress,
+      oldSignature,
+      newSignature
+    );
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Account transferred successfully',
+      username: updatedUser.username,
+      new_address: updatedUser.address,
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    return res.status(status).json({ error: error.message || 'Transfer failed' });
+  }
+});
 
 router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
@@ -294,7 +262,9 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
           where: { address, deletedAt: null },
           select: { username: true },
         });
-        return row ? { username: row.username, address } : null;
+        if (!row) return null;
+        const balances = await getBalances(row.username);
+        return { username: row.username, address, balances };
       });
 
       if (!result) {
@@ -332,10 +302,14 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt.toISOString(),
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt.toISOString(),
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -353,11 +327,15 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
       }),
     ]);
 
-const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
+    const totalPages = Math.ceil(totalCount / limit);
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt.toISOString(),
+        balances,
+      };
     }));
 
     return res.json({ data, totalCount, totalPages, currentPage: page });
@@ -390,10 +368,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -411,11 +393,15 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
       }),
     ]);
 
-const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+    const totalPages = Math.ceil(totalCount / limit);
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+        balances,
+      };
     }));
 
     res.json({
@@ -438,5 +424,71 @@ const totalPages = Math.ceil(totalCount / limit);
     return next(dbError);
   }
 }));
+
+
+
+router.get(
+  '/users/:username/activity',
+  validateSchema({ query: activityQuerySchema }),
+  asyncHandler(async (req, res, next) => {
+    const rawUsername = typeof req.params.username === 'string' ? req.params.username : '';
+    const username = normalizeNameTag(rawUsername);
+    if (!username) {
+      return next(new ApiError('INVALID_INPUT', 'Missing username parameter'));
+    }
+
+    let user;
+    try {
+      const signature = req.headers['x-stellar-signature'] || req.body?.signature;
+      const signerAddress = req.headers['x-stellar-signer'] || req.body?.signerAddress;
+      
+      user = await authenticateUsernameOwner({
+        username,
+        signature,
+        signerAddress,
+        operation: 'activity'
+      });
+    } catch (err) {
+      if (err.statusCode) return next(err);
+      const e = new Error(err.message || 'Failed to authenticate');
+      e.statusCode = 401;
+      return next(e);
+    }
+
+    const { page, limit, skip } = parsePagination(req.query);
+    const range = req.query.startDate || req.query.endDate ? {
+      ...(req.query.startDate && { gte: new Date(req.query.startDate) }),
+      ...(req.query.endDate && { lte: new Date(req.query.endDate) }),
+    } : null;
+    
+    if (range && (
+      (range.gte && isNaN(range.gte.getTime())) || 
+      (range.lte && isNaN(range.lte.getTime())) ||
+      (range.gte && range.lte && range.gte > range.lte)
+    )) {
+       const e = new Error('Invalid date range');
+       e.statusCode = 400;
+       return next(e);
+    }
+
+    try {
+      const { rows, total } = await listActivity(prisma, {
+        username: user.username,
+        page,
+        limit,
+        range,
+      });
+
+      return res.status(200).json(
+        paginatedResponse(rows.map(serializeActivity), total, { page, limit }),
+      );
+    } catch (err) {
+      logger.error('[activity] error listing activity:', err);
+      const e = new Error('Failed to load activity');
+      e.statusCode = 500;
+      return next(e);
+    }
+  }),
+);
 
 module.exports = router;

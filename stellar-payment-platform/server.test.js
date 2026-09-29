@@ -34,6 +34,10 @@ jest.mock('./prismaClient', () => ({
       count: jest.fn(),
       create: jest.fn(),
     },
+    walletBalance: {
+      findMany: jest.fn().mockResolvedValue([]),
+      upsert: jest.fn(),
+    },
     $transaction: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
   },
@@ -65,13 +69,25 @@ jest.mock('./src/multisigner-verifier', () => ({
 jest.mock('pg', () => ({
   Pool: jest.fn().mockImplementation(() => ({
     query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-    on: jest.fn(),
+    connect: jest.fn().mockResolvedValue({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      release: jest.fn(),
+    }),
     end: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
+    options: { max: 10 },
   })),
 }));
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+
+// closeWebSocket is awaited in gracefulShutdown before server.close() is called.
+// Resolve immediately so tests that check server.close() synchronously still pass.
+jest.mock('./src/websocket', () => ({
+  initWebSocket: jest.fn(),
+  closeWebSocket: jest.fn().mockResolvedValue(undefined),
+}));
 
 describe('gracefulShutdown', () => {
   let gracefulShutdown;
@@ -98,13 +114,15 @@ describe('gracefulShutdown', () => {
     jest.restoreAllMocks();
   });
 
-  test('SIGTERM — calls server.close()', () => {
+  test('SIGTERM — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
-  test('SIGINT — calls server.close()', () => {
+  test('SIGINT — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGINT');
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
@@ -131,7 +149,8 @@ describe('gracefulShutdown', () => {
     });
 
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-    await Promise.resolve();
+    await Promise.resolve(); // flush closeWebSocket().then(...)
+    await Promise.resolve(); // flush server.close callback
 
     expect(callOrder).toEqual(['server.close', 'prisma.$disconnect']);
   });
@@ -146,10 +165,10 @@ describe('gracefulShutdown', () => {
     expect(mockPrisma.$disconnect).not.toHaveBeenCalled();
   });
 
-  test('second signal is a no-op (double-invocation guard)', () => {
+  test('second signal is a no-op (double-invocation guard)', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
@@ -316,8 +335,13 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -397,8 +421,13 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -780,8 +809,13 @@ jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: j
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -855,7 +889,7 @@ describe('Idempotency Middleware', () => {
     // First request
     const res1 = await request(app)
       .post('/register')
-      .set('X-Idempotency-Key', 'test-key-123')
+      .set('Idempotency-Key', 'test-key-123')
       .set('Content-Type', 'application/json')
       .send(payload);
     
@@ -865,7 +899,7 @@ describe('Idempotency Middleware', () => {
     // Second request with SAME key
     const res2 = await request(app)
       .post('/register')
-      .set('X-Idempotency-Key', 'test-key-123')
+      .set('Idempotency-Key', 'test-key-123')
       .set('Content-Type', 'application/json')
       .send(payload);
     
@@ -911,8 +945,13 @@ describe('Database disconnection — 503 handling', () => {
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
         query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
-        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
         end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -982,7 +1021,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1001'],
     ['P1008'],
   ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
-    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
+    prisma.user.count.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app)
       .post('/api/v1/register')
@@ -991,11 +1030,11 @@ describe('Database disconnection — 503 handling', () => {
     expect(res.body.error.message).toBe('Service Unavailable');
   });
 
-  test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {
+  test('server.js federation route returns 503 on Prisma P10 connection errors', async () => {
     prisma.user.findFirst.mockRejectedValue(makePrismaError('P1001'));
 
     const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(503);
   });
 
 });

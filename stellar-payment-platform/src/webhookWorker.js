@@ -1,67 +1,117 @@
 const crypto = require('crypto');
-const cron = require('node-cron');
+const { Queue, Worker } = require('bullmq');
+const { createRedisConnection, withRedisRetry } = require('./config/redis');
 const { logger } = require('./logger');
+const { shouldFallbackToLocalRegistry } = require('./utils');
+const { internalFetch } = require('./utils/internalClient');
+const { routeToDlq, isDlqAvailable, DLQ_QUEUE_NAME } = require('./dlq');
+
+/** Reads a positive integer env var, falling back when unset or malformed. */
+const parseEnvInt = (value, fallback) => {
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
+};
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
+const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
+// Retry budget for the main queue. Both are env-tunable so a deployment can
+// widen the retry window without a code change; the DLQ reuses the same values
+// when it replays a message.
+const MAX_WEBHOOK_ATTEMPTS = parseEnvInt(process.env.MAX_RETRY_ATTEMPTS, 5);
+const WEBHOOK_BACKOFF_DELAY_MS = parseEnvInt(process.env.RETRY_BACKOFF_MS, 1_000);
+const WEBHOOK_WORKER_CONCURRENCY = 5;
 const MAX_RETRY_BACKLOG_DAYS = 3;
-const RETRY_JOB_CRON = '*/5 * * * *'; // every 5 minutes
+// A cluster failover can reject an enqueue while the slot map is being
+// refreshed. Retry those transient errors so a delivery is never dropped.
+const WEBHOOK_ENQUEUE_RETRY_ATTEMPTS = 5;
+const WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS = 50;
 
-const shouldFallbackToLocalRegistry = (error) => {
-  const code = typeof error?.code === 'string' ? error.code : '';
-  const message = typeof error?.message === 'string' ? error.message : '';
-  return (
-    code.startsWith('P10') ||
-    ['P2021', 'P2023', 'P2028', 'P2001'].includes(code) ||
-    /DATABASE_URL|connect|relation|table|timeout/i.test(message)
-  );
-};
+const WEBHOOK_JOB_OPTIONS = Object.freeze({
+  attempts: MAX_WEBHOOK_ATTEMPTS,
+  backoff: {
+    type: 'exponential',
+    delay: WEBHOOK_BACKOFF_DELAY_MS,
+  },
+  removeOnComplete: 1_000,
+  removeOnFail: 5_000,
+});
+
+let webhookQueue;
+let webhookWorker;
+let queueConnection;
+let workerConnection;
 
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 };
 
-const fetchWebhooksForAddress = async (prisma, poolGetFn, stellarAddress) => {
-  try {
-    return await prisma.webhook.findMany({
-      where: {
-        user: { address: stellarAddress },
-      },
-      select: {
-        id: true,
-        username: true,
-        url: true,
-        secret: true,
-        failingSince: true,
-      },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
+// Bound signature for the `Stellar-*` headers: the dispatch timestamp is
+// cryptographically bound (`timestamp.rawBody`) so the header cannot be
+// swapped in transit without invalidating the signature.
+const computeBoundSignature = (secret, timestamp, rawBody) => {
+  return crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
+};
 
-    const rows = await poolGetFn(
-      `SELECT w.id, w.username, w.url, w.secret, w.failing_since
-       FROM webhooks w
-       INNER JOIN username_registry u ON u.username = w.username
-       WHERE u.address = ?`,
-      [stellarAddress],
-    );
-    return (rows || []).map((r) => ({
-      id: r.id,
-      username: r.username,
-      url: r.url,
-      secret: r.secret,
-      failingSince: r.failing_since ? new Date(r.failing_since) : null,
-    }));
-  }
+const webhookEventMatches = (webhook, eventName) => {
+  const subscriptions = Array.isArray(webhook?.events) ? webhook.events : ['*'];
+  const normalized = subscriptions
+    .filter((value) => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (normalized.length === 0 || normalized.includes('*')) return true;
+  return normalized.includes(eventName);
+};
+
+const fetchWebhooksForAddress = async (prisma, stellarAddress) => {
+  return prisma.webhook.findMany({
+    where: {
+      user: { address: stellarAddress },
+    },
+    select: {
+      id: true,
+      username: true,
+      url: true,
+      secret: true,
+      events: true,
+      failingSince: true,
+    },
+  });
+};
+
+const getWebhooksExhaustedRetries = async (prisma) => {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - MAX_RETRY_BACKLOG_DAYS);
+
+  return prisma.webhook.findMany({
+    where: {
+      failingSince: { not: null, lt: cutoff },
+    },
+    select: {
+      id: true,
+      username: true,
+      url: true,
+      secret: true,
+      failingSince: true,
+    },
+  });
 };
 
 const sendWebhook = async (url, payload, secret) => {
   const rawBody = JSON.stringify(payload);
   const signature = computeSignature(secret, rawBody);
+  // `Stellar-Timestamp` is the ISO 8601 dispatch timestamp already present
+  // in `payload.timestamp`; it is bound into `Stellar-Signature`.
+  const timestamp = payload.timestamp;
+  const stellarSignature = computeBoundSignature(secret, timestamp, rawBody);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    // internalFetch is a pass-through to `fetch` for merchant endpoints on the
+  // public internet, and presents this service's client certificate when a
+  // webhook points at another internal service.
+  const response = await internalFetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -69,89 +119,185 @@ const sendWebhook = async (url, payload, secret) => {
         'X-Webhook-Signature': signature,
         // Legacy alias kept for backward compatibility.
         'X-Stellar-Tags-Signature': signature,
-        'X-Webhook-Timestamp': payload.timestamp,
+        'X-Webhook-Timestamp': timestamp,
+        // Timestamp-bound headers per issue #727 spec.
+        'Stellar-Signature': stellarSignature,
+        'Stellar-Timestamp': timestamp,
       },
       body: rawBody,
       signal: controller.signal,
     });
-    clearTimeout(timeoutId);
-    if (!res.ok) {
-      throw new Error(`Webhook responded with HTTP ${res.status}`);
+    if (!response.ok) {
+      throw new Error(`Webhook responded with HTTP ${response.status}`);
     }
     return { ok: true };
-  } catch (err) {
+  } finally {
     clearTimeout(timeoutId);
-    throw err;
   }
 };
 
-const markWebhookSuccess = async (prisma, poolRunFn, webhookId, now) => {
+const markWebhookSuccess = async (prisma, webhookId, now) => {
+  await prisma.webhook.update({
+    where: { id: webhookId },
+    data: { lastSentAt: now, failingSince: null },
+  });
+};
+
+const markWebhookFailure = async (prisma, webhookId, now) => {
+  const current = await prisma.webhook.findUnique({
+    where: { id: webhookId },
+    select: { failingSince: true },
+  });
+  await prisma.webhook.update({
+    where: { id: webhookId },
+    data: {
+      lastSentAt: now,
+      failingSince: current?.failingSince || now,
+    },
+  });
+};
+
+const processWebhookJob = async (job, { prisma }) => {
+  const { webhook, payload } = job.data;
+  const now = new Date();
+
   try {
-    await prisma.webhook.update({
-      where: { id: webhookId },
-      data: { lastSentAt: now, failingSince: null },
-    });
+    await sendWebhook(webhook.url, payload, webhook.secret);
   } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-    await poolRunFn(
-      `UPDATE webhooks SET last_sent_at = ?, failing_since = NULL WHERE id = ?`,
-      [now.toISOString(), webhookId],
+    try {
+      await markWebhookFailure(prisma, webhook.id, now);
+    } catch (databaseError) {
+      logger.error(
+        `[webhook-worker] Failed to mark failure for webhook ${webhook.id}: ${databaseError.message}`,
+      );
+    }
+    throw error;
+  }
+
+  try {
+    await markWebhookSuccess(prisma, webhook.id, now);
+  } catch (databaseError) {
+    logger.error(
+      `[webhook-worker] Failed to mark success for webhook ${webhook.id}: ${databaseError.message}`,
     );
   }
+
+  logger.info(
+    `[webhook-worker] Delivered event=${payload.event_id} webhook=${webhook.id} attempt=${job.attemptsMade + 1}`,
+  );
 };
 
-const markWebhookFailure = async (prisma, poolRunFn, webhookId, now) => {
-  try {
-    const current = await prisma.webhook.findUnique({
-      where: { id: webhookId },
-      select: { failingSince: true },
+const getWebhookQueue = () => {
+  if (!webhookQueue) {
+    queueConnection = createRedisConnection();
+    webhookQueue = new Queue(WEBHOOK_QUEUE_NAME, { connection: queueConnection });
+    webhookQueue.on('error', (error) => {
+      logger.error(`[webhook-queue] Redis error: ${error.message}`);
     });
-    await prisma.webhook.update({
-      where: { id: webhookId },
-      data: {
-        lastSentAt: now,
-        failingSince: current?.failingSince || now,
+  }
+  return webhookQueue;
+};
+
+const startWebhookWorker = ({ prisma }) => {
+  if (webhookWorker) return webhookWorker;
+
+  workerConnection = createRedisConnection();
+  webhookWorker = new Worker(
+    WEBHOOK_QUEUE_NAME,
+    (job) => processWebhookJob(job, { prisma }),
+    {
+      connection: workerConnection,
+      concurrency: WEBHOOK_WORKER_CONCURRENCY,
+    },
+  );
+
+  webhookWorker.on('failed', async (job, error) => {
+    const maxAttempts = job?.opts?.attempts || MAX_WEBHOOK_ATTEMPTS;
+    const attemptsMade = job?.attemptsMade || 1;
+
+    if (attemptsMade < maxAttempts) {
+      logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retry scheduled (${attemptsMade}/${maxAttempts})`);
+      return;
+    }
+
+    logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retries exhausted (${attemptsMade}/${maxAttempts})`);
+
+    // Prefer the dead letter queue: it keeps the original payload and the
+    // failure reason, so the delivery can be replayed later. Without Redis
+    // there is nowhere to park it, so the webhook row is marked instead.
+    if (isDlqAvailable()) {
+      try {
+        await routeToDlq(job, error);
+        return;
+      } catch (dlqErr) {
+        logger.error(`[webhook-worker] Failed to route job=${job?.id || 'unknown'} to DLQ: ${dlqErr.message}`);
+      }
+    } else {
+      logger.warn(
+        `[webhook-worker] Redis is not configured; skipping DLQ (${DLQ_QUEUE_NAME}). ` +
+          'Failed deliveries are recorded on the webhook row only.',
+      );
+    }
+
+    if (job?.data?.webhook) {
+      try {
+        await moveToDLQ(prisma, job.data.webhook);
+      } catch (dlqErr) {
+        logger.error(`[webhook-worker] Failed to move webhook ${job.data.webhook.id} to DLQ: ${dlqErr.message}`);
+      }
+    }
+  });
+
+  webhookWorker.on('error', (error) => {
+    logger.error(`[webhook-worker] Redis error: ${error.message}`);
+  });
+
+  logger.info(
+    `[webhook-worker] Started queue=${WEBHOOK_QUEUE_NAME} concurrency=${WEBHOOK_WORKER_CONCURRENCY}`,
+  );
+  return webhookWorker;
+};
+
+const buildJobId = (webhookId, eventId) => {
+  return crypto.createHash('sha256').update(`${webhookId}:${eventId}`).digest('hex');
+};
+
+const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
+  return withRedisRetry(
+    () => queue.add(
+      'deliver',
+      { webhook, payload },
+      {
+        ...WEBHOOK_JOB_OPTIONS,
+        backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
+        jobId: buildJobId(webhook.id, payload.event_id),
       },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-    await poolRunFn(
-      `UPDATE webhooks
-       SET last_sent_at = ?,
-           failing_since = COALESCE(failing_since, ?)
-       WHERE id = ?`,
-      [now.toISOString(), now.toISOString(), webhookId],
-    );
-  }
+    ),
+    {
+      attempts: WEBHOOK_ENQUEUE_RETRY_ATTEMPTS,
+      baseDelayMs: WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS,
+      onRetry: (error, attempt) => {
+        logger.warn(
+          `[webhook-queue] Enqueue for webhook=${webhook.id} failed (${error.message}); retrying after transient Redis error (attempt ${attempt}/${WEBHOOK_ENQUEUE_RETRY_ATTEMPTS})`,
+        );
+      },
+    },
+  );
 };
 
 const formatAsset = (payment) => {
-  if (!payment) return 'native';
-  if (payment.asset_type === 'native') return 'native';
+  if (!payment || payment.asset_type === 'native') return 'native';
   return `${payment.asset_code}:${payment.asset_issuer}`;
 };
 
-const dispatchPaymentWebhooks = async ({
-  prisma,
-  poolGetFn,
-  poolRunFn,
-  payment,
-}) => {
-  if (!payment) return;
-  if (payment.type !== 'payment' && payment.type_i !== 1) return;
+const dispatchPaymentWebhooks = async ({ prisma, payment, queue }) => {
+  if (!payment || (payment.type !== 'payment' && payment.type_i !== 1)) return;
 
   const recipientAddress = payment.to;
   if (!recipientAddress) return;
 
-  let webhooks;
-  try {
-    webhooks = await fetchWebhooksForAddress(prisma, poolGetFn, recipientAddress);
-  } catch (err) {
-    logger.error(`[webhook-worker] Failed to fetch webhooks for ${recipientAddress}:`, err.message);
-    return;
-  }
-
-  if (!webhooks || webhooks.length === 0) return;
+  const webhooks = await fetchWebhooksForAddress(prisma, recipientAddress);
+  if (!webhooks.length) return;
 
   const payload = {
     event: 'payment.received',
@@ -173,101 +319,168 @@ const dispatchPaymentWebhooks = async ({
     },
   };
 
-  for (const wh of webhooks) {
-    const now = new Date();
-    try {
-      await sendWebhook(wh.url, payload, wh.secret);
-      try {
-        await markWebhookSuccess(prisma, poolRunFn, wh.id, now);
-      } catch (dbErr) {
-        logger.error(`[webhook-worker] Failed to mark success for webhook ${wh.id}:`, dbErr.message);
-      }
-      logger.info(`[webhook-worker] Dispatched payment webhook id=${wh.id} url=${wh.url} recipient=${recipientAddress}`);
-    } catch (err) {
-      try {
-        await markWebhookFailure(prisma, poolRunFn, wh.id, now);
-      } catch (dbErr) {
-        logger.error(`[webhook-worker] Failed to mark failure for webhook ${wh.id}:`, dbErr.message);
-      }
-      logger.error(`[webhook-worker] Webhook delivery failed id=${wh.id} url=${wh.url}:`, err.message);
+  const deliveryQueue = queue || getWebhookQueue();
+  await Promise.all(webhooks.map(async (webhook) => {
+    if (!webhookEventMatches(webhook, payload.event)) {
+      logger.info(`[webhook-worker] Skipping webhook id=${webhook.id} url=${webhook.url} for event=${payload.event} due to subscription filter`);
+      return;
     }
-  }
-};
-
-const listStaleFailingWebhooks = async (prisma, poolAllFn) => {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - MAX_RETRY_BACKLOG_DAYS);
-  try {
-    return await prisma.webhook.findMany({
-      where: {
-        failingSince: { not: null, gte: cutoff },
-      },
-      select: {
-        id: true,
-        username: true,
-        url: true,
-        secret: true,
-      },
-    });
-  } catch (error) {
-    if (!shouldFallbackToLocalRegistry(error)) throw error;
-    const rows = await poolAllFn(
-      `SELECT id, username, url, secret FROM webhooks
-       WHERE failing_since IS NOT NULL AND failing_since >= ?`,
-      [cutoff.toISOString()],
+    await enqueueWebhookDelivery(webhook, payload, deliveryQueue);
+    logger.info(
+      `[webhook-queue] Enqueued event=${payload.event_id} webhook=${webhook.id} recipient=${recipientAddress}`,
     );
-    return (rows || []).map((r) => ({
-      id: r.id,
-      username: r.username,
-      url: r.url,
-      secret: r.secret,
-    }));
-  }
+  }));
 };
 
-const sendLivenessPing = async (prisma, poolRunFn, webhook) => {
+const closeWebhookQueue = async () => {
+  const resources = [webhookWorker, webhookQueue].filter(Boolean);
+  await Promise.all(resources.map((resource) => resource.close()));
+
+  const connections = [workerConnection, queueConnection].filter(Boolean);
+  await Promise.all(connections.map((connection) => connection.quit()));
+
+  webhookWorker = undefined;
+  webhookQueue = undefined;
+  workerConnection = undefined;
+  queueConnection = undefined;
+};
+
+// ── Dead Letter Queue (DLQ) ──────────────────────────────────────────────
+
+/**
+ * Move a permanently-failed webhook delivery to the dead-letter queue.
+ * The webhook row itself is left intact so the user can re-register if needed;
+ * only the delivery record is preserved for manual replay.
+ */
+const moveToDLQ = async (prisma, webhook) => {
   const payload = {
-    event: 'webhook.ping',
-    event_id: `ping-${crypto.randomBytes(16).toString('hex')}`,
+    event: 'webhook.delivery_failed',
+    event_id: `dlq-${webhook.id}-${crypto.randomBytes(8).toString('hex')}`,
     timestamp: new Date().toISOString(),
-    data: { message: 'ping' },
+    data: {
+      webhook_id: webhook.id,
+      webhook_url: webhook.url,
+      username: webhook.username,
+      failing_since: webhook.failingSince ? (webhook.failingSince instanceof Date
+        ? webhook.failingSince
+        : new Date(webhook.failingSince)
+      ).toISOString() : null,
+    },
   };
+
   const now = new Date();
-  try {
-    await sendWebhook(webhook.url, payload, webhook.secret);
-    await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
-    return true;
-  } catch (err) {
-    await markWebhookFailure(prisma, poolRunFn, webhook.id, now);
-    return false;
-  }
+  await prisma.webhookDLQ.create({
+    data: {
+      webhookId: webhook.id,
+      webhookUrl: webhook.url,
+      webhookSecret: webhook.secret,
+      username: webhook.username,
+      eventType: payload.event,
+      eventPayload: JSON.stringify(payload),
+      failureReason: `Delivery exhausted after ${MAX_WEBHOOK_ATTEMPTS} attempts`,
+      deliveryAttempts: 0,
+      movedAt: now,
+      replayed: false,
+    },
+  });
+
+  // Clear failingSince on the webhook so it's not repeatedly moved to DLQ.
+  // The webhook stays registered; a new payment will retry fresh.
+  await markWebhookSuccess(prisma, webhook.id, now);
+
+  logger.info(
+    `[webhook-worker] Moved to DLQ: webhookId=${webhook.id} username=${webhook.username} url=${webhook.url}`,
+  );
 };
 
-const scheduleWebhookRetryJob = ({ prisma, poolAllFn, poolRunFn }) => {
-  cron.schedule(RETRY_JOB_CRON, async () => {
-    logger.info('[webhook-worker] Running periodic liveness pings for failing webhooks…');
-    try {
-      const hooks = await listStaleFailingWebhooks(prisma, poolAllFn);
-      if (hooks.length === 0) return;
-      let recovered = 0;
-      for (const wh of hooks) {
-        const ok = await sendLivenessPing(prisma, poolRunFn, wh);
-        if (ok) recovered += 1;
-      }
-      logger.info(
-        `[webhook-worker] Liveness pings done. total=${hooks.length}, recovered=${recovered}`,
-      );
-    } catch (err) {
-      logger.error('[webhook-worker] Retry job failed:', err.message);
-    }
+/**
+ * List dead-letter-queue entries with optional username filter and pagination.
+ */
+const listDLQEntries = async (prisma, opts = {}) => {
+  const { username, limit = 50, offset = 0 } = opts;
+  const where = username
+    ? { username: { equals: username, mode: 'insensitive' } }
+    : {};
+
+  const [entries, total] = await prisma.$transaction([
+    prisma.webhookDLQ.findMany({
+      where,
+      orderBy: { movedAt: 'desc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.webhookDLQ.count({ where }),
+  ]);
+
+  return { entries, total };
+};
+
+/**
+ * Replay a single DLQ entry.
+ */
+const replayFromDLQ = async (prisma, dqlId) => {
+  const entry = await prisma.webhookDLQ.findUnique({
+    where: { id: dqlId },
   });
-  logger.info(`[webhook-worker] Retry/liveness job scheduled (cron: ${RETRY_JOB_CRON}).`);
+
+  if (!entry) {
+    return { ok: false, error: 'DLQ entry not found' };
+  }
+  if (entry.replayed) {
+    return { ok: false, error: 'DLQ entry has already been replayed' };
+  }
+
+  const payload = typeof entry.eventPayload === 'string'
+    ? JSON.parse(entry.eventPayload)
+    : entry.eventPayload;
+  const secret = entry.webhookSecret;
+
+  try {
+    await sendWebhook(entry.webhookUrl, payload, secret);
+    const now = new Date();
+    await prisma.webhookDLQ.update({
+      where: { id: dqlId },
+      data: { replayed: true, replayedAt: now },
+    });
+    logger.info(`[webhook-worker] DLQ entry ${dqlId} replayed successfully`);
+    return { ok: true };
+  } catch (err) {
+    try {
+      await prisma.webhookDLQ.update({
+        where: { id: dqlId },
+        data: { deliveryAttempts: (entry.deliveryAttempts || 0) + 1 },
+      });
+    } catch (dbErr) {
+      logger.error(`[webhook-worker] Failed to update DLQ attempt count for ${dqlId}: ${dbErr.message}`);
+    }
+    logger.error(`[webhook-worker] DLQ replay failed for ${dqlId}: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
 };
 
 module.exports = {
   dispatchPaymentWebhooks,
-  scheduleWebhookRetryJob,
+  enqueueWebhookDelivery,
+  startWebhookWorker,
+  closeWebhookQueue,
+  processWebhookJob,
   sendWebhook,
+  markWebhookSuccess,
+  markWebhookFailure,
   computeSignature,
+  computeBoundSignature,
   WEBHOOK_TIMEOUT_MS,
+  WEBHOOK_QUEUE_NAME,
+  MAX_WEBHOOK_ATTEMPTS,
+  WEBHOOK_BACKOFF_DELAY_MS,
+  WEBHOOK_JOB_OPTIONS,
+  MAX_RETRY_BACKLOG_DAYS,
+  WEBHOOK_ENQUEUE_RETRY_ATTEMPTS,
+  WEBHOOK_ENQUEUE_RETRY_BASE_DELAY_MS,
+  getWebhooksExhaustedRetries,
+  moveToDLQ,
+  listDLQEntries,
+  replayFromDLQ,
 };
+
+
