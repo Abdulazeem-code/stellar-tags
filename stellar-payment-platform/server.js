@@ -1247,17 +1247,24 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
       } catch (err) {
         logger.error(err, "Error disconnecting Prisma during shutdown:");
       }
-    }
-    // Only await when the DLQ was actually used, so a process that never
-    // opened it does not pay for an extra async hop during shutdown.
-    if (hasOpenDlqQueues()) {
-      try {
-        await closeDlqQueue();
-      } catch (err) {
-        logger.error(err, "Error closing the DLQ queues during shutdown:");
+      if (redis) {
+        try {
+          await redis.quit();
+        } catch (err) {
+          logger.error(err, "Error disconnecting Redis during shutdown:");
+        }
       }
-    }
-    process.exit(0);
+      // Only await when the DLQ was actually used, so a process that never
+      // opened it does not pay for an extra async hop during shutdown.
+      if (hasOpenDlqQueues()) {
+        try {
+          await closeDlqQueue();
+        } catch (err) {
+          logger.error(err, "Error closing the DLQ queues during shutdown:");
+        }
+      }
+      process.exit(0);
+    });
   });
 };
 

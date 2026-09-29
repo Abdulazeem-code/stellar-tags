@@ -17,12 +17,12 @@ const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
   scheduleWebhookRetryJob,
+  closeWebhookQueue,
 } = require('./src/webhookWorker');
 const {
   horizon,
   createBreaker,
 } = require('./src/services/stellarService');
-const { createRedisConnection } = require('./src/config/redis');
 const { publishPaymentUpdate } = require('./src/websocket');
 
 // ---------------------------------------------------------------------------
