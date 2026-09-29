@@ -76,6 +76,9 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
         buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
     ]);
 
+fn unpack_spending(packed: u128) -> (u64, i128) {
+    let last_reset_time = (packed >> 64) as u64;
+    let accumulated_amount = (packed & 0xFFFF_FFFF_FFFF_FFFF) as i128;
     (last_reset_time, accumulated_amount)
 }
 
@@ -89,7 +92,7 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
 ///
 /// Retained purely so existing test snapshots that reference this type by
 /// name keep compiling. Live contract state is stored as a packed
-/// `BytesN<24>` (see `pack_spending` / `unpack_spending`); this struct is not
+/// `u128` (see `pack_spending` / `unpack_spending`); this struct is not
 /// read from or written to storage at runtime.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -515,8 +518,8 @@ impl PaymentRouter {
         let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
             .storage()
             .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
+            .get::<DataKey, u128>(&spending_key)
+            .map(|packed| unpack_spending(packed))
             .unwrap_or((current_time, 0));
 
         if current_time - last_reset_time >= Self::SECONDS_IN_24H {
@@ -531,7 +534,7 @@ impl PaymentRouter {
 
         env.storage().persistent().set(
             &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
+            &pack_spending(last_reset_time, accumulated_amount),
         );
         env.storage().persistent().extend_ttl(
             &spending_key,
@@ -893,8 +896,8 @@ impl PaymentRouter {
         let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
             .storage()
             .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
+            .get::<DataKey, u128>(&spending_key)
+            .map(|packed| unpack_spending(packed))
             .unwrap_or((current_time, 0));
 
         if current_time - last_reset_time >= Self::SECONDS_IN_24H {
@@ -912,7 +915,7 @@ impl PaymentRouter {
 
         env.storage().persistent().set(
             &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
+            &pack_spending(last_reset_time, accumulated_amount),
         );
         env.storage().persistent().extend_ttl(
             &spending_key,
