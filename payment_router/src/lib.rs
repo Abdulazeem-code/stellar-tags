@@ -1,9 +1,13 @@
 #![no_std]
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractclient, contractimpl, contracttype, log, symbol_short,
-    token, Address, BytesN, Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
+    Address, BytesN, Env, Symbol, Vec, Bytes, String,
 };
+
+// ── Axelar Cross-Chain Integration Module ────────────────────────────────────
+mod axelar;
+use axelar::{CrossChainPayment, IAxelarExecutable, axelar_helpers};
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
 //
@@ -312,15 +316,47 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
-    /// Whether a DEX router contract is approved to receive cross-contract
-    /// swap calls.  Stored as `bool` in persistent storage.
-    RegisteredDex(Address),
-    /// Maximum tolerated swap slippage in basis points, applied against a
-    /// caller-supplied quote.  Stored as `i128` in instance storage.
-    MaxSlippageBps,
-    MerkleRoot,
-    RebateToken,
-    MerkleClaimed(Address),
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited for a treasury asset.
+    YieldPrincipal(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
+    /// Active designated address for an administrative role: Role -> Address.
+    Role(Role),
+    /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
+    UserRole(Address, Role),
+    /// Governance token used to weight fee proposals.
+    GovernanceToken,
+    /// Minimum token voting weight required to execute a fee proposal.
+    GovernanceQuorum,
+    /// Monotonically increasing governance proposal ID.
+    GovernanceNonce,
+    /// Fee proposal stored by ID.
+    GovernanceProposal(u64),
+    /// Whether an address has voted on a proposal.
+    GovernanceVote(u64, Address),
+    /// Axelar Gateway contract address for cross-chain validation
+    AxelarGateway,
+    /// Trusted source chains for cross-chain payments
+    TrustedChain(String),
+}
+
+/// A fee change proposal weighted by governance-token balances.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeProposal {
+    pub proposer: Address,
+    pub fee_bps: i128,
+    pub fee_cap: i128,
+    pub created_at: u64,
+    pub voting_ends_at: u64,
+    pub yes_votes: i128,
+    pub no_votes: i128,
+    pub quorum: i128,
+    pub executed: bool,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -380,9 +416,15 @@ pub enum Error {
     /// A governance proposal is missing, expired, or not yet ready.
     InvalidProposal = 23,
     /// The caller already voted on the proposal.
-    AlreadyVoted = 24,
-    InvalidMerkleProof = 20,
-    RebateAlreadyClaimed = 21,
+    AlreadyVoted = 25,
+    /// Axelar Gateway validation failed
+    AxelarValidationFailed = 26,
+    /// Invalid cross-chain payload
+    InvalidCrossChainPayload = 27,
+    /// Source chain not trusted
+    UntrustedChain = 28,
+    /// Axelar Gateway not configured
+    AxelarGatewayNotConfigured = 29,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -1770,27 +1812,1929 @@ impl PaymentRouter {
     /// Routes multiple payments from a sender to multiple recipients/tags in a single contract invocation.
     ///
     /// # Parameters
-    /// * `env` - The Soroban environment interface.
-    /// * `sender` - The address initiating the payments. Must authorize the transaction.
-    /// * `recipients` - A vector of destination addresses (tags) for the payments.
-    /// * `platform_treasury` - The address where the platform fees will be deposited.
-    /// * `token_address` - The contract ID of the token asset being transferred.
-    /// * `amounts` - A vector of amounts corresponding to each recipient.
+    /// - `user`: Sender address to look up.
     ///
-    /// # Errors & Atomicity
-    /// * Fails if `sender.require_auth()` fails.
-    /// * Fails if `recipients` and `amounts` lengths do not match.
-    /// * Fails and atomically reverts the entire batch if any individual transfer fails (e.g., insufficient funds).
-    pub fn batch_pay(
+    /// # Returns
+    /// The lifetime routed volume for `user`, or `0` if they have never
+    /// routed a payment.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_user_volume(env: Env, user: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserVolume(user))
+            .unwrap_or(0)
+    }
+
+    /// Adds an address to the blacklist. ComplianceOfficer-protected.
+    ///
+    /// # Parameters
+    /// - `address`: Address to blacklist; subsequent payments to it as a
+    ///   recipient will be rejected.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn blacklist_address(env: Env, address: Address) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Blacklist(address.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Blacklist(address),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Removes an address from the blacklist. ComplianceOfficer-protected.
+    ///
+    /// # Parameters
+    /// - `address`: Address to remove from the blacklist.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current ComplianceOfficer does not authorize the call.
+    pub fn unblacklist_address(env: Env, address: Address) -> Result<(), Error> {
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Blacklist(address));
+
+        Ok(())
+    }
+
+    /// Returns whether an address is blacklisted.
+    ///
+    /// # Parameters
+    /// - `address`: Address to check.
+    ///
+    /// # Returns
+    /// `true` if `address` is blacklisted, `false` otherwise.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_blacklisted(env: Env, address: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Blacklist(address))
+            .unwrap_or(false)
+    }
+
+    /// Returns the effective fee_bps for a sender after applying any
+    /// volume-based tiered discount.
+    ///
+    /// # Parameters
+    /// - `sender`: Address whose discounted fee rate to compute.
+    ///
+    /// # Returns
+    /// The configured `fee_bps`, halved if `sender`'s lifetime volume
+    /// exceeds the tiered-discount threshold, or `0` if not initialized.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let user_volume = Self::get_user_volume(env.clone(), sender);
+        if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        }
+    }
+
+    /// Set a new admin. SuperAdmin-protected.
+    ///
+    /// # Parameters
+    /// - `new_admin`: Address to install as the new admin.
+    ///
+    /// # Returns
+    /// Always `Ok(())`.
+    ///
+    /// # Panics
+    /// Panics if an admin is already set and current SuperAdmin does not authorize the call.
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            Self::require_role(&env, Role::SuperAdmin)?;
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Transfers admin rights to a new address. Requires current SuperAdmin authorization.
+    ///
+    /// # Parameters
+    /// - `new_admin`: Address to become the new admin.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current SuperAdmin does not authorize the call.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::TransferAdmin(…))`.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let current_admin = Self::require_role(&env, Role::SuperAdmin)?;
+        Self::remove_role_internal(&env, Role::SuperAdmin, &current_admin);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to recover.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
+    pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &treasury_mgr, &amount);
+
+        Ok(())
+    }
+
+    /// Records a token as supported (no-op; routing accepts any token contract ID).
+    ///
+    /// # Parameters
+    /// - `_token`: Ignored; present for API compatibility.
+    ///
+    /// # Returns
+    /// Always `Ok(())`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Configures the lending protocol used for treasury yield operations. TreasuryManager-protected.
+    pub fn set_yield_protocol(env: Env, protocol: Address) -> Result<(), Error> {
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldProtocol, &protocol);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_cfg"),), protocol);
+        Ok(())
+    }
+
+    /// Configures the trusted KYC oracle and the high-value payment threshold. ComplianceOfficer-protected.
+    pub fn set_kyc_config(env: Env, oracle: Address, threshold: i128) -> Result<(), Error> {
+        if threshold < 0 {
+            return Err(Error::InvalidKycThreshold);
+        }
+        Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        env.storage().instance().set(&DataKey::KycOracle, &oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::KycThreshold, &threshold);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("kyc_cfg"), oracle), threshold);
+        Ok(())
+    }
+
+    /// Deposits idle treasury funds into the configured lending protocol.
+    ///
+    /// Both the TreasuryManager and treasury authorize this operation. The second
+    /// authorization is required because the funds are held by the treasury,
+    /// rather than by this router contract.
+    pub fn deposit_to_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        treasury.require_auth();
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).deposit(&treasury, &token, &amount);
+
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(principal + amount));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("yield_dep"), token), amount);
+        Ok(())
+    }
+
+    /// Withdraws treasury principal from the configured lending protocol. TreasuryManager-protected.
+    pub fn withdraw_from_yield(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let key = DataKey::YieldPrincipal(token.clone());
+        let principal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 || amount > principal {
+            return Err(Error::InvalidYieldAmount);
+        }
+
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        LendingProtocolClient::new(&env, &protocol).withdraw(&treasury, &token, &amount);
+        let remaining = principal - amount;
+        if remaining == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &remaining);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.events()
+            .publish((symbol_short!("yield_wdr"), token), amount);
+        Ok(())
+    }
+
+    /// Claims all currently available yield to the platform treasury. TreasuryManager-protected.
+    pub fn harvest_yield(env: Env, token: Address) -> Result<i128, Error> {
+        Self::require_role(&env, Role::TreasuryManager)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .ok_or(Error::NotInitialized)?;
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .ok_or(Error::YieldProtocolNotConfigured)?;
+
+        let harvested = LendingProtocolClient::new(&env, &protocol).harvest(&treasury, &token);
+        env.events()
+            .publish((symbol_short!("yield_har"), token), harvested);
+        Ok(harvested)
+    }
+
+    /// Returns the tracked principal deposited for `token`.
+    pub fn get_yield_position(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldPrincipal(token))
+            .unwrap_or(0)
+    }
+
+    /// Returns the configured KYC threshold, or `None` when enforcement is off.
+    pub fn get_kyc_threshold(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::KycThreshold)
+    }
+
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// # Parameters
+    /// - `sender`: Address the funds are debited from; must authorize the call.
+    /// - `recipient`: Address to receive the funds (minus the platform fee).
+    /// - `token_address`: Contract ID of the token being transferred.
+    /// - `amount`: Amount to route, in the token's smallest unit. Must be
+    ///   positive and within the configured min/max and daily-limit bounds.
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Returns `Err(Error::Paused)` if routing is
+    /// paused, `Err(Error::NotInitialized)` if the contract has no admin
+    /// set, `Err(Error::InvalidRecipient)` if `sender == recipient`,
+    /// `Err(Error::Blacklisted)` if `recipient` is blacklisted,
+    /// `Err(Error::LimitExceeded)` if `amount` is outside the configured
+    /// bounds or exceeds the sender's remaining daily limit, or
+    /// `Err(Error::InsufficientBalance)` if `sender`'s token balance is
+    /// below `amount`.
+    ///
+    /// # Panics
+    /// Panics if `sender` does not authorize the call, or if the underlying
+    /// token transfer to `platform_treasury` fails.
+    pub fn route_payment(
         env: Env,
         sender: Address,
-        recipients: Vec<Address>,
-        platform_treasury: Address,
+        recipient: Address,
         token_address: Address,
-        amounts: Vec<i128>,
-    ) {
-        // 1. Verify the sender authorized this transaction
+        amount: i128,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount)?;
+
         sender.require_auth();
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
+    }
+
+    /// Swaps `token_in` through a caller-supplied DEX path and routes the
+    /// resulting `token_out` to the recipient. The DEX adapter must return the
+    /// received output and any unused input as `[received, unused]`; unused
+    /// input is credited to the sender's refund balance.
+    pub fn route_payment_with_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex_router: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        Self::validate_swap_path(&token_in, &token_out, &path, min_amount_out)?;
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let token_in_client = token::Client::new(&env, &token_in);
+        token_in_client.transfer(&sender, &dex_router, &amount_in);
+
+        let swap_result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
+            &token_in,
+            &token_out,
+            &amount_in,
+            &min_amount_out,
+            &path,
+            &env.current_contract_address(),
+        );
+        if swap_result.len() != 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        let amount_received: i128 = swap_result.get(0).unwrap();
+        let unused_input: i128 = swap_result.get(1).unwrap();
+        if amount_received < min_amount_out || amount_received <= 0 || unused_input < 0 {
+            return Err(Error::SlippageExceeded);
+        }
+        if unused_input > 0 {
+            token_in_client.transfer(&env.current_contract_address(), &sender, &unused_input);
+        }
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_out,
+            amount_received,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
+    }
+
+    /// Routes multiple payments in a single transaction. If any payment fails,
+    /// the entire batch is reverted atomically.
+    ///
+    /// # Parameters
+    /// - `payments`: Batch of transfer instructions to apply in order. See
+    ///   [`Payment`] for per-item constraints.
+    ///
+    /// # Returns
+    /// `Ok(())` if every payment in the batch succeeds. Returns the first
+    /// error encountered (see `route_payment` for the possible `Err`
+    /// variants and their causes) if any payment fails; the Soroban host
+    /// reverts all storage and balance changes from the batch in that case.
+    ///
+    /// # Panics
+    /// Panics if any payment's `sender` does not authorize the call, or if
+    /// a token transfer to `platform_treasury` fails.
+    pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        // Pre-validate all payments to avoid rollback panic from require_auth
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        for payment in payments.iter() {
+            payment.sender.require_auth();
+            if payment.sender == payment.recipient {
+                return Err(Error::InvalidRecipient);
+            }
+            if Self::is_blacklisted(env.clone(), payment.recipient.clone()) {
+                return Err(Error::Blacklisted);
+            }
+            if payment.amount <= 0 || payment.amount > max_amount {
+                return Err(Error::LimitExceeded);
+            }
+            if payment.amount < min_limit {
+                return Err(Error::LimitExceeded);
+            }
+            Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        for payment in payments.iter() {
+            Self::process_single_payment(
+                &env,
+                &payment.sender,
+                &payment.recipient,
+                &payment.token_address,
+                payment.amount,
+                &platform_treasury,
+                fee_bps,
+                fee_cap,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the available internal refund balance for a user and token.
+    ///
+    /// # Parameters
+    /// - `user`: Address whose refund balance to look up.
+    /// - `token`: Contract ID of the token.
+    ///
+    /// # Returns
+    /// The refundable balance for `(user, token)`, or `0` if none is held.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_refund_balance(env: Env, user: Address, token: Address) -> i128 {
+        Self::get_refund_balance_internal(&env, &user, &token)
+    }
+
+    /// Withdraws a specific amount from the user's internal refund balance.
+    ///
+    /// A refund balance accrues when a `route_payment` / `route_payments`
+    /// transfer to the recipient fails (e.g. missing trustline) and the
+    /// funds are held by the contract on the sender's behalf instead.
+    ///
+    /// # Parameters
+    /// - `user`: Address withdrawing funds; must authorize the call.
+    /// - `token`: Contract ID of the token to withdraw.
+    /// - `amount`: Amount to withdraw. Must be positive and not exceed the
+    ///   current refund balance.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NoRefundAvailable)` if `amount`
+    /// is zero, negative, or greater than the available balance.
+    ///
+    /// # Panics
+    /// Panics if `user` does not authorize the call, or if the underlying
+    /// token transfer fails.
+    pub fn withdraw_refund(
+        env: Env,
+        user: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        user.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
+        if amount > current_balance {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        let key = DataKey::RefundBalance(user.clone(), token.clone());
+        let new_balance = current_balance - amount;
+        if new_balance > 0 {
+            env.storage().persistent().set(&key, &new_balance);
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &user, &amount);
+
+        env.events().publish(
+            (symbol_short!("withdrawn"), user.clone(), token.clone()),
+            amount,
+        );
+
+        log!(&env, "Refund balance withdrawn by user");
+        Ok(())
+    }
+
+    /// Claims and withdraws the entire available refund balance for a user and token.
+    ///
+    /// # Parameters
+    /// - `user`: Address withdrawing funds; must authorize the call.
+    /// - `token`: Contract ID of the token to withdraw.
+    ///
+    /// # Returns
+    /// `Ok(amount)` with the amount withdrawn, or
+    /// `Err(Error::NoRefundAvailable)` if the refund balance is zero.
+    ///
+    /// # Panics
+    /// Panics if `user` does not authorize the call, or if the underlying
+    /// token transfer fails.
+    pub fn claim_all_refunds(env: Env, user: Address, token: Address) -> Result<i128, Error> {
+        user.require_auth();
+
+        let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
+        if current_balance <= 0 {
+            return Err(Error::NoRefundAvailable);
+        }
+
+        Self::withdraw_refund(env, user, token, current_balance)?;
+        Ok(current_balance)
+    }
+
+    /// Admin-only emergency withdrawal of tokens held by this contract.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to withdraw.
+    /// Admin-only emergency withdrawal of tokens held by this contract. TreasuryManager-protected.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to withdraw.
+    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current TreasuryManager does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
+    pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &treasury_mgr, &amount);
+
+        log!(&env, "Emergency withdraw executed by TreasuryManager");
+        Ok(())
+    }
+
+    /// Replaces this contract's WASM with a previously uploaded version. SuperAdmin-protected.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
+    ///   network, to install as this contract's new executable.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current SuperAdmin does not authorize the call, or if
+    /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
+    ///
+    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_role(&env, Role::SuperAdmin)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Returns the contract version.
+    ///
+    /// # Returns
+    /// The contract's version number, currently `1`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn version(_env: Env) -> u32 {
+        Self::VERSION
+    }
+
+    // ── Axelar Cross-Chain Integration ──────────────────────────────────────
+
+    /// Set the Axelar Gateway contract address (admin only)
+    pub fn set_axelar_gateway(env: Env, gateway: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::AxelarGateway, &gateway);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        log!(&env, "Axelar Gateway set: {}", gateway);
+        Ok(())
+    }
+
+    /// Add a trusted source chain for cross-chain payments (admin only)
+    pub fn add_trusted_chain(env: Env, chain_name: String) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TrustedChain(chain_name.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TrustedChain(chain_name.clone()),
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        log!(&env, "Trusted chain added: {}", chain_name);
+        Ok(())
+    }
+
+    /// Remove a trusted source chain (admin only)
+    pub fn remove_trusted_chain(env: Env, chain_name: String) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TrustedChain(chain_name.clone()));
+
+        log!(&env, "Trusted chain removed: {}", chain_name);
+        Ok(())
+    }
+
+    /// Check if a chain is trusted
+    fn is_chain_trusted(env: &Env, chain_name: &String) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TrustedChain(chain_name.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Execute cross-chain payment (called by Axelar Gateway)
+    /// Implements the Axelar executable interface
+    pub fn execute_cross_chain(
+        env: Env,
+        command_id: Bytes,
+        source_chain: String,
+        source_address: String,
+        payload: Bytes,
+    ) -> Result<(), Error> {
+        // Get Axelar Gateway
+        let gateway_addr = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AxelarGateway)
+            .ok_or(Error::AxelarGatewayNotConfigured)?;
+
+        // Require authorization from gateway
+        gateway_addr.require_auth();
+
+        // Validate command ID format
+        if !axelar_helpers::is_valid_command_id(&command_id) {
+            return Err(Error::InvalidCrossChainPayload);
+        }
+
+        // Check if source chain is trusted
+        if !Self::is_chain_trusted(&env, &source_chain) {
+            log!(&env, "Untrusted chain: {}", source_chain);
+            return Err(Error::UntrustedChain);
+        }
+
+        // Validate against Axelar Gateway
+        let payload_hash = axelar_helpers::compute_payload_hash(&env, &payload);
+        
+        // In production, call gateway.validate_contract_call()
+        // For now, we log the validation
+        log!(
+            &env,
+            "Validating cross-chain call from {} on {}",
+            source_address,
+            source_chain
+        );
+
+        // Decode payment payload
+        let cross_chain_payment = axelar_helpers::decode_payment_payload(&env, &payload);
+
+        // Validate payment
+        if cross_chain_payment.amount <= 0 {
+            return Err(Error::LimitExceeded);
+        }
+
+        // Check if frozen
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+
+        // Check if paused
+        if Self::is_paused_internal(&env) {
+            return Err(Error::Paused);
+        }
+
+        // Log cross-chain payment initiation
+        log!(
+            &env,
+            "Cross-chain payment from {} ({}) to {} amount: {}",
+            source_address,
+            source_chain,
+            cross_chain_payment.recipient,
+            cross_chain_payment.amount
+        );
+
+        // Execute the payment routing
+        // Note: For cross-chain payments, the "sender" is the gateway contract
+        // which must hold the bridged tokens
+        let token_client = token::Client::new(&env, &cross_chain_payment.token_address);
+        let platform_treasury = Self::get_platform_treasury(&env)?;
+
+        // Calculate fee
+        let fee_bps = Self::get_fee_bps(&env)?;
+        let fee_cap = Self::get_fee_cap(&env)?;
+        let fee = Self::compute_fee(cross_chain_payment.amount, fee_bps, fee_cap);
+        let net_amount = cross_chain_payment.amount
+            .checked_sub(fee)
+            .ok_or(Error::InsufficientBalance)?;
+
+        // Transfer fee to treasury
+        if fee > 0 {
+            token_client.transfer(
+                &gateway_addr,
+                &platform_treasury,
+                &fee,
+            );
+        }
+
+        // Transfer net amount to recipient
+        token_client.transfer(
+            &gateway_addr,
+            &cross_chain_payment.recipient,
+            &net_amount,
+        );
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("xchain"), gateway_addr.clone()),
+            (
+                source_chain.clone(),
+                source_address.clone(),
+                cross_chain_payment.recipient.clone(),
+                cross_chain_payment.amount,
+                net_amount,
+            ),
+        );
+
+        log!(
+            &env,
+            "Cross-chain payment completed: {} tokens routed (fee: {})",
+            net_amount,
+            fee
+        );
+
+        Ok(())
+    }
+
+    /// Get the configured Axelar Gateway address
+    pub fn get_axelar_gateway(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AxelarGateway)
+    }
+}
+
+// ── Axelar Executable Implementation ────────────────────────────────────────
+
+#[contractimpl]
+impl IAxelarExecutable for PaymentRouter {
+    fn execute(
+        env: Env,
+        command_id: Bytes,
+        source_chain: String,
+        source_address: String,
+        payload: Bytes,
+    ) {
+        // Call internal implementation with proper error handling
+        match PaymentRouter::execute_cross_chain(
+            env.clone(),
+            command_id,
+            source_chain.clone(),
+            source_address.clone(),
+            payload,
+        ) {
+            Ok(_) => {
+                log!(&env, "Cross-chain execution successful");
+            }
+            Err(e) => {
+                log!(&env, "Cross-chain execution failed: {:?}", e);
+                panic!("Cross-chain execution failed");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
+        token::StellarAssetClient,
+        Address, Env, Symbol, TryIntoVal,
+    };
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockLendingKey {
+        Principal(Address),
+        Yield(Address),
+    }
+
+    #[contract]
+    struct MockLendingProtocol;
+
+    #[contractimpl]
+    impl MockLendingProtocol {
+        pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
+            from.require_auth();
+            token::Client::new(&env, &token).transfer(
+                &from,
+                &env.current_contract_address(),
+                &amount,
+            );
+            let key = MockLendingKey::Principal(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+
+        pub fn withdraw(env: Env, to: Address, token: Address, amount: i128) {
+            let key = MockLendingKey::Principal(token.clone());
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            assert!(current >= amount);
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &to,
+                &amount,
+            );
+            env.storage().instance().set(&key, &(current - amount));
+        }
+
+        pub fn harvest(env: Env, to: Address, token: Address) -> i128 {
+            let key = MockLendingKey::Yield(token.clone());
+            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            if amount > 0 {
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &to,
+                    &amount,
+                );
+                env.storage().instance().remove(&key);
+            }
+            amount
+        }
+
+        pub fn accrue_yield(env: Env, token: Address, amount: i128) {
+            let key = MockLendingKey::Yield(token);
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(current + amount));
+        }
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockKycKey {
+        Verified(Address),
+    }
+
+    #[contract]
+    struct MockKycOracle;
+
+    #[contractimpl]
+    impl MockKycOracle {
+        pub fn set_verified(env: Env, account: Address, verified: bool) {
+            env.storage()
+                .instance()
+                .set(&MockKycKey::Verified(account), &verified);
+        }
+
+        pub fn is_verified(env: Env, account: Address) -> bool {
+            env.storage()
+                .instance()
+                .get(&MockKycKey::Verified(account))
+                .unwrap_or(false)
+        }
+    }
+
+    /// Returns (env, client, contract_id).
+    fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+        (env, client, contract_id)
+    }
+
+    /// Deploys a Stellar Asset Contract test token. Returns
+    /// (token_address, token_client, stellar_asset_admin_client).
+    fn setup_token(
+        env: &Env,
+    ) -> (
+        Address,
+        token::Client<'static>,
+        token::StellarAssetClient<'static>,
+    ) {
+        let token_admin = Address::generate(env);
+        let token_address = env.register_stellar_asset_contract(token_admin);
+        let token_client = token::Client::new(env, &token_address);
+        let token_admin_client = token::StellarAssetClient::new(env, &token_address);
+        (token_address, token_client, token_admin_client)
+    }
+
+    // ── Timelock tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_treasury_yield_deposit_harvest_and_withdraw() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let protocol_id = env.register_contract(None, MockLendingProtocol);
+        let protocol_client = MockLendingProtocolClient::new(&env, &protocol_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_yield_protocol(&protocol_id);
+        token_admin_client.mint(&treasury, &10_000);
+
+        client.deposit_to_yield(&token_address, &6_000);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+        assert_eq!(token_client.balance(&treasury), 4_000);
+        assert_eq!(token_client.balance(&protocol_id), 6_000);
+
+        token_admin_client.mint(&protocol_id, &500);
+        protocol_client.accrue_yield(&token_address, &500);
+        assert_eq!(client.harvest_yield(&token_address), 500);
+        assert_eq!(token_client.balance(&treasury), 4_500);
+        assert_eq!(client.get_yield_position(&token_address), 6_000);
+
+        client.withdraw_from_yield(&token_address, &2_000);
+        assert_eq!(client.get_yield_position(&token_address), 4_000);
+        assert_eq!(token_client.balance(&treasury), 6_500);
+        assert_eq!(token_client.balance(&protocol_id), 4_000);
+    }
+
+    #[test]
+    fn test_yield_operations_require_configuration_and_valid_amounts() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &100),
+            Err(Ok(Error::YieldProtocolNotConfigured))
+        );
+        assert_eq!(
+            client.try_deposit_to_yield(&token_address, &0),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+        assert_eq!(
+            client.try_withdraw_from_yield(&token_address, &1),
+            Err(Ok(Error::InvalidYieldAmount))
+        );
+    }
+
+    #[test]
+    fn test_kyc_oracle_gates_only_high_value_payments() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let oracle_client = MockKycOracleClient::new(&env, &oracle_id);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &10_000);
+
+        client.route_payment(&sender, &recipient, &token_address, &500);
+        assert_eq!(
+            client.try_route_payment(&sender, &recipient, &token_address, &2_000),
+            Err(Ok(Error::KycRequired))
+        );
+
+        oracle_client.set_verified(&sender, &true);
+        client.route_payment(&sender, &recipient, &token_address, &2_000);
+        assert_eq!(client.get_kyc_threshold(), Some(1_000));
+        assert_eq!(token_client.balance(&sender), 7_500);
+    }
+
+    #[test]
+    fn test_kyc_config_rejects_negative_threshold() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_set_kyc_config(&oracle, &-1),
+            Err(Ok(Error::InvalidKycThreshold))
+        );
+    }
+
+    #[test]
+    fn test_batch_payments_enforce_kyc_for_each_sender() {
+        let (env, client, _contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let oracle_id = env.register_contract(None, MockKycOracle);
+        let (token_address, _token_client, token_admin_client) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        client.set_kyc_config(&oracle_id, &1_000);
+        token_admin_client.mint(&sender, &5_000);
+
+        let payments = Vec::from_array(
+            &env,
+            [Payment {
+                sender,
+                recipient,
+                token_address,
+                amount: 2_000,
+            }],
+        );
+        assert_eq!(
+            client.try_route_payments(&payments),
+            Err(Ok(Error::KycRequired))
+        );
+    }
+
+    #[test]
+    fn test_queue_and_execute_set_fee_bps_after_delay() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Queue a fee-bps change.
+        let nonce = client.queue_action(&ActionType::SetFeeBps(250));
+        assert_eq!(nonce, 1);
+        assert_eq!(client.get_fee(), 100); // Not applied yet.
+
+        // Trying to execute immediately should fail (delay not elapsed).
+        let res = client.try_execute_action(&nonce);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
+
+        // Advance time past 24 hours.
+        let current_time = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: current_time + PaymentRouter::SECONDS_IN_24H + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        // Now execution should succeed.
+        client.execute_action(&nonce);
+        assert_eq!(client.get_fee(), 250);
+
+        // Entry should be gone.
+        let res = client.try_get_queued_action(&nonce);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+    }
+
+    #[test]
+    fn test_queue_and_execute_set_platform_treasury() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.queue_action(&ActionType::SetPlatformTreasury(new_treasury.clone()));
+
+        // Advance 24h+.
+        let ts = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: ts + PaymentRouter::SECONDS_IN_24H + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        client.execute_action(&nonce);
+
+        // Verify the treasury was actually updated by routing a payment and
+        // checking where the fee lands.
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_addr, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+        client.route_payment(&sender, &recipient, &token_addr, &1000);
+
+        // 100 bps of 1000 = 10, capped to min(10, 1000) = 10
+        assert_eq!(token_client.balance(&new_treasury), 10);
+        assert_eq!(token_client.balance(&treasury), 0);
+    }
+
+    #[test]
+    fn test_execute_action_not_found() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_execute_action(&99u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+    }
+
+    #[test]
+    fn test_cancel_action() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.queue_action(&ActionType::SetFeeBps(999));
+        assert!(client.try_get_queued_action(&nonce).is_ok());
+
+        client.cancel_action(&nonce);
+
+        // Entry should be gone.
+        let res = client.try_get_queued_action(&nonce);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+
+        // Fee should remain unchanged.
+        assert_eq!(client.get_fee(), 100);
+    }
+
+    #[test]
+    fn test_cancel_nonexistent_action() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_cancel_action(&42u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+    }
+
+    #[test]
+    fn test_nonce_increments() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let n1 = client.queue_action(&ActionType::SetFeeBps(200));
+        let n2 = client.queue_action(&ActionType::SetFeeBps(300));
+        let n3 = client.queue_action(&ActionType::SetFeeBps(400));
+
+        assert_eq!(n1, 1);
+        assert_eq!(n2, 2);
+        assert_eq!(n3, 3);
+    }
+
+    // ── Freeze tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_emergency_freeze_blocks_payments() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        assert!(!client.is_frozen());
+
+        client.emergency_freeze();
+        assert!(client.is_frozen());
+
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
+    }
+
+    #[test]
+    fn test_emergency_freeze_blocks_timelock_execution() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.queue_action(&ActionType::SetFeeBps(500));
+
+        // Advance past 24h.
+        let ts = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: ts + PaymentRouter::SECONDS_IN_24H + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        // Freeze the contract before execution.
+        client.emergency_freeze();
+
+        let res = client.try_execute_action(&nonce);
+        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
+
+        // Fee remains unchanged.
+        assert_eq!(client.get_fee(), 100);
+    }
+
+    #[test]
+    fn test_unfreeze_restores_payments() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        client.emergency_freeze();
+        assert!(client.is_frozen());
+
+        client.unfreeze();
+        assert!(!client.is_frozen());
+
+        // Payments should work again.
+        client.route_payment(&sender, &recipient, &token_address, &1000);
+    }
+
+    #[test]
+    fn test_freeze_queue_action_blocked() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.emergency_freeze();
+
+        // Cannot queue new actions while frozen.
+        let res = client.try_queue_action(&ActionType::SetFeeBps(500));
+        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
+    }
+
+    #[test]
+    fn test_cancel_action_allowed_while_frozen() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Queue an action before freezing.
+        let nonce = client.queue_action(&ActionType::SetFeeBps(500));
+
+        client.emergency_freeze();
+
+        // Cancellation should still be possible while frozen (incident response).
+        client.cancel_action(&nonce);
+        let res = client.try_get_queued_action(&nonce);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+    }
+
+    // ── Timelock emits events ────────────────────────────────────────────────
+
+    #[test]
+    fn test_queue_action_emits_event() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.queue_action(&ActionType::SetFeeBps(200));
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if topics.is_empty() {
+                return false;
+            }
+            let raw = topics.get(0).unwrap();
+            let sym: Result<Symbol, _> = raw.try_into_val(&env);
+            sym.map(|s| s == Symbol::new(&env, "action_queued"))
+                .unwrap_or(false)
+        });
+        assert!(found, "action_queued event not found");
+    }
+
+    #[test]
+    fn test_freeze_emits_event() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.emergency_freeze();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if topics.is_empty() {
+                return false;
+            }
+            let raw = topics.get(0).unwrap();
+            let sym: Result<Symbol, _> = raw.try_into_val(&env);
+            sym.map(|s| s == Symbol::new(&env, "emergency_freeze"))
+                .unwrap_or(false)
+        });
+        assert!(found, "emergency_freeze event not found");
+    }
+
+    // ── Original tests (retained) ────────────────────────────────────────────
+
+    #[test]
+    fn test_get_fee() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        // Before initialization, get_fee returns 0
+        assert_eq!(client.get_fee(), 0);
+
+        // Initialize with 150 bps
+        client.initialize(&admin, &treasury, &150, &5000, &PaymentRouter::MAX_AMOUNT);
+        assert_eq!(client.get_fee(), 150);
+
+        // Update via set_fee_bps
+        client.set_fee_bps(&250);
+        assert_eq!(client.get_fee(), 250);
+
+        // Update via set_fee_config
+        client.set_fee_config(&300, &10000);
+        assert_eq!(client.get_fee(), 300);
+    }
+
+    #[test]
+    fn test_version_reports_contract_version() {
+        let (_env, client, _) = setup_env();
+
+        // #269 — the version view is callable without initialization and
+        // returns the compiled-in contract version so a UI can check
+        // compatibility before interacting with the contract.
+        assert_eq!(client.version(), PaymentRouter::VERSION);
+        assert_eq!(client.version(), 1);
+    }
+
+    #[test]
+    fn test_admin_restrictions_and_updates() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Trying to initialize again should fail
+        let res = client.try_initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyInitialized);
+
+        client.set_admin(&new_admin);
+
+        // Modify config
+        client.set_fee_config(&200, &2000);
+        client.set_fee_bps(&200);
+        assert_eq!(client.get_fee(), 200);
+
+        let new_treasury = Address::generate(&env);
+        client.set_platform_treasury(&new_treasury);
+    }
+
+    #[test]
+    fn test_recover_tokens() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+
+        // Simulate tokens accidentally sent directly to the contract address
+        let accidental_amount = 5_000i128;
+        stellar_asset_client.mint(&contract_id, &accidental_amount);
+
+        assert_eq!(token_client.balance(&contract_id), accidental_amount);
+        assert_eq!(token_client.balance(&admin), 0);
+
+        // Admin recovers tokens
+        let recover_amount = 3_000i128;
+        client.recover_tokens(&token_address, &recover_amount);
+
+        assert_eq!(token_client.balance(&admin), recover_amount);
+        assert_eq!(
+            token_client.balance(&contract_id),
+            accidental_amount - recover_amount
+        );
+    }
+
+    #[test]
+    fn test_set_pause_emits_event() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.set_pause(&true);
+
+        let events = env.events().all();
+        assert!(!events.is_empty());
+        let (_, topics, _) = events.get(0).unwrap();
+        assert_eq!(topics.len(), 1);
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("pause"));
+    }
+
+    #[test]
+    fn test_route_payment_emits_payment_initiated_event() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        client
+            .mock_all_auths()
+            .route_payment(&sender, &recipient, &token_address, &5_000);
+
+        let events = env.events().all();
+        assert!(!events.is_empty());
+
+        let mut found = false;
+        for (_, topics, data) in events.iter() {
+            if !topics.is_empty() {
+                if let Ok(topic_sym) = topics.get(0).unwrap().try_into_val(&env) {
+                    let sym: Symbol = topic_sym;
+                    if sym == Symbol::new(&env, "payment_initiated") {
+                        found = true;
+                        let amt: i128 = data.try_into_val(&env).unwrap();
+                        assert_eq!(amt, 5_000);
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found, "payment_initiated event not found");
+    }
+
+    #[test]
+    fn test_route_payment_emits_routed_event() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.add_supported_token(&token_address);
+
+        let amount = 2_000i128;
+        client.route_payment(&sender, &recipient, &token_address, &amount);
+
+        let events = env.events().all();
+        assert!(!events.is_empty());
+
+        // Find the "routed" event by topic
+        let mut found = None;
+        for evt in events.iter() {
+            let (_contract_id, topics, _data) = evt.clone();
+            if topics.len() != 3 {
+                continue;
+            }
+            let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            if topic0 == symbol_short!("routed") {
+                found = Some(evt.clone());
+                break;
+            }
+        }
+        let routed = found.expect("route_payment should publish a \"routed\" event");
+
+        let (_contract_id, topics, data) = routed;
+        assert_eq!(topics.len(), 3);
+
+        let topic_sender: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        let topic_recipient: Address = topics.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_sender, sender);
+        assert_eq!(topic_recipient, recipient);
+
+        let event_amount: i128 = data.try_into_val(&env).unwrap();
+        assert_eq!(event_amount, amount);
+    }
+
+    #[test]
+    fn test_admin_pause_functionality() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Initially not paused
+        assert!(!client.is_paused());
+
+        // Pause
+        client.set_pause(&true);
+        assert!(client.is_paused());
+
+        // Route payment should fail when paused
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
+
+        // Unpause via set_paused alias
+        client.set_paused(&false);
+        assert!(!client.is_paused());
+
+        // Route payment should succeed now
+        client.route_payment(&sender, &recipient, &token_address, &1000);
+    }
+
+    #[test]
+    fn test_route_payment_calculates_and_sends_fee() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, _token_admin_client) = setup_token(&env);
+
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        let initial_balance = 10_000i128;
+        sac.mint(&sender, &initial_balance);
+
+        // Initialize router with 1% fee (100 bps) and cap of 50
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.add_supported_token(&token_address);
+
+        // Test normal fee calculation: 1% of 2000 = 20, below cap of 50
+        let amount_1 = 2000i128;
+        client.route_payment(&sender, &recipient, &token_address, &amount_1);
+
+        assert_eq!(token_client.balance(&treasury), 20);
+        assert_eq!(token_client.balance(&recipient), 1980);
+        assert_eq!(token_client.balance(&sender), initial_balance - amount_1);
+        assert_eq!(client.get_user_volume(&sender), amount_1);
+
+        // Test fee capped at 50: 1% of 8000 = 80, capped to 50
+        let amount_2 = 8000i128;
+        client.route_payment(&sender, &recipient, &token_address, &amount_2);
+
+        assert_eq!(token_client.balance(&treasury), 70);
+        assert_eq!(token_client.balance(&recipient), 9930);
+        assert_eq!(
+            token_client.balance(&sender),
+            initial_balance - amount_1 - amount_2
+        );
+        assert_eq!(client.get_user_volume(&sender), amount_1 + amount_2);
+    }
+
+    #[test]
+    fn test_insufficient_balance() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &100);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.add_supported_token(&token_address);
+
+        // Route payment of 500 when balance is only 100
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &500);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
+    }
+
+    #[test]
+    fn test_daily_limit_and_reset() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, _token_admin_client) = setup_token(&env);
+
+        let limit = 10_000_000_000_000i128;
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &(limit + 2000));
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.add_supported_token(&token_address);
+
+        // Route amount up to daily limit
+        client.route_payment(&sender, &recipient, &token_address, &limit);
+
+        // Next payment should exceed daily limit
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &2000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+
+        // Advance time past 24 hours to reset the daily limit
+        let current_time = env.ledger().timestamp();
+        let current_protocol_version = env.ledger().protocol_version();
+        env.ledger().set(LedgerInfo {
+            timestamp: current_time + 86400,
+            protocol_version: current_protocol_version,
+            sequence_number: 1,
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        // Now routing should succeed again. The first payment pushed volume past
+        // VOLUME_THRESHOLD, so the halved rate applies: 2000 * 50 bps = 10.
+        client.route_payment(&sender, &recipient, &token_address, &2000);
+        assert_eq!(token_client.balance(&recipient), (limit - 50) + (2000 - 10));
+    }
+
+    #[test]
+    fn test_prevent_self_routing() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_route_payment(&sender, &sender, &token_address, &1000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidRecipient);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tiered_fee_discount_applied_after_volume_threshold() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, _token_admin_client) = setup_token(&env);
+
+        // Threshold is 10,000 XLM = 10,000 * 10,000,000 (7 decimals)
+        let threshold = 100_000_000_000i128;
+        let first_amount = threshold + 1;
+        let second_amount = 1000i128;
+        let total_mint = first_amount + second_amount + 10_000_000;
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &total_mint);
+
+        // Initialize with 1% fee (100 bps) and no cap
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // First payment: volume is 0 (< threshold), full fee applies
+        client.route_payment(&sender, &recipient, &token_address, &first_amount);
+
+        let full_fee_first = (first_amount * 100) / 10_000;
+        assert_eq!(token_client.balance(&treasury), full_fee_first);
+        assert_eq!(
+            token_client.balance(&recipient),
+            first_amount - full_fee_first
+        );
+        assert_eq!(client.get_user_volume(&sender), first_amount);
+        // Volume is now past threshold, so next call gets the discount
+        assert_eq!(client.get_effective_fee_bps(&sender), 50);
+
+        // Second payment: volume > threshold, 50% discount applies
+        client.route_payment(&sender, &recipient, &token_address, &second_amount);
+
+        let discounted_fee = (second_amount * 50) / 10_000;
+        assert_eq!(
+            token_client.balance(&treasury),
+            full_fee_first + discounted_fee
+        );
+        assert_eq!(
+            token_client.balance(&recipient),
+            (first_amount - full_fee_first) + (second_amount - discounted_fee)
+        );
+    }
+
+    #[test]
+    fn test_get_effective_fee_bps_no_discount_below_threshold() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, _token_admin_client) = setup_token(&env);
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // No volume yet
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
+
+        // Route a small payment (below threshold)
+        client.route_payment(&sender, &recipient, &token_address, &1000);
+
+        // Volume is 1000, far below 10,000 XLM threshold
+        assert_eq!(client.get_effective_fee_bps(&sender), 100);
+    }
+
+    #[test]
+    fn test_successful_xlm_routing() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let platform_treasury = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
 
         // 2. Ensure input vectors match in length
         if recipients.len() != amounts.len() {
