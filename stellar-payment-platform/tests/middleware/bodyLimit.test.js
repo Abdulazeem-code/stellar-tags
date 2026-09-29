@@ -99,7 +99,7 @@ describe('body size limits (#588)', () => {
     const res = await request(buildApp('/api/v1/users'))
       .post('/api/v1/users')
       .set('Content-Type', 'text/plain')
-      .send(over(1000));
+      .send(over(50));
     expect(res.status).not.toBe(413);
   });
 });

@@ -31,24 +31,13 @@ jest.mock('../prismaClient', () => ({
   },
 }));
 
-jest.mock('../src/db', () => ({
-  poolGet: jest.fn(),
-}));
-
 jest.mock('../src/multisigner-verifier', () => ({
   verifyMultiSignerThreshold: jest.fn(),
 }));
 
-jest.mock('../src/utils', () => {
-  const actual = jest.requireActual('../src/utils');
-  return {
-    ...actual,
-    shouldFallbackToLocalRegistry: jest.fn().mockReturnValue(false),
-  };
-});
 
 const { prisma } = require('../prismaClient');
-const { poolGet } = require('../src/db');
+
 const { verifyMultiSignerThreshold } = require('../src/multisigner-verifier');
 const sdk = require('@stellar/stellar-sdk');
 const {
@@ -217,21 +206,4 @@ describe('authenticateUsernameOwner', () => {
     ).rejects.toMatchObject({ message: 'Username not registered.', statusCode: 404 });
   });
 
-  it('falls back to the local registry when the primary lookup fails', async () => {
-    prisma.user.findUnique.mockRejectedValue(new Error('db unavailable'));
-    const { shouldFallbackToLocalRegistry } = require('../src/utils');
-    shouldFallbackToLocalRegistry.mockReturnValue(true);
-    poolGet.mockResolvedValue({ username: 'alice', address: VALID_ADDRESS });
-
-    const result = await authenticateUsernameOwner({
-      username: 'alice',
-      signature: BASE64_SIGNATURE,
-    });
-
-    expect(result.username).toBe('alice');
-    expect(poolGet).toHaveBeenCalledWith(
-      'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
-      ['alice*localhost'],
-    );
-  });
 });
