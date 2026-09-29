@@ -1,8 +1,8 @@
 #![no_std]
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    BytesN, Env, Error as SdkError, IntoVal, InvokeError, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
+    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, Symbol, Vec,
 };
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
@@ -111,6 +111,53 @@ pub struct Payment {
     /// Amount to route, denominated in the token's smallest unit. Must be
     /// positive and within the contract's configured min/max bounds.
     pub amount: i128,
+}
+
+/// Interface implemented by supported Soroban lending protocols.
+///
+/// Keeping the protocol behind this small adapter lets the router integrate
+/// with Blend-compatible deployments while tests use an in-process mock.
+#[contractclient(name = "LendingProtocolClient")]
+pub trait LendingProtocol {
+    fn deposit(env: Env, from: Address, token: Address, amount: i128);
+    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
+    fn harvest(env: Env, to: Address, token: Address) -> i128;
+}
+
+/// Minimal interface for an admin-selected KYC issuer or oracle contract.
+#[contractclient(name = "KycOracleClient")]
+pub trait KycOracle {
+    fn is_verified(env: Env, account: Address) -> bool;
+}
+
+/// Interface implemented by the price-feed oracle queried by `get_price`.
+///
+/// The oracle must expose a `get_price(base_asset, quote_asset) -> PriceData`
+/// method returning the latest price together with the Unix timestamp it was
+/// recorded at, so staleness can be validated against the configured
+/// threshold.
+///
+/// Prices are returned as a fixed-point integer: a price of
+/// 0.12500000 with `decimals = 8` is returned as `price = 12500000`.
+#[contractclient(name = "PriceFeedOracleClient")]
+pub trait PriceFeedOracle {
+    /// Returns the latest price of `base_asset` denominated in `quote_asset`.
+    ///
+    /// # Returns
+    /// A `PriceData` struct containing `price`, `decimals`, and `timestamp`.
+    fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData;
+}
+
+/// A single price quote returned by the oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceData {
+    /// Fixed-point price value. The true price is `price / 10^decimals`.
+    pub price: i128,
+    /// Number of decimal places used in `price`.
+    pub decimals: u32,
+    /// Unix timestamp (seconds) when this price was last updated on-chain.
+    pub timestamp: u64,
 }
 
 // ── Token swap types ─────────────────────────────────────────────────────────
@@ -240,7 +287,8 @@ pub struct TimelockEntry {
 /// Role definitions for the Role-Based Access Control (RBAC) system.
 ///
 /// Segregates operational privileges across dedicated role boundaries:
-/// SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+/// SuperAdmin (root Admin), Pauser, FeeManager, TreasuryManager, and
+/// ComplianceOfficer.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -252,11 +300,15 @@ pub enum Role {
     /// token recovery, and emergency asset withdrawals.
     TreasuryManager = 2,
     /// Compliance officer with authority over address blacklisting, KYC oracle
-    /// configurations, and emergency operational pause switches.
+    /// configurations, and oracle price configuration.
     ComplianceOfficer = 3,
     /// Fee manager with authority over platform fee basis points, fee caps, and
     /// minimum payment limits.
     FeeManager = 4,
+    /// Pauser with authority over the operational pause switch. Kept separate
+    /// from the broader compliance role so the ability to halt routing can be
+    /// delegated narrowly.
+    Pauser = 5,
 }
 
 /// Storage keys for all contract instance and persistent data.
@@ -303,6 +355,56 @@ pub enum DataKey {
     /// Maximum tolerated swap slippage in basis points, applied against a
     /// caller-supplied quote.  Stored as `i128` in instance storage.
     MaxSlippageBps,
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited for a treasury asset.
+    YieldPrincipal(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
+    /// Active designated address for an administrative role: Role -> Address.
+    Role(Role),
+    /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
+    UserRole(Address, Role),
+    /// Per-user meta-transaction nonce for replay protection.
+    /// Stored as `u64` in persistent storage, incremented on each
+    /// successful `route_payment_meta`.
+    MetaNonce(Address),
+    /// Address of the configured price-feed oracle contract.
+    OracleAddress,
+    /// Maximum age (in seconds) a price reading may have before it is
+    /// considered stale and rejected.  Defaults to 3 600 s (1 hour).
+    StalenessThreshold,
+    /// Administrator-supplied fallback price for a (base, quote) asset pair.
+    /// Used when the live oracle is unavailable or returns a stale value.
+    /// Keyed by `(base_asset, quote_asset)`.
+    FallbackPrice(Address, Address),
+    /// Governance token used to weight fee proposals.
+    GovernanceToken,
+    /// Minimum token voting weight required to execute a fee proposal.
+    GovernanceQuorum,
+    /// Monotonically increasing governance proposal ID.
+    GovernanceNonce,
+    /// Fee proposal stored by ID.
+    GovernanceProposal(u64),
+    /// Whether an address has voted on a proposal.
+    GovernanceVote(u64, Address),
+}
+
+/// A fee change proposal weighted by governance-token balances.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeProposal {
+    pub proposer: Address,
+    pub fee_bps: i128,
+    pub fee_cap: i128,
+    pub created_at: u64,
+    pub voting_ends_at: u64,
+    pub yes_votes: i128,
+    pub no_votes: i128,
+    pub quorum: i128,
+    pub executed: bool,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -353,6 +455,48 @@ pub enum Error {
     /// Swap parameters are self-contradictory or unusable (for example
     /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
     InvalidSwapParams = 19,
+    /// The caller does not hold the role required by the entrypoint.
+    RoleNotFound = 20,
+    /// The requested role operation is invalid (for example revoking the
+    /// only active SuperAdmin, which would leave the contract without root
+    /// governance).
+    InvalidRole = 21,
+    /// No lending protocol has been configured by the admin.
+    YieldProtocolNotConfigured = 22,
+    /// Yield amount must be positive and withdrawals cannot exceed principal.
+    InvalidYieldAmount = 23,
+    /// The sender lacks a valid KYC claim for a high-value payment.
+    KycRequired = 24,
+    /// The configured KYC threshold must not be negative.
+    InvalidKycThreshold = 25,
+    /// No price-feed oracle has been configured by the admin.
+    OracleNotConfigured = 26,
+    /// The price reading returned by the oracle is older than the configured
+    /// staleness threshold and cannot be used.
+    OraclePriceStale = 27,
+    /// The price returned by the oracle is zero or negative, which is
+    /// logically invalid for an asset price.
+    OraclePriceInvalid = 28,
+    /// The call to the external oracle contract failed (e.g. the oracle
+    /// contract is unavailable or returned an unexpected error), and no
+    /// fallback price has been configured for the requested asset pair.
+    OracleCallFailed = 29,
+    /// A swap path is empty, malformed, or does not connect the requested assets.
+    InvalidSwapPath = 30,
+    /// A governance token has not been configured.
+    GovernanceNotConfigured = 31,
+    /// A governance proposal is missing, expired, or not yet ready.
+    InvalidProposal = 32,
+    /// The caller already voted on the proposal.
+    AlreadyVoted = 33,
+    /// Supplied meta-transaction nonce does not match stored nonce.
+    InvalidNonce = 34,
+    /// Meta-transaction deadline has passed (`ledger.timestamp() > deadline`).
+    DeadlineExpired = 35,
+    /// Off-chain ed25519 signature failed verification.
+    /// Note: `env.crypto().ed25519_verify` traps on invalid signatures,
+    /// so this variant documents the failure mode for integrators.
+    InvalidSignature = 36,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -390,6 +534,23 @@ impl PaymentRouter {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn set_role_internal(env: &Env, role: Role, account: &Address) {
+        // Only one address can be the designated signer for a role at a time.
+        // When a role is reassigned, clear the previous holder's grant so the
+        // per-address set in `DataKey::UserRole` keeps agreeing with what
+        // `require_role` will actually accept; otherwise the displaced holder
+        // keeps reporting the role through `has_role` while being unable to
+        // exercise it.
+        if let Some(previous) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Role(role))
+        {
+            if &previous != account {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::UserRole(previous, role), &false);
+            }
+        }
         env.storage().instance().set(&DataKey::Role(role), account);
         env.storage()
             .persistent()
@@ -416,6 +577,32 @@ impl PaymentRouter {
             .set(&DataKey::UserRole(account.clone(), role), &false);
     }
 
+    /// Applies a role grant and emits `role_assigned`.
+    ///
+    /// Idempotent: granting a role the grantee already holds re-writes the same
+    /// state and emits the same event rather than failing, so a retried or
+    /// duplicated administrative call converges instead of trapping.
+    fn apply_role_grant(env: &Env, grantee: &Address, role: Role) {
+        Self::set_role_internal(env, role, grantee);
+        env.events().publish(
+            (Symbol::new(env, "role_assigned"), role, grantee.clone()),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Applies a role revocation and emits `role_revoked`.
+    ///
+    /// Idempotent, and the mirror of [`Self::apply_role_grant`]: revoking a
+    /// role that was never held clears an already-clear grant and emits the
+    /// same event, so callers do not have to track prior state to revoke.
+    fn apply_role_revoke(env: &Env, grantee: &Address, role: Role) {
+        Self::remove_role_internal(env, role, grantee);
+        env.events().publish(
+            (Symbol::new(env, "role_revoked"), role, grantee.clone()),
+            env.ledger().timestamp(),
+        );
+    }
+
     fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
         let addr = if let Some(role_addr) = env
             .storage()
@@ -435,6 +622,57 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Reports whether `account` currently holds `role` for the purposes of
+    /// `require_role`.
+    ///
+    /// A role has at most one designated address (`DataKey::Role`), so this
+    /// mirrors the resolution order of [`Self::require_role`]: the per-address
+    /// grant first, then the designated address, and finally — when the role
+    /// has no designated address at all — the root admin, which inherits every
+    /// role that has not been delegated away.
+    ///
+    /// Keeping the two in step matters: an integration that asks `has_role`
+    /// before building a transaction must not be told "yes" for an address the
+    /// contract will then refuse to authorize, nor "no" for one it will accept.
+    fn has_role_internal(env: &Env, account: &Address, role: Role) -> bool {
+        let granted: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserRole(account.clone(), role))
+            .unwrap_or(false);
+        if granted {
+            return true;
+        }
+        let designated: Option<Address> = env.storage().instance().get(&DataKey::Role(role));
+        match designated {
+            Some(primary) => &primary == account,
+            None => {
+                env.storage()
+                    .instance()
+                    .get::<DataKey, Address>(&DataKey::Admin)
+                    .as_ref()
+                    == Some(account)
+            }
+        }
+    }
+
+    /// Asserts that an explicitly supplied `caller` holds `role`, authorizing
+    /// the call on that address's behalf.
+    ///
+    /// This is the caller-addressed counterpart to [`Self::require_role`],
+    /// which resolves the single address the contract expects to sign on its
+    /// own.  Entrypoints that name the acting admin as a parameter — the
+    /// role-management calls — use this so that a caller without the role is
+    /// rejected with [`Error::RoleNotFound`] instead of silently authorizing
+    /// some other stored address.
+    fn require_role_of(env: &Env, caller: &Address, role: Role) -> Result<(), Error> {
+        if !Self::has_role_internal(env, caller, role) {
+            return Err(Error::RoleNotFound);
+        }
+        caller.require_auth();
+        Ok(())
     }
 
     /// Fee authority helper: if a Governance address is set it takes exclusive
@@ -562,6 +800,50 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
+    /// Returns whether the contract is currently paused.
+    fn is_paused_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Circuit-breaker guard applied to every non-essential operation.
+    ///
+    /// While the pause switch is engaged all operational state changes —
+    /// payments, timelock queue/execute, fee/treasury/governance/min-limit
+    /// configuration, treasury yield movements and token recovery — are
+    /// rejected with `Error::Paused`.
+    ///
+    /// Essential recovery paths (unpausing/unfreezing, cancelling a queued
+    /// action, refunds and emergency withdrawals) stay available so a
+    /// Pauser can always restore service.
+    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+        if Self::is_paused_internal(env) {
+            return Err(Error::Paused);
+        }
+        Ok(())
+    }
+
+    /// Enforces KYC only after the admin has configured a threshold. This
+    /// preserves existing routing behavior until compliance is enabled.
+    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
+        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
+            return Ok(());
+        }
+
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycOracle)
+            .ok_or(Error::KycRequired)?;
+        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
+            return Err(Error::KycRequired);
+        }
+        Ok(())
+    }
+
     /// Splits `amount` into the platform fee and the amount forwarded to the
     /// recipient, applying the fee cap and the volume-based discount.
     ///
@@ -667,23 +949,6 @@ impl PaymentRouter {
         } else {
             floor
         }
-    }
-
-    fn validate_swap_path(
-        token_in: &Address,
-        token_out: &Address,
-        path: &Vec<Address>,
-        min_amount_out: i128,
-    ) -> Result<(), Error> {
-        if min_amount_out <= 0 || path.len() < 2 {
-            return Err(Error::InvalidSwapPath);
-        }
-        if path.get(0) != Some(token_in.clone())
-            || path.get(path.len() - 1) != Some(token_out.clone())
-        {
-            return Err(Error::InvalidSwapPath);
-        }
-        Ok(())
     }
 
     /// Allocates and returns the next timelock nonce, incrementing the counter.
@@ -1040,6 +1305,7 @@ impl PaymentRouter {
         Self::set_role_internal(&env, Role::TreasuryManager, &admin);
         Self::set_role_internal(&env, Role::ComplianceOfficer, &admin);
         Self::set_role_internal(&env, Role::FeeManager, &admin);
+        Self::set_role_internal(&env, Role::Pauser, &admin);
 
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -1051,87 +1317,108 @@ impl PaymentRouter {
 
     // ── Role-Based Access Control (RBAC) ────────────────────────────────────
 
-    /// Assigns an operational role to a specified account.
+    /// Grants an operational role to `grantee`.
     ///
-    /// Restricted exclusively to `SuperAdmin`.
+    /// Only an address holding `SuperAdmin` may call this.  The `admin`
+    /// parameter is the address expected to authorize the transaction, and
+    /// `admin.require_auth()` is always invoked, so a caller that cannot supply
+    /// that signature is rejected even if the role would otherwise resolve.
+    ///
+    /// # Parameters
+    /// - `admin`: Address expected to authorize the call; must hold `SuperAdmin`.
+    /// - `grantee`: Address to receive the role.
+    /// - `role`: The `Role` variant to grant.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::RoleNotFound)` if `admin` does not hold
+    /// `SuperAdmin`, or `Err(Error::NotInitialized)` if the contract has no
+    /// admin set yet.
+    ///
+    /// # Panics
+    /// Panics if `admin` does not authorize the call.
+    ///
+    /// Granting a role the grantee already holds is a no-op that emits
+    /// `role_assigned` again rather than an error.  Because a role has a single
+    /// designated holder, granting it to a new address revokes it from the
+    /// previous one.
+    pub fn grant_role(env: Env, admin: Address, grantee: Address, role: Role) -> Result<(), Error> {
+        Self::require_role_of(&env, &admin, Role::SuperAdmin)?;
+        Self::apply_role_grant(&env, &grantee, role);
+        Ok(())
+    }
+
+    /// Revokes an operational role from `grantee`.
+    ///
+    /// Only an address holding `SuperAdmin` may call this.  As with
+    /// [`Self::grant_role`], `admin.require_auth()` is always invoked.
+    ///
+    /// # Parameters
+    /// - `admin`: Address expected to authorize the call; must hold `SuperAdmin`.
+    /// - `grantee`: Address from which the role will be revoked.
+    /// - `role`: The `Role` variant to revoke.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::RoleNotFound)` if `admin` does not hold
+    /// `SuperAdmin`, `Err(Error::InvalidRole)` if the call would revoke the
+    /// acting `SuperAdmin`'s own root role, or `Err(Error::NotInitialized)`.
+    ///
+    /// # Panics
+    /// Panics if `admin` does not authorize the call.
+    ///
+    /// Revoking a role the grantee never held is a no-op that emits
+    /// `role_revoked` rather than an error, so revocations are idempotent and
+    /// safe to retry.
+    pub fn revoke_role(
+        env: Env,
+        admin: Address,
+        grantee: Address,
+        role: Role,
+    ) -> Result<(), Error> {
+        Self::require_role_of(&env, &admin, Role::SuperAdmin)?;
+        if role == Role::SuperAdmin && admin == grantee {
+            return Err(Error::InvalidRole);
+        }
+        Self::apply_role_revoke(&env, &grantee, role);
+        Ok(())
+    }
+
+    /// Grants an operational role to an account. SuperAdmin-protected.
+    ///
+    /// Retained for compatibility with the published bindings; this is
+    /// [`Self::grant_role`] with the `admin` argument resolved by the contract
+    /// instead of supplied by the caller.
     ///
     /// # Parameters
     /// - `account`: Target address to receive the role.
     /// - `role`: The `Role` variant to grant.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if uninitialized.
     ///
     /// # Panics
     /// Panics if the current `SuperAdmin` does not authorize the call.
     pub fn assign_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
+        // The resolved address is discarded: the point is the `require_auth()`
+        // that `require_role` performs on it.
         Self::require_role(&env, Role::SuperAdmin)?;
-        Self::set_role_internal(&env, role, &account);
-        env.events().publish(
-            (Symbol::new(&env, "role_assigned"), role, account),
-            env.ledger().timestamp(),
-        );
-        Ok(())
-    }
-
-    /// Revokes an operational role from a specified account.
-    ///
-    /// Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
-    /// when it would leave the contract without root governance.
-    ///
-    /// # Parameters
-    /// - `account`: Target address from which the role will be revoked.
-    /// - `role`: The `Role` variant to revoke.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
-    /// or `Err(Error::NotInitialized)`.
-    ///
-    /// # Panics
-    /// Panics if the current `SuperAdmin` does not authorize the call.
-    pub fn revoke_role(env: Env, account: Address, role: Role) -> Result<(), Error> {
-        let caller = Self::require_role(&env, Role::SuperAdmin)?;
-        if role == Role::SuperAdmin && caller == account {
-            return Err(Error::InvalidRole);
-        }
-        Self::remove_role_internal(&env, role, &account);
-        env.events().publish(
-            (Symbol::new(&env, "role_revoked"), role, account),
-            env.ledger().timestamp(),
-        );
+        Self::apply_role_grant(&env, &account, role);
         Ok(())
     }
 
     /// Queries whether a given account holds an active role assignment.
     ///
-    /// Checks persistent user role assignments and primary designated roles.
+    /// Read-only and authorization-free.  Reports effective authority: the
+    /// account is granted the role directly, is the role's designated holder,
+    /// or is the root admin standing in for a role that has not been delegated.
     ///
     /// # Parameters
     /// - `account`: Address to query.
     /// - `role`: Role variant to check.
     ///
     /// # Returns
-    /// `true` if authorized for this role, `false` otherwise.
+    /// `true` if the account can exercise `role`, `false` otherwise.
     pub fn has_role(env: Env, account: Address, role: Role) -> bool {
-        if let Some(has) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::UserRole(account.clone(), role))
-        {
-            if has {
-                return true;
-            }
-        }
-        if let Some(primary) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Role(role))
-        {
-            if primary == account {
-                return true;
-            }
-        }
-        false
+        Self::has_role_internal(&env, &account, role)
     }
 
     /// Returns the primary designated member address for a role, if one is configured.
@@ -1715,7 +2002,7 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
-    /// Pauses or unpauses the payment router. ComplianceOfficer-protected.
+    /// Pauses or unpauses the payment router. Pauser-protected.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject `route_payment` / `route_payments`
@@ -1726,11 +2013,11 @@ impl PaymentRouter {
     /// has no admin set yet.
     ///
     /// # Panics
-    /// Panics if the current ComplianceOfficer does not authorize the call.
+    /// Panics if the current Pauser does not authorize the call.
     ///
     /// This is NOT timelocked — operational pausing must remain instant.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
-        Self::require_role(&env, Role::ComplianceOfficer)?;
+        Self::require_role(&env, Role::Pauser)?;
 
         env.storage().instance().set(&DataKey::Paused, &paused);
         env.storage().instance().extend_ttl(
@@ -1743,7 +2030,7 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Alias for `set_pause`. Admin-only.
+    /// Alias for `set_pause`. Pauser-protected.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject routing calls, `false` to allow them.
@@ -1752,7 +2039,7 @@ impl PaymentRouter {
     /// See `set_pause`.
     ///
     /// # Panics
-    /// Panics if the current admin does not authorize the call.
+    /// Panics if the current Pauser does not authorize the call.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         Self::set_pause(env, paused)
     }
@@ -2141,8 +2428,7 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        env.events()
-            .publish((symbol_short!("price_cfg"),), oracle);
+        env.events().publish((symbol_short!("price_cfg"),), oracle);
         Ok(())
     }
 
@@ -2262,40 +2548,27 @@ impl PaymentRouter {
     ///
     /// ## Validation flow
     ///
-    /// 1. **Oracle configured?** — If no oracle address is stored, return
-    ///    `Err(Error::OracleNotConfigured)` (unless a fallback is available).
-    /// 2. **Call oracle** — Invoke the oracle's `get_price` method.  If the
-    ///    call fails (oracle contract unavailable or traps), attempt to return
-    ///    the fallback price.  If there is no fallback either, return
-    ///    `Err(Error::OracleCallFailed)`.
-    /// 3. **Staleness check** — Compare `price_data.timestamp` with the
-    ///    current ledger time.  If older than the configured threshold (default
-    ///    3 600 s), attempt to return the fallback price.  If there is no
-    ///    fallback, return `Err(Error::OraclePriceStale)`.
-    /// 4. **Validity check** — A price ≤ 0 is logically invalid.  Attempt
-    ///    fallback; if unavailable return `Err(Error::OraclePriceInvalid)`.
-    /// 5. **Return** — The validated `PriceData` is returned to the caller.
+    /// 1. No oracle configured -> fallback, else `Err(Error::OracleNotConfigured)`.
+    /// 2. Oracle call fails (missing, trapping, or mistyped contract) ->
+    ///    fallback, else `Err(Error::OracleCallFailed)`.
+    /// 3. Reading older than the staleness threshold (default 3 600 s) ->
+    ///    fallback, else `Err(Error::OraclePriceStale)`. A threshold of `0`
+    ///    disables the staleness check entirely.
+    /// 4. Price <= 0 -> fallback, else `Err(Error::OraclePriceInvalid)`.
     ///
-    /// A staleness threshold of `0` disables the staleness check entirely.
+    /// On success the validated `PriceData` is returned to the caller and a
+    /// `price_ok` event is published for the requested pair.
     ///
     /// ## Parameters
     /// - `base_asset`: Address of the base asset (e.g. XLM native contract).
     /// - `quote_asset`: Address of the quote asset (e.g. USDC contract).
-    ///
-    /// ## Returns
-    /// `Ok(PriceData)` on success, or one of:
-    /// - `Err(Error::OracleNotConfigured)` — no oracle set and no fallback.
-    /// - `Err(Error::OracleCallFailed)` — oracle call failed and no fallback.
-    /// - `Err(Error::OraclePriceStale)` — data too old and no fallback.
-    /// - `Err(Error::OraclePriceInvalid)` — price ≤ 0 and no fallback.
     pub fn get_price(
         env: Env,
         base_asset: Address,
         quote_asset: Address,
     ) -> Result<PriceData, Error> {
         // Retrieve the oracle address, falling back gracefully if absent.
-        let oracle_opt: Option<Address> =
-            env.storage().instance().get(&DataKey::OracleAddress);
+        let oracle_opt: Option<Address> = env.storage().instance().get(&DataKey::OracleAddress);
 
         let staleness_threshold: u64 = env
             .storage()
@@ -2310,10 +2583,7 @@ impl PaymentRouter {
                 if let Some(fallback) = env
                     .storage()
                     .persistent()
-                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(
-                        base.clone(),
-                        quote.clone(),
-                    ))
+                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(base.clone(), quote.clone()))
                 {
                     log!(env, "Oracle error; using fallback price");
                     Ok(fallback)
@@ -2326,7 +2596,12 @@ impl PaymentRouter {
         let oracle = match oracle_opt {
             Some(addr) => addr,
             None => {
-                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleNotConfigured);
+                return fallback_or_err(
+                    &env,
+                    &base_asset,
+                    &quote_asset,
+                    Error::OracleNotConfigured,
+                );
             }
         };
 
@@ -2408,6 +2683,33 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount)?;
+
+        sender.require_auth();
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_payment(
@@ -2444,6 +2746,35 @@ impl PaymentRouter {
         }
         if Self::is_paused(env.clone()) {
             return Err(Error::Paused);
+        }
+
+        // Pre-validate all payments to avoid rollback panic from require_auth
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        for payment in payments.iter() {
+            payment.sender.require_auth();
+            if payment.sender == payment.recipient {
+                return Err(Error::InvalidRecipient);
+            }
+            if Self::is_blacklisted(env.clone(), payment.recipient.clone()) {
+                return Err(Error::Blacklisted);
+            }
+            if payment.amount <= 0 || payment.amount > max_amount {
+                return Err(Error::LimitExceeded);
+            }
+            if payment.amount < min_limit {
+                return Err(Error::LimitExceeded);
+            }
+            Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -2749,6 +3080,89 @@ impl PaymentRouter {
         }
 
         Ok(total_delivered)
+    }
+
+    // ── Meta-transactions (relayer-submitted, allowance-based) ──────────────
+
+    /// Returns the current meta-transaction nonce for a user.
+    ///
+    /// Relayers must use this nonce when building the signed payload.
+    /// The nonce starts at `0` and increments after each successful
+    /// `route_payment_meta`, preventing replay attacks.
+    pub fn get_meta_nonce(env: Env, user: Address) -> u64 {
+        Self::get_meta_nonce_internal(&env, &user)
+    }
+
+    /// Relays a user-signed payment on behalf of the user.
+    ///
+    /// The user signs `SHA256(contract || sender || pubkey || recipient ||
+    /// token || amount || nonce || deadline)` off-chain with Ed25519.
+    /// Any relayer holding XLM for fees submits the payload; the contract
+    /// verifies the signature, checks `nonce` and `deadline`, then moves
+    /// funds via prior token allowance (`approve` + `transfer_from`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_payment_meta(
+        env: Env,
+        sender: Address,
+        signer_pubkey: BytesN<32>,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        if env.ledger().timestamp() > deadline {
+            return Err(Error::DeadlineExpired);
+        }
+
+        let stored = Self::get_meta_nonce_internal(&env, &sender);
+        if stored != nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        let message = Self::build_meta_message(
+            &env,
+            &sender,
+            &signer_pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+        );
+        // Traps on invalid signature; `Error::InvalidSignature` documents
+        // this failure mode for off-chain integrators.
+        env.crypto()
+            .ed25519_verify(&signer_pubkey, &message, &signature);
+
+        let key = DataKey::MetaNonce(sender.clone());
+        env.storage().persistent().set(&key, &(nonce + 1));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::process_single_payment_no_auth(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
     }
 
     /// Asks a registered DEX how much `buy_token` a swap would return, and
@@ -3095,9 +3509,9 @@ impl PaymentRouter {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo, MockAuth, MockAuthInvoke},
         token::StellarAssetClient,
-        Address, Env, Symbol, TryIntoVal,
+        Address, Env, Symbol, TryIntoVal, Val,
     };
 
     #[contracttype]
@@ -3191,6 +3605,14 @@ mod test {
         ShouldFail,
     }
 
+    /// Errors the mock oracle can return.
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum MockOracleError {
+        /// The mock was told to simulate a failing oracle.
+        Failed = 1,
+    }
+
     #[contract]
     struct MockPriceFeedOracle;
 
@@ -3223,23 +3645,28 @@ mod test {
         }
 
         /// Implements the PriceFeedOracle interface.
-        pub fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData {
+        pub fn get_price(
+            env: Env,
+            base_asset: Address,
+            quote_asset: Address,
+        ) -> Result<PriceData, MockOracleError> {
             let should_fail: bool = env
                 .storage()
                 .instance()
                 .get(&MockOracleKey::ShouldFail)
                 .unwrap_or(false);
             if should_fail {
-                panic!("mock oracle failure");
+                return Err(MockOracleError::Failed);
             }
-            env.storage()
+            Ok(env
+                .storage()
                 .instance()
                 .get(&MockOracleKey::Price(base_asset, quote_asset))
                 .unwrap_or(PriceData {
                     price: 0,
                     decimals: 7,
                     timestamp: 0,
-                })
+                }))
         }
     }
 
@@ -3256,13 +3683,24 @@ mod test {
     ) {
         let env = Env::default();
         env.mock_all_auths();
+        // Non-zero baseline ledger time so freshly-stamped oracle readings are
+        // not mistaken for the sentinel "timestamp == 0 => stale" value.
+        set_timestamp(&env, 1_000_000);
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
         let oracle_id = env.register_contract(None, MockPriceFeedOracle);
         let oracle_client = MockPriceFeedOracleClient::new(&env, &oracle_id);
         let base = Address::generate(&env);
         let quote = Address::generate(&env);
-        (env, client, contract_id, oracle_client, oracle_id, base, quote)
+        (
+            env,
+            client,
+            contract_id,
+            oracle_client,
+            oracle_id,
+            base,
+            quote,
+        )
     }
 
     // ── Oracle tests ─────────────────────────────────────────────────────────
@@ -3279,7 +3717,7 @@ mod test {
         let now = env.ledger().timestamp();
         oracle_client.set_price(&base, &quote, &1_250_000, &7, &now);
 
-        let price_data = client.get_price(&base, &quote).unwrap();
+        let price_data = client.get_price(&base, &quote);
         assert_eq!(price_data.price, 1_250_000);
         assert_eq!(price_data.decimals, 7);
         assert_eq!(price_data.timestamp, now);
@@ -3314,9 +3752,8 @@ mod test {
         assert_eq!(fallback.unwrap().price, 1_000_000);
 
         // get_price should return the fallback
-        let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 1_000_000);
+        let price_data = client.get_price(&base, &quote);
+        assert_eq!(price_data.price, 1_000_000);
     }
 
     #[test]
@@ -3341,9 +3778,8 @@ mod test {
 
         // Add a fallback: should now return the fallback price
         client.set_fallback_price(&base, &quote, &1_800_000, &7);
-        let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 1_800_000);
+        let price_data = client.get_price(&base, &quote);
+        assert_eq!(price_data.price, 1_800_000);
     }
 
     #[test]
@@ -3383,9 +3819,8 @@ mod test {
 
         // With fallback configured: should succeed
         client.set_fallback_price(&base, &quote, &5_000_000, &7);
-        let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 5_000_000);
+        let price_data = client.get_price(&base, &quote);
+        assert_eq!(price_data.price, 5_000_000);
     }
 
     #[test]
@@ -3402,9 +3837,8 @@ mod test {
         oracle_client.set_price(&base, &quote, &3_000_000, &7, &0);
 
         // Should pass because staleness check is disabled
-        let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 3_000_000);
+        let price_data = client.get_price(&base, &quote);
+        assert_eq!(price_data.price, 3_000_000);
     }
 
     #[test]
@@ -4109,6 +4543,472 @@ mod test {
 
         // Route payment should succeed now
         client.route_payment(&sender, &recipient, &token_address, &1000);
+    }
+
+    // ── RBAC tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_initialize_seeds_admin_into_all_roles() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        for role in [
+            Role::SuperAdmin,
+            Role::TreasuryManager,
+            Role::ComplianceOfficer,
+            Role::FeeManager,
+            Role::Pauser,
+        ] {
+            assert!(client.has_role(&admin, &role));
+            assert_eq!(client.get_role_member(&role), Some(admin.clone()));
+        }
+    }
+
+    #[test]
+    fn test_admin_can_grant_and_revoke_pauser_role() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        assert!(!client.has_role(&pauser, &Role::Pauser));
+
+        client.grant_role(&admin, &pauser, &Role::Pauser);
+        assert!(client.has_role(&pauser, &Role::Pauser));
+        assert_eq!(client.get_role_member(&Role::Pauser), Some(pauser.clone()));
+
+        client.revoke_role(&admin, &pauser, &Role::Pauser);
+        assert!(!client.has_role(&pauser, &Role::Pauser));
+        assert_eq!(client.get_role_member(&Role::Pauser), None);
+    }
+
+    #[test]
+    fn test_assign_role_requires_super_admin_authorization() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let grantee = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.assign_role(&grantee, &Role::Pauser);
+
+        // The SuperAdmin (admin) must be the authorizing address.
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == admin));
+        assert_eq!(client.get_role_member(&Role::SuperAdmin), Some(admin));
+    }
+
+    #[test]
+    fn test_granted_pauser_can_pause_and_unpause() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.assign_role(&pauser, &Role::Pauser);
+
+        client.set_pause(&true);
+
+        // The delegated Pauser, not the admin, authorizes the switch.
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == pauser));
+        assert!(!auths.iter().any(|(addr, _)| *addr == admin));
+        assert!(client.is_paused());
+
+        client.set_paused(&false);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_revoking_pauser_role_restores_admin_fallback() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.assign_role(&pauser, &Role::Pauser);
+        client.revoke_role(&admin, &pauser, &Role::Pauser);
+
+        // With no primary Pauser configured, pause authority falls back to admin.
+        assert!(!client.has_role(&pauser, &Role::Pauser));
+        client.set_pause(&true);
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == admin));
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn test_fee_manager_role_gates_fee_functions() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let fee_manager = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.assign_role(&fee_manager, &Role::FeeManager);
+        assert!(client.has_role(&fee_manager, &Role::FeeManager));
+
+        client.set_min_limit(&50);
+
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == fee_manager));
+    }
+
+    #[test]
+    fn test_revoked_fee_manager_loses_privileges() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let fee_manager = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.assign_role(&fee_manager, &Role::FeeManager);
+        client.revoke_role(&admin, &fee_manager, &Role::FeeManager);
+        assert!(!client.has_role(&fee_manager, &Role::FeeManager));
+
+        // Authority falls back to the admin for the now-vacant role.
+        client.set_min_limit(&75);
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == admin));
+    }
+
+    #[test]
+    fn test_has_role_is_false_for_unassigned_accounts() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        for role in [
+            Role::SuperAdmin,
+            Role::TreasuryManager,
+            Role::ComplianceOfficer,
+            Role::FeeManager,
+            Role::Pauser,
+        ] {
+            assert!(!client.has_role(&stranger, &role));
+        }
+    }
+
+    // ── RBAC authorization tests ─────────────────────────────────────────────
+
+    /// Like [`setup_env`], but without `mock_all_auths`.  A role gate can only
+    /// be shown to *reject* an unauthorized caller when authorization is
+    /// recorded explicitly, so these tests register exactly the signature the
+    /// contract demands and observe whether it is accepted.
+    fn setup_env_ungated() -> (Env, PaymentRouterClient<'static>, Address) {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+        (env, client, contract_id)
+    }
+
+    /// Records one authorization: `address` is permitted to invoke `fn_name`
+    /// with `args` on `contract`.  Every address the contract requires must be
+    /// covered by some entry, or the call is rejected.
+    fn authorize(env: &Env, contract: &Address, address: &Address, fn_name: &str, args: Vec<Val>) {
+        env.mock_auths(&[MockAuth {
+            address,
+            invoke: &MockAuthInvoke {
+                contract,
+                fn_name,
+                args,
+                sub_invokes: &[],
+            },
+        }]);
+    }
+
+    /// The `initialize` arguments used throughout these tests, in the shape
+    /// `MockAuthInvoke` needs.
+    fn init_args(env: &Env, admin: &Address, treasury: &Address) -> Vec<Val> {
+        (
+            admin.clone(),
+            treasury.clone(),
+            100i128,
+            1000i128,
+            PaymentRouter::MAX_AMOUNT,
+        )
+            .into_val(env)
+    }
+
+    /// A non-admin cannot grant a role, and the grant does not take effect.
+    #[test]
+    fn test_non_admin_cannot_grant_role() {
+        let (env, client, contract_id) = setup_env_ungated();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        let grantee = Address::generate(&env);
+        authorize(
+            &env,
+            &contract_id,
+            &admin,
+            "initialize",
+            init_args(&env, &admin, &treasury),
+        );
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // The outsider signs, but holds no SuperAdmin role.
+        authorize(
+            &env,
+            &contract_id,
+            &outsider,
+            "grant_role",
+            (outsider.clone(), grantee.clone(), Role::Pauser).into_val(&env),
+        );
+        assert_eq!(
+            client.try_grant_role(&outsider, &grantee, &Role::Pauser),
+            Err(Ok(Error::RoleNotFound))
+        );
+        assert!(!client.has_role(&grantee, &Role::Pauser));
+    }
+
+    /// A non-admin cannot revoke a role, and the role survives the attempt.
+    #[test]
+    fn test_non_admin_cannot_revoke_role() {
+        let (env, client, contract_id) = setup_env_ungated();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        authorize(
+            &env,
+            &contract_id,
+            &admin,
+            "initialize",
+            init_args(&env, &admin, &treasury),
+        );
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+        authorize(
+            &env,
+            &contract_id,
+            &admin,
+            "grant_role",
+            (admin.clone(), pauser.clone(), Role::Pauser).into_val(&env),
+        );
+        client.grant_role(&admin, &pauser, &Role::Pauser);
+
+        authorize(
+            &env,
+            &contract_id,
+            &outsider,
+            "revoke_role",
+            (outsider.clone(), pauser.clone(), Role::Pauser).into_val(&env),
+        );
+        assert_eq!(
+            client.try_revoke_role(&outsider, &pauser, &Role::Pauser),
+            Err(Ok(Error::RoleNotFound))
+        );
+        assert!(client.has_role(&pauser, &Role::Pauser));
+    }
+
+    /// Granting a role requires the SuperAdmin to be the authorizing address.
+    ///
+    /// This asserts *which* address must sign rather than driving an auth
+    /// failure, because the Soroban test host aborts the process on an
+    /// unmatched `require_auth` rather than surfacing it as a catchable
+    /// contract error.  The rejection path itself is covered by
+    /// `test_non_admin_cannot_grant_role`, which names a non-admin in the
+    /// `admin` position and observes `Err(Error::RoleNotFound)`.
+    #[test]
+    fn test_grant_role_is_gated_on_the_super_admin_signature() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let grantee = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.grant_role(&admin, &grantee, &Role::Pauser);
+
+        let auths = env.auths();
+        assert!(
+            auths.iter().any(|(addr, _)| *addr == admin),
+            "grant_role must require the SuperAdmin to authorize"
+        );
+        assert!(client.has_role(&grantee, &Role::Pauser));
+    }
+
+    /// Granting twice and revoking twice converge on the same state: neither
+    /// direction traps on a redundant call.
+    #[test]
+    fn test_grant_and_revoke_are_idempotent() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.grant_role(&admin, &pauser, &Role::Pauser);
+        client.grant_role(&admin, &pauser, &Role::Pauser);
+        assert!(client.has_role(&pauser, &Role::Pauser));
+        assert_eq!(client.get_role_member(&Role::Pauser), Some(pauser.clone()));
+
+        client.revoke_role(&admin, &pauser, &Role::Pauser);
+        client.revoke_role(&admin, &pauser, &Role::Pauser);
+        assert!(!client.has_role(&pauser, &Role::Pauser));
+        assert_eq!(client.get_role_member(&Role::Pauser), None);
+    }
+
+    /// Revoking a role that was never granted is a no-op rather than a trap.
+    #[test]
+    fn test_revoke_never_granted_role_is_a_noop() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        assert!(!client.has_role(&stranger, &Role::Pauser));
+        client.revoke_role(&admin, &stranger, &Role::Pauser);
+        assert!(!client.has_role(&stranger, &Role::Pauser));
+    }
+
+    /// Reassigning a role transfers it: the previous holder must stop reporting
+    /// the role, otherwise `has_role` would advertise authority the contract no
+    /// longer accepts.
+    #[test]
+    fn test_reassigning_role_clears_the_previous_holder() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        assert!(client.has_role(&admin, &Role::Pauser));
+        client.grant_role(&admin, &first, &Role::Pauser);
+        assert!(client.has_role(&first, &Role::Pauser));
+
+        client.grant_role(&admin, &second, &Role::Pauser);
+        assert!(client.has_role(&second, &Role::Pauser));
+        assert!(
+            !client.has_role(&first, &Role::Pauser),
+            "the displaced holder must not still report the role"
+        );
+        assert!(!client.has_role(&admin, &Role::Pauser));
+    }
+
+    /// With no holder for a role the root admin stands in, and `has_role` must
+    /// agree with that fallback rather than reporting `false`.
+    #[test]
+    fn test_has_role_reports_the_admin_fallback() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Revoking the admin's own Pauser role leaves the role unassigned, so
+        // authority reverts to the admin even though its grant flag is cleared.
+        client.revoke_role(&admin, &admin, &Role::Pauser);
+        assert_eq!(client.get_role_member(&Role::Pauser), None);
+        assert!(client.has_role(&admin, &Role::Pauser));
+        assert!(!client.has_role(&pauser, &Role::Pauser));
+
+        client.set_pause(&true);
+        assert!(client.is_paused());
+    }
+
+    /// The pause switch is gated on the `Pauser` role: the address the contract
+    /// asks to authorize is the Pauser, and that authority is distinguishable
+    /// from the admin's once the role is delegated.
+    ///
+    /// As above, the assertion is on which address must sign, since an
+    /// unmatched `require_auth` aborts the test host.  `env.auths()` only
+    /// reports the most recent invocation, so it is read immediately after the
+    /// call under test and before any other client call.
+    #[test]
+    fn test_pause_switch_is_gated_on_the_pauser_role() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // `initialize` seeds the admin into every role, so it signs first.
+        client.set_pause(&true);
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == admin));
+        assert!(!auths.iter().any(|(addr, _)| *addr == pauser));
+        assert!(client.is_paused());
+
+        // After delegation only the Pauser is asked to authorize the switch.
+        client.grant_role(&admin, &pauser, &Role::Pauser);
+        client.set_paused(&false);
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == pauser));
+        assert!(!auths.iter().any(|(addr, _)| *addr == admin));
+        assert!(!client.is_paused());
+
+        // An unassigned account is never treated as a Pauser.
+        assert!(!client.has_role(&stranger, &Role::Pauser));
+    }
+
+    /// The `MinLimit` setter is gated on the `FeeManager` role, and that gate
+    /// follows the role rather than the plain admin flag: once the role is
+    /// delegated the FeeManager is the address asked to authorize.
+    #[test]
+    fn test_min_limit_is_gated_on_the_fee_manager_role() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let fee_manager = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Undelegated: the seeded FeeManager is the admin itself.
+        client.set_min_limit(&50);
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == admin));
+
+        client.grant_role(&admin, &fee_manager, &Role::FeeManager);
+        client.set_min_limit(&75);
+        let auths = env.auths();
+        assert!(auths.iter().any(|(addr, _)| *addr == fee_manager));
+        assert!(!auths.iter().any(|(addr, _)| *addr == admin));
+    }
+
+    /// The acting SuperAdmin may not revoke its own root role, which would
+    /// leave role management unreachable.
+    #[test]
+    fn test_revoke_role_refuses_to_remove_the_acting_super_admin() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client.try_revoke_role(&admin, &admin, &Role::SuperAdmin),
+            Err(Ok(Error::InvalidRole))
+        );
+        assert!(client.has_role(&admin, &Role::SuperAdmin));
+    }
+
+    /// Grants and revocations publish `role_assigned` / `role_revoked`.
+    #[test]
+    fn test_role_changes_emit_events() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.grant_role(&admin, &pauser, &Role::Pauser);
+        let (_, topics, _) = env.events().all().last().unwrap();
+        let assigned: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(assigned, Symbol::new(&env, "role_assigned"));
+        assert!(client.has_role(&pauser, &Role::Pauser));
+
+        client.revoke_role(&admin, &pauser, &Role::Pauser);
+        let (_, topics, _) = env.events().all().last().unwrap();
+        let revoked: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(revoked, Symbol::new(&env, "role_revoked"));
     }
 
     // ── Circuit breaker tests ────────────────────────────────────────────────

@@ -102,11 +102,7 @@ impl PaymentProxy {
     ///
     /// # Errors
     /// - [`ProxyError::AlreadyInitialized`] if called more than once.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        logic_contract: Address,
-    ) -> Result<(), ProxyError> {
+    pub fn initialize(env: Env, admin: Address, logic_contract: Address) -> Result<(), ProxyError> {
         if env.storage().instance().has(&ProxyDataKey::Admin) {
             return Err(ProxyError::AlreadyInitialized);
         }
@@ -185,21 +181,17 @@ impl PaymentProxy {
     ///
     /// # Errors
     /// - [`ProxyError::NotInitialized`] / [`ProxyError::Unauthorized`] as above.
-    pub fn transfer_admin(
-        env: Env,
-        admin: Address,
-        new_admin: Address,
-    ) -> Result<(), ProxyError> {
+    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), ProxyError> {
         Self::assert_admin(&env, &admin)?;
 
-        env.storage().instance().set(&ProxyDataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&ProxyDataKey::Admin, &new_admin);
 
         Self::bump_ttl(&env);
 
-        env.events().publish(
-            (Symbol::new(&env, "AdminTransfer"), admin),
-            new_admin,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransfer"), admin), new_admin);
 
         Ok(())
     }
@@ -447,8 +439,7 @@ mod tests {
         let proxy_id = env.register_contract(None, PaymentProxy);
         let client = PaymentProxyClient::new(&env, &proxy_id);
 
-        let result =
-            client.try_forward(&Symbol::new(&env, "get_admin"), &vec![&env]);
+        let result = client.try_forward(&Symbol::new(&env, "get_admin"), &vec![&env]);
         // Val does not implement PartialEq, so we cannot use assert_eq! on the
         // full return type.  Match on only the error branch instead.
         assert!(
@@ -540,10 +531,7 @@ mod tests {
         let proxy_id = env.register_contract(None, PaymentProxy);
         let client = PaymentProxyClient::new(&env, &proxy_id);
 
-        assert_eq!(
-            client.try_get_admin(),
-            Err(Ok(ProxyError::NotInitialized))
-        );
+        assert_eq!(client.try_get_admin(), Err(Ok(ProxyError::NotInitialized)));
         assert_eq!(
             client.try_get_logic_contract(),
             Err(Ok(ProxyError::NotInitialized))
