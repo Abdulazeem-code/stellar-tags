@@ -91,6 +91,10 @@
     "mtls",
     "MTLS",
     "POSIX",
-    "ZIPKIN"
+    "ZIPKIN",
+    "CQRS",
+    "XADD",
+    "COOLDOWN",
+    "SOROSWAP"
   ]
 }
