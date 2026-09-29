@@ -7,6 +7,8 @@ const {
   decodeCursor,
   parseCursorQuery,
   keysetWhereDesc,
+  keysetWhereDescById,
+  keysetWhereAscById,
   paginateByKeyset,
   cursorPaginatedResponse,
 } = require('../src/pagination');
@@ -87,6 +89,38 @@ describe('keysetWhereDesc', () => {
       OR: [
         { createdAt: { lt: ts } },
         { AND: [{ createdAt: { equals: ts } }, { username: { lt: 'mia' } }] },
+      ],
+    });
+  });
+});
+
+describe('keysetWhereDescById', () => {
+  test('builds an OR tuple strictly after the point (DESC ordering)', () => {
+    const where = keysetWhereDescById({ createdAt: '2026-05-05T05:05:05.000Z', id: 'txn-9' });
+    const ts = new Date('2026-05-05T05:05:05.000Z');
+    expect(where).toEqual({
+      OR: [
+        { createdAt: { lt: ts } },
+        { AND: [{ createdAt: { equals: ts } }, { id: { lt: 'txn-9' } }] },
+      ],
+    });
+  });
+
+  test('accepts Date instances for createdAt', () => {
+    const ts = new Date('2026-05-05T05:05:05.000Z');
+    const where = keysetWhereDescById({ createdAt: ts, id: 'txn-9' });
+    expect(where.OR[0]).toEqual({ createdAt: { lt: ts } });
+  });
+});
+
+describe('keysetWhereAscById', () => {
+  test('builds an OR tuple strictly after the point (ASC ordering)', () => {
+    const where = keysetWhereAscById({ createdAt: '2026-05-05T05:05:05.000Z', id: 'txn-9' });
+    const ts = new Date('2026-05-05T05:05:05.000Z');
+    expect(where).toEqual({
+      OR: [
+        { createdAt: { gt: ts } },
+        { AND: [{ createdAt: { equals: ts } }, { id: { gt: 'txn-9' } }] },
       ],
     });
   });
