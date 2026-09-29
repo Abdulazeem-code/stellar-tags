@@ -218,6 +218,29 @@ cd payment_router
 cargo build
 ```
 
+### Token swaps (cross-contract DEX routing)
+
+A sender can pay in any token they hold and have it swapped into the merchant's
+preferred token during routing. The swap is a cross-contract call into a
+registered DEX adapter, runs inside the same Soroban transaction as the
+transfer, and reverts as a whole if anything goes wrong: the fee, the payment,
+and the state changes are all rolled back together.
+
+```text
+route_payment_with_swap   one swap-routed payment
+route_payments_with_swap  a batch, reverted atomically if any leg fails
+quote_swap                price a swap and derive a slippage floor
+```
+
+Slippage is enforced twice: a per-payment `min_amount_out` floor, and a
+contract-level `max_slippage_bps` ceiling against the caller's own quote. Both
+are checked against the tokens the router actually receives, not the number the
+DEX reports. Only DEXes the admin registers through the 24-hour timelock can be
+called.
+
+See [docs/dex-token-swaps.md](docs/dex-token-swaps.md) for the adapter
+interface, the full call list, and an end-to-end example.
+
 ### Contract TypeScript bindings
 
 The TypeScript client for the `payment_router` contract lives in
@@ -247,6 +270,22 @@ trusting the payload.
 
 See [docs/webhook-signature-verification.md](docs/webhook-signature-verification.md)
 for step-by-step verification examples in Node.js, Python, and Go.
+
+## Internal service-to-service mTLS
+
+Service-to-service calls are encrypted and mutually authenticated: the API
+requires a client certificate signed by an internal CA before a request is
+routed, and a peer with no valid certificate never reaches a handler. An
+internal CA issues, rotates and retires the certificates, including a
+zero-downtime cutover to a new issuing CA. Off by default, so local development
+and CI keep using plain HTTP.
+
+```sh
+MTLS_ENABLED=true docker compose --profile dev --profile mtls up --build
+```
+
+See [docs/mtls.md](docs/mtls.md) for the PKI layout, rotation runbook and
+configuration reference.
 
 ## Tests
 
@@ -291,6 +330,12 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
 - `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
 - `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). `warn` (default) logs a clear warning and continues; `strict` logs an error and exits non-zero before the server binds a port; `off` skips the check. Set to `strict` where you want deploys to fail fast on schema drift instead of failing on the first query.
+- `REDIS_URL` / `REDIS_CLUSTER_NODES` - (Optional) Redis connection for rate limiting and the BullMQ queues. The dead letter queue is only enabled when one of these is set; see [Dead letter queue](#dead-letter-queue-admindlq).
+- `MAX_RETRY_ATTEMPTS` - (Optional) Total delivery attempts before a webhook job is parked on the dead letter queue. Defaults to `5`.
+- `RETRY_BACKOFF_MS` - (Optional) Base delay in milliseconds for the exponential backoff between retry attempts. Defaults to `1000`.
+- `DLQ_ALERT_THRESHOLD` - (Optional) Log an error once the dead letter queue holds this many messages. Defaults to `10`.
+- `DLQ_ALERT_COOLDOWN_MS` - (Optional) Minimum gap in milliseconds between two depth alerts, so a queue that stays deep does not log on every job. Defaults to `300000`.
+- `DLQ_REPLAY_BATCH_LIMIT` - (Optional) Largest number of messages one `POST /admin/dlq/replay` call replays. Defaults to `100`.
 
 For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
 
@@ -572,6 +617,59 @@ Aggregates webhook delivery health so operators can spot broken merchant integra
 
 A webhook is "failing" while its `failingSince` timestamp is set (cleared on the next successful delivery). `successRate24h` is the share of webhooks with a delivery attempt in the last 24h that are currently healthy; it is `null` when nothing has been active in that window.
 
+### Dead letter queue: `/admin/dlq`
+
+Webhook deliveries that exhaust `MAX_RETRY_ATTEMPTS` are parked on the
+`payment-retries-dlq` BullMQ queue instead of being retried forever, so they can
+be inspected and replayed by hand. Parked jobs keep their original payload,
+attempt count, failure reason, and a truncated stack trace, and are never retried
+or removed on their own.
+
+The dead letter queue needs Redis. With neither `REDIS_URL` nor
+`REDIS_CLUSTER_NODES` set, the worker logs a warning and falls back to the legacy
+database-backed dead letter handling; `GET /admin/dlq` then reports
+`available: false` with an empty list, and the per-message endpoints below return
+`503`.
+
+All endpoints below require `x-api-key` matching `ADMIN_API_KEY`. The mutating
+ones (`POST`, `DELETE`) additionally require an `Idempotency-Key` header, as with
+every other mutating `/api/v1` request, so a retried or double-clicked call
+cannot replay a message twice. Webhook secrets are redacted from every payload
+before it is returned.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /admin/dlq` | List parked messages |
+| `GET /admin/dlq/:id` | Read one message |
+| `POST /admin/dlq/:id/replay` | Replay one message |
+| `POST /admin/dlq/replay` | Replay a batch |
+| `DELETE /admin/dlq/:id` | Discard one message |
+
+**`GET /admin/dlq`**
+- **Query Parameters:** `limit` (optional, 1-100, default `20`), `page` (optional, default `1`), `username` (optional) to scope the listing to one merchant. A non-numeric `limit` or `page` falls back to the default rather than failing.
+- **Returns:** `success: true`, `available`, `messages`, and `meta` (`total`, `page`, `limit`, `totalPages`). `total` always describes the same set as `messages`: unfiltered, BullMQ counts the queue directly; filtered, the queue is walked in full so the page and the count stay consistent.
+- **Status Codes:** `200 OK`, `401 Unauthorized`.
+
+**`GET /admin/dlq/:id`**
+- **Returns:** `success: true` and the `message`, with `failureReason`, `stack`, `attemptsMade`, and the redacted `payload`.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable` (no Redis).
+
+**`POST /admin/dlq/:id/replay`**
+- **Headers:** `x-api-key`, `Idempotency-Key`.
+- **Returns:** `success: true`, `replayed: true`, `replayedJobId`, and the `queue` the job went back to. The attempt budget is reset, so a replayed job gets a fresh set of retries.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`.
+
+**`POST /admin/dlq/replay`**
+- **Headers:** `x-api-key`, `Idempotency-Key`.
+- **Body (optional):** `limit` (capped at `DLQ_REPLAY_BATCH_LIMIT`) and `username` to narrow the batch. An empty body replays the whole queue up to that cap.
+- **Returns:** `success: true`, counts of `replayed` and `failed`, a `failed` array of `{ id, error }` for messages that could not be replayed, and `capped` when the queue held more messages than the batch limit allowed. Per-message failures are reported without failing the whole batch.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `503 Service Unavailable`.
+
+**`DELETE /admin/dlq/:id`**
+- **Headers:** `x-api-key`, `Idempotency-Key`.
+- **Returns:** `success: true`, `id`, `discarded: true`. The message is dropped without being replayed, which is permanent.
+- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`.
+
 ### `GET /metrics`
 
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
@@ -590,10 +688,18 @@ rate limiter so a scraper on a fixed interval is never throttled.
 | `db_pool_connections_idle` | gauge | Connections open but unused |
 | `db_pool_queries_waiting` | gauge | Queries queued waiting for a connection |
 | `redis_connections_active` | gauge | `1` while Redis is ready for commands, else `0` |
+| `stellar_tags_dlq_depth` | gauge | Messages currently parked on `payment-retries-dlq`; reads `0` when Redis is unavailable |
+| `stellar_tags_dlq_messages_total` | counter | Messages ever routed to the dead letter queue |
 
 Memory and CPU come from `prom-client`'s default collectors. The pool gauges read
 Prisma's `$metrics` (which requires the `metrics` preview feature in
-`schema.prisma`) and report `0` when it is unavailable.
+`schema.prisma`) and report `0` when it is unavailable. The dead letter queue
+depth is read at scrape time, so a restart does not reset it and no work happens
+unless something asks for the value.
+
+`monitoring/prometheus-dlq-alerts.yml` contains ready-to-load rules that fire when
+the backlog grows past `DLQ_ALERT_THRESHOLD`, and when it keeps rising for 15
+minutes.
 
 ## Smart Contract Refund Mechanism
 
@@ -604,6 +710,24 @@ Users can query and withdraw their credited refunds at any time using the pull-b
 - `get_refund_balance(user: Address, token: Address) -> i128`: Query available internal refund balance.
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
+
+### Arbitrary-token swaps
+
+`route_payment_with_swap` accepts a DEX adapter, an input/output token pair, a
+full token `path`, and `min_amount_out`. The adapter receives the input token and
+must return `[amount_received, unused_input]`; the router rejects malformed
+paths or slippage below the caller's minimum and credits unused input to the
+sender's refund balance. Existing same-token `route_payment` and
+`route_payments` calls remain unchanged.
+
+### Fee governance
+
+The contract supports token-weighted fee proposals. A SuperAdmin first calls
+`configure_governance(governance_token, quorum)`. A token holder can then call
+`propose_fee_change` and `vote_fee_proposal`; after the voting period, anyone
+can call `execute_fee_proposal` when yes votes exceed no votes and quorum is
+met. A voter can vote only once per proposal, and fee updates are applied only
+after successful finalization.
 
 ## Smart Contract Deployment & Upgrades
 
@@ -650,4 +774,3 @@ Upon successful deployment, the tool automatically updates the contract address 
 ## License
 
 See [LICENSE](LICENSE).
-

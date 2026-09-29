@@ -2,7 +2,16 @@
 # ==============================================================================
 # scripts/deploy_contract.sh
 #
-# Automated wrapper script to deploy and upgrade the Soroban PaymentRouter contract.
+# Automated wrapper to deploy, upgrade, and manage Soroban contracts.
+#
+# KEY COMMANDS:
+#   deploy              — Deploy PaymentRouter only (legacy)
+#   deploy-proxy        — Deploy PaymentRouter + PaymentProxy wired together
+#   upgrade-proxy-logic — Point proxy at a new logic contract address
+#   upgrade             — Upgrade PaymentRouter WASM in-place via its timelock
+#   build               — Compile and optimize WASM only
+#
+# Run with --help for full usage.
 # ==============================================================================
 
 set -euo pipefail
