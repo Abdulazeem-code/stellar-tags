@@ -26,6 +26,18 @@ const HORIZON_URLS = {
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
+// Dedicated ioredis publisher for cross-process WebSocket payment events.
+// When REDIS_URL is absent real-time updates are silently disabled.
+const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
+if (redisPublisher) {
+  redisPublisher.on('error', (err) =>
+    logger.error({ err }, '[listener] Redis publisher error'),
+  );
+} else {
+  logger.warn(
+    '[listener] REDIS_URL not set — real-time WebSocket payment updates are disabled.',
+  );
+}
 
 const healthCheckBreaker = createBreaker(
   () => horizon.ledgers().latest().call(),

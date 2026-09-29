@@ -358,6 +358,16 @@ pub enum Error {
     /// Swap parameters are self-contradictory or unusable (for example
     /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
     InvalidSwapParams = 19,
+    /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
+    InvalidRole = 20,
+    /// A swap path is empty, malformed, or does not connect the requested assets.
+    InvalidSwapPath = 21,
+    /// A governance token has not been configured.
+    GovernanceNotConfigured = 22,
+    /// A governance proposal is missing, expired, or not yet ready.
+    InvalidProposal = 23,
+    /// The caller already voted on the proposal.
+    AlreadyVoted = 24,
 }
 
 /// Soroban contract that routes token payments between addresses while
