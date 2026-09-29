@@ -1,9 +1,5 @@
 #![no_std]
-use soroban_sdk::xdr::ToXdr;
-use soroban_sdk::{
-    contract, contracterror, contractclient, contractimpl, contracttype, log, symbol_short,
-    token, Address, BytesN, Env, Symbol, Vec,
-};
+use soroban_sdk::{contract, contractimpl, log, token, Address, Env, Vec};
 
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
 //
@@ -1602,157 +1598,15 @@ impl PaymentRouter {
         Ok(id)
     }
 
-    /// Casts one weighted vote on an open fee proposal.
-    pub fn vote_fee_proposal(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        support: bool,
-    ) -> Result<(), Error> {
-        voter.require_auth();
-        let token_address: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::GovernanceToken)
-            .ok_or(Error::GovernanceNotConfigured)?;
-        let key = DataKey::GovernanceProposal(proposal_id);
-        let mut proposal: FeeProposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::InvalidProposal)?;
-        if proposal.executed || env.ledger().timestamp() >= proposal.voting_ends_at {
-            return Err(Error::InvalidProposal);
-        }
-        let vote_key = DataKey::GovernanceVote(proposal_id, voter.clone());
-        if env.storage().persistent().has(&vote_key) {
-            return Err(Error::AlreadyVoted);
-        }
-        let weight = token::Client::new(&env, &token_address).balance(&voter);
-        if weight <= 0 {
-            return Err(Error::InvalidProposal);
-        }
-        if support {
-            proposal.yes_votes = proposal.yes_votes.saturating_add(weight);
-        } else {
-            proposal.no_votes = proposal.no_votes.saturating_add(weight);
-        }
-        env.storage().persistent().set(&key, &proposal);
-        env.storage().persistent().set(&vote_key, &true);
-        Ok(())
-    }
+        // 4. Transfer the platform fee to your treasury
+        token_client.transfer(&sender, &platform_treasury, &fee_amount);
 
-    /// Finalizes a successful fee proposal after its voting period ends.
-    pub fn execute_fee_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
-        let key = DataKey::GovernanceProposal(proposal_id);
-        let mut proposal: FeeProposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::InvalidProposal)?;
-        if proposal.executed
-            || env.ledger().timestamp() < proposal.voting_ends_at
-            || proposal.yes_votes <= proposal.no_votes
-            || proposal.yes_votes.saturating_add(proposal.no_votes) < proposal.quorum
-        {
-            return Err(Error::InvalidProposal);
-        }
-        proposal.executed = true;
-        env.storage().persistent().set(&key, &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeBps, &proposal.fee_bps);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCap, &proposal.fee_cap);
-        Ok(())
-    }
+        // 5. Transfer the remaining balance to the recipient
+        token_client.transfer(&sender, &recipient, &recipient_amount);
 
-    pub fn get_fee_proposal(env: Env, proposal_id: u64) -> Option<FeeProposal> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::GovernanceProposal(proposal_id))
-    }
-
-    /// Sets the minimum allowed routing amount. FeeManager-protected.
-    ///
-    /// # Parameters
-    /// - `min_limit`: Smallest `amount` that `route_payment` /
-    ///   `route_payments` will accept going forward.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
-    ///
-    /// # Panics
-    /// Panics if the current FeeManager does not authorize the call.
-    ///
-    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
-    pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
-        // Circuit breaker: routing limit changes are non-essential.
-        Self::require_circuit_closed(&env)?;
-        Self::require_role(&env, Role::FeeManager)?;
-
-        env.storage().instance().set(&DataKey::MinLimit, &min_limit);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
-    }
-
-    /// Returns the current protocol fee percentage in basis points.
-    ///
-    /// # Returns
-    /// The configured `fee_bps`, or `0` if the contract has not been
-    /// initialized.
-    ///
-    /// # Panics
-    /// Does not panic.
-    pub fn get_fee(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
-    }
-
-    /// Pauses or unpauses the payment router. ComplianceOfficer-protected.
-    ///
-    /// # Parameters
-    /// - `paused`: `true` to reject `route_payment` / `route_payments`
-    ///   calls, `false` to allow them again.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
-    ///
-    /// # Panics
-    /// Panics if the current ComplianceOfficer does not authorize the call.
-    ///
-    /// This is NOT timelocked — operational pausing must remain instant.
-    pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
-        Self::require_role(&env, Role::ComplianceOfficer)?;
-
-        env.storage().instance().set(&DataKey::Paused, &paused);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        env.events().publish((symbol_short!("pause"),), (paused,));
-
-        Ok(())
-    }
-
-    /// Alias for `set_pause`. Admin-only.
-    ///
-    /// # Parameters
-    /// - `paused`: `true` to reject routing calls, `false` to allow them.
-    ///
-    /// # Returns
-    /// See `set_pause`.
-    ///
-    /// # Panics
-    /// Panics if the current admin does not authorize the call.
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
-        Self::set_pause(env, paused)
+        // 6. Log success
+        log!(&env, "Platform fee routed to treasury");
+        log!(&env, "Remaining balance routed to recipient");
     }
 
     /// Routes multiple payments from a sender to multiple recipients/tags in a single contract invocation.
@@ -1794,14 +1648,10 @@ impl PaymentRouter {
             let amount = amounts.get(i).unwrap();
 
             // Calculate the fee split for this recipient
-            let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-            let fee_cap: i128 = env.storage().instance().get(&DataKey::FeeCap).unwrap_or(0);
-
-            let mut fee_amount = (amount * fee_bps) / Self::BPS_DIVISOR;
-            if fee_amount > fee_cap {
-                fee_amount = fee_cap;
+            let mut fee_amount = (amount * Self::FEE_BPS) / Self::BPS_DIVISOR;
+            if fee_amount > Self::FEE_CAP {
+                fee_amount = Self::FEE_CAP;
             }
-            
             if fee_amount > amount {
                 fee_amount = amount;
             }
@@ -1813,106 +1663,20 @@ impl PaymentRouter {
         }
 
         // 5. Log success
-        log!(
-            &env,
-            "Batch payments processed successfully in a single transaction"
-        );
-    }
-
-    /// Performs multi-hop routing for token swaps (Token A -> Token X -> Token B) across multiple DEX pools.
-    ///
-    /// # Parameters
-    /// * `env` - The Soroban environment interface.
-    /// * `sender` - The address initiating the swap. Must authorize the transaction.
-    /// * `recipient` - The destination address for the final received tokens.
-    /// * `path` - A vector of token contract addresses representing the multi-hop routing path (`[token_in, ..., token_out]`).
-    /// * `amount_in` - The input amount of the initial token (`path[0]`).
-    /// * `min_amount_out` - The minimum acceptable output amount of the final token (`path[last]`) for slippage tolerance protection.
-    ///
-    /// # Acceptance Criteria & Errors
-    /// * Contract accepts a path array of tokens for swapping.
-    /// * Execution fails (panics) if the final received amount is below the specified slippage tolerance (`min_amount_out`).
-    /// * Gas costs are optimized for additional hops via efficient iteration and re-use of clients.
-    pub fn multi_hop_swap(
-        env: Env,
-        sender: Address,
-        _recipient: Address,
-        path: Vec<Address>,
-        amount_in: i128,
-        _min_amount_out: i128,
-    ) -> i128 {
-        // 1. Verify sender authorized the transaction
-        sender.require_auth();
-
-        // 2. Validate path length (must have at least 2 tokens: input and output)
-        let path_len = path.len();
-        if path_len < 2 {
-            panic!("invalid path length: must contain at least 2 tokens");
-        }
-
-        if amount_in <= 0 {
-            panic!("amount_in must be positive");
-        }
-
-        // 3. Transfer initial tokens from sender to router contract
-        let first_token_addr = path.get(0).unwrap();
-        let first_token_client = token::Client::new(&env, &first_token_addr);
-        let contract_address = env.current_contract_address();
-
-        first_token_client.transfer(&sender, &contract_address, &amount_in);
-
-        amount_in
-    }
-
-    /// Alias for multi-hop swap to support cargo-fuzz fuzz targets expecting `route_payments`.
-    pub fn route_payments(
-        env: Env,
-        sender: Address,
-        recipient: Address,
-        path: Vec<Address>,
-        amount_in: i128,
-        min_amount_out: i128,
-    ) -> i128 {
-        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
-    }
-
-    /// Alias for multi-hop swap route_swap.
-    pub fn route_swap(
-        env: Env,
-        sender: Address,
-        recipient: Address,
-        path: Vec<Address>,
-        amount_in: i128,
-        min_amount_out: i128,
-    ) -> i128 {
-        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
-    }
-
-    /// Alias for multi-hop swap swap.
-    pub fn swap(
-        env: Env,
-        sender: Address,
-        recipient: Address,
-        path: Vec<Address>,
-        amount_in: i128,
-        min_amount_out: i128,
-    ) -> i128 {
-        Self::multi_hop_swap(env, sender, recipient, path, amount_in, min_amount_out)
+        log!(&env, "Batch payments processed successfully in a single transaction");
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{token, Address, Env};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Env, Address, token};
 
     #[test]
     fn test_batch_pay_success() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let admin = Address::generate(&env);
         let sender = Address::generate(&env);
         let treasury = Address::generate(&env);
         let recipient1 = Address::generate(&env);
@@ -1928,7 +1692,6 @@ mod test {
 
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
-        client.route_payment(&admin, &treasury, &40, &1_000_000, &1_000_000_000_000_000);
 
         let recipients = Vec::from_array(&env, [recipient1.clone(), recipient2.clone()]);
         let amounts = Vec::from_array(&env, [100_000_000_i128, 200_000_000_i128]);
@@ -1990,120 +1753,5 @@ mod test {
 
         // Second payment exceeds sender's balance, should panic and revert entire batch
         client.batch_pay(&sender, &recipients, &treasury, &token_contract, &amounts);
-    }
-
-    #[test]
-    fn test_multi_hop_swap_success() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        // Token A, Token X (intermediate), Token B (final)
-        let token_a_admin = Address::generate(&env);
-        let token_a_contract = env.register_stellar_asset_contract(token_a_admin);
-        let token_a_client = token::StellarAssetClient::new(&env, &token_a_contract);
-
-        let token_b_admin = Address::generate(&env);
-        let token_b_contract = env.register_stellar_asset_contract(token_b_admin);
-        let token_b_client = token::StellarAssetClient::new(&env, &token_b_contract);
-
-        let token_x_admin = Address::generate(&env);
-        let token_x_contract = env.register_stellar_asset_contract(token_x_admin);
-
-        // Mint token A to sender
-        let amount_in = 100_000_000_i128;
-        token_a_client.mint(&sender, &amount_in);
-
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-
-        // Mint final token B to contract so it can transfer output to recipient
-        let expected_out = (amount_in * 997 / 1000) * 997 / 1000;
-        token_b_client.mint(&contract_id, &expected_out);
-
-        let path = Vec::from_array(
-            &env,
-            [
-                token_a_contract.clone(),
-                token_x_contract,
-                token_b_contract.clone(),
-            ],
-        );
-        let min_amount_out = expected_out - 1000; // acceptable slippage
-
-        // Test multi_hop_swap and route_payments alias
-        let res = client.try_multi_hop_swap(&sender, &recipient, &path, &amount_in, &min_amount_out);
-        let final_received = res.unwrap().unwrap();
-        assert_eq!(final_received, expected_out);
-
-        // Reset and test route_payments alias
-        token_a_client.mint(&sender, &amount_in);
-        let recipient2 = Address::generate(&env);
-        let res_alias = client.try_route_payments(&sender, &recipient2, &path, &amount_in, &min_amount_out);
-        let final_received_alias = res_alias.unwrap().unwrap();
-        assert_eq!(final_received_alias, expected_out);
-
-        let token_b_token_client = token::Client::new(&env, &token_b_contract);
-        assert_eq!(token_b_token_client.balance(&recipient), expected_out);
-        assert_eq!(token_b_token_client.balance(&recipient2), expected_out);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_multi_hop_swap_slippage_failure() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let token_a_admin = Address::generate(&env);
-        let token_a_contract = env.register_stellar_asset_contract(token_a_admin);
-        let token_a_client = token::StellarAssetClient::new(&env, &token_a_contract);
-
-        let token_b_admin = Address::generate(&env);
-        let token_b_contract = env.register_stellar_asset_contract(token_b_admin);
-        let token_x_admin = Address::generate(&env);
-        let token_x_contract = env.register_stellar_asset_contract(token_x_admin);
-
-        let amount_in = 100_000_000_i128;
-        token_a_client.mint(&sender, &amount_in);
-
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-
-        let path = Vec::from_array(&env, [token_a_contract, token_x_contract, token_b_contract]);
-        // Set min_amount_out higher than amount_in to trigger slippage failure
-        let min_amount_out = amount_in * 2;
-
-        client.multi_hop_swap(&sender, &recipient, &path, &amount_in, &min_amount_out);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_multi_hop_swap_invalid_path_length() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let token_a_admin = Address::generate(&env);
-        let token_a_contract = env.register_stellar_asset_contract(token_a_admin);
-        let token_a_client = token::StellarAssetClient::new(&env, &token_a_contract);
-
-        let amount_in = 100_000_000_i128;
-        token_a_client.mint(&sender, &amount_in);
-
-        let contract_id = env.register_contract(None, PaymentRouter);
-        let client = PaymentRouterClient::new(&env, &contract_id);
-
-        // Path with only 1 token (invalid)
-        let path = Vec::from_array(&env, [token_a_contract]);
-        let min_amount_out = 50_000_000_i128;
-
-        client.multi_hop_swap(&sender, &recipient, &path, &amount_in, &min_amount_out);
     }
 }
