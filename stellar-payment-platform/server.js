@@ -398,6 +398,99 @@ const etagCache = (req, res, next) => {
   next();
 };
 
+const getLocalUserByAddress = async (address) =>
+  poolGet(
+    'SELECT username, address FROM username_registry WHERE address = ? LIMIT 1',
+    [address],
+  );
+
+const getLocalUserByUsername = async (username) =>
+  poolGet(
+    'SELECT username, address FROM username_registry WHERE username = ? LIMIT 1',
+    [username],
+  );
+
+const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
+  const searchPattern = `%${search}%`;
+  const LIKE_FILTER =
+    'WHERE (username LIKE ? COLLATE NOCASE OR address LIKE ? COLLATE NOCASE)';
+
+  if (cursorPoint) {
+    // Keyset mode for the fallback path as well. created_at is stored as an
+    // ISO-8601 string, so lexicographic comparison matches chronological
+    // ordering and the tuple predicate seeks straight past the cursor row.
+    const rows = await poolAll(
+      `SELECT username, address, created_at
+      FROM username_registry
+      ${LIKE_FILTER}
+      AND (created_at < ? OR (created_at = ? AND username < ?))
+      ORDER BY created_at DESC, username DESC
+      LIMIT ?`,
+      [searchPattern, searchPattern, String(cursorPoint.createdAt), String(cursorPoint.createdAt), String(cursorPoint.username), limit + 1],
+    );
+    const normalized = rows.map((row) => ({
+      username: row.username,
+      address: row.address,
+      createdAt: row.created_at,
+    }));
+    const { rows: pageRows, hasMore, nextCursor } = paginateByKeyset(normalized, limit);
+    return cursorPaginatedResponse(
+      pageRows.map((user) => ({
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt,
+      })),
+      { limit, nextCursor, hasMore },
+    );
+  }
+
+  const skip = (page - 1) * limit;
+  const rows = await poolAll(
+    `SELECT username, address, created_at
+     FROM username_registry
+     ${LIKE_FILTER}
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`,
+    [searchPattern, searchPattern, limit, skip],
+  );
+
+  const countRow = await poolGet(
+    `SELECT COUNT(*) AS totalCount
+     FROM username_registry
+     ${LIKE_FILTER}`,
+    [searchPattern, searchPattern],
+  );
+
+  const totalCount = Number(countRow?.totalCount || 0);
+  return paginatedResponse(
+    rows.map((user) => ({
+      username: user.username,
+      address: user.address,
+      created_at: user.created_at,
+    })),
+    totalCount,
+    { page, limit },
+  );
+};
+
+const registerLocalUser = async ({ username, address }) => {
+  const existingByAddress = await getLocalUserByAddress(address);
+  if (existingByAddress) {
+    throw new ApiError('CONFLICT', 'Address already registered');
+  }
+
+  const existingByUsername = await getLocalUserByUsername(username);
+  if (existingByUsername) {
+    throw new ApiError('CONFLICT', 'Username is already taken. Please choose another.');
+  }
+
+  await poolRun(
+    `INSERT INTO username_registry (username, address, created_at)
+     VALUES (?, ?, ?)`,
+    [username, address, new Date().toISOString()],
+  );
+};
+
 // Expose /metrics endpoint for Prometheus to scrape
 
 /**
@@ -462,12 +555,10 @@ app.get(
             orderBy: PRIMARY_USERNAME_ORDER,
           });
 
-          if (!row) return null;
-          if (row.flaggedAt) {
-            const forbiddenError = new Error("Address is blocked");
-            forbiddenError.statusCode = 403;
-            throw forbiddenError;
-          }
+        if (!row) return null;
+        if (row.flaggedAt) {
+          throw new ApiError('FORBIDDEN', 'Address is blocked');
+        }
 
           const response = {
             stellar_address: `${row.username}*${process.env.DOMAIN || "localhost"}`,
@@ -480,11 +571,9 @@ app.get(
           return response;
         });
 
-        if (!cached) {
-          const notFoundError = new Error("Address not found");
-          notFoundError.statusCode = 404;
-          return next(notFoundError);
-        }
+      if (!cached) {
+        return next(new ApiError('NOT_FOUND', 'Address not found'));
+      }
 
         return res.json(cached);
       } else if (type === "name" || !type) {
@@ -504,9 +593,12 @@ app.get(
           });
 
           if (row && row.flaggedAt) {
-            const forbiddenError = new Error("Address is blocked");
-            forbiddenError.statusCode = 403;
-            throw forbiddenError;
+            throw new ApiError('FORBIDDEN', 'Address is blocked');
+          }
+        } catch (error) {
+          if (error instanceof ApiError && error.code === 'FORBIDDEN') throw error;
+          if (!shouldFallbackToLocalRegistry(error)) {
+            throw error;
           }
 
           const address = row?.address || USER_DATABASE[queryName];
@@ -529,22 +621,18 @@ app.get(
           return next(notFoundError);
         }
 
-        return res.json(cached);
-      } else {
-        return next(
-          new ApiError(
-            "INVALID_INPUT",
-            "Unsupported query type. Supported types: 'id', 'name'",
-          ),
-        );
+      if (!cached) {
+        return next(new ApiError('NOT_FOUND', 'Name tag not found'));
       }
     } catch (error) {
       const dbError = new Error("Database lookup failed", { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
     }
-  },
-);
+  } catch (error) {
+    return next(new ApiError('INTERNAL_ERROR', 'Database lookup failed', { cause: error }));
+  }
+});
 
 // Initialise profanity filter once at module load (reused across requests).
 const profanityFilter = new Filter();
@@ -558,9 +646,7 @@ const verifyFreighterRegistrationSignature = ({
   const claimedSigner = signerAddress || address;
 
   if (!StrKey.isValidEd25519PublicKey(claimedSigner)) {
-    const error = new Error("Invalid signer address format.");
-    error.statusCode = 400;
-    throw error;
+    throw new ApiError('INVALID_INPUT', 'Invalid signer address format.');
   }
 
   const keypair = Keypair.fromPublicKey(claimedSigner);
@@ -583,7 +669,7 @@ const verifyFreighterRegistrationSignature = ({
       }
     }
   } else {
-    throw new Error("Invalid message signature format.");
+    throw new ApiError('INVALID_INPUT', 'Invalid message signature format.');
   }
 
   // --- SEP-0053 Verification Logic ---
@@ -599,19 +685,13 @@ const verifyFreighterRegistrationSignature = ({
     if (!keypair.verify(messageBytes, signatureBuffer)) {
       // Also try verifying the payload without hashing it
       if (!keypair.verify(payload, signatureBuffer)) {
-        const error = new Error("Signature verification failed.");
-        error.statusCode = 401;
-        throw error;
+        throw new ApiError('UNAUTHENTICATED', 'Signature verification failed.');
       }
     }
   }
 
   if (claimedSigner !== address) {
-    const error = new Error(
-      "Signer address does not match the connected wallet.",
-    );
-    error.statusCode = 401;
-    throw error;
+    throw new ApiError('UNAUTHENTICATED', 'Signer address does not match the connected wallet.');
   }
 
   return claimedSigner;
@@ -670,10 +750,9 @@ app.post(
       );
     }
 
-    // Extract the username part before the * for the profanity check
-    const usernameLocalPart = username.includes("*")
-      ? username.split("*")[0]
-      : username;
+  if (!StrKey.isValidEd25519PublicKey(address)) {
+    return next(new ApiError('INVALID_INPUT', 'Invalid Stellar Public Key format.'));
+  }
 
     // Reject usernames containing profanity or offensive words.
     if (profanityFilter.isProfane(usernameLocalPart)) {
@@ -702,22 +781,8 @@ app.post(
       return res.status(403).json({ error: "Username is reserved." });
     }
 
-    const RESERVED_NAMES = [
-      "admin",
-      "root",
-      "support",
-      "system",
-      "stellar",
-      "api",
-      "help",
-    ];
-    if (RESERVED_NAMES.includes(normalizedUsername)) {
-      return next(
-        new ApiError(
-          "FORBIDDEN",
-          "This username is reserved and cannot be registered.",
-        ),
-      );
+    if (existing) {
+      return next(new ApiError('CONFLICT', 'Address already registered'));
     }
 
     try {
@@ -739,10 +804,19 @@ app.post(
       }
       const isPrimary = usernameCount === 0;
 
-      let verificationResult = null;
-      if (signature) {
-        const isLegacyPublicKeyFlow =
-          StrKey.isValidEd25519PublicKey(signature) && !signerAddress;
+        if (!verificationResult.success) {
+          throw new ApiError(
+            'UNAUTHENTICATED',
+            verificationResult.errorMessage || 'Signature verification failed',
+          );
+        }
+      } else {
+        const claimedSigner = verifyFreighterRegistrationSignature({
+          username: req.body.username,
+          address: req.body.address, // Make sure this is using the raw body too!
+          signature,
+          signerAddress,
+        });
 
         if (isLegacyPublicKeyFlow) {
           verificationResult = await verifyMultiSignerThreshold(
@@ -857,25 +931,46 @@ app.post(
         return next(notFoundError);
       }
 
-      // Handle signature verification errors
-      if (error.statusCode === 401) {
-        return next(error);
-      }
+    return res.status(201).json({
+      ok: true,
+      username: normalizedUsername,
+      address,
+      federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      ...(verificationResult && {
+        verification: {
+          accountId: verificationResult.accountId,
+          signerCount: verificationResult.signerCount,
+          thresholdMet: verificationResult.success,
+          requiredThreshold: verificationResult.requiredThreshold,
+          providedWeight: verificationResult.totalWeight,
+        },
+      }),
+      ...(memoType && { memo_type: memoType, memo }),
+    });
+  } catch (error) {
+    if (error.code === '23505' || (error.message && error.message.includes('UNIQUE'))) {
+      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
+    }
+    
+    // Handle verification errors
+    if (error.message && error.message.includes('Account not found')) {
+      return next(new ApiError('NOT_FOUND', `Account not found on Horizon: ${address}`));
+    }
 
-      // Handle other errors
-      logger.error({ err: error.message }, "Registration error:");
-      const registrationError = new Error(
-        `Registration verification failed: ${error.message}`,
-      );
-      registrationError.statusCode = 500;
-      return next(registrationError);
+    // Pass ApiError instances through unchanged (e.g. UNAUTHENTICATED from signature check)
+    if (error instanceof ApiError) {
+      return next(error);
     }
   },
 );
 
-app.all("/register", (req, res, next) =>
-  next(new ApiError("METHOD_NOT_ALLOWED")),
-);
+    // Handle other errors
+    logger.error({ err: error.message }, 'Registration error:');
+    return next(new ApiError('INTERNAL_ERROR', 'Registration verification failed', { cause: error }));
+  }
+});
+
+app.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWED')));
 
 /**
  * @openapi
@@ -914,13 +1009,8 @@ app.get(
           return next(notFoundError);
         }
 
-        return res.json(result);
-      } catch (err) {
-        logger.error(err, "≡ƒÜ¿ ACTUAL PRISMA ERROR:");
-
-        const dbError = new Error("Database lookup failed", { cause: err });
-        dbError.statusCode = 500;
-        return next(dbError);
+      if (!result) {
+        return next(new ApiError('NOT_FOUND', 'Username not found for this address'));
       }
     }
 
@@ -986,12 +1076,10 @@ app.get(
           );
         }
 
-
-      return res.json(response);
-    } catch (error) {
-      const dbError = new Error("Database lookup failed", { cause: error });
-      dbError.statusCode = 500;
-      return next(dbError);
+      return res.json(result);
+    } catch (err) {
+      logger.error(err, '🚨 ACTUAL PRISMA ERROR:');
+      return next(new ApiError('INTERNAL_ERROR', 'Database lookup failed', { cause: err }));
     }
   },
 );
@@ -1059,17 +1147,40 @@ app.get(
         );
       }
 
-      const [totalCount, rows] = await prisma.$transaction([
-        prisma.user.count({ where }),
-        prisma.user.findMany({
-          where,
-          orderBy: [{ createdAt: "desc" }, { username: "desc" }],
-          skip,
-          take: limit,
-        }),
-      ]);
+    return res.json(response);
+  } catch (error) {
+    return next(new ApiError('INTERNAL_ERROR', 'Database lookup failed', { cause: error }));
+  }
+});
 
-      const totalPages = Math.ceil(totalCount / limit);
+app.get('/users', validateSchema({ query: usersQuerySchema }), async (req, res, next) => {
+  const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
+  const { page, limit, skip } = parsePagination(req.query);
+  if (invalidCursor) {
+    return next(new ApiError('INVALID_INPUT', 'Invalid cursor parameter'));
+  }
+  const search = req.query.search ?? null;
+
+  const where = search
+    ? {
+        deletedAt: null,
+        OR: [
+          { username: { contains: search, mode: 'insensitive' } },
+          { address: { contains: search, mode: 'insensitive' } },
+        ],
+      }
+    : { deletedAt: null };
+
+  try {
+    if (cursor) {
+      // Keyset mode: seek straight past the cursor row instead of skipping
+      // every preceding row, so deep pages cost the same as page one.
+      const candidates = await prisma.user.findMany({
+        where: { AND: [where, keysetWhereDesc(cursor)] },
+        orderBy: [{ createdAt: 'desc' }, { username: 'desc' }],
+        take: cursorLimit + 1,
+      });
+      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
       const data = rows.map((user) => ({
         username: user.username,
         address: user.address,
@@ -1088,43 +1199,14 @@ app.get(
         },
         totalCount,
         totalPages,
-        currentPage: page,
-      });
-    } catch (error) {
-      const dbError = new Error("Database error", { cause: error });
-      dbError.statusCode = 500;
-      return next(dbError);
-    }
-  },
-);
-// Request versioning: URI (/api/v1, /api/v2) first, then Accept-Version /
-// API-Version header, defaulting to v1. Routers below then decide routing.
-app.use(apiVersion);
-
-// RFC 8594 deprecation headers: attaches Deprecation/Sunset/Link to endpoints
-// listed in src/config/deprecations.js and logs a server-side warning.
-app.use(deprecationMiddleware());
-
-// v2 first so an explicit /api/v2 request wins over the unversioned fallback.
-app.use("/api/v2", v2Router);
-// Explicit v1 mount, then /api (no version) and the legacy unversioned root
-// both resolve to v1 so existing clients keep working unchanged.
-app.use("/api/v1", v1Router);
-// #492 ΓÇö Strict rate limiter for auth/login endpoints. These are prime
-// brute-force targets, so they get a much tighter budget than the global
-// limiter. Uses the same Redis-backed store so the limit is shared across
-// all distributed nodes.
-const authLimiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  prefix: "auth-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
-  keyGenerator: (req) =>
-    req.ip || (req.connection && req.connection.remoteAddress) || "",
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
+  } catch (error) {
+    return next(new ApiError('INTERNAL_ERROR', 'Database error', { cause: error }));
+  }
 });
 
 app.use("/api", v1Router);
