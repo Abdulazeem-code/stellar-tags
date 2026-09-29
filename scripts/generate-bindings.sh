@@ -45,9 +45,13 @@ echo "Using CLI: $CLI"
 echo "Building payment_router contract (wasm32-unknown-unknown, release)..."
 cargo build --manifest-path "$CONTRACT_DIR/Cargo.toml" --target wasm32-unknown-unknown --release
 
-WASM="$CONTRACT_DIR/$WASM_REL"
+WASM="$ROOT/$WASM_REL"
 if [[ ! -f "$WASM" ]]; then
-  echo "error: expected WASM artifact not found at $WASM" >&2
+  # Fall back to a crate-local target dir for standalone checkouts.
+  WASM="$CONTRACT_DIR/$WASM_REL"
+fi
+if [[ ! -f "$WASM" ]]; then
+  echo "error: expected WASM artifact not found at $ROOT/$WASM_REL" >&2
   exit 1
 fi
 
