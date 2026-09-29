@@ -79,6 +79,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: stellar_tags
+    command: ["postgres", "-c", "wal_level=logical"]
     ports:
       - "5432:5432"
     volumes:
@@ -360,6 +361,77 @@ services:
       timeout: 5s
       retries: 20
       start_period: 30s
+
+  zookeeper:
+    profiles: ["dev", "full", "mtls"]
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    profiles: ["dev", "full", "mtls"]
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+  debezium:
+    profiles: ["dev", "full", "mtls"]
+    image: debezium/connect:2.4
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: 'kafka:29092'
+      GROUP_ID: '1'
+      CONFIG_STORAGE_TOPIC: 'my_connect_configs'
+      OFFSET_STORAGE_TOPIC: 'my_connect_offsets'
+      STATUS_STORAGE_TOPIC: 'my_connect_statuses'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  debezium-init:
+    profiles: ["dev", "full", "mtls"]
+    image: curlimages/curl
+    depends_on:
+      debezium:
+        condition: service_started
+    command: >
+      sh -c '
+      echo "Waiting for Debezium to be ready...";
+      while ! curl -s -f http://debezium:8083/ > /dev/null; do sleep 2; done;
+      echo "Registering Postgres connector...";
+      curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" http://debezium:8083/connectors -d '\''
+      {
+        "name": "postgres-connector",
+        "config": {
+          "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+          "tasks.max": "1",
+          "database.hostname": "postgres",
+          "database.port": "5432",
+          "database.user": "postgres",
+          "database.password": "postgres",
+          "database.dbname": "stellar_tags",
+          "database.server.name": "dbserver1",
+          "topic.prefix": "pg",
+          "plugin.name": "pgoutput"
+        }
+      }'\''
+      '
 
 volumes:
   pgdata:
