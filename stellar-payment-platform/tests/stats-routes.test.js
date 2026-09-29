@@ -12,7 +12,7 @@ jest.mock('../prismaClient', () => ({
 }));
 
 jest.mock('../src/db', () => ({
-  poolGet: jest.fn(),
+  
   etagCache: (req, res, next) => next(),
 }));
 

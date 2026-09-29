@@ -26,9 +26,9 @@ jest.mock('../src/services/ownershipService', () => ({
 
 jest.mock('../src/multisigner-verifier', () => ({ verifyMultiSignerThreshold: jest.fn() }));
 jest.mock('../src/db', () => ({
-  poolGet: jest.fn(),
-  poolRun: jest.fn(),
-  poolAll: jest.fn(),
+  
+  
+  
   etagCache: (req, res, next) => next(),
   normalizeNameTag: require('../src/utils').normalizeNameTag,
 }));
