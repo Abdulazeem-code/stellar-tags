@@ -70,11 +70,9 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
 
-    // accumulated_amount — bytes 8..24
-    let accumulated_amount = i128::from_be_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
-        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-    ]);
+fn pack_spending(last_reset_time: u64, accumulated_amount: i128) -> u128 {
+    ((last_reset_time as u128) << 64) | ((accumulated_amount as u128) & 0xFFFF_FFFF_FFFF_FFFF)
+}
 
 fn unpack_spending(packed: u128) -> (u64, i128) {
     let last_reset_time = (packed >> 64) as u64;
@@ -308,6 +306,9 @@ pub enum DataKey {
     /// Maximum tolerated swap slippage in basis points, applied against a
     /// caller-supplied quote.  Stored as `i128` in instance storage.
     MaxSlippageBps,
+    MerkleRoot,
+    RebateToken,
+    MerkleClaimed(Address),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -368,6 +369,8 @@ pub enum Error {
     InvalidProposal = 23,
     /// The caller already voted on the proposal.
     AlreadyVoted = 24,
+    InvalidMerkleProof = 20,
+    RebateAlreadyClaimed = 21,
 }
 
 /// Soroban contract that routes token payments between addresses while
