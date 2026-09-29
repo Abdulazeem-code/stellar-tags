@@ -25,6 +25,7 @@ const {
 } = require('../../schemas');
 const { streamAdminExport } = require('../../utils/exporter');
 const { getRoutingStats } = require('../../services/statsService');
+const { getRoutingStatsFromAnalytics, getAnalyticsPool } = require('../../analytics/analyticsRepository');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
@@ -358,20 +359,33 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
-      const { prisma } = getPrisma();
+      const selectedInterval = interval || groupBy || 'day';
 
+      // Prefer the analytics read model (TimescaleDB) when available.
+      // Falls back to the primary Prisma DB when ANALYTICS_DATABASE_URL is
+      // not configured so development without TimescaleDB keeps working.
+      const analyticsPool = getAnalyticsPool();
+      if (analyticsPool) {
+        const stats = await getRoutingStatsFromAnalytics({
+          startDate,
+          endDate,
+          groupBy: selectedInterval,
+          assetCode,
+          pool: analyticsPool,
+        });
+        return res.status(200).json({ success: true, ...stats });
+      }
+
+      // Fallback: query the transactional Prisma DB directly.
+      const { prisma } = getPrisma();
       const stats = await getRoutingStats({
         prisma,
         startDate,
         endDate,
-        groupBy: interval || groupBy || 'day',
+        groupBy: selectedInterval,
         assetCode,
       });
-
-      return res.status(200).json({
-        success: true,
-        ...stats,
-      });
+      return res.status(200).json({ success: true, ...stats });
     }),
   );
 
