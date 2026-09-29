@@ -93,6 +93,10 @@
     "POSIX",
     "ZIPKIN",
     "SOROSWAP",
-    "COOLDOWN"
+    "COOLDOWN",
+    "CQRS",
+    "XADD",
+    "XREADGROUP",
+    "XTRIM"
   ]
 }
