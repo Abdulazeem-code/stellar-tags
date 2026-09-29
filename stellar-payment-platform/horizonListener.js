@@ -1,14 +1,4 @@
-// ---------------------------------------------------------------------------
-// #52 — SSE Horizon Listener for Real-Time Payment Detection
-// ---------------------------------------------------------------------------
-// This background service connects to the Stellar Horizon network using
-// Server-Sent Events (SSE) to monitor incoming payments for all public keys
-// registered in the local federation database.
-//
-// Usage:
-//   npm run listener                  (testnet, default)
-//   HORIZON_NETWORK=public npm run listener  (mainnet)
-// ---------------------------------------------------------------------------
+// SSE Horizon Listener for Real-Time Payment Detection
 
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
@@ -25,9 +15,7 @@ const {
 } = require('./src/services/stellarService');
 const { publishPaymentUpdate } = require('./src/websocket');
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
 
 const HORIZON_URLS = {
@@ -38,40 +26,13 @@ const HORIZON_URLS = {
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
-// ---------------------------------------------------------------------------
-// Redis publisher for real-time WebSocket events
-// ---------------------------------------------------------------------------
-// When a payment is detected on-chain we publish a message to the Redis
-// channel `stellar:payment:update`. The API server process subscribes to that
-// channel (via src/websocket/index.js) and broadcasts the event to every
-// browser client currently watching the affected payment intent ID.
-//
-// A dedicated ioredis connection is used for publishing so the BullMQ
-// worker connections (which require maxRetriesPerRequest: null) are unaffected.
-const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
-if (redisPublisher) {
-  redisPublisher.on('error', (err) =>
-    logger.error({ err }, '[listener] Redis publisher error'),
-  );
-} else {
-  logger.warn(
-    '[listener] REDIS_URL not set — real-time WebSocket payment updates are disabled.',
-  );
-}
 
-// ---------------------------------------------------------------------------
-// Horizon Health-Check Circuit Breaker
-// ---------------------------------------------------------------------------
-// Wraps a lightweight Horizon query so we can detect outages fast and avoid
-// opening new streams (or polling the DB) while Horizon is unreachable.
 const healthCheckBreaker = createBreaker(
   () => horizon.ledgers().latest().call(),
   { timeout: 5000, volumeThreshold: 3 },
 );
 
-// ---------------------------------------------------------------------------
-// Stream Management
-// ---------------------------------------------------------------------------
+
 const activeStreams = new Map();
 const fraudStream = process.env.REDIS_URL ? createRedisConnection() : null;
 // Handle for the periodic account-sync timer, kept so shutdown can clear it.
@@ -80,9 +41,7 @@ let syncInterval = null;
 // takes longer than the poll interval.
 let isSyncing = false;
 
-// ---------------------------------------------------------------------------
-// Formatting Helpers
-// ---------------------------------------------------------------------------
+
 const timestamp = () => new Date().toISOString();
 
 const formatPayment = (payment, trackedAccount) => {
@@ -104,96 +63,13 @@ const formatPayment = (payment, trackedAccount) => {
   ].join('\n');
 };
 
-const publishPaymentForFraudDetection = async (payment) => {
-  if (!fraudStream) return;
-  const payload = { ...payment, event_id: payment.transaction_hash || payment.paging_token };
-  await fraudStream.xadd(PAYMENT_STREAM, '*', 'payload', JSON.stringify(payload));
-};
+
 
 // ---------------------------------------------------------------------------
 // Stream Management
 // ---------------------------------------------------------------------------
 
-/**
- * Resolve any pending PaymentIntent records that match the on-chain payment
- * and broadcast a real-time status update via Redis → Socket.io.
- *
- * A PaymentIntent is considered a match when:
- *   - its `to` address equals the payment's destination, and
- *   - its `status` is still "pending".
- *
- * On a match we mark the intent as "completed" and publish the event so the
- * API server can notify subscribed browser clients over the WebSocket channel.
- *
- * @param {object} payment         - The Horizon payment operation object.
- * @param {string} trackedAccount  - The local address that was being watched.
- */
-const notifyPaymentIntents = async (payment, trackedAccount) => {
-  if (!redisPublisher) return; // Real-time updates not configured
-
-  try {
-    // Find pending intents addressed to this account. There may be several
-    // (e.g. multiple outstanding invoices for the same recipient).
-    const matchingIntents = await prisma.paymentIntent.findMany({
-      where: {
-        to: trackedAccount,
-        status: 'pending',
-      },
-      select: { id: true },
-    });
-
-    if (matchingIntents.length === 0) return;
-
-    // Update all matched intents to "completed" in one atomic batch.
-    await prisma.paymentIntent.updateMany({
-      where: {
-        id: { in: matchingIntents.map((i) => i.id) },
-        status: 'pending', // guard against concurrent updates
-      },
-      data: { status: 'completed' },
-    });
-
-    // Broadcast a real-time update for each resolved intent.
-    const updatePayload = {
-      status: 'completed',
-      transactionHash: payment.transaction_hash,
-      from: payment.from,
-      to: payment.to,
-      amount: payment.amount,
-      asset:
-        payment.asset_type === 'native'
-          ? 'XLM'
-          : `${payment.asset_code}:${payment.asset_issuer}`,
-      detectedAt: new Date().toISOString(),
-    };
-
-    await Promise.all(
-      matchingIntents.map((intent) =>
-        publishPaymentUpdate(redisPublisher, intent.id, updatePayload),
-      ),
-    );
-
-    logger.info(
-      {
-        count: matchingIntents.length,
-        transactionHash: payment.transaction_hash,
-        to: trackedAccount,
-      },
-      '[listener] Published payment:update for matching PaymentIntent(s)',
-    );
-  } catch (err) {
-    logger.error(
-      { err: err.message, transactionHash: payment.transaction_hash },
-      '[listener] Failed to notify PaymentIntent(s) via WebSocket',
-    );
-  }
-};
-
-/**
- * Open a payment SSE stream for a single Stellar account.
- * On error the stream is removed from the active map so the next sync cycle
- * can attempt to reconnect it (instead of staying stuck on a dead stream).
- */
+// Open a payment SSE stream for a single Stellar account.
 const watchAccount = (accountId) => {
   if (activeStreams.has(accountId)) {
     return; // Already watching
@@ -204,10 +80,7 @@ const watchAccount = (accountId) => {
   let closeStream = null;
   let closed = false;
 
-  // Idempotent teardown for a single account stream. Closing the SDK stream is
-  // essential: it owns a reconnect timer plus an EventSource/socket that keep
-  // running (and retaining their closures) until the returned close function is
-  // invoked. Dropping the map entry alone leaked both (#683).
+
   const stopStream = () => {
     if (closed) return;
     closed = true;
@@ -232,26 +105,16 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
-          publishPaymentForFraudDetection(payment).catch((err) =>
-            logger.error({ err, transactionHash: payment.transaction_hash }, 'Failed to publish payment to fraud stream'),
-          );
-          dispatchPaymentWebhooks({
-            prisma,
-            payment,
-          }).catch((err) =>
-            logger.error(
-              `[${timestamp()}] ⚠️  Webhook dispatch failed for tx ${payment.transaction_hash}:`,
-              err?.message || err,
-            ),
-          );
-          // Emit a real-time WebSocket update for any pending PaymentIntent
-          // records addressed to this account.
-          notifyPaymentIntents(payment, accountId).catch((err) =>
-            logger.error(
-              `[${timestamp()}] ⚠️  WebSocket notification failed for tx ${payment.transaction_hash}:`,
-              err?.message || err,
-            ),
-          );
+          prisma.payment.create({
+            data: {
+              transactionHash: payment.transaction_hash,
+              fromAddress: payment.from,
+              toAddress: payment.to,
+              amount: parseFloat(payment.amount),
+              assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
+              status: 'completed'
+            }
+          }).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
         }
       },
       onerror: (error) => {
@@ -259,9 +122,7 @@ const watchAccount = (accountId) => {
           `[${timestamp()}] ⚠️  Stream error for ${accountId}:`,
           error?.message || error,
         );
-        // Release the dead stream (socket + reconnect timer) before removing
-        // the map entry, so syncWatchedAccounts can re-open a fresh one next
-        // poll cycle without leaking the old connection.
+        // Release dead stream before removing map entry
         stopStream();
         logger.info(
           `[${timestamp()}] 🔄 Removed dead stream for ${accountId}; will reconnect on next sync`,
@@ -270,9 +131,7 @@ const watchAccount = (accountId) => {
     });
 
   if (closed) {
-    // `onerror` fired synchronously while the stream was being created, before
-    // we could register its close function. Close it now and skip the map so
-    // the next sync retries cleanly.
+    // Close synchronously-errored stream
     if (typeof closeStream === 'function') {
       try {
         closeStream();
@@ -289,17 +148,13 @@ const watchAccount = (accountId) => {
   activeStreams.set(accountId, stopStream);
 };
 
-/**
- * Query the local database for all registered public keys and open
- * streams for any that aren't already being watched.
- */
+// Query the local database for all registered public keys and open streams for any that aren't already being watched.
 const syncWatchedAccounts = async () => {
-  if (isSyncing) return; // previous cycle still running — don't stack streams
+  if (isSyncing) return;
   isSyncing = true;
 
   try {
-    // Fast-fail when Horizon is known to be down — don't waste resources
-    // opening streams that will immediately error.
+
     try {
       await healthCheckBreaker.fire();
     } catch {
@@ -347,13 +202,10 @@ const syncWatchedAccounts = async () => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Graceful Shutdown
-// ---------------------------------------------------------------------------
+
 const shutdown = async () => {
   logger.info(`\n[${timestamp()}] Shutting down Horizon listener...`);
 
-  // Stop the poll timer so no new sync (and therefore no new stream) starts.
   if (syncInterval) {
     clearInterval(syncInterval);
     syncInterval = null;
@@ -381,9 +233,7 @@ const shutdown = async () => {
   process.exit(0);
 };
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+
 const main = async () => {
   logger.info('═══════════════════════════════════════════════════════');
   logger.info('  Stellar Horizon Payment Listener');
@@ -402,8 +252,7 @@ const main = async () => {
     logger.error('Failed to schedule webhook retry job:', err.message);
   }
 
-  // Periodically check for newly registered accounts. The handle is retained
-  // (and unref'd) so shutdown can clear it instead of leaking the timer.
+  // Periodically check for newly registered accounts.
   syncInterval = setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
   if (syncInterval && typeof syncInterval.unref === 'function') {
     syncInterval.unref();
@@ -412,9 +261,7 @@ const main = async () => {
   return { syncInterval };
 };
 
-// Only bootstrap when executed directly (`node horizonListener.js`); importing
-// the module (e.g. from tests) must not start streams or install signal
-// handlers.
+
 if (require.main === module) {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);

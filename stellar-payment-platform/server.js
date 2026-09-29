@@ -1356,4 +1356,5 @@ module.exports = {
   gracefulShutdown,
   rejectNestedObjects,
   validateMemo,
+  normalizeNameTag,
 };
