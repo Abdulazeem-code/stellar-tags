@@ -1169,20 +1169,12 @@ impl PaymentRouter {
     /// in instance storage. Must be called before `route_payment`.
     ///
     /// # Parameters
-    /// - `admin`: Address granted admin rights over the contract; must
-    ///   authorize this call.
-    /// - `platform_treasury`: Address that receives collected platform fees.
-    /// - `fee_bps`: Platform fee rate, in basis points.
-    /// - `fee_cap`: Maximum fee (in the token's smallest unit) taken from a
-    ///   single payment.
-    /// - `max_amount`: Maximum amount accepted by a single payment.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or `Err(Error::AlreadyInitialized)` if the
-    /// contract already has an admin set.
-    ///
-    /// # Panics
-    /// Panics if `admin` does not authorize the call.
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the payment. Must authorize the transaction.
+    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
+    /// * `platform_treasury` - The address where the platform fee will be deposited.
+    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
+    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -6019,12 +6011,9 @@ mod test {
         assert_eq!(client.get_fee(), 200);
     }
 
-    // ── Token swaps: cross-contract DEX routing ──────────────────────────────
-    //
-    // Issue #665.  These tests drive `route_payment_with_swap` and
-    // `route_payments_with_swap` against a mock DEX that implements the
-    // adapter interface the router expects, and assert both the happy path
-    // and that every failure mode leaves the sender whole.
+    #[test]
+    fn test_tiered_fee_discount_applied_after_volume_threshold() {
+        let (env, client, _) = setup_env();
 
     /// Instance-storage keys for [`MockDex`].
     #[contracttype]
