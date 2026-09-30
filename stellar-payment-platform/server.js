@@ -1,4 +1,4 @@
-﻿require("./src/utils/tracing");
+require("./src/utils/tracing");
 require("./config/envCheck");
 const express = require("express");
 const pinoHttp = require("pino-http");
@@ -6,6 +6,7 @@ const cors = require("cors");
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
+const { maintenanceMiddleware } = require("./src/middleware/maintenance");
 const crypto = require("crypto");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
@@ -33,7 +34,9 @@ const {
   getMetrics,
   getContentType,
   setMetricsSources,
+  setDlqDepthSource,
 } = require("./src/metrics");
+const { closeDlqQueue, getDlqDepth, hasOpenDlqQueues } = require("./src/dlq");
 const { validateSchema } = require("./src/middleware/validateSchema");
 const {
   buildErrorHandler,
@@ -79,6 +82,10 @@ const {
   USER_DATABASE,
 } = require("./src/utils");
 const { getCachedApprovedOrigins } = require("./src/originCache");
+const {
+  initWebSocket,
+  closeWebSocket,
+} = require("./src/websocket");
 const { createHttpServer, describeTlsStatus } = require("./src/config/tls");
 const { requireMutualTls, serviceIdentity } = require("./src/middleware/mtls");
 
@@ -128,6 +135,7 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
 app.disable("x-powered-by");
 app.use(securityMiddleware);
+app.use(maintenanceMiddleware);
 
 app.use(timeout("10s"));
 app.use((err, req, res, next) => {
@@ -226,6 +234,8 @@ if (redisClient) {
 }
 
 setMetricsSources({ prisma, redisClient });
+// Lets /metrics report DLQ depth without the metrics module importing BullMQ.
+setDlqDepthSource(getDlqDepth);
 
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
@@ -391,12 +401,6 @@ const etagCache = (req, res, next) => {
 
   next();
 };
-
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    "SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1",
-    [username],
-  );
 
 // Expose /metrics endpoint for Prometheus to scrape
 
@@ -1237,21 +1241,34 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
-  server.close(async () => {
-    clearTimeout(timer);
-    try {
-      await prismaClient.$disconnect();
-    } catch (err) {
-      logger.error(err, "Error disconnecting Prisma during shutdown:");
-    }
-    if (redis) {
+  // Gracefully close Socket.io before closing the underlying HTTP server so
+  // existing WebSocket connections can finish in-flight before being dropped.
+  closeWebSocket().then(() => {
+    server.close(async () => {
+      clearTimeout(timer);
       try {
-        await redis.quit();
+        await prismaClient.$disconnect();
       } catch (err) {
-        logger.error(err, "Error disconnecting Redis during shutdown:");
+        logger.error(err, "Error disconnecting Prisma during shutdown:");
       }
-    }
-    process.exit(0);
+      if (redis) {
+        try {
+          await redis.quit();
+        } catch (err) {
+          logger.error(err, "Error disconnecting Redis during shutdown:");
+        }
+      }
+      // Only await when the DLQ was actually used, so a process that never
+      // opened it does not pay for an extra async hop during shutdown.
+      if (hasOpenDlqQueues()) {
+        try {
+          await closeDlqQueue();
+        } catch (err) {
+          logger.error(err, "Error closing the DLQ queues during shutdown:");
+        }
+      }
+      process.exit(0);
+    });
   });
 };
 
@@ -1297,6 +1314,11 @@ if (require.main === module) {
       }
     });
 
+    // Attach Socket.io to the same HTTP server so WebSocket upgrades are
+    // handled on the same port as the REST API. Pass the existing CORS
+    // allow-list so WebSocket handshakes respect the same origin policy.
+    initWebSocket(server, allowedOrigins);
+
     process.on("SIGTERM", (sig) =>
       gracefulShutdown(server, prisma, sig, redisClient),
     );
@@ -1338,4 +1360,5 @@ module.exports = {
   gracefulShutdown,
   rejectNestedObjects,
   validateMemo,
+  normalizeNameTag,
 };

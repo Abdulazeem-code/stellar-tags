@@ -3,12 +3,23 @@ const { Queue, Worker } = require('bullmq');
 const { createRedisConnection, withRedisRetry } = require('./config/redis');
 const { logger } = require('./logger');
 const { shouldFallbackToLocalRegistry } = require('./utils');
+const { context, propagation, trace } = require('@opentelemetry/api');
 const { internalFetch } = require('./utils/internalClient');
+const { routeToDlq, isDlqAvailable, DLQ_QUEUE_NAME } = require('./dlq');
+
+/** Reads a positive integer env var, falling back when unset or malformed. */
+const parseEnvInt = (value, fallback) => {
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
+};
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
 const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
-const MAX_WEBHOOK_ATTEMPTS = 5;
-const WEBHOOK_BACKOFF_DELAY_MS = 1_000;
+// Retry budget for the main queue. Both are env-tunable so a deployment can
+// widen the retry window without a code change; the DLQ reuses the same values
+// when it replays a message.
+const MAX_WEBHOOK_ATTEMPTS = parseEnvInt(process.env.MAX_RETRY_ATTEMPTS, 5);
+const WEBHOOK_BACKOFF_DELAY_MS = parseEnvInt(process.env.RETRY_BACKOFF_MS, 1_000);
 const WEBHOOK_WORKER_CONCURRENCY = 5;
 const MAX_RETRY_BACKLOG_DAYS = 3;
 // A cluster failover can reject an enqueue while the slot map is being
@@ -147,7 +158,7 @@ const markWebhookFailure = async (prisma, webhookId, now) => {
   });
 };
 
-const processWebhookJob = async (job, { prisma }) => {
+const processWebhookJobImpl = async (job, { prisma }) => {
   const { webhook, payload } = job.data;
   const now = new Date();
 
@@ -177,6 +188,26 @@ const processWebhookJob = async (job, { prisma }) => {
   );
 };
 
+const processWebhookJob = async (job, options) => {
+  const parentContext = propagation.extract(context.active(), job.data?.otelContext || {});
+  const tracer = trace.getTracer('stellar-tags-webhook-worker');
+  return context.with(parentContext, () => tracer.startActiveSpan(
+    'webhook.process',
+    { attributes: { 'messaging.system': 'bullmq', 'messaging.destination.name': WEBHOOK_QUEUE_NAME } },
+    async (span) => {
+      try {
+        return await processWebhookJobImpl(job, options);
+      } catch (error) {
+        span.recordException(error);
+        span.setStatus({ code: 2, message: error.message });
+        throw error;
+      } finally {
+        span.end();
+      }
+    },
+  ));
+};
+
 const getWebhookQueue = () => {
   if (!webhookQueue) {
     queueConnection = createRedisConnection();
@@ -204,16 +235,37 @@ const startWebhookWorker = ({ prisma }) => {
   webhookWorker.on('failed', async (job, error) => {
     const maxAttempts = job?.opts?.attempts || MAX_WEBHOOK_ATTEMPTS;
     const attemptsMade = job?.attemptsMade || 1;
-    
-    if (attemptsMade >= maxAttempts && job?.data?.webhook) {
-      logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retries exhausted (${attemptsMade}/${maxAttempts})`);
+
+    if (attemptsMade < maxAttempts) {
+      logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retry scheduled (${attemptsMade}/${maxAttempts})`);
+      return;
+    }
+
+    logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retries exhausted (${attemptsMade}/${maxAttempts})`);
+
+    // Prefer the dead letter queue: it keeps the original payload and the
+    // failure reason, so the delivery can be replayed later. Without Redis
+    // there is nowhere to park it, so the webhook row is marked instead.
+    if (isDlqAvailable()) {
+      try {
+        await routeToDlq(job, error);
+        return;
+      } catch (dlqErr) {
+        logger.error(`[webhook-worker] Failed to route job=${job?.id || 'unknown'} to DLQ: ${dlqErr.message}`);
+      }
+    } else {
+      logger.warn(
+        `[webhook-worker] Redis is not configured; skipping DLQ (${DLQ_QUEUE_NAME}). ` +
+          'Failed deliveries are recorded on the webhook row only.',
+      );
+    }
+
+    if (job?.data?.webhook) {
       try {
         await moveToDLQ(prisma, job.data.webhook);
       } catch (dlqErr) {
         logger.error(`[webhook-worker] Failed to move webhook ${job.data.webhook.id} to DLQ: ${dlqErr.message}`);
       }
-    } else {
-      logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retry scheduled (${attemptsMade}/${maxAttempts})`);
     }
   });
 
@@ -232,10 +284,12 @@ const buildJobId = (webhookId, eventId) => {
 };
 
 const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
+  const otelContext = {};
+  propagation.inject(context.active(), otelContext);
   return withRedisRetry(
     () => queue.add(
       'deliver',
-      { webhook, payload },
+      { webhook, payload, otelContext },
       {
         ...WEBHOOK_JOB_OPTIONS,
         backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
