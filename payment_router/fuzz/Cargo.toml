@@ -7,6 +7,9 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# Keep the fuzz package isolated from the repository's root Cargo workspace.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "=1.3.2", features = ["derive"] }
