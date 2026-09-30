@@ -11,6 +11,7 @@ members = [
     "payment_router",
     "pausable_token",
     "payment_proxy",
+    "timelock_escrow",
 ]
 
 # Edition 2021 members require resolver v2.
