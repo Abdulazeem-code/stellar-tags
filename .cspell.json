@@ -92,9 +92,11 @@
     "MTLS",
     "POSIX",
     "ZIPKIN",
+    "SOROSWAP",
+    "COOLDOWN",
     "CQRS",
     "XADD",
-    "COOLDOWN",
-    "SOROSWAP"
+    "XREADGROUP",
+    "XTRIM"
   ]
 }
