@@ -23,7 +23,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACT_DIR="$ROOT/payment_router"
 PACKAGE_DIR="$ROOT/packages/types"
 PACKAGE_NAME="@stellar-tags/payment-router"
-WASM_REL="target/wasm32-unknown-unknown/release/payment_router.wasm"
+WASM_REL="../target/wasm32-unknown-unknown/release/payment_router.wasm"
 
 # --- 1. Locate the CLI ------------------------------------------------------
 CLI="${STELLAR_CLI:-}"
@@ -80,6 +80,10 @@ mkdir -p "$(dirname "$PACKAGE_DIR")"
 cp -R "$TMP_OUT" "$PACKAGE_DIR"
 rm -rf "$TMP_ROOT"
 trap - EXIT
+
+# Rustdoc emits a trailing space for empty documentation lines; trim it so
+# generated bindings pass repository whitespace checks.
+sed -i 's/[[:blank:]]*$//' "$PACKAGE_DIR/src/index.ts"
 
 # --- 5. Normalize package metadata ------------------------------------------
 # The generated package.json points at a compiled dist/ that only exists after

@@ -40,7 +40,6 @@
 ///
 /// `address_strkey_bytes` is the UTF-8 bytes of the G.../C... strkey string,
 /// which is always exactly 56 ASCII characters for a Stellar address.
-
 use soroban_sdk::{contracttype, Address, BytesN, Env, String, Symbol};
 
 // ─── Archive types exposed to lib.rs ────────────────────────────────────────

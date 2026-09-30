@@ -1,8 +1,10 @@
 #![no_std]
+mod archival;
+use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
-    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, Symbol, Vec,
+    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, String, Symbol, Vec,
 };
 
 // ── Packed UserRecord helpers ───────────────────────────────────────────────
@@ -430,6 +432,12 @@ pub enum DataKey {
     GovernanceProposal(u64),
     /// Recorded yes/no vote weight for a fee proposal.
     GovernanceVote(u64, Address),
+    /// Current archival epoch counter, stored in instance storage.
+    ArchiveEpoch,
+    /// Merkle root committed for an archival epoch.
+    ArchiveRoot(u64),
+    /// Metadata committed alongside an archival root.
+    ArchiveMeta(u64),
     /// Lending protocol contract used for treasury yield operations.
     YieldProtocol,
     /// Principal currently deposited into the yield protocol per token.
@@ -907,14 +915,24 @@ impl PaymentRouter {
     /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
     fn build_meta_message(
         env: &Env,
-        payload: &MetaPayment,
+        sender: &Address,
         signer_pubkey: &BytesN<32>,
+        recipient: &Address,
+        token_address: &Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
     ) -> Bytes {
-        let mut msg = Bytes::new(env);
-        msg.append(&env.current_contract_address().to_xdr(env));
-        msg.append(&payload.to_xdr(env));
-        msg.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
-        let hash = env.crypto().sha256(&msg);
+        let mut payload = Bytes::new(env);
+        payload.append(&env.current_contract_address().to_xdr(env));
+        payload.append(&sender.to_xdr(env));
+        payload.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
+        payload.append(&recipient.to_xdr(env));
+        payload.append(&token_address.to_xdr(env));
+        payload.append(&amount.to_xdr(env));
+        payload.append(&nonce.to_xdr(env));
+        payload.append(&deadline.to_xdr(env));
+        let hash = env.crypto().sha256(&payload);
         Bytes::from(&hash)
     }
 
@@ -3559,18 +3577,10 @@ impl PaymentRouter {
 
     /// Returns the Merkle root and metadata for an archive epoch, or `None`
     /// if no archive exists for that epoch.
-    pub fn get_archive_info(
-        env: Env,
-        epoch: u64,
-    ) -> Option<(BytesN<32>, ArchiveMetadata)> {
-        let root: Option<BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArchiveRoot(epoch));
-        let meta: Option<ArchiveMetadata> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArchiveMeta(epoch));
+    pub fn get_archive_info(env: Env, epoch: u64) -> Option<(BytesN<32>, ArchiveMetadata)> {
+        let root: Option<BytesN<32>> = env.storage().persistent().get(&DataKey::ArchiveRoot(epoch));
+        let meta: Option<ArchiveMetadata> =
+            env.storage().persistent().get(&DataKey::ArchiveMeta(epoch));
         match (root, meta) {
             (Some(r), Some(m)) => Some((r, m)),
             _ => None,
@@ -6010,10 +6020,6 @@ mod test {
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
     }
-
-    #[test]
-    fn test_tiered_fee_discount_applied_after_volume_threshold() {
-        let (env, client, _) = setup_env();
 
     /// Instance-storage keys for [`MockDex`].
     #[contracttype]

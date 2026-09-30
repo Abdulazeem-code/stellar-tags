@@ -47,7 +47,7 @@ export const networks = {
 
 /**
  * Role definitions for the Role-Based Access Control (RBAC) system.
- * 
+ *
  * Segregates operational privileges across dedicated role boundaries:
  * SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
  */
@@ -209,7 +209,7 @@ export const Errors = {
 /**
  * Storage keys for all contract instance and persistent data.
  */
-export type DataKey = {tag: "Admin", values: void} | {tag: "Governance", values: void} | {tag: "PlatformTreasury", values: void} | {tag: "FeeBps", values: void} | {tag: "FeeCap", values: void} | {tag: "MinLimit", values: void} | {tag: "Paused", values: void} | {tag: "MaxAmount", values: void} | {tag: "UserRecord", values: readonly [string]} | {tag: "UserSpending", values: readonly [string]} | {tag: "UserVolume", values: readonly [string]} | {tag: "Blacklist", values: readonly [string]} | {tag: "RefundBalance", values: readonly [string, string]} | {tag: "TimelockNonce", values: void} | {tag: "TimelockEntry", values: readonly [u64]} | {tag: "Frozen", values: void} | {tag: "UserRole", values: readonly [string, Role]} | {tag: "Role", values: readonly [Role]} | {tag: "MetaNonce", values: readonly [string]} | {tag: "KycOracle", values: void} | {tag: "KycThreshold", values: void} | {tag: "OracleAddress", values: void} | {tag: "StalenessThreshold", values: void} | {tag: "FallbackPrice", values: readonly [string, string]} | {tag: "GovernanceToken", values: void} | {tag: "GovernanceQuorum", values: void} | {tag: "GovernanceNonce", values: void} | {tag: "GovernanceProposal", values: readonly [u64]} | {tag: "GovernanceVote", values: readonly [u64, string]} | {tag: "YieldProtocol", values: void} | {tag: "YieldPrincipal", values: readonly [string]} | {tag: "RegisteredDex", values: readonly [string]} | {tag: "MaxSlippageBps", values: void};
+export type DataKey = {tag: "Admin", values: void} | {tag: "Governance", values: void} | {tag: "PlatformTreasury", values: void} | {tag: "FeeBps", values: void} | {tag: "FeeCap", values: void} | {tag: "MinLimit", values: void} | {tag: "Paused", values: void} | {tag: "MaxAmount", values: void} | {tag: "UserRecord", values: readonly [string]} | {tag: "UserSpending", values: readonly [string]} | {tag: "UserVolume", values: readonly [string]} | {tag: "Blacklist", values: readonly [string]} | {tag: "RefundBalance", values: readonly [string, string]} | {tag: "TimelockNonce", values: void} | {tag: "TimelockEntry", values: readonly [u64]} | {tag: "Frozen", values: void} | {tag: "UserRole", values: readonly [string, Role]} | {tag: "Role", values: readonly [Role]} | {tag: "MetaNonce", values: readonly [string]} | {tag: "KycOracle", values: void} | {tag: "KycThreshold", values: void} | {tag: "OracleAddress", values: void} | {tag: "StalenessThreshold", values: void} | {tag: "FallbackPrice", values: readonly [string, string]} | {tag: "GovernanceToken", values: void} | {tag: "GovernanceQuorum", values: void} | {tag: "GovernanceNonce", values: void} | {tag: "GovernanceProposal", values: readonly [u64]} | {tag: "GovernanceVote", values: readonly [u64, string]} | {tag: "ArchiveEpoch", values: void} | {tag: "ArchiveRoot", values: readonly [u64]} | {tag: "ArchiveMeta", values: readonly [u64]} | {tag: "YieldProtocol", values: void} | {tag: "YieldPrincipal", values: readonly [string]} | {tag: "RegisteredDex", values: readonly [string]} | {tag: "MaxSlippageBps", values: void};
 
 
 /**
@@ -286,7 +286,7 @@ export type ActionType = {tag: "SetPlatformTreasury", values: readonly [string]}
 /**
  * A user's combined routing stats, unpacked from the packed `BytesN<40>`
  * `UserRecord` ledger value (issue #663).
- * 
+ *
  * Returned by [`PaymentRouter::get_user_record`] so a client can read both
  * counters in a single view call instead of two.
  */
@@ -319,6 +319,19 @@ export interface FeeProposal {
   quorum: i128;
   voting_ends_at: u64;
   yes_votes: i128;
+}
+
+
+/**
+ * Structured payload for meta-transactions.
+ */
+export interface MetaPayment {
+  amount: i128;
+  deadline: u64;
+  nonce: u64;
+  recipient: string;
+  sender: string;
+  token_address: string;
 }
 
 
@@ -374,7 +387,7 @@ sender: string;
 
 /**
  * A user's rolling 24-hour spending record.
- * 
+ *
  * Retained purely so existing test snapshots that reference this type by
  * name keep compiling. Pre-#663 live contract state was stored as a packed
  * `BytesN<24>` (still readable via `unpack_legacy_spending`); this struct is
@@ -406,15 +419,74 @@ action: ActionType;
 queued_at: u64;
 }
 
+
+/**
+ * A single archive leaf descriptor passed into `commit_archive_root` and
+ * `prune_archived_entries`.
+ *
+ * The contract uses `record_type + primary_key (+ secondary_key)` to locate
+ * the corresponding `DataKey` to delete during a prune. It does not re-hash
+ * the leaves — the Merkle root is computed and trusted from off-chain.
+ */
+export interface ArchiveLeaf {
+  /**
+ * Primary key address:
+ * - `UserVolume` / `UserSpending`: the sender address.
+ * - `RefundBalance`: the user (sender) address.
+ */
+primary_key: string;
+  /**
+ * Which type of record this leaf represents.
+ */
+record_type: ArchiveRecordType;
+  /**
+ * Secondary key address:
+ * - `RefundBalance`: the token contract address.
+ * - Other types: ignored (may be any address).
+ */
+secondary_key: string;
+}
+
+
+/**
+ * Metadata stored alongside each archive root.
+ */
+export interface ArchiveMetadata {
+  /**
+ * Unix timestamp (seconds) when this archive epoch was committed.
+ */
+committed_at: u64;
+  /**
+ * Free-form description tag (e.g. `"user_volume:2026-09"`).
+ */
+description: string;
+  /**
+ * Total number of leaf records included in this archive.
+ */
+record_count: u32;
+}
+
+/**
+ * Record types supported by the archival system.
+ *
+ * The `repr(u32)` discriminant doubles as the tag byte prepended when
+ * computing leaf hashes off-chain.
+ */
+export enum ArchiveRecordType {
+  UserVolume = 1,
+  UserSpending = 2,
+  RefundBalance = 3,
+}
+
 export interface Client {
   /**
    * Construct and simulate a get_fee transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the current protocol fee percentage in basis points.
-   * 
+   *
    * # Returns
    * The configured `fee_bps`, or `0` if the contract has not been
    * initialized.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -423,19 +495,19 @@ export interface Client {
   /**
    * Construct and simulate a upgrade transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Replaces this contract's WASM with a previously uploaded version. SuperAdmin-protected.
-   * 
+   *
    * # Parameters
    * - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
    * network, to install as this contract's new executable.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current SuperAdmin does not authorize the call, or if
    * `new_wasm_hash` does not reference a previously uploaded WASM blob.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
    */
   upgrade: ({new_wasm_hash}: {new_wasm_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -443,10 +515,10 @@ export interface Client {
   /**
    * Construct and simulate a version transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the contract version.
-   * 
+   *
    * # Returns
    * The contract's version number, currently `1`.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -455,13 +527,13 @@ export interface Client {
   /**
    * Construct and simulate a has_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Queries whether a given account holds an active role assignment.
-   * 
+   *
    * Checks persistent user role assignments and primary designated roles.
-   * 
+   *
    * # Parameters
    * - `account`: Address to query.
    * - `role`: Role variant to check.
-   * 
+   *
    * # Returns
    * `true` if authorized for this role, `false` otherwise.
    */
@@ -470,10 +542,10 @@ export interface Client {
   /**
    * Construct and simulate a unfreeze transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Removes the frozen state, restoring normal contract operation.
-   * 
+   *
    * Like `emergency_freeze`, this takes effect immediately and does not
    * go through the timelock.
-   * 
+   *
    * SuperAdmin authorization is required.
    */
   unfreeze: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -483,13 +555,13 @@ export interface Client {
    * Fetches the current exchange rate for a `(base_asset, quote_asset)`
    * pair from the configured price-feed oracle, validates it, and returns
    * the result.
-   * 
+   *
    * Every failure path below first attempts to serve an admin-configured
    * fallback price for the pair; the oracle error is only surfaced when no
    * fallback exists.
-   * 
+   *
    * ## Validation flow
-   * 
+   *
    * 1. **Oracle configured?** - Otherwise `Err(Error::OracleNotConfigured)`.
    * 2. **Call oracle** - Invoke the oracle's `get_price`; a trapped or
    * unavailable contract yields `Err(Error::OracleCallFailed)`.
@@ -499,7 +571,7 @@ export interface Client {
    * 4. **Validity check** - A price <= 0 is invalid
    * (`Err(Error::OraclePriceInvalid)`).
    * 5. **Return** - The validated `PriceData` is returned to the caller.
-   * 
+   *
    * `base_asset` is typically the XLM native contract and `quote_asset` the
    * USDC contract.
    */
@@ -514,10 +586,10 @@ export interface Client {
   /**
    * Construct and simulate a is_paused transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns whether the contract is currently paused.
-   * 
+   *
    * # Returns
    * `true` if paused, `false` if unpaused or not yet initialized.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -526,13 +598,13 @@ export interface Client {
   /**
    * Construct and simulate a set_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Set a new admin. SuperAdmin-protected.
-   * 
+   *
    * # Parameters
    * - `new_admin`: Address to install as the new admin.
-   * 
+   *
    * # Returns
    * Always `Ok(())`.
-   * 
+   *
    * # Panics
    * Panics if an admin is already set and current SuperAdmin does not authorize the call.
    */
@@ -541,18 +613,18 @@ export interface Client {
   /**
    * Construct and simulate a set_pause transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Pauses or unpauses the payment router. ComplianceOfficer-protected.
-   * 
+   *
    * # Parameters
    * - `paused`: `true` to reject `route_payment` / `route_payments`
    * calls, `false` to allow them again.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current ComplianceOfficer does not authorize the call.
-   * 
+   *
    * This is NOT timelocked — operational pausing must remain instant.
    */
   set_pause: ({paused}: {paused: boolean}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -561,22 +633,14 @@ export interface Client {
    * Construct and simulate a initialize transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * One-time setup: records the admin and the initial fee configuration
    * in instance storage. Must be called before `route_payment`.
-   * 
+   *
    * # Parameters
-   * - `admin`: Address granted admin rights over the contract; must
-   * authorize this call.
-   * - `platform_treasury`: Address that receives collected platform fees.
-   * - `fee_bps`: Platform fee rate, in basis points.
-   * - `fee_cap`: Maximum fee (in the token's smallest unit) taken from a
-   * single payment.
-   * - `max_amount`: Maximum amount accepted by a single payment.
-   * 
-   * # Returns
-   * `Ok(())` on success, or `Err(Error::AlreadyInitialized)` if the
-   * contract already has an admin set.
-   * 
-   * # Panics
-   * Panics if `admin` does not authorize the call.
+   * * `env` - The Soroban environment interface.
+   * * `sender` - The address initiating the payment. Must authorize the transaction.
+   * * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
+   * * `platform_treasury` - The address where the platform fee will be deposited.
+   * * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
+   * * `amount` - The total amount of tokens to be routed (inclusive of the fee).
    */
   initialize: ({admin, platform_treasury, fee_bps, fee_cap, max_amount}: {admin: string, platform_treasury: string, fee_bps: i128, fee_cap: i128, max_amount: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
@@ -585,23 +649,23 @@ export interface Client {
    * Asks a registered DEX how much `buy_token` a swap would return, and
    * derives the `min_amount_out` the sender should use from the contract's
    * configured slippage ceiling.
-   * 
+   *
    * This is a read-only cross-contract call: it moves no funds and changes no
    * state, so it is safe to call off-chain before building a
    * [`SwapPayment`].
-   * 
+   *
    * # Parameters
    * - `dex`: Contract ID of a registered DEX adapter.
    * - `sell_token`: Token the sender would pay with.
    * - `buy_token`: Token the recipient would be paid in.
    * - `amount_in`: Amount of `sell_token` to price, in its smallest unit.
-   * 
+   *
    * # Returns
    * A [`SwapQuote`] with the quoted output, the slippage-adjusted
    * `min_amount_out`, and the slippage ceiling used. Returns
    * `Err(Error::DexNotRegistered)` if `dex` was never registered or
    * `Err(Error::SwapFailed)` if the DEX quote call reverts.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -610,13 +674,13 @@ export interface Client {
   /**
    * Construct and simulate a set_paused transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Alias for `set_pause`. Admin-only.
-   * 
+   *
    * # Parameters
    * - `paused`: `true` to reject routing calls, `false` to allow them.
-   * 
+   *
    * # Returns
    * See `set_pause`.
-   * 
+   *
    * # Panics
    * Panics if the current admin does not authorize the call.
    */
@@ -625,16 +689,16 @@ export interface Client {
   /**
    * Construct and simulate a assign_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Assigns an operational role to a specified account.
-   * 
+   *
    * Restricted exclusively to `SuperAdmin`.
-   * 
+   *
    * # Parameters
    * - `account`: Target address to receive the role.
    * - `role`: The `Role` variant to grant.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if contract is uninitialized.
-   * 
+   *
    * # Panics
    * Panics if the current `SuperAdmin` does not authorize the call.
    */
@@ -643,18 +707,18 @@ export interface Client {
   /**
    * Construct and simulate a revoke_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Revokes an operational role from a specified account.
-   * 
+   *
    * Restricted exclusively to `SuperAdmin`. Prevents removing the active SuperAdmin
    * when it would leave the contract without root governance.
-   * 
+   *
    * # Parameters
    * - `account`: Target address from which the role will be revoked.
    * - `role`: The `Role` variant to revoke.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, `Err(Error::InvalidRole)` if attempting to revoke own SuperAdmin,
    * or `Err(Error::NotInitialized)`.
-   * 
+   *
    * # Panics
    * Panics if the current `SuperAdmin` does not authorize the call.
    */
@@ -664,17 +728,17 @@ export interface Client {
    * Construct and simulate a set_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Updates the fee basis points.
    * Requires governance authority if a governance address is set; otherwise admin-only.
-   * 
+   *
    * # Parameters
    * - `new_fee_bps`: New platform fee rate, in basis points.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the caller does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeBps(…))`.
    */
   set_fee_bps: ({new_fee_bps}: {new_fee_bps: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -682,18 +746,18 @@ export interface Client {
   /**
    * Construct and simulate a queue_action transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Queues an admin action to be executed after a 24-hour delay.
-   * 
+   *
    * The admin provides the desired `ActionType` variant and receives a
    * numeric nonce that uniquely identifies this pending entry.  Pass this
    * nonce to `execute_action` after 24 hours, or to `cancel_action` to
    * abort the intent.
-   * 
+   *
    * Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
    * `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
    * `upgrade`) must go through the timelock.  Use the direct setter
    * functions only for actions that are not sensitive (e.g. `set_pause`
    * which can also be called directly for immediate operational pauses).
-   * 
+   *
    * The contract must not be frozen when queuing, and the admin must
    * authorize the call.
    */
@@ -702,20 +766,20 @@ export interface Client {
   /**
    * Construct and simulate a register_dex transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Allows swap routing to invoke a DEX router contract. Admin-only.
-   * 
+   *
    * Restricting cross-contract calls to a registered allowlist is what keeps
    * swap routing pointed at audited code.
-   * 
+   *
    * # Parameters
    * - `dex`: Contract ID of the DEX router to approve.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
    * no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current admin does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::RegisterDex(…))`
    * and execute after 24 hours.
    */
@@ -724,11 +788,11 @@ export interface Client {
   /**
    * Construct and simulate a cancel_action transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Cancels a pending timelock entry before it can be executed.
-   * 
+   *
    * This is the primary defence when a compromised admin has queued a
    * malicious action: any other admin (after a key rotation) or a
    * multi-sig governance can cancel it within the 24-hour window.
-   * 
+   *
    * Admin authorization is required. The contract may be frozen.
    */
   cancel_action: ({nonce}: {nonce: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -742,14 +806,14 @@ export interface Client {
   /**
    * Construct and simulate a route_payment transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Routes a payment from a sender to a recipient, deducting a platform fee.
-   * 
+   *
    * # Parameters
    * - `sender`: Address the funds are debited from; must authorize the call.
    * - `recipient`: Address to receive the funds (minus the platform fee).
    * - `token_address`: Contract ID of the token being transferred.
    * - `amount`: Amount to route, in the token's smallest unit. Must be
    * positive and within the configured min/max and daily-limit bounds.
-   * 
+   *
    * # Returns
    * `Ok(())` on success. Returns `Err(Error::Paused)` if routing is
    * paused, `Err(Error::NotInitialized)` if the contract has no admin
@@ -759,7 +823,7 @@ export interface Client {
    * bounds or exceeds the sender's remaining daily limit, or
    * `Err(Error::InsufficientBalance)` if `sender`'s token balance is
    * below `amount`.
-   * 
+   *
    * # Panics
    * Panics if `sender` does not authorize the call, or if the underlying
    * token transfer to `platform_treasury` fails.
@@ -769,18 +833,18 @@ export interface Client {
   /**
    * Construct and simulate a set_min_limit transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Sets the minimum allowed routing amount. FeeManager-protected.
-   * 
+   *
    * # Parameters
    * - `min_limit`: Smallest `amount` that `route_payment` /
    * `route_payments` will accept going forward.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current FeeManager does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMinLimit(…))`.
    */
   set_min_limit: ({min_limit}: {min_limit: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -788,17 +852,17 @@ export interface Client {
   /**
    * Construct and simulate a deregister_dex transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Stops swap routing from invoking a DEX router contract. Admin-only.
-   * 
+   *
    * # Parameters
    * - `dex`: Contract ID of the DEX router to revoke.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
    * no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current admin does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::DeregisterDex(…))`
    * and execute after 24 hours.
    */
@@ -807,13 +871,13 @@ export interface Client {
   /**
    * Construct and simulate a execute_action transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Executes a previously queued action identified by `nonce`.
-   * 
+   *
    * Requirements:
    * - The contract must not be frozen.
    * - The admin must authorize.
    * - The entry identified by `nonce` must exist.
    * - At least 24 hours (`SECONDS_IN_24H`) must have passed since queuing.
-   * 
+   *
    * On success the entry is removed and the underlying setter is invoked.
    */
   execute_action: ({nonce}: {nonce: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -821,7 +885,7 @@ export interface Client {
   /**
    * Construct and simulate a get_meta_nonce transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the current meta-transaction nonce for a user.
-   * 
+   *
    * Relayers must use this nonce when building the signed payload.
    * The nonce starts at `0` and increments after each successful
    * `route_payment_meta`, preventing replay attacks.
@@ -831,7 +895,7 @@ export interface Client {
   /**
    * Construct and simulate a get_role_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the administrative role governing the specified role.
-   * 
+   *
    * In this RBAC architecture, `SuperAdmin` governs all operational roles.
    */
   get_role_admin: ({_role}: {_role: Role}, options?: MethodOptions) => Promise<AssembledTransaction<Role>>
@@ -839,13 +903,13 @@ export interface Client {
   /**
    * Construct and simulate a is_blacklisted transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns whether an address is blacklisted.
-   * 
+   *
    * # Parameters
    * - `address`: Address to check.
-   * 
+   *
    * # Returns
    * `true` if `address` is blacklisted, `false` otherwise.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -854,15 +918,15 @@ export interface Client {
   /**
    * Construct and simulate a recover_tokens transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
-   * 
+   *
    * # Parameters
    * - `token`: Contract ID of the token to recover.
    * - `amount`: Amount to transfer from the contract's balance to the treasury manager.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current TreasuryManager does not authorize the call, or if the
    * token transfer fails (e.g. the contract's balance is below `amount`).
@@ -873,17 +937,17 @@ export interface Client {
    * Construct and simulate a route_payments transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Routes multiple payments in a single transaction. If any payment fails,
    * the entire batch is reverted atomically.
-   * 
+   *
    * # Parameters
    * - `payments`: Batch of transfer instructions to apply in order. See
    * [`Payment`] for per-item constraints.
-   * 
+   *
    * # Returns
    * `Ok(())` if every payment in the batch succeeds. Returns the first
    * error encountered (see `route_payment` for the possible `Err`
    * variants and their causes) if any payment fails; the Soroban host
    * reverts all storage and balance changes from the batch in that case.
-   * 
+   *
    * # Panics
    * Panics if any payment's `sender` does not authorize the call, or if
    * a token transfer to `platform_treasury` fails.
@@ -893,17 +957,17 @@ export interface Client {
   /**
    * Construct and simulate a set_fee_config transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Alias for `set_fee_config_legacy`. Admin-only.
-   * 
+   *
    * # Parameters
    * - `fee_bps`: New platform fee rate, in basis points.
    * - `fee_cap`: New maximum fee taken from a single payment.
-   * 
+   *
    * # Returns
    * See `set_fee_config_legacy`.
-   * 
+   *
    * # Panics
    * Panics if the current admin does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
    */
   set_fee_config: ({fee_bps, fee_cap}: {fee_bps: i128, fee_cap: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -912,7 +976,7 @@ export interface Client {
    * Construct and simulate a set_governance transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Sets the governance contract address. After this call, only the governance
    * contract can update fees. Admin-only — can only be set once per governance cycle.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetGovernance(…))`.
    */
   set_governance: ({gov}: {gov: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -926,17 +990,17 @@ export interface Client {
   /**
    * Construct and simulate a transfer_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Transfers admin rights to a new address. Requires current SuperAdmin authorization.
-   * 
+   *
    * # Parameters
    * - `new_admin`: Address to become the new admin.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current SuperAdmin does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::TransferAdmin(…))`.
    */
   transfer_admin: ({new_admin}: {new_admin: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -944,10 +1008,10 @@ export interface Client {
   /**
    * Construct and simulate a get_role_member transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the primary designated member address for a role, if one is configured.
-   * 
+   *
    * # Parameters
    * - `role`: The role variant to query.
-   * 
+   *
    * # Returns
    * `Some(Address)` if set, or `None` if unassigned.
    */
@@ -958,18 +1022,18 @@ export interface Client {
    * Returns a sender's combined routing record: the amount accumulated in
    * the current 24-hour window and their cumulative lifetime volume
    * (issue #663).
-   * 
+   *
    * Reads the single packed `UserRecord` entry. For a sender that only has
    * the legacy pre-#663 split entries, both counters are combined from
    * those without writing anything.
-   * 
+   *
    * # Parameters
    * - `user`: Sender address to look up.
-   * 
+   *
    * # Returns
    * A [`UserRecord`] with zeroed counters if `user` has never routed a
    * payment; `last_reset_time` is then the current ledger timestamp.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -978,14 +1042,14 @@ export interface Client {
   /**
    * Construct and simulate a get_user_volume transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the cumulative amount a given sender has routed through the contract.
-   * 
+   *
    * # Parameters
    * - `user`: Sender address to look up.
-   * 
+   *
    * # Returns
    * The lifetime routed volume for `user`, or `0` if they have never
    * routed a payment.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -994,21 +1058,21 @@ export interface Client {
   /**
    * Construct and simulate a withdraw_refund transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Withdraws a specific amount from the user's internal refund balance.
-   * 
+   *
    * A refund balance accrues when a `route_payment` / `route_payments`
    * transfer to the recipient fails (e.g. missing trustline) and the
    * funds are held by the contract on the sender's behalf instead.
-   * 
+   *
    * # Parameters
    * - `user`: Address withdrawing funds; must authorize the call.
    * - `token`: Contract ID of the token to withdraw.
    * - `amount`: Amount to withdraw. Must be positive and not exceed the
    * current refund balance.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NoRefundAvailable)` if `amount`
    * is zero, negative, or greater than the available balance.
-   * 
+   *
    * # Panics
    * Panics if `user` does not authorize the call, or if the underlying
    * token transfer fails.
@@ -1018,7 +1082,7 @@ export interface Client {
   /**
    * Construct and simulate a deposit_to_yield transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Deposits idle treasury funds into the configured lending protocol.
-   * 
+   *
    * Both the TreasuryManager and treasury authorize this operation. The second
    * authorization is required because the funds are held by the treasury,
    * rather than by this router contract.
@@ -1030,14 +1094,21 @@ export interface Client {
    * Instantly freezes the contract, blocking all payments and timelock
    * executions.  This is the emergency last resort when an admin key is
    * known to be compromised.
-   * 
+   *
    * Unlike other sensitive admin operations, freeze takes effect immediately
    * — it does NOT go through the timelock — so it is always available as a
    * rapid-response tool.
-   * 
+   *
    * Admin authorization is required.
    */
   emergency_freeze: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a get_archive_info transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the Merkle root and metadata for an archive epoch, or `None`
+   * if no archive exists for that epoch.
+   */
+  get_archive_info: ({epoch}: {epoch: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Option<readonly [Buffer, ArchiveMetadata]>>>
 
   /**
    * Construct and simulate a get_fee_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -1047,19 +1118,19 @@ export interface Client {
   /**
    * Construct and simulate a set_price_oracle transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Configures the price-feed oracle contract address. ComplianceOfficer-protected.
-   * 
+   *
    * The oracle contract must implement the [`PriceFeedOracle`] interface:
    * it must expose a `get_price(base_asset, quote_asset) -> PriceData`
    * method that returns the latest price together with a Unix timestamp so
    * staleness can be validated against the configured threshold.
-   * 
+   *
    * # Parameters
    * - `oracle`: Address of the oracle contract to use for price lookups.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has not been initialized.
-   * 
+   *
    * # Panics
    * Panics if the current ComplianceOfficer does not authorize the call.
    */
@@ -1068,15 +1139,15 @@ export interface Client {
   /**
    * Construct and simulate a blacklist_address transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Adds an address to the blacklist. ComplianceOfficer-protected.
-   * 
+   *
    * # Parameters
    * - `address`: Address to blacklist; subsequent payments to it as a
    * recipient will be rejected.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current ComplianceOfficer does not authorize the call.
    */
@@ -1085,20 +1156,26 @@ export interface Client {
   /**
    * Construct and simulate a claim_all_refunds transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Claims and withdraws the entire available refund balance for a user and token.
-   * 
+   *
    * # Parameters
    * - `user`: Address withdrawing funds; must authorize the call.
    * - `token`: Contract ID of the token to withdraw.
-   * 
+   *
    * # Returns
    * `Ok(amount)` with the amount withdrawn, or
    * `Err(Error::NoRefundAvailable)` if the refund balance is zero.
-   * 
+   *
    * # Panics
    * Panics if `user` does not authorize the call, or if the underlying
    * token transfer fails.
    */
   claim_all_refunds: ({user, token}: {user: string, token: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
+
+  /**
+   * Construct and simulate a get_archive_epoch transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the current archive epoch counter (0 = no epochs committed yet).
+   */
+  get_archive_epoch: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
 
   /**
    * Construct and simulate a get_kyc_threshold transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -1116,14 +1193,14 @@ export interface Client {
   /**
    * Construct and simulate a is_dex_registered transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns whether a DEX router is approved for swap routing.
-   * 
+   *
    * # Parameters
    * - `dex`: Contract ID to check.
-   * 
+   *
    * # Returns
    * `true` if the DEX may be used by `route_payment_with_swap`, `false`
    * otherwise.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -1138,19 +1215,19 @@ export interface Client {
   /**
    * Construct and simulate a emergency_withdraw transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Admin-only emergency withdrawal of tokens held by this contract.
-   * 
+   *
    * # Parameters
    * - `token`: Contract ID of the token to withdraw.
    * Admin-only emergency withdrawal of tokens held by this contract. TreasuryManager-protected.
-   * 
+   *
    * # Parameters
    * - `token`: Contract ID of the token to withdraw.
    * - `amount`: Amount to transfer from the contract's balance to the treasury manager.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current TreasuryManager does not authorize the call, or if the
    * token transfer fails (e.g. the contract's balance is below `amount`).
@@ -1160,11 +1237,11 @@ export interface Client {
   /**
    * Construct and simulate a get_fallback_price transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the stored fallback price for a (base, quote) asset pair, if any.
-   * 
+   *
    * # Parameters
    * - `base_asset`: Address of the base asset.
    * - `quote_asset`: Address of the quote asset.
-   * 
+   *
    * # Returns
    * `Some(PriceData)` if a fallback has been configured, `None` otherwise.
    */
@@ -1173,14 +1250,14 @@ export interface Client {
   /**
    * Construct and simulate a get_refund_balance transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the available internal refund balance for a user and token.
-   * 
+   *
    * # Parameters
    * - `user`: Address whose refund balance to look up.
    * - `token`: Contract ID of the token.
-   * 
+   *
    * # Returns
    * The refundable balance for `(user, token)`, or `0` if none is held.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -1202,12 +1279,12 @@ export interface Client {
    * Construct and simulate a route_payment_meta transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Routes a payment authorised by an off-chain relayer's Ed25519 signature
    * instead of the sender's on-chain authorization.
-   * 
+   *
    * The relayer signs a canonical payload binding the sender, recipient,
    * token, amount, nonce and deadline. The contract verifies the signature,
    * burns the nonce to block replays, and then settles the payment through
    * the same accounting as a direct `route_payment`.
-   * 
+   *
    * # Parameters
    * - `sender`: Address whose funds are routed and whose nonce is consumed.
    * - `signer_pubkey`: Ed25519 public key that must have signed the payload.
@@ -1217,10 +1294,10 @@ export interface Client {
    * - `nonce`: Must equal the sender's current meta-transaction nonce.
    * - `deadline`: Ledger timestamp after which the submission is rejected.
    * - `signature`: Ed25519 signature over the canonical payload.
-   * 
+   *
    * # Returns
    * `Ok(())` once the payment has settled.
-   * 
+   *
    * # Panics
    * Panics if the signature does not verify.
    */
@@ -1230,23 +1307,23 @@ export interface Client {
    * Construct and simulate a set_fallback_price transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Stores an admin-supplied fallback price for a (base, quote) asset pair.
    * ComplianceOfficer-protected.
-   * 
+   *
    * The fallback is used by [`get_price`] when the live oracle is
    * unavailable or returns data that fails validation (stale or invalid).
    * Setting a fallback price to `0` effectively removes the fallback,
    * meaning that oracle failures will propagate as errors rather than
    * silently using a stale cached value.
-   * 
+   *
    * # Parameters
    * - `base_asset`: Address of the base asset (e.g. XLM contract).
    * - `quote_asset`: Address of the quote asset (e.g. USDC contract).
    * - `fallback_price`: Price expressed in the same fixed-point format as
    * the oracle (`price / 10^decimals`). Pass `0` to clear the fallback.
    * - `decimals`: Decimal precision of `fallback_price`.
-   * 
+   *
    * # Returns
    * `Ok(())` on success.
-   * 
+   *
    * # Panics
    * Panics if the current ComplianceOfficer does not authorize the call.
    */
@@ -1261,36 +1338,48 @@ export interface Client {
   /**
    * Construct and simulate a add_supported_token transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Records a token as supported (no-op; routing accepts any token contract ID).
-   * 
+   *
    * # Parameters
    * - `_token`: Ignored; present for API compatibility.
-   * 
+   *
    * # Returns
    * Always `Ok(())`.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
   add_supported_token: ({_token}: {_token: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a commit_archive_root transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Commits a SHA-256 Merkle root of a batch of payment-record snapshots
+   * into persistent storage, opening a new archive epoch.
+   *
+   * Call this before `prune_archived_entries`. Requires TreasuryManager.
+   * Returns the new epoch number.
+   *
+   * Errors: NotInitialized, ContractFrozen.
+   */
+  commit_archive_root: ({root, leaves, description}: {root: Buffer, leaves: Array<ArchiveLeaf>, description: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+
+  /**
    * Construct and simulate a migrate_user_record transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Permissionless migration of a sender's legacy pre-#663 split entries
    * (`UserSpending` + `UserVolume`) into the single packed `UserRecord`
    * (issue #663).
-   * 
+   *
    * Callable by anyone: it only recombines values that are already on the
    * ledger and never invents or destroys value. When the sender's packed
    * record was already created by a recent payment, this just removes the
    * stale legacy keys and keeps the newer packed values.
-   * 
+   *
    * # Parameters
    * - `user`: The sender whose legacy entries should be migrated.
-   * 
+   *
    * # Returns
    * `true` if legacy state was found and migrated, `false` if `user` has
    * no legacy entries to migrate.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -1299,14 +1388,14 @@ export interface Client {
   /**
    * Construct and simulate a unblacklist_address transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Removes an address from the blacklist. ComplianceOfficer-protected.
-   * 
+   *
    * # Parameters
    * - `address`: Address to remove from the blacklist.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current ComplianceOfficer does not authorize the call.
    */
@@ -1335,11 +1424,11 @@ export interface Client {
   /**
    * Construct and simulate a get_max_slippage_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the maximum tolerated swap slippage in basis points.
-   * 
+   *
    * # Returns
    * The configured `max_slippage_bps`, or the 1 000 bps (10%) default if
    * the contract has not been initialized.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -1348,22 +1437,22 @@ export interface Client {
   /**
    * Construct and simulate a set_max_slippage_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Sets the maximum tolerated swap slippage. Admin-only.
-   * 
+   *
    * Applied against the `expected_amount_out` a caller supplies alongside a
    * quote, as a second guard on top of the per-payment `min_amount_out`
    * floor.
-   * 
+   *
    * # Parameters
    * - `max_slippage_bps`: New ceiling in basis points; `0` to `10_000`.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, `Err(Error::InvalidSwapParams)` if the value is
    * outside `0..=10_000`, or `Err(Error::NotInitialized)` if the contract has
    * no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current admin does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetMaxSlippageBps(…))`
    * and execute after 24 hours.
    */
@@ -1373,14 +1462,14 @@ export interface Client {
    * Construct and simulate a get_effective_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the effective fee_bps for a sender after applying any
    * volume-based tiered discount.
-   * 
+   *
    * # Parameters
    * - `sender`: Address whose discounted fee rate to compute.
-   * 
+   *
    * # Returns
    * The configured `fee_bps`, halved if `sender`'s lifetime volume
    * exceeds the tiered-discount threshold, or `0` if not initialized.
-   * 
+   *
    * # Panics
    * Does not panic.
    */
@@ -1390,18 +1479,18 @@ export interface Client {
    * Construct and simulate a set_fee_config_legacy transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Updates the fee basis points and fee cap.
    * Requires governance authority if a governance address is set; otherwise admin-only.
-   * 
+   *
    * # Parameters
    * - `fee_bps`: New platform fee rate, in basis points.
    * - `fee_cap`: New maximum fee taken from a single payment.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the caller does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
    */
   set_fee_config_legacy: ({fee_bps, fee_cap}: {fee_bps: i128, fee_cap: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -1409,19 +1498,19 @@ export interface Client {
   /**
    * Construct and simulate a set_platform_treasury transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Updates the treasury address that receives the platform fee.
-   * 
+   *
    * Updates the treasury address that receives the platform fee. Protected by TreasuryManager.
-   * 
+   *
    * # Parameters
    * - `new_treasury`: Address to receive platform fees going forward.
-   * 
+   *
    * # Returns
    * `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
    * has no admin set yet.
-   * 
+   *
    * # Panics
    * Panics if the current TreasuryManager does not authorize the call.
-   * 
+   *
    * DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetPlatformTreasury(…))`
    * and execute after 24 hours.  This direct path is retained for tooling
    * compatibility only.
@@ -1429,19 +1518,32 @@ export interface Client {
   set_platform_treasury: ({new_treasury}: {new_treasury: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a prune_archived_entries transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Deletes on-chain ledger entries committed via `commit_archive_root`.
+   *
+   * Requires the epoch from a prior commit call. Silently skips absent
+   * entries. Returns the count of entries removed.
+   *
+   * Supported: UserVolume, UserSpending, RefundBalance.
+   * Errors: NotInitialized, ContractFrozen, TimelockNotFound (unknown epoch).
+   * Requires TreasuryManager.
+   */
+  prune_archived_entries: ({committed_epoch, leaves}: {committed_epoch: u64, leaves: Array<ArchiveLeaf>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u32>>>
+
+  /**
    * Construct and simulate a route_payment_with_swap transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Routes a payment in any token, swapping it into the recipient's
    * preferred token on the way.
-   * 
+   *
    * The swap-routed counterpart of [`PaymentRouter::route_payment`]: the same
    * fee, limit, blacklist, and freeze rules apply, with the conversion
    * inserted between pulling the funds and delivering them. The platform fee
    * is taken on the `buy_token` output, so `fee_cap` applies in `buy_token`
    * units for this route.
-   * 
+   *
    * # Parameters
    * - `payment`: The swap-routed transfer (see [`SwapPayment`]).
-   * 
+   *
    * # Returns
    * The amount of `buy_token` delivered to the recipient, after the
    * platform fee. Otherwise the payment is abandoned whole, with:
@@ -1449,7 +1551,7 @@ export interface Client {
    * `Err(Error::DexNotRegistered)`, `Err(Error::SwapFailed)`, or
    * `Err(Error::SlippageExceeded)` for swap-specific problems,
    * - the same `Err` variants as `route_payment` otherwise.
-   * 
+   *
    * # Panics
    * Panics if `payment.sender` does not authorize the call, or if a token
    * transfer out of this contract fails.
@@ -1460,18 +1562,18 @@ export interface Client {
    * Construct and simulate a set_staleness_threshold transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Sets the maximum age (in seconds) a price reading may have before it is
    * considered stale. ComplianceOfficer-protected.
-   * 
+   *
    * When a price timestamp is older than `(current_ledger_time - threshold)`
    * the reading is rejected with [`Error::OraclePriceStale`] and the
    * fallback price (if configured) is used instead.
-   * 
+   *
    * # Parameters
    * - `threshold_secs`: Maximum allowed age in seconds. A value of `0`
    * disables the staleness check entirely (every price is accepted).
-   * 
+   *
    * # Returns
    * `Ok(())` on success.
-   * 
+   *
    * # Panics
    * Panics if the current ComplianceOfficer does not authorize the call.
    */
@@ -1482,16 +1584,16 @@ export interface Client {
    * Routes several swap-routed payments in a single transaction. If any
    * payment fails, the entire batch is reverted atomically, including any
    * swaps that already executed earlier in the batch.
-   * 
+   *
    * # Parameters
    * - `payments`: Batch of swap-routed transfers to apply in order. See
    * [`SwapPayment`] for per-item constraints.
-   * 
+   *
    * # Returns
    * The total amount of `buy_token` delivered across the batch, or the
    * first error encountered (see `route_payment_with_swap` for the
    * possible variants and their causes).
-   * 
+   *
    * # Panics
    * Panics if any payment's `sender` does not authorize the call, or if a
    * token transfer out of this contract fails.
@@ -1528,9 +1630,9 @@ export class Client extends ContractClient {
         "AAAAAAAAAJRSZXR1cm5zIHdoZXRoZXIgdGhlIGNvbnRyYWN0IGlzIGN1cnJlbnRseSBwYXVzZWQuCgojIFJldHVybnMKYHRydWVgIGlmIHBhdXNlZCwgYGZhbHNlYCBpZiB1bnBhdXNlZCBvciBub3QgeWV0IGluaXRpYWxpemVkLgoKIyBQYW5pY3MKRG9lcyBub3QgcGFuaWMuAAAACWlzX3BhdXNlZAAAAAAAAAAAAAABAAAAAQ==",
         "AAAAAAAAAORTZXQgYSBuZXcgYWRtaW4uIFN1cGVyQWRtaW4tcHJvdGVjdGVkLgoKIyBQYXJhbWV0ZXJzCi0gYG5ld19hZG1pbmA6IEFkZHJlc3MgdG8gaW5zdGFsbCBhcyB0aGUgbmV3IGFkbWluLgoKIyBSZXR1cm5zCkFsd2F5cyBgT2soKCkpYC4KCiMgUGFuaWNzClBhbmljcyBpZiBhbiBhZG1pbiBpcyBhbHJlYWR5IHNldCBhbmQgY3VycmVudCBTdXBlckFkbWluIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbC4AAAAJc2V0X2FkbWluAAAAAAAAAQAAAAAAAAAJbmV3X2FkbWluAAAAAAAAEwAAAAEAAAPpAAAD7QAAAAAAAAAD",
         "AAAAAAAAAa9QYXVzZXMgb3IgdW5wYXVzZXMgdGhlIHBheW1lbnQgcm91dGVyLiBDb21wbGlhbmNlT2ZmaWNlci1wcm90ZWN0ZWQuCgojIFBhcmFtZXRlcnMKLSBgcGF1c2VkYDogYHRydWVgIHRvIHJlamVjdCBgcm91dGVfcGF5bWVudGAgLyBgcm91dGVfcGF5bWVudHNgCmNhbGxzLCBgZmFsc2VgIHRvIGFsbG93IHRoZW0gYWdhaW4uCgojIFJldHVybnMKYE9rKCgpKWAgb24gc3VjY2Vzcywgb3IgYEVycihFcnJvcjo6Tm90SW5pdGlhbGl6ZWQpYCBpZiB0aGUgY29udHJhY3QKaGFzIG5vIGFkbWluIHNldCB5ZXQuCgojIFBhbmljcwpQYW5pY3MgaWYgdGhlIGN1cnJlbnQgQ29tcGxpYW5jZU9mZmljZXIgZG9lcyBub3QgYXV0aG9yaXplIHRoZSBjYWxsLgoKVGhpcyBpcyBOT1QgdGltZWxvY2tlZCDigJQgb3BlcmF0aW9uYWwgcGF1c2luZyBtdXN0IHJlbWFpbiBpbnN0YW50LgAAAAAJc2V0X3BhdXNlAAAAAAAAAQAAAAAAAAAGcGF1c2VkAAAAAAABAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
-        "AAAAAgAAADtTdG9yYWdlIGtleXMgZm9yIGFsbCBjb250cmFjdCBpbnN0YW5jZSBhbmQgcGVyc2lzdGVudCBkYXRhLgAAAAAAAAAAB0RhdGFLZXkAAAAAIQAAAAAAAAAaVGhlIGN1cnJlbnQgYWRtaW4gYWRkcmVzcy4AAAAAAAVBZG1pbgAAAAAAAAAAAABQR292ZXJuYW5jZSBjb250cmFjdCBhZGRyZXNzOyBpZiBzZXQsIGl0IHRha2VzIG92ZXIgZmVlLWF1dGhvcml0eSBmcm9tIHRoZSBhZG1pbi4AAAAKR292ZXJuYW5jZQAAAAAAAAAAAC5BZGRyZXNzIHRoYXQgcmVjZWl2ZXMgY29sbGVjdGVkIHBsYXRmb3JtIGZlZXMuAAAAAAAQUGxhdGZvcm1UcmVhc3VyeQAAAAAAAAA6UGxhdGZvcm0gZmVlIHJhdGUsIGluIGJhc2lzIHBvaW50cyAoMS8xMDB0aCBvZiBhIHBlcmNlbnQpLgAAAAAABkZlZUJwcwAAAAAAAAAAADNVcHBlciBib3VuZCBvbiB0aGUgZmVlIHRha2VuIGZyb20gYSBzaW5nbGUgcGF5bWVudC4AAAAABkZlZUNhcAAAAAAAAAAAAEZNaW5pbXVtIGFtb3VudCBhY2NlcHRlZCBieSBgcm91dGVfcGF5bWVudGAgLyBgcm91dGVfcGF5bWVudHNgLCBpZiBzZXQuAAAAAAAITWluTGltaXQAAAAAAAAAJFdoZXRoZXIgcm91dGluZyBpcyBjdXJyZW50bHkgcGF1c2VkLgAAAAZQYXVzZWQAAAAAAAAAAAAsTWF4aW11bSBhbW91bnQgYWNjZXB0ZWQgYnkgYSBzaW5nbGUgcGF5bWVudC4AAAAJTWF4QW1vdW50AAAAAAAAAQAAAPpDdW11bGF0aXZlIGxpZmV0aW1lIGFtb3VudCByb3V0ZWQgYnkgYSBnaXZlbiBzZW5kZXIuClBhY2tlZCBwZXItdXNlciByZWNvcmQgKGlzc3VlICM2NjMpOiB0aGUgMjQtaG91ciBzcGVuZGluZyB3aW5kb3cgcGx1cwp0aGUgY3VtdWxhdGl2ZSBsaWZldGltZSB2b2x1bWUsIHN0b3JlZCBhcyBhIHNpbmdsZSA0MC1ieXRlIHZhbHVlIHNvCnJlZ2lzdGVyaW5nIGEgc2VuZGVyIGNvc3RzIG9uZSBsZWRnZXIgZW50cnkgaW5zdGVhZCBvZiB0d28uAAAAAAAKVXNlclJlY29yZAAAAAAAAQAAABMAAAABAAAAoURFUFJFQ0FURUQgKHByZS0jNjYzKTogcGFja2VkIDI0LWhvdXIgc3BlbmRpbmcgd2luZG93IGZvciBhIHNlbmRlci4KTm8gbG9uZ2VyIHdyaXR0ZW47IHJlYWQgb25seSBieSB0aGUgYGxvYWRfdXNlcl9yZWNvcmRgIGZhbGxiYWNrIGFuZCBieQpgbWlncmF0ZV91c2VyX3JlY29yZGAuAAAAAAAADFVzZXJTcGVuZGluZwAAAAEAAAATAAAAAQAAAKNERVBSRUNBVEVEIChwcmUtIzY2Myk6IGN1bXVsYXRpdmUgbGlmZXRpbWUgYW1vdW50IHJvdXRlZCBieSBhIHNlbmRlci4KTm8gbG9uZ2VyIHdyaXR0ZW47IHJlYWQgb25seSBieSB0aGUgYGxvYWRfdXNlcl9yZWNvcmRgIGZhbGxiYWNrIGFuZCBieQpgbWlncmF0ZV91c2VyX3JlY29yZGAuAAAAAApVc2VyVm9sdW1lAAAAAAABAAAAEwAAAAEAAAAxV2hldGhlciBhIGdpdmVuIHJlY2lwaWVudCBhZGRyZXNzIGlzIGJsYWNrbGlzdGVkLgAAAAAAAAlCbGFja2xpc3QAAAAAAAABAAAAEwAAAAEAAABpSW50ZXJuYWwgcmVmdW5kIGJhbGFuY2UgZm9yIGEgKHVzZXIsIHRva2VuKSBwYWlyLCBjcmVkaXRlZCB3aGVuIGEKZGlyZWN0IHRyYW5zZmVyIHRvIHRoZSByZWNpcGllbnQgZmFpbHMuAAAAAAAADVJlZnVuZEJhbGFuY2UAAAAAAAACAAAAEwAAABMAAAAAAAAAfk1vbm90b25pY2FsbHktaW5jcmVhc2luZyBub25jZSBjb3VudGVyIHVzZWQgdG8gZ2VuZXJhdGUgdW5pcXVlIElEcyBmb3IKdGltZWxvY2sgZW50cmllcy4gIFN0b3JlZCBhcyBgdTY0YCBpbiBpbnN0YW5jZSBzdG9yYWdlLgAAAAAADVRpbWVsb2NrTm9uY2UAAAAAAAABAAAAbkEgcGVuZGluZyB0aW1lbG9jayBlbnRyeSBrZXllZCBieSBpdHMgbm9uY2UgSUQuClN0b3JlZCBpbiBwZXJzaXN0ZW50IHN0b3JhZ2Ugc28gaXQgc3Vydml2ZXMgaW5zdGFuY2UgZXZpY3Rpb24uAAAAAAANVGltZWxvY2tFbnRyeQAAAAAAAAEAAAAGAAAAAAAAAHhXaGVuIGB0cnVlYCB0aGUgY29udHJhY3QgaXMgZnJvemVuOiBwYXltZW50cyBhbmQgdGltZWxvY2sgZXhlY3V0aW9ucwphcmUgYmxvY2tlZC4gIFN0b3JlZCBhcyBgYm9vbGAgaW4gaW5zdGFuY2Ugc3RvcmFnZS4AAAAGRnJvemVuAAAAAAABAAAAJldoZXRoZXIgYW4gYWRkcmVzcyBob2xkcyBhIGdpdmVuIHJvbGUuAAAAAAAIVXNlclJvbGUAAAACAAAAEwAAB9AAAAAEUm9sZQAAAAEAAAAtVGhlIHByaW1hcnkgYWRkcmVzcyBjdXJyZW50bHkgaG9sZGluZyBhIHJvbGUuAAAAAAAABFJvbGUAAAABAAAH0AAAAARSb2xlAAAAAQAAADdNb25vdG9uaWMgbm9uY2UgZm9yIG1ldGEtdHJhbnNhY3Rpb24gcmVwbGF5IHByb3RlY3Rpb24uAAAAAAlNZXRhTm9uY2UAAAAAAAABAAAAEwAAAAAAAAA9VHJ1c3RlZCBpc3N1ZXIvb3JhY2xlIHF1ZXJpZWQgZm9yIGhpZ2gtdmFsdWUgcGF5bWVudCBzZW5kZXJzLgAAAAAAAAlLeWNPcmFjbGUAAAAAAAAAAAAAPlBheW1lbnRzIHN0cmljdGx5IGFib3ZlIHRoaXMgYW1vdW50IHJlcXVpcmUgYSB2YWxpZCBLWUMgY2xhaW0uAAAAAAAMS3ljVGhyZXNob2xkAAAAAAAAAD5BZGRyZXNzIG9mIHRoZSBwcmljZS1mZWVkIG9yYWNsZSB1c2VkIGZvciBmaWF0L2NyeXB0byBsb29rdXBzLgAAAAAADU9yYWNsZUFkZHJlc3MAAAAAAAAAAAAAPU1heGltdW0gYWNjZXB0YWJsZSBhZ2UsIGluIHNlY29uZHMsIG9mIGFuIG9yYWNsZSBwcmljZSBxdW90ZS4AAAAAAAASU3RhbGVuZXNzVGhyZXNob2xkAAAAAAABAAAAPUFkbWluLXN1cHBsaWVkIGZhbGxiYWNrIHByaWNlIGZvciBhIChiYXNlLCBxdW90ZSkgYXNzZXQgcGFpci4AAAAAAAANRmFsbGJhY2tQcmljZQAAAAAAAAIAAAATAAAAEwAAAAAAAAAxVG9rZW4gd2hvc2UgYmFsYW5jZXMgd2VpZ2h0IGZlZS1nb3Zlcm5hbmNlIHZvdGVzLgAAAAAAAA9Hb3Zlcm5hbmNlVG9rZW4AAAAAAAAAADxNaW5pbXVtIHdlaWdodGVkIHZvdGUgc2hhcmUgcmVxdWlyZWQgdG8gcGFzcyBhIGZlZSBwcm9wb3NhbC4AAAAQR292ZXJuYW5jZVF1b3J1bQAAAAAAAAAlTW9ub3RvbmljIG5vbmNlIGZvciBmZWUtcHJvcG9zYWwgaWRzLgAAAAAAAA9Hb3Zlcm5hbmNlTm9uY2UAAAAAAQAAAC5BIHBlbmRpbmcgZmVlLWNoYW5nZSBwcm9wb3NhbCBrZXllZCBieSBpdHMgaWQuAAAAAAASR292ZXJuYW5jZVByb3Bvc2FsAAAAAAABAAAABgAAAAEAAAAvUmVjb3JkZWQgeWVzL25vIHZvdGUgd2VpZ2h0IGZvciBhIGZlZSBwcm9wb3NhbC4AAAAADkdvdmVybmFuY2VWb3RlAAAAAAACAAAABgAAABMAAAAAAAAAPUxlbmRpbmcgcHJvdG9jb2wgY29udHJhY3QgdXNlZCBmb3IgdHJlYXN1cnkgeWllbGQgb3BlcmF0aW9ucy4AAAAAAAANWWllbGRQcm90b2NvbAAAAAAAAAEAAABAUHJpbmNpcGFsIGN1cnJlbnRseSBkZXBvc2l0ZWQgaW50byB0aGUgeWllbGQgcHJvdG9jb2wgcGVyIHRva2VuLgAAAA5ZaWVsZFByaW5jaXBhbAAAAAAAAQAAABMAAAABAAAAeFdoZXRoZXIgYSBERVggcm91dGVyIGNvbnRyYWN0IGlzIGFwcHJvdmVkIHRvIHJlY2VpdmUgY3Jvc3MtY29udHJhY3QKc3dhcCBjYWxscy4gIFN0b3JlZCBhcyBgYm9vbGAgaW4gcGVyc2lzdGVudCBzdG9yYWdlLgAAAA1SZWdpc3RlcmVkRGV4AAAAAAAAAQAAABMAAAAAAAAAgE1heGltdW0gdG9sZXJhdGVkIHN3YXAgc2xpcHBhZ2UgaW4gYmFzaXMgcG9pbnRzLCBhcHBsaWVkIGFnYWluc3QgYQpjYWxsZXItc3VwcGxpZWQgcXVvdGUuICBTdG9yZWQgYXMgYGkxMjhgIGluIGluc3RhbmNlIHN0b3JhZ2UuAAAADk1heFNsaXBwYWdlQnBzAAA=",
+        "AAAAAgAAADtTdG9yYWdlIGtleXMgZm9yIGFsbCBjb250cmFjdCBpbnN0YW5jZSBhbmQgcGVyc2lzdGVudCBkYXRhLgAAAAAAAAAAB0RhdGFLZXkAAAAAJAAAAAAAAAAaVGhlIGN1cnJlbnQgYWRtaW4gYWRkcmVzcy4AAAAAAAVBZG1pbgAAAAAAAAAAAABQR292ZXJuYW5jZSBjb250cmFjdCBhZGRyZXNzOyBpZiBzZXQsIGl0IHRha2VzIG92ZXIgZmVlLWF1dGhvcml0eSBmcm9tIHRoZSBhZG1pbi4AAAAKR292ZXJuYW5jZQAAAAAAAAAAAC5BZGRyZXNzIHRoYXQgcmVjZWl2ZXMgY29sbGVjdGVkIHBsYXRmb3JtIGZlZXMuAAAAAAAQUGxhdGZvcm1UcmVhc3VyeQAAAAAAAAA6UGxhdGZvcm0gZmVlIHJhdGUsIGluIGJhc2lzIHBvaW50cyAoMS8xMDB0aCBvZiBhIHBlcmNlbnQpLgAAAAAABkZlZUJwcwAAAAAAAAAAADNVcHBlciBib3VuZCBvbiB0aGUgZmVlIHRha2VuIGZyb20gYSBzaW5nbGUgcGF5bWVudC4AAAAABkZlZUNhcAAAAAAAAAAAAEZNaW5pbXVtIGFtb3VudCBhY2NlcHRlZCBieSBgcm91dGVfcGF5bWVudGAgLyBgcm91dGVfcGF5bWVudHNgLCBpZiBzZXQuAAAAAAAITWluTGltaXQAAAAAAAAAJFdoZXRoZXIgcm91dGluZyBpcyBjdXJyZW50bHkgcGF1c2VkLgAAAAZQYXVzZWQAAAAAAAAAAAAsTWF4aW11bSBhbW91bnQgYWNjZXB0ZWQgYnkgYSBzaW5nbGUgcGF5bWVudC4AAAAJTWF4QW1vdW50AAAAAAAAAQAAAPpDdW11bGF0aXZlIGxpZmV0aW1lIGFtb3VudCByb3V0ZWQgYnkgYSBnaXZlbiBzZW5kZXIuClBhY2tlZCBwZXItdXNlciByZWNvcmQgKGlzc3VlICM2NjMpOiB0aGUgMjQtaG91ciBzcGVuZGluZyB3aW5kb3cgcGx1cwp0aGUgY3VtdWxhdGl2ZSBsaWZldGltZSB2b2x1bWUsIHN0b3JlZCBhcyBhIHNpbmdsZSA0MC1ieXRlIHZhbHVlIHNvCnJlZ2lzdGVyaW5nIGEgc2VuZGVyIGNvc3RzIG9uZSBsZWRnZXIgZW50cnkgaW5zdGVhZCBvZiB0d28uAAAAAAAKVXNlclJlY29yZAAAAAAAAQAAABMAAAABAAAAoURFUFJFQ0FURUQgKHByZS0jNjYzKTogcGFja2VkIDI0LWhvdXIgc3BlbmRpbmcgd2luZG93IGZvciBhIHNlbmRlci4KTm8gbG9uZ2VyIHdyaXR0ZW47IHJlYWQgb25seSBieSB0aGUgYGxvYWRfdXNlcl9yZWNvcmRgIGZhbGxiYWNrIGFuZCBieQpgbWlncmF0ZV91c2VyX3JlY29yZGAuAAAAAAAADFVzZXJTcGVuZGluZwAAAAEAAAATAAAAAQAAAKNERVBSRUNBVEVEIChwcmUtIzY2Myk6IGN1bXVsYXRpdmUgbGlmZXRpbWUgYW1vdW50IHJvdXRlZCBieSBhIHNlbmRlci4KTm8gbG9uZ2VyIHdyaXR0ZW47IHJlYWQgb25seSBieSB0aGUgYGxvYWRfdXNlcl9yZWNvcmRgIGZhbGxiYWNrIGFuZCBieQpgbWlncmF0ZV91c2VyX3JlY29yZGAuAAAAAApVc2VyVm9sdW1lAAAAAAABAAAAEwAAAAEAAAAxV2hldGhlciBhIGdpdmVuIHJlY2lwaWVudCBhZGRyZXNzIGlzIGJsYWNrbGlzdGVkLgAAAAAAAAlCbGFja2xpc3QAAAAAAAABAAAAEwAAAAEAAABpSW50ZXJuYWwgcmVmdW5kIGJhbGFuY2UgZm9yIGEgKHVzZXIsIHRva2VuKSBwYWlyLCBjcmVkaXRlZCB3aGVuIGEKZGlyZWN0IHRyYW5zZmVyIHRvIHRoZSByZWNpcGllbnQgZmFpbHMuAAAAAAAADVJlZnVuZEJhbGFuY2UAAAAAAAACAAAAEwAAABMAAAAAAAAAfk1vbm90b25pY2FsbHktaW5jcmVhc2luZyBub25jZSBjb3VudGVyIHVzZWQgdG8gZ2VuZXJhdGUgdW5pcXVlIElEcyBmb3IKdGltZWxvY2sgZW50cmllcy4gIFN0b3JlZCBhcyBgdTY0YCBpbiBpbnN0YW5jZSBzdG9yYWdlLgAAAAAADVRpbWVsb2NrTm9uY2UAAAAAAAABAAAAbkEgcGVuZGluZyB0aW1lbG9jayBlbnRyeSBrZXllZCBieSBpdHMgbm9uY2UgSUQuClN0b3JlZCBpbiBwZXJzaXN0ZW50IHN0b3JhZ2Ugc28gaXQgc3Vydml2ZXMgaW5zdGFuY2UgZXZpY3Rpb24uAAAAAAANVGltZWxvY2tFbnRyeQAAAAAAAAEAAAAGAAAAAAAAAHhXaGVuIGB0cnVlYCB0aGUgY29udHJhY3QgaXMgZnJvemVuOiBwYXltZW50cyBhbmQgdGltZWxvY2sgZXhlY3V0aW9ucwphcmUgYmxvY2tlZC4gIFN0b3JlZCBhcyBgYm9vbGAgaW4gaW5zdGFuY2Ugc3RvcmFnZS4AAAAGRnJvemVuAAAAAAABAAAAJldoZXRoZXIgYW4gYWRkcmVzcyBob2xkcyBhIGdpdmVuIHJvbGUuAAAAAAAIVXNlclJvbGUAAAACAAAAEwAAB9AAAAAEUm9sZQAAAAEAAAAtVGhlIHByaW1hcnkgYWRkcmVzcyBjdXJyZW50bHkgaG9sZGluZyBhIHJvbGUuAAAAAAAABFJvbGUAAAABAAAH0AAAAARSb2xlAAAAAQAAADdNb25vdG9uaWMgbm9uY2UgZm9yIG1ldGEtdHJhbnNhY3Rpb24gcmVwbGF5IHByb3RlY3Rpb24uAAAAAAlNZXRhTm9uY2UAAAAAAAABAAAAEwAAAAAAAAA9VHJ1c3RlZCBpc3N1ZXIvb3JhY2xlIHF1ZXJpZWQgZm9yIGhpZ2gtdmFsdWUgcGF5bWVudCBzZW5kZXJzLgAAAAAAAAlLeWNPcmFjbGUAAAAAAAAAAAAAPlBheW1lbnRzIHN0cmljdGx5IGFib3ZlIHRoaXMgYW1vdW50IHJlcXVpcmUgYSB2YWxpZCBLWUMgY2xhaW0uAAAAAAAMS3ljVGhyZXNob2xkAAAAAAAAAD5BZGRyZXNzIG9mIHRoZSBwcmljZS1mZWVkIG9yYWNsZSB1c2VkIGZvciBmaWF0L2NyeXB0byBsb29rdXBzLgAAAAAADU9yYWNsZUFkZHJlc3MAAAAAAAAAAAAAPU1heGltdW0gYWNjZXB0YWJsZSBhZ2UsIGluIHNlY29uZHMsIG9mIGFuIG9yYWNsZSBwcmljZSBxdW90ZS4AAAAAAAASU3RhbGVuZXNzVGhyZXNob2xkAAAAAAABAAAAPUFkbWluLXN1cHBsaWVkIGZhbGxiYWNrIHByaWNlIGZvciBhIChiYXNlLCBxdW90ZSkgYXNzZXQgcGFpci4AAAAAAAANRmFsbGJhY2tQcmljZQAAAAAAAAIAAAATAAAAEwAAAAAAAAAxVG9rZW4gd2hvc2UgYmFsYW5jZXMgd2VpZ2h0IGZlZS1nb3Zlcm5hbmNlIHZvdGVzLgAAAAAAAA9Hb3Zlcm5hbmNlVG9rZW4AAAAAAAAAADxNaW5pbXVtIHdlaWdodGVkIHZvdGUgc2hhcmUgcmVxdWlyZWQgdG8gcGFzcyBhIGZlZSBwcm9wb3NhbC4AAAAQR292ZXJuYW5jZVF1b3J1bQAAAAAAAAAlTW9ub3RvbmljIG5vbmNlIGZvciBmZWUtcHJvcG9zYWwgaWRzLgAAAAAAAA9Hb3Zlcm5hbmNlTm9uY2UAAAAAAQAAAC5BIHBlbmRpbmcgZmVlLWNoYW5nZSBwcm9wb3NhbCBrZXllZCBieSBpdHMgaWQuAAAAAAASR292ZXJuYW5jZVByb3Bvc2FsAAAAAAABAAAABgAAAAEAAAAvUmVjb3JkZWQgeWVzL25vIHZvdGUgd2VpZ2h0IGZvciBhIGZlZSBwcm9wb3NhbC4AAAAADkdvdmVybmFuY2VWb3RlAAAAAAACAAAABgAAABMAAAAAAAAAO0N1cnJlbnQgYXJjaGl2YWwgZXBvY2ggY291bnRlciwgc3RvcmVkIGluIGluc3RhbmNlIHN0b3JhZ2UuAAAAAAxBcmNoaXZlRXBvY2gAAAABAAAALE1lcmtsZSByb290IGNvbW1pdHRlZCBmb3IgYW4gYXJjaGl2YWwgZXBvY2guAAAAC0FyY2hpdmVSb290AAAAAAEAAAAGAAAAAQAAAC5NZXRhZGF0YSBjb21taXR0ZWQgYWxvbmdzaWRlIGFuIGFyY2hpdmFsIHJvb3QuAAAAAAALQXJjaGl2ZU1ldGEAAAAAAQAAAAYAAAAAAAAAPUxlbmRpbmcgcHJvdG9jb2wgY29udHJhY3QgdXNlZCBmb3IgdHJlYXN1cnkgeWllbGQgb3BlcmF0aW9ucy4AAAAAAAANWWllbGRQcm90b2NvbAAAAAAAAAEAAABAUHJpbmNpcGFsIGN1cnJlbnRseSBkZXBvc2l0ZWQgaW50byB0aGUgeWllbGQgcHJvdG9jb2wgcGVyIHRva2VuLgAAAA5ZaWVsZFByaW5jaXBhbAAAAAAAAQAAABMAAAABAAAAeFdoZXRoZXIgYSBERVggcm91dGVyIGNvbnRyYWN0IGlzIGFwcHJvdmVkIHRvIHJlY2VpdmUgY3Jvc3MtY29udHJhY3QKc3dhcCBjYWxscy4gIFN0b3JlZCBhcyBgYm9vbGAgaW4gcGVyc2lzdGVudCBzdG9yYWdlLgAAAA1SZWdpc3RlcmVkRGV4AAAAAAAAAQAAABMAAAAAAAAAgE1heGltdW0gdG9sZXJhdGVkIHN3YXAgc2xpcHBhZ2UgaW4gYmFzaXMgcG9pbnRzLCBhcHBsaWVkIGFnYWluc3QgYQpjYWxsZXItc3VwcGxpZWQgcXVvdGUuICBTdG9yZWQgYXMgYGkxMjhgIGluIGluc3RhbmNlIHN0b3JhZ2UuAAAADk1heFNsaXBwYWdlQnBzAAA=",
         "AAAAAQAAAE1BIHNpbmdsZSB0cmFuc2ZlciBpbnN0cnVjdGlvbiBmb3IgdXNlIHdpdGggW2BQYXltZW50Um91dGVyOjpyb3V0ZV9wYXltZW50c2BdLgAAAAAAAAAAAAAHUGF5bWVudAAAAAAEAAAAgEFtb3VudCB0byByb3V0ZSwgZGVub21pbmF0ZWQgaW4gdGhlIHRva2VuJ3Mgc21hbGxlc3QgdW5pdC4gTXVzdCBiZQpwb3NpdGl2ZSBhbmQgd2l0aGluIHRoZSBjb250cmFjdCdzIGNvbmZpZ3VyZWQgbWluL21heCBib3VuZHMuAAAABmFtb3VudAAAAAAACwAAADtBZGRyZXNzIHRoZSBmdW5kcyAobWludXMgdGhlIHBsYXRmb3JtIGZlZSkgYXJlIGNyZWRpdGVkIHRvLgAAAAAJcmVjaXBpZW50AAAAAAAAEwAAADxBZGRyZXNzIHRoZSBmdW5kcyBhcmUgZGViaXRlZCBmcm9tLiBNdXN0IGF1dGhvcml6ZSB0aGUgY2FsbC4AAAAGc2VuZGVyAAAAAAATAAAAR0NvbnRyYWN0IElEIG9mIHRoZSB0b2tlbiAob3IgU3RlbGxhciBBc3NldCBDb250cmFjdCkgYmVpbmcgdHJhbnNmZXJyZWQuAAAAAA10b2tlbl9hZGRyZXNzAAAAAAAAEw==",
-        "AAAAAAAAApJPbmUtdGltZSBzZXR1cDogcmVjb3JkcyB0aGUgYWRtaW4gYW5kIHRoZSBpbml0aWFsIGZlZSBjb25maWd1cmF0aW9uCmluIGluc3RhbmNlIHN0b3JhZ2UuIE11c3QgYmUgY2FsbGVkIGJlZm9yZSBgcm91dGVfcGF5bWVudGAuCgojIFBhcmFtZXRlcnMKLSBgYWRtaW5gOiBBZGRyZXNzIGdyYW50ZWQgYWRtaW4gcmlnaHRzIG92ZXIgdGhlIGNvbnRyYWN0OyBtdXN0CmF1dGhvcml6ZSB0aGlzIGNhbGwuCi0gYHBsYXRmb3JtX3RyZWFzdXJ5YDogQWRkcmVzcyB0aGF0IHJlY2VpdmVzIGNvbGxlY3RlZCBwbGF0Zm9ybSBmZWVzLgotIGBmZWVfYnBzYDogUGxhdGZvcm0gZmVlIHJhdGUsIGluIGJhc2lzIHBvaW50cy4KLSBgZmVlX2NhcGA6IE1heGltdW0gZmVlIChpbiB0aGUgdG9rZW4ncyBzbWFsbGVzdCB1bml0KSB0YWtlbiBmcm9tIGEKc2luZ2xlIHBheW1lbnQuCi0gYG1heF9hbW91bnRgOiBNYXhpbXVtIGFtb3VudCBhY2NlcHRlZCBieSBhIHNpbmdsZSBwYXltZW50LgoKIyBSZXR1cm5zCmBPaygoKSlgIG9uIHN1Y2Nlc3MsIG9yIGBFcnIoRXJyb3I6OkFscmVhZHlJbml0aWFsaXplZClgIGlmIHRoZQpjb250cmFjdCBhbHJlYWR5IGhhcyBhbiBhZG1pbiBzZXQuCgojIFBhbmljcwpQYW5pY3MgaWYgYGFkbWluYCBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwuAAAAAAAKaW5pdGlhbGl6ZQAAAAAABQAAAAAAAAAFYWRtaW4AAAAAAAATAAAAAAAAABFwbGF0Zm9ybV90cmVhc3VyeQAAAAAAABMAAAAAAAAAB2ZlZV9icHMAAAAACwAAAAAAAAAHZmVlX2NhcAAAAAALAAAAAAAAAAptYXhfYW1vdW50AAAAAAALAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
+        "AAAAAAAAAm9PbmUtdGltZSBzZXR1cDogcmVjb3JkcyB0aGUgYWRtaW4gYW5kIHRoZSBpbml0aWFsIGZlZSBjb25maWd1cmF0aW9uCmluIGluc3RhbmNlIHN0b3JhZ2UuIE11c3QgYmUgY2FsbGVkIGJlZm9yZSBgcm91dGVfcGF5bWVudGAuCgojIFBhcmFtZXRlcnMKKiBgZW52YCAtIFRoZSBTb3JvYmFuIGVudmlyb25tZW50IGludGVyZmFjZS4KKiBgc2VuZGVyYCAtIFRoZSBhZGRyZXNzIGluaXRpYXRpbmcgdGhlIHBheW1lbnQuIE11c3QgYXV0aG9yaXplIHRoZSB0cmFuc2FjdGlvbi4KKiBgcmVjaXBpZW50YCAtIFRoZSBkZXN0aW5hdGlvbiBhZGRyZXNzIGZvciB0aGUgcGF5bWVudCAoZS5nLiwgdGhlIEFuY2hvcidzIHdhbGxldCBmb3IgZmlhdCB3aXRoZHJhd2FscykuCiogYHBsYXRmb3JtX3RyZWFzdXJ5YCAtIFRoZSBhZGRyZXNzIHdoZXJlIHRoZSBwbGF0Zm9ybSBmZWUgd2lsbCBiZSBkZXBvc2l0ZWQuCiogYHRva2VuX2FkZHJlc3NgIC0gVGhlIGNvbnRyYWN0IElEIG9mIHRoZSB0b2tlbiBhc3NldCBiZWluZyB0cmFuc2ZlcnJlZCAoZS5nLiwgTkdOQyBvciBVU0RDKS4KKiBgYW1vdW50YCAtIFRoZSB0b3RhbCBhbW91bnQgb2YgdG9rZW5zIHRvIGJlIHJvdXRlZCAoaW5jbHVzaXZlIG9mIHRoZSBmZWUpLgAAAAAKaW5pdGlhbGl6ZQAAAAAABQAAAAAAAAAFYWRtaW4AAAAAAAATAAAAAAAAABFwbGF0Zm9ybV90cmVhc3VyeQAAAAAAABMAAAAAAAAAB2ZlZV9icHMAAAAACwAAAAAAAAAHZmVlX2NhcAAAAAALAAAAAAAAAAptYXhfYW1vdW50AAAAAAALAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
         "AAAAAAAAAzxBc2tzIGEgcmVnaXN0ZXJlZCBERVggaG93IG11Y2ggYGJ1eV90b2tlbmAgYSBzd2FwIHdvdWxkIHJldHVybiwgYW5kCmRlcml2ZXMgdGhlIGBtaW5fYW1vdW50X291dGAgdGhlIHNlbmRlciBzaG91bGQgdXNlIGZyb20gdGhlIGNvbnRyYWN0J3MKY29uZmlndXJlZCBzbGlwcGFnZSBjZWlsaW5nLgoKVGhpcyBpcyBhIHJlYWQtb25seSBjcm9zcy1jb250cmFjdCBjYWxsOiBpdCBtb3ZlcyBubyBmdW5kcyBhbmQgY2hhbmdlcyBubwpzdGF0ZSwgc28gaXQgaXMgc2FmZSB0byBjYWxsIG9mZi1jaGFpbiBiZWZvcmUgYnVpbGRpbmcgYQpbYFN3YXBQYXltZW50YF0uCgojIFBhcmFtZXRlcnMKLSBgZGV4YDogQ29udHJhY3QgSUQgb2YgYSByZWdpc3RlcmVkIERFWCBhZGFwdGVyLgotIGBzZWxsX3Rva2VuYDogVG9rZW4gdGhlIHNlbmRlciB3b3VsZCBwYXkgd2l0aC4KLSBgYnV5X3Rva2VuYDogVG9rZW4gdGhlIHJlY2lwaWVudCB3b3VsZCBiZSBwYWlkIGluLgotIGBhbW91bnRfaW5gOiBBbW91bnQgb2YgYHNlbGxfdG9rZW5gIHRvIHByaWNlLCBpbiBpdHMgc21hbGxlc3QgdW5pdC4KCiMgUmV0dXJucwpBIFtgU3dhcFF1b3RlYF0gd2l0aCB0aGUgcXVvdGVkIG91dHB1dCwgdGhlIHNsaXBwYWdlLWFkanVzdGVkCmBtaW5fYW1vdW50X291dGAsIGFuZCB0aGUgc2xpcHBhZ2UgY2VpbGluZyB1c2VkLiBSZXR1cm5zCmBFcnIoRXJyb3I6OkRleE5vdFJlZ2lzdGVyZWQpYCBpZiBgZGV4YCB3YXMgbmV2ZXIgcmVnaXN0ZXJlZCBvcgpgRXJyKEVycm9yOjpTd2FwRmFpbGVkKWAgaWYgdGhlIERFWCBxdW90ZSBjYWxsIHJldmVydHMuCgojIFBhbmljcwpEb2VzIG5vdCBwYW5pYy4AAAAKcXVvdGVfc3dhcAAAAAAABAAAAAAAAAADZGV4AAAAABMAAAAAAAAACnNlbGxfdG9rZW4AAAAAABMAAAAAAAAACWJ1eV90b2tlbgAAAAAAABMAAAAAAAAACWFtb3VudF9pbgAAAAAAAAsAAAABAAAD6QAAB9AAAAAJU3dhcFF1b3RlAAAAAAAAAw==",
         "AAAAAAAAANJBbGlhcyBmb3IgYHNldF9wYXVzZWAuIEFkbWluLW9ubHkuCgojIFBhcmFtZXRlcnMKLSBgcGF1c2VkYDogYHRydWVgIHRvIHJlamVjdCByb3V0aW5nIGNhbGxzLCBgZmFsc2VgIHRvIGFsbG93IHRoZW0uCgojIFJldHVybnMKU2VlIGBzZXRfcGF1c2VgLgoKIyBQYW5pY3MKUGFuaWNzIGlmIHRoZSBjdXJyZW50IGFkbWluIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbC4AAAAAAApzZXRfcGF1c2VkAAAAAAABAAAAAAAAAAZwYXVzZWQAAAAAAAEAAAABAAAD6QAAA+0AAAAAAAAAAw==",
         "AAAAAAAAAWpBc3NpZ25zIGFuIG9wZXJhdGlvbmFsIHJvbGUgdG8gYSBzcGVjaWZpZWQgYWNjb3VudC4KClJlc3RyaWN0ZWQgZXhjbHVzaXZlbHkgdG8gYFN1cGVyQWRtaW5gLgoKIyBQYXJhbWV0ZXJzCi0gYGFjY291bnRgOiBUYXJnZXQgYWRkcmVzcyB0byByZWNlaXZlIHRoZSByb2xlLgotIGByb2xlYDogVGhlIGBSb2xlYCB2YXJpYW50IHRvIGdyYW50LgoKIyBSZXR1cm5zCmBPaygoKSlgIG9uIHN1Y2Nlc3MsIG9yIGBFcnIoRXJyb3I6Ok5vdEluaXRpYWxpemVkKWAgaWYgY29udHJhY3QgaXMgdW5pbml0aWFsaXplZC4KCiMgUGFuaWNzClBhbmljcyBpZiB0aGUgY3VycmVudCBgU3VwZXJBZG1pbmAgZG9lcyBub3QgYXV0aG9yaXplIHRoZSBjYWxsLgAAAAAAC2Fzc2lnbl9yb2xlAAAAAAIAAAAAAAAAB2FjY291bnQAAAAAEwAAAAAAAAAEcm9sZQAAB9AAAAAEUm9sZQAAAAEAAAPpAAAD7QAAAAAAAAAD",
@@ -1547,6 +1649,7 @@ export class Client extends ContractClient {
         "AAAAAAAAA/ZSb3V0ZXMgYSBwYXltZW50IGZyb20gYSBzZW5kZXIgdG8gYSByZWNpcGllbnQsIGRlZHVjdGluZyBhIHBsYXRmb3JtIGZlZS4KCiMgUGFyYW1ldGVycwotIGBzZW5kZXJgOiBBZGRyZXNzIHRoZSBmdW5kcyBhcmUgZGViaXRlZCBmcm9tOyBtdXN0IGF1dGhvcml6ZSB0aGUgY2FsbC4KLSBgcmVjaXBpZW50YDogQWRkcmVzcyB0byByZWNlaXZlIHRoZSBmdW5kcyAobWludXMgdGhlIHBsYXRmb3JtIGZlZSkuCi0gYHRva2VuX2FkZHJlc3NgOiBDb250cmFjdCBJRCBvZiB0aGUgdG9rZW4gYmVpbmcgdHJhbnNmZXJyZWQuCi0gYGFtb3VudGA6IEFtb3VudCB0byByb3V0ZSwgaW4gdGhlIHRva2VuJ3Mgc21hbGxlc3QgdW5pdC4gTXVzdCBiZQpwb3NpdGl2ZSBhbmQgd2l0aGluIHRoZSBjb25maWd1cmVkIG1pbi9tYXggYW5kIGRhaWx5LWxpbWl0IGJvdW5kcy4KCiMgUmV0dXJucwpgT2soKCkpYCBvbiBzdWNjZXNzLiBSZXR1cm5zIGBFcnIoRXJyb3I6OlBhdXNlZClgIGlmIHJvdXRpbmcgaXMKcGF1c2VkLCBgRXJyKEVycm9yOjpOb3RJbml0aWFsaXplZClgIGlmIHRoZSBjb250cmFjdCBoYXMgbm8gYWRtaW4Kc2V0LCBgRXJyKEVycm9yOjpJbnZhbGlkUmVjaXBpZW50KWAgaWYgYHNlbmRlciA9PSByZWNpcGllbnRgLApgRXJyKEVycm9yOjpCbGFja2xpc3RlZClgIGlmIGByZWNpcGllbnRgIGlzIGJsYWNrbGlzdGVkLApgRXJyKEVycm9yOjpMaW1pdEV4Y2VlZGVkKWAgaWYgYGFtb3VudGAgaXMgb3V0c2lkZSB0aGUgY29uZmlndXJlZApib3VuZHMgb3IgZXhjZWVkcyB0aGUgc2VuZGVyJ3MgcmVtYWluaW5nIGRhaWx5IGxpbWl0LCBvcgpgRXJyKEVycm9yOjpJbnN1ZmZpY2llbnRCYWxhbmNlKWAgaWYgYHNlbmRlcmAncyB0b2tlbiBiYWxhbmNlIGlzCmJlbG93IGBhbW91bnRgLgoKIyBQYW5pY3MKUGFuaWNzIGlmIGBzZW5kZXJgIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbCwgb3IgaWYgdGhlIHVuZGVybHlpbmcKdG9rZW4gdHJhbnNmZXIgdG8gYHBsYXRmb3JtX3RyZWFzdXJ5YCBmYWlscy4AAAAAAA1yb3V0ZV9wYXltZW50AAAAAAAABAAAAAAAAAAGc2VuZGVyAAAAAAATAAAAAAAAAAlyZWNpcGllbnQAAAAAAAATAAAAAAAAAA10b2tlbl9hZGRyZXNzAAAAAAAAEwAAAAAAAAAGYW1vdW50AAAAAAALAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
         "AAAAAAAAAbNTZXRzIHRoZSBtaW5pbXVtIGFsbG93ZWQgcm91dGluZyBhbW91bnQuIEZlZU1hbmFnZXItcHJvdGVjdGVkLgoKIyBQYXJhbWV0ZXJzCi0gYG1pbl9saW1pdGA6IFNtYWxsZXN0IGBhbW91bnRgIHRoYXQgYHJvdXRlX3BheW1lbnRgIC8KYHJvdXRlX3BheW1lbnRzYCB3aWxsIGFjY2VwdCBnb2luZyBmb3J3YXJkLgoKIyBSZXR1cm5zCmBPaygoKSlgIG9uIHN1Y2Nlc3MsIG9yIGBFcnIoRXJyb3I6Ok5vdEluaXRpYWxpemVkKWAgaWYgdGhlIGNvbnRyYWN0CmhhcyBubyBhZG1pbiBzZXQgeWV0LgoKIyBQYW5pY3MKUGFuaWNzIGlmIHRoZSBjdXJyZW50IEZlZU1hbmFnZXIgZG9lcyBub3QgYXV0aG9yaXplIHRoZSBjYWxsLgoKREVQUkVDQVRFRCBmb3IgZGlyZWN0IHVzZS4gIFF1ZXVlIHZpYSBgcXVldWVfYWN0aW9uKEFjdGlvblR5cGU6OlNldE1pbkxpbWl0KOKApikpYC4AAAAADXNldF9taW5fbGltaXQAAAAAAAABAAAAAAAAAAltaW5fbGltaXQAAAAAAAALAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
         "AAAAAQAAADxBIGZlZSBjaGFuZ2UgcHJvcG9zYWwgd2VpZ2h0ZWQgYnkgZ292ZXJuYW5jZS10b2tlbiBiYWxhbmNlcy4AAAAAAAAAC0ZlZVByb3Bvc2FsAAAAAAkAAAAAAAAACmNyZWF0ZWRfYXQAAAAAAAYAAAAAAAAACGV4ZWN1dGVkAAAAAQAAAAAAAAAHZmVlX2JwcwAAAAALAAAAAAAAAAdmZWVfY2FwAAAAAAsAAAAAAAAACG5vX3ZvdGVzAAAACwAAAAAAAAAIcHJvcG9zZXIAAAATAAAAAAAAAAZxdW9ydW0AAAAAAAsAAAAAAAAADnZvdGluZ19lbmRzX2F0AAAAAAAGAAAAAAAAAAl5ZXNfdm90ZXMAAAAAAAAL",
+        "AAAAAQAAAClTdHJ1Y3R1cmVkIHBheWxvYWQgZm9yIG1ldGEtdHJhbnNhY3Rpb25zLgAAAAAAAAAAAAALTWV0YVBheW1lbnQAAAAABgAAAAAAAAAGYW1vdW50AAAAAAALAAAAAAAAAAhkZWFkbGluZQAAAAYAAAAAAAAABW5vbmNlAAAAAAAABgAAAAAAAAAJcmVjaXBpZW50AAAAAAAAEwAAAAAAAAAGc2VuZGVyAAAAAAATAAAAAAAAAA10b2tlbl9hZGRyZXNzAAAAAAAAEw==",
         "AAAAAQAAAJJBIHNpbmdsZSBzd2FwLXJvdXRlZCB0cmFuc2ZlciBpbnN0cnVjdGlvbiBmb3IgdXNlIHdpdGgKW2BQYXltZW50Um91dGVyOjpyb3V0ZV9wYXltZW50X3dpdGhfc3dhcGBdIGFuZApbYFBheW1lbnRSb3V0ZXI6OnJvdXRlX3BheW1lbnRzX3dpdGhfc3dhcGBdLgAAAAAAAAAAAAtTd2FwUGF5bWVudAAAAAAJAAAAOEFtb3VudCBvZiBgc2VsbF90b2tlbmAgdG8gcHVsbCBmcm9tIHRoZSBzZW5kZXIgYW5kIHN3YXAuAAAACWFtb3VudF9pbgAAAAAAAAsAAAA+VG9rZW4gdGhlIHJlY2lwaWVudCBpcyBwYWlkIGluLiBNdXN0IGRpZmZlciBmcm9tIGBzZWxsX3Rva2VuYC4AAAAAAAlidXlfdG9rZW4AAAAAAAATAAAAeVVuaXggdGltZXN0YW1wIChzZWNvbmRzKSBhZnRlciB3aGljaCB0aGUgc3dhcCBtdXN0IG5vdCBleGVjdXRlLiBgMGAKZGlzYWJsZXMgdGhlIGRlYWRsaW5lLCBsZXR0aW5nIHRoZSBERVggYXBwbHkgaXRzIG93bi4AAAAAAAAIZGVhZGxpbmUAAAAGAAAAh0NvbnRyYWN0IElEIG9mIHRoZSBERVggYWRhcHRlciB0byBpbnZva2UuIE11c3QgYmUgcmVnaXN0ZXJlZCBieSB0aGUKYWRtaW4sIHdoaWNoIGtlZXBzIHRoZSBjcm9zcy1jb250cmFjdCBjYWxsIHBvaW50ZWQgYXQgYXVkaXRlZCBjb2RlLgAAAAADZGV4AAAAABMAAADKQW1vdW50IG9mIGBidXlfdG9rZW5gIHRoZSBjYWxsZXIgZXhwZWN0ZWQgZnJvbSBhIHByaW9yIGBxdW90ZV9zd2FwYApjYWxsLiBgMGAgZGlzYWJsZXMgdGhlIGNlaWxpbmcgY2hlY2s7IG90aGVyd2lzZSB0aGUgcmVhbGlzZWQgb3V0cHV0Cm11c3Qgc3RheSB3aXRoaW4gdGhlIGNvbnRyYWN0J3MgYG1heF9zbGlwcGFnZV9icHNgIG9mIHRoaXMgZmlndXJlLgAAAAAAE2V4cGVjdGVkX2Ftb3VudF9vdXQAAAAACwAAAIRNaW5pbXVtIGFtb3VudCBvZiBgYnV5X3Rva2VuYCB0aGUgc3dhcCBtdXN0IGRlbGl2ZXIuIFRoaXMgaXMgdGhlCnNsaXBwYWdlIGZsb29yOiBpZiB0aGUgREVYIHJldHVybnMgbGVzcywgdGhlIHdob2xlIHBheW1lbnQgcmV2ZXJ0cy4AAAAObWluX2Ftb3VudF9vdXQAAAAAAAsAAABDQWRkcmVzcyB0aGUgc3dhcHBlZCBmdW5kcyAobWludXMgdGhlIHBsYXRmb3JtIGZlZSkgYXJlIGNyZWRpdGVkIHRvLgAAAAAJcmVjaXBpZW50AAAAAAAAEwAAADpUb2tlbiB0aGUgc2VuZGVyIHBheXMgd2l0aCwgaW4gdGhhdCB0b2tlbidzIHNtYWxsZXN0IHVuaXQuAAAAAAAKc2VsbF90b2tlbgAAAAAAEwAAADxBZGRyZXNzIHRoZSBmdW5kcyBhcmUgZGViaXRlZCBmcm9tLiBNdXN0IGF1dGhvcml6ZSB0aGUgY2FsbC4AAAAGc2VuZGVyAAAAAAAT",
         "AAAAAAAAAZ5TdG9wcyBzd2FwIHJvdXRpbmcgZnJvbSBpbnZva2luZyBhIERFWCByb3V0ZXIgY29udHJhY3QuIEFkbWluLW9ubHkuCgojIFBhcmFtZXRlcnMKLSBgZGV4YDogQ29udHJhY3QgSUQgb2YgdGhlIERFWCByb3V0ZXIgdG8gcmV2b2tlLgoKIyBSZXR1cm5zCmBPaygoKSlgIG9uIHN1Y2Nlc3MsIG9yIGBFcnIoRXJyb3I6Ok5vdEluaXRpYWxpemVkKWAgaWYgdGhlIGNvbnRyYWN0IGhhcwpubyBhZG1pbiBzZXQgeWV0LgoKIyBQYW5pY3MKUGFuaWNzIGlmIHRoZSBjdXJyZW50IGFkbWluIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbC4KCkRFUFJFQ0FURUQgZm9yIGRpcmVjdCB1c2UuICBRdWV1ZSB2aWEgYHF1ZXVlX2FjdGlvbihBY3Rpb25UeXBlOjpEZXJlZ2lzdGVyRGV4KOKApikpYAphbmQgZXhlY3V0ZSBhZnRlciAyNCBob3Vycy4AAAAAAA5kZXJlZ2lzdGVyX2RleAAAAAAAAQAAAAAAAAADZGV4AAAAABMAAAABAAAD6QAAA+0AAAAAAAAAAw==",
         "AAAAAAAAAURFeGVjdXRlcyBhIHByZXZpb3VzbHkgcXVldWVkIGFjdGlvbiBpZGVudGlmaWVkIGJ5IGBub25jZWAuCgpSZXF1aXJlbWVudHM6Ci0gVGhlIGNvbnRyYWN0IG11c3Qgbm90IGJlIGZyb3plbi4KLSBUaGUgYWRtaW4gbXVzdCBhdXRob3JpemUuCi0gVGhlIGVudHJ5IGlkZW50aWZpZWQgYnkgYG5vbmNlYCBtdXN0IGV4aXN0LgotIEF0IGxlYXN0IDI0IGhvdXJzIChgU0VDT05EU19JTl8yNEhgKSBtdXN0IGhhdmUgcGFzc2VkIHNpbmNlIHF1ZXVpbmcuCgpPbiBzdWNjZXNzIHRoZSBlbnRyeSBpcyByZW1vdmVkIGFuZCB0aGUgdW5kZXJseWluZyBzZXR0ZXIgaXMgaW52b2tlZC4AAAAOZXhlY3V0ZV9hY3Rpb24AAAAAAAEAAAAAAAAABW5vbmNlAAAAAAAABgAAAAEAAAPpAAAD7QAAAAAAAAAD",
@@ -1567,10 +1670,12 @@ export class Client extends ContractClient {
         "AAAAAQAAAD1BIHBlbmRpbmcgdGltZWxvY2sgZW50cnkgc3RvcmVkIGluIHBlcnNpc3RlbnQgbGVkZ2VyIHN0b3JhZ2UuAAAAAAAAAAAAAA1UaW1lbG9ja0VudHJ5AAAAAAAAAgAAADdUaGUgYWN0aW9uIHBheWxvYWQgdG8gYXBwbHkgb25jZSB0aGUgZGVsYXkgaGFzIGVsYXBzZWQuAAAAAAZhY3Rpb24AAAAAB9AAAAAKQWN0aW9uVHlwZQAAAAAAQ0xlZGdlciB0aW1lc3RhbXAgKHNlY29uZHMgc2luY2UgZXBvY2gpIHdoZW4gdGhpcyBhY3Rpb24gd2FzIHF1ZXVlZC4AAAAACXF1ZXVlZF9hdAAAAAAAAAY=",
         "AAAAAAAAAPlEZXBvc2l0cyBpZGxlIHRyZWFzdXJ5IGZ1bmRzIGludG8gdGhlIGNvbmZpZ3VyZWQgbGVuZGluZyBwcm90b2NvbC4KCkJvdGggdGhlIFRyZWFzdXJ5TWFuYWdlciBhbmQgdHJlYXN1cnkgYXV0aG9yaXplIHRoaXMgb3BlcmF0aW9uLiBUaGUgc2Vjb25kCmF1dGhvcml6YXRpb24gaXMgcmVxdWlyZWQgYmVjYXVzZSB0aGUgZnVuZHMgYXJlIGhlbGQgYnkgdGhlIHRyZWFzdXJ5LApyYXRoZXIgdGhhbiBieSB0aGlzIHJvdXRlciBjb250cmFjdC4AAAAAAAAQZGVwb3NpdF90b195aWVsZAAAAAIAAAAAAAAABXRva2VuAAAAAAAAEwAAAAAAAAAGYW1vdW50AAAAAAALAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
         "AAAAAAAAAWtJbnN0YW50bHkgZnJlZXplcyB0aGUgY29udHJhY3QsIGJsb2NraW5nIGFsbCBwYXltZW50cyBhbmQgdGltZWxvY2sKZXhlY3V0aW9ucy4gIFRoaXMgaXMgdGhlIGVtZXJnZW5jeSBsYXN0IHJlc29ydCB3aGVuIGFuIGFkbWluIGtleSBpcwprbm93biB0byBiZSBjb21wcm9taXNlZC4KClVubGlrZSBvdGhlciBzZW5zaXRpdmUgYWRtaW4gb3BlcmF0aW9ucywgZnJlZXplIHRha2VzIGVmZmVjdCBpbW1lZGlhdGVseQrigJQgaXQgZG9lcyBOT1QgZ28gdGhyb3VnaCB0aGUgdGltZWxvY2sg4oCUIHNvIGl0IGlzIGFsd2F5cyBhdmFpbGFibGUgYXMgYQpyYXBpZC1yZXNwb25zZSB0b29sLgoKQWRtaW4gYXV0aG9yaXphdGlvbiBpcyByZXF1aXJlZC4AAAAAEGVtZXJnZW5jeV9mcmVlemUAAAAAAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
+        "AAAAAAAAAGlSZXR1cm5zIHRoZSBNZXJrbGUgcm9vdCBhbmQgbWV0YWRhdGEgZm9yIGFuIGFyY2hpdmUgZXBvY2gsIG9yIGBOb25lYAppZiBubyBhcmNoaXZlIGV4aXN0cyBmb3IgdGhhdCBlcG9jaC4AAAAAAAAQZ2V0X2FyY2hpdmVfaW5mbwAAAAEAAAAAAAAABWVwb2NoAAAAAAAABgAAAAEAAAPoAAAD7QAAAAIAAAPuAAAAIAAAB9AAAAAPQXJjaGl2ZU1ldGFkYXRhAA==",
         "AAAAAAAAAAAAAAAQZ2V0X2ZlZV9wcm9wb3NhbAAAAAEAAAAAAAAAC3Byb3Bvc2FsX2lkAAAAAAYAAAABAAAD6AAAB9AAAAALRmVlUHJvcG9zYWwA",
         "AAAAAAAAAmlDb25maWd1cmVzIHRoZSBwcmljZS1mZWVkIG9yYWNsZSBjb250cmFjdCBhZGRyZXNzLiBDb21wbGlhbmNlT2ZmaWNlci1wcm90ZWN0ZWQuCgpUaGUgb3JhY2xlIGNvbnRyYWN0IG11c3QgaW1wbGVtZW50IHRoZSBbYFByaWNlRmVlZE9yYWNsZWBdIGludGVyZmFjZToKaXQgbXVzdCBleHBvc2UgYSBgZ2V0X3ByaWNlKGJhc2VfYXNzZXQsIHF1b3RlX2Fzc2V0KSAtPiBQcmljZURhdGFgCm1ldGhvZCB0aGF0IHJldHVybnMgdGhlIGxhdGVzdCBwcmljZSB0b2dldGhlciB3aXRoIGEgVW5peCB0aW1lc3RhbXAgc28Kc3RhbGVuZXNzIGNhbiBiZSB2YWxpZGF0ZWQgYWdhaW5zdCB0aGUgY29uZmlndXJlZCB0aHJlc2hvbGQuCgojIFBhcmFtZXRlcnMKLSBgb3JhY2xlYDogQWRkcmVzcyBvZiB0aGUgb3JhY2xlIGNvbnRyYWN0IHRvIHVzZSBmb3IgcHJpY2UgbG9va3Vwcy4KCiMgUmV0dXJucwpgT2soKCkpYCBvbiBzdWNjZXNzLCBvciBgRXJyKEVycm9yOjpOb3RJbml0aWFsaXplZClgIGlmIHRoZSBjb250cmFjdApoYXMgbm90IGJlZW4gaW5pdGlhbGl6ZWQuCgojIFBhbmljcwpQYW5pY3MgaWYgdGhlIGN1cnJlbnQgQ29tcGxpYW5jZU9mZmljZXIgZG9lcyBub3QgYXV0aG9yaXplIHRoZSBjYWxsLgAAAAAAABBzZXRfcHJpY2Vfb3JhY2xlAAAAAQAAAAAAAAAGb3JhY2xlAAAAAAATAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
         "AAAAAAAAAV9BZGRzIGFuIGFkZHJlc3MgdG8gdGhlIGJsYWNrbGlzdC4gQ29tcGxpYW5jZU9mZmljZXItcHJvdGVjdGVkLgoKIyBQYXJhbWV0ZXJzCi0gYGFkZHJlc3NgOiBBZGRyZXNzIHRvIGJsYWNrbGlzdDsgc3Vic2VxdWVudCBwYXltZW50cyB0byBpdCBhcyBhCnJlY2lwaWVudCB3aWxsIGJlIHJlamVjdGVkLgoKIyBSZXR1cm5zCmBPaygoKSlgIG9uIHN1Y2Nlc3MsIG9yIGBFcnIoRXJyb3I6Ok5vdEluaXRpYWxpemVkKWAgaWYgdGhlIGNvbnRyYWN0CmhhcyBubyBhZG1pbiBzZXQgeWV0LgoKIyBQYW5pY3MKUGFuaWNzIGlmIHRoZSBjdXJyZW50IENvbXBsaWFuY2VPZmZpY2VyIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbC4AAAAAEWJsYWNrbGlzdF9hZGRyZXNzAAAAAAAAAQAAAAAAAAAHYWRkcmVzcwAAAAATAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
         "AAAAAAAAAaNDbGFpbXMgYW5kIHdpdGhkcmF3cyB0aGUgZW50aXJlIGF2YWlsYWJsZSByZWZ1bmQgYmFsYW5jZSBmb3IgYSB1c2VyIGFuZCB0b2tlbi4KCiMgUGFyYW1ldGVycwotIGB1c2VyYDogQWRkcmVzcyB3aXRoZHJhd2luZyBmdW5kczsgbXVzdCBhdXRob3JpemUgdGhlIGNhbGwuCi0gYHRva2VuYDogQ29udHJhY3QgSUQgb2YgdGhlIHRva2VuIHRvIHdpdGhkcmF3LgoKIyBSZXR1cm5zCmBPayhhbW91bnQpYCB3aXRoIHRoZSBhbW91bnQgd2l0aGRyYXduLCBvcgpgRXJyKEVycm9yOjpOb1JlZnVuZEF2YWlsYWJsZSlgIGlmIHRoZSByZWZ1bmQgYmFsYW5jZSBpcyB6ZXJvLgoKIyBQYW5pY3MKUGFuaWNzIGlmIGB1c2VyYCBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwsIG9yIGlmIHRoZSB1bmRlcmx5aW5nCnRva2VuIHRyYW5zZmVyIGZhaWxzLgAAAAARY2xhaW1fYWxsX3JlZnVuZHMAAAAAAAACAAAAAAAAAAR1c2VyAAAAEwAAAAAAAAAFdG9rZW4AAAAAAAATAAAAAQAAA+kAAAALAAAAAw==",
+        "AAAAAAAAAEhSZXR1cm5zIHRoZSBjdXJyZW50IGFyY2hpdmUgZXBvY2ggY291bnRlciAoMCA9IG5vIGVwb2NocyBjb21taXR0ZWQgeWV0KS4AAAARZ2V0X2FyY2hpdmVfZXBvY2gAAAAAAAAAAAAAAQAAAAY=",
         "AAAAAAAAAEhSZXR1cm5zIHRoZSBjb25maWd1cmVkIEtZQyB0aHJlc2hvbGQsIG9yIGBOb25lYCB3aGVuIGVuZm9yY2VtZW50IGlzIG9mZi4AAAARZ2V0X2t5Y190aHJlc2hvbGQAAAAAAAAAAAAAAQAAA+gAAAAL",
         "AAAAAAAAAFpSZXR1cm5zIHRoZSBwZW5kaW5nIGBUaW1lbG9ja0VudHJ5YCBmb3IgdGhlIGdpdmVuIG5vbmNlLCBvciBhbiBlcnJvciBpZgppdCBkb2VzIG5vdCBleGlzdC4AAAAAABFnZXRfcXVldWVkX2FjdGlvbgAAAAAAAAEAAAAAAAAABW5vbmNlAAAAAAAABgAAAAEAAAPpAAAH0AAAAA1UaW1lbG9ja0VudHJ5AAAAAAAAAw==",
         "AAAAAAAAANtSZXR1cm5zIHdoZXRoZXIgYSBERVggcm91dGVyIGlzIGFwcHJvdmVkIGZvciBzd2FwIHJvdXRpbmcuCgojIFBhcmFtZXRlcnMKLSBgZGV4YDogQ29udHJhY3QgSUQgdG8gY2hlY2suCgojIFJldHVybnMKYHRydWVgIGlmIHRoZSBERVggbWF5IGJlIHVzZWQgYnkgYHJvdXRlX3BheW1lbnRfd2l0aF9zd2FwYCwgYGZhbHNlYApvdGhlcndpc2UuCgojIFBhbmljcwpEb2VzIG5vdCBwYW5pYy4AAAAAEWlzX2RleF9yZWdpc3RlcmVkAAAAAAAAAQAAAAAAAAADZGV4AAAAABMAAAABAAAAAQ==",
@@ -1584,6 +1689,7 @@ export class Client extends ContractClient {
         "AAAAAAAAA09TdG9yZXMgYW4gYWRtaW4tc3VwcGxpZWQgZmFsbGJhY2sgcHJpY2UgZm9yIGEgKGJhc2UsIHF1b3RlKSBhc3NldCBwYWlyLgpDb21wbGlhbmNlT2ZmaWNlci1wcm90ZWN0ZWQuCgpUaGUgZmFsbGJhY2sgaXMgdXNlZCBieSBbYGdldF9wcmljZWBdIHdoZW4gdGhlIGxpdmUgb3JhY2xlIGlzCnVuYXZhaWxhYmxlIG9yIHJldHVybnMgZGF0YSB0aGF0IGZhaWxzIHZhbGlkYXRpb24gKHN0YWxlIG9yIGludmFsaWQpLgpTZXR0aW5nIGEgZmFsbGJhY2sgcHJpY2UgdG8gYDBgIGVmZmVjdGl2ZWx5IHJlbW92ZXMgdGhlIGZhbGxiYWNrLAptZWFuaW5nIHRoYXQgb3JhY2xlIGZhaWx1cmVzIHdpbGwgcHJvcGFnYXRlIGFzIGVycm9ycyByYXRoZXIgdGhhbgpzaWxlbnRseSB1c2luZyBhIHN0YWxlIGNhY2hlZCB2YWx1ZS4KCiMgUGFyYW1ldGVycwotIGBiYXNlX2Fzc2V0YDogQWRkcmVzcyBvZiB0aGUgYmFzZSBhc3NldCAoZS5nLiBYTE0gY29udHJhY3QpLgotIGBxdW90ZV9hc3NldGA6IEFkZHJlc3Mgb2YgdGhlIHF1b3RlIGFzc2V0IChlLmcuIFVTREMgY29udHJhY3QpLgotIGBmYWxsYmFja19wcmljZWA6IFByaWNlIGV4cHJlc3NlZCBpbiB0aGUgc2FtZSBmaXhlZC1wb2ludCBmb3JtYXQgYXMKdGhlIG9yYWNsZSAoYHByaWNlIC8gMTBeZGVjaW1hbHNgKS4gUGFzcyBgMGAgdG8gY2xlYXIgdGhlIGZhbGxiYWNrLgotIGBkZWNpbWFsc2A6IERlY2ltYWwgcHJlY2lzaW9uIG9mIGBmYWxsYmFja19wcmljZWAuCgojIFJldHVybnMKYE9rKCgpKWAgb24gc3VjY2Vzcy4KCiMgUGFuaWNzClBhbmljcyBpZiB0aGUgY3VycmVudCBDb21wbGlhbmNlT2ZmaWNlciBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwuAAAAABJzZXRfZmFsbGJhY2tfcHJpY2UAAAAAAAQAAAAAAAAACmJhc2VfYXNzZXQAAAAAABMAAAAAAAAAC3F1b3RlX2Fzc2V0AAAAABMAAAAAAAAADmZhbGxiYWNrX3ByaWNlAAAAAAALAAAAAAAAAAhkZWNpbWFscwAAAAQAAAABAAAD6QAAA+0AAAAAAAAAAw==",
         "AAAAAAAAAF5Db25maWd1cmVzIHRoZSBsZW5kaW5nIHByb3RvY29sIHVzZWQgZm9yIHRyZWFzdXJ5IHlpZWxkIG9wZXJhdGlvbnMuIFRyZWFzdXJ5TWFuYWdlci1wcm90ZWN0ZWQuAAAAAAASc2V0X3lpZWxkX3Byb3RvY29sAAAAAAABAAAAAAAAAAhwcm90b2NvbAAAABMAAAABAAAD6QAAA+0AAAAAAAAAAw==",
         "AAAAAAAAAMRSZWNvcmRzIGEgdG9rZW4gYXMgc3VwcG9ydGVkIChuby1vcDsgcm91dGluZyBhY2NlcHRzIGFueSB0b2tlbiBjb250cmFjdCBJRCkuCgojIFBhcmFtZXRlcnMKLSBgX3Rva2VuYDogSWdub3JlZDsgcHJlc2VudCBmb3IgQVBJIGNvbXBhdGliaWxpdHkuCgojIFJldHVybnMKQWx3YXlzIGBPaygoKSlgLgoKIyBQYW5pY3MKRG9lcyBub3QgcGFuaWMuAAAAE2FkZF9zdXBwb3J0ZWRfdG9rZW4AAAAAAQAAAAAAAAAGX3Rva2VuAAAAAAATAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
+        "AAAAAAAAAQdDb21taXRzIGEgU0hBLTI1NiBNZXJrbGUgcm9vdCBvZiBhIGJhdGNoIG9mIHBheW1lbnQtcmVjb3JkIHNuYXBzaG90cwppbnRvIHBlcnNpc3RlbnQgc3RvcmFnZSwgb3BlbmluZyBhIG5ldyBhcmNoaXZlIGVwb2NoLgoKQ2FsbCB0aGlzIGJlZm9yZSBgcHJ1bmVfYXJjaGl2ZWRfZW50cmllc2AuIFJlcXVpcmVzIFRyZWFzdXJ5TWFuYWdlci4KUmV0dXJucyB0aGUgbmV3IGVwb2NoIG51bWJlci4KCkVycm9yczogTm90SW5pdGlhbGl6ZWQsIENvbnRyYWN0RnJvemVuLgAAAAATY29tbWl0X2FyY2hpdmVfcm9vdAAAAAADAAAAAAAAAARyb290AAAD7gAAACAAAAAAAAAABmxlYXZlcwAAAAAD6gAAB9AAAAALQXJjaGl2ZUxlYWYAAAAAAAAAAAtkZXNjcmlwdGlvbgAAAAAQAAAAAQAAA+kAAAAGAAAAAw==",
         "AAAAAAAAAnFQZXJtaXNzaW9ubGVzcyBtaWdyYXRpb24gb2YgYSBzZW5kZXIncyBsZWdhY3kgcHJlLSM2NjMgc3BsaXQgZW50cmllcwooYFVzZXJTcGVuZGluZ2AgKyBgVXNlclZvbHVtZWApIGludG8gdGhlIHNpbmdsZSBwYWNrZWQgYFVzZXJSZWNvcmRgCihpc3N1ZSAjNjYzKS4KCkNhbGxhYmxlIGJ5IGFueW9uZTogaXQgb25seSByZWNvbWJpbmVzIHZhbHVlcyB0aGF0IGFyZSBhbHJlYWR5IG9uIHRoZQpsZWRnZXIgYW5kIG5ldmVyIGludmVudHMgb3IgZGVzdHJveXMgdmFsdWUuIFdoZW4gdGhlIHNlbmRlcidzIHBhY2tlZApyZWNvcmQgd2FzIGFscmVhZHkgY3JlYXRlZCBieSBhIHJlY2VudCBwYXltZW50LCB0aGlzIGp1c3QgcmVtb3ZlcyB0aGUKc3RhbGUgbGVnYWN5IGtleXMgYW5kIGtlZXBzIHRoZSBuZXdlciBwYWNrZWQgdmFsdWVzLgoKIyBQYXJhbWV0ZXJzCi0gYHVzZXJgOiBUaGUgc2VuZGVyIHdob3NlIGxlZ2FjeSBlbnRyaWVzIHNob3VsZCBiZSBtaWdyYXRlZC4KCiMgUmV0dXJucwpgdHJ1ZWAgaWYgbGVnYWN5IHN0YXRlIHdhcyBmb3VuZCBhbmQgbWlncmF0ZWQsIGBmYWxzZWAgaWYgYHVzZXJgIGhhcwpubyBsZWdhY3kgZW50cmllcyB0byBtaWdyYXRlLgoKIyBQYW5pY3MKRG9lcyBub3QgcGFuaWMuAAAAAAAAE21pZ3JhdGVfdXNlcl9yZWNvcmQAAAAAAQAAAAAAAAAEdXNlcgAAABMAAAABAAAAAQ==",
         "AAAAAAAAATlSZW1vdmVzIGFuIGFkZHJlc3MgZnJvbSB0aGUgYmxhY2tsaXN0LiBDb21wbGlhbmNlT2ZmaWNlci1wcm90ZWN0ZWQuCgojIFBhcmFtZXRlcnMKLSBgYWRkcmVzc2A6IEFkZHJlc3MgdG8gcmVtb3ZlIGZyb20gdGhlIGJsYWNrbGlzdC4KCiMgUmV0dXJucwpgT2soKCkpYCBvbiBzdWNjZXNzLCBvciBgRXJyKEVycm9yOjpOb3RJbml0aWFsaXplZClgIGlmIHRoZSBjb250cmFjdApoYXMgbm8gYWRtaW4gc2V0IHlldC4KCiMgUGFuaWNzClBhbmljcyBpZiB0aGUgY3VycmVudCBDb21wbGlhbmNlT2ZmaWNlciBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwuAAAAAAAAE3VuYmxhY2tsaXN0X2FkZHJlc3MAAAAAAQAAAAAAAAAHYWRkcmVzcwAAAAATAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
         "AAAAAAAAAF1XaXRoZHJhd3MgdHJlYXN1cnkgcHJpbmNpcGFsIGZyb20gdGhlIGNvbmZpZ3VyZWQgbGVuZGluZyBwcm90b2NvbC4gVHJlYXN1cnlNYW5hZ2VyLXByb3RlY3RlZC4AAAAAAAATd2l0aGRyYXdfZnJvbV95aWVsZAAAAAACAAAAAAAAAAV0b2tlbgAAAAAAABMAAAAAAAAABmFtb3VudAAAAAAACwAAAAEAAAPpAAAD7QAAAAAAAAAD",
@@ -1594,9 +1700,13 @@ export class Client extends ContractClient {
         "AAAAAAAAAUlSZXR1cm5zIHRoZSBlZmZlY3RpdmUgZmVlX2JwcyBmb3IgYSBzZW5kZXIgYWZ0ZXIgYXBwbHlpbmcgYW55CnZvbHVtZS1iYXNlZCB0aWVyZWQgZGlzY291bnQuCgojIFBhcmFtZXRlcnMKLSBgc2VuZGVyYDogQWRkcmVzcyB3aG9zZSBkaXNjb3VudGVkIGZlZSByYXRlIHRvIGNvbXB1dGUuCgojIFJldHVybnMKVGhlIGNvbmZpZ3VyZWQgYGZlZV9icHNgLCBoYWx2ZWQgaWYgYHNlbmRlcmAncyBsaWZldGltZSB2b2x1bWUKZXhjZWVkcyB0aGUgdGllcmVkLWRpc2NvdW50IHRocmVzaG9sZCwgb3IgYDBgIGlmIG5vdCBpbml0aWFsaXplZC4KCiMgUGFuaWNzCkRvZXMgbm90IHBhbmljLgAAAAAAABVnZXRfZWZmZWN0aXZlX2ZlZV9icHMAAAAAAAABAAAAAAAAAAZzZW5kZXIAAAAAABMAAAABAAAACw==",
         "AAAAAAAAAfJVcGRhdGVzIHRoZSBmZWUgYmFzaXMgcG9pbnRzIGFuZCBmZWUgY2FwLgpSZXF1aXJlcyBnb3Zlcm5hbmNlIGF1dGhvcml0eSBpZiBhIGdvdmVybmFuY2UgYWRkcmVzcyBpcyBzZXQ7IG90aGVyd2lzZSBhZG1pbi1vbmx5LgoKIyBQYXJhbWV0ZXJzCi0gYGZlZV9icHNgOiBOZXcgcGxhdGZvcm0gZmVlIHJhdGUsIGluIGJhc2lzIHBvaW50cy4KLSBgZmVlX2NhcGA6IE5ldyBtYXhpbXVtIGZlZSB0YWtlbiBmcm9tIGEgc2luZ2xlIHBheW1lbnQuCgojIFJldHVybnMKYE9rKCgpKWAgb24gc3VjY2Vzcywgb3IgYEVycihFcnJvcjo6Tm90SW5pdGlhbGl6ZWQpYCBpZiB0aGUgY29udHJhY3QKaGFzIG5vIGFkbWluIHNldCB5ZXQuCgojIFBhbmljcwpQYW5pY3MgaWYgdGhlIGNhbGxlciBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwuCgpERVBSRUNBVEVEIGZvciBkaXJlY3QgdXNlLiAgUXVldWUgdmlhIGBxdWV1ZV9hY3Rpb24oQWN0aW9uVHlwZTo6U2V0RmVlQ29uZmlnKOKApikpYC4AAAAAABVzZXRfZmVlX2NvbmZpZ19sZWdhY3kAAAAAAAACAAAAAAAAAAdmZWVfYnBzAAAAAAsAAAAAAAAAB2ZlZV9jYXAAAAAACwAAAAEAAAPpAAAD7QAAAAAAAAAD",
         "AAAAAAAAAlFVcGRhdGVzIHRoZSB0cmVhc3VyeSBhZGRyZXNzIHRoYXQgcmVjZWl2ZXMgdGhlIHBsYXRmb3JtIGZlZS4KClVwZGF0ZXMgdGhlIHRyZWFzdXJ5IGFkZHJlc3MgdGhhdCByZWNlaXZlcyB0aGUgcGxhdGZvcm0gZmVlLiBQcm90ZWN0ZWQgYnkgVHJlYXN1cnlNYW5hZ2VyLgoKIyBQYXJhbWV0ZXJzCi0gYG5ld190cmVhc3VyeWA6IEFkZHJlc3MgdG8gcmVjZWl2ZSBwbGF0Zm9ybSBmZWVzIGdvaW5nIGZvcndhcmQuCgojIFJldHVybnMKYE9rKCgpKWAgb24gc3VjY2Vzcywgb3IgYEVycihFcnJvcjo6Tm90SW5pdGlhbGl6ZWQpYCBpZiB0aGUgY29udHJhY3QKaGFzIG5vIGFkbWluIHNldCB5ZXQuCgojIFBhbmljcwpQYW5pY3MgaWYgdGhlIGN1cnJlbnQgVHJlYXN1cnlNYW5hZ2VyIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbC4KCkRFUFJFQ0FURUQgZm9yIGRpcmVjdCB1c2UuICBRdWV1ZSB2aWEgYHF1ZXVlX2FjdGlvbihBY3Rpb25UeXBlOjpTZXRQbGF0Zm9ybVRyZWFzdXJ5KOKApikpYAphbmQgZXhlY3V0ZSBhZnRlciAyNCBob3Vycy4gIFRoaXMgZGlyZWN0IHBhdGggaXMgcmV0YWluZWQgZm9yIHRvb2xpbmcKY29tcGF0aWJpbGl0eSBvbmx5LgAAAAAAABVzZXRfcGxhdGZvcm1fdHJlYXN1cnkAAAAAAAABAAAAAAAAAAxuZXdfdHJlYXN1cnkAAAATAAAAAQAAA+kAAAPtAAAAAAAAAAM=",
+        "AAAAAAAAAVBEZWxldGVzIG9uLWNoYWluIGxlZGdlciBlbnRyaWVzIGNvbW1pdHRlZCB2aWEgYGNvbW1pdF9hcmNoaXZlX3Jvb3RgLgoKUmVxdWlyZXMgdGhlIGVwb2NoIGZyb20gYSBwcmlvciBjb21taXQgY2FsbC4gU2lsZW50bHkgc2tpcHMgYWJzZW50CmVudHJpZXMuIFJldHVybnMgdGhlIGNvdW50IG9mIGVudHJpZXMgcmVtb3ZlZC4KClN1cHBvcnRlZDogVXNlclZvbHVtZSwgVXNlclNwZW5kaW5nLCBSZWZ1bmRCYWxhbmNlLgpFcnJvcnM6IE5vdEluaXRpYWxpemVkLCBDb250cmFjdEZyb3plbiwgVGltZWxvY2tOb3RGb3VuZCAodW5rbm93biBlcG9jaCkuClJlcXVpcmVzIFRyZWFzdXJ5TWFuYWdlci4AAAAWcHJ1bmVfYXJjaGl2ZWRfZW50cmllcwAAAAAAAgAAAAAAAAAPY29tbWl0dGVkX2Vwb2NoAAAAAAYAAAAAAAAABmxlYXZlcwAAAAAD6gAAB9AAAAALQXJjaGl2ZUxlYWYAAAAAAQAAA+kAAAAEAAAAAw==",
         "AAAAAAAAA89Sb3V0ZXMgYSBwYXltZW50IGluIGFueSB0b2tlbiwgc3dhcHBpbmcgaXQgaW50byB0aGUgcmVjaXBpZW50J3MKcHJlZmVycmVkIHRva2VuIG9uIHRoZSB3YXkuCgpUaGUgc3dhcC1yb3V0ZWQgY291bnRlcnBhcnQgb2YgW2BQYXltZW50Um91dGVyOjpyb3V0ZV9wYXltZW50YF06IHRoZSBzYW1lCmZlZSwgbGltaXQsIGJsYWNrbGlzdCwgYW5kIGZyZWV6ZSBydWxlcyBhcHBseSwgd2l0aCB0aGUgY29udmVyc2lvbgppbnNlcnRlZCBiZXR3ZWVuIHB1bGxpbmcgdGhlIGZ1bmRzIGFuZCBkZWxpdmVyaW5nIHRoZW0uIFRoZSBwbGF0Zm9ybSBmZWUKaXMgdGFrZW4gb24gdGhlIGBidXlfdG9rZW5gIG91dHB1dCwgc28gYGZlZV9jYXBgIGFwcGxpZXMgaW4gYGJ1eV90b2tlbmAKdW5pdHMgZm9yIHRoaXMgcm91dGUuCgojIFBhcmFtZXRlcnMKLSBgcGF5bWVudGA6IFRoZSBzd2FwLXJvdXRlZCB0cmFuc2ZlciAoc2VlIFtgU3dhcFBheW1lbnRgXSkuCgojIFJldHVybnMKVGhlIGFtb3VudCBvZiBgYnV5X3Rva2VuYCBkZWxpdmVyZWQgdG8gdGhlIHJlY2lwaWVudCwgYWZ0ZXIgdGhlCnBsYXRmb3JtIGZlZS4gT3RoZXJ3aXNlIHRoZSBwYXltZW50IGlzIGFiYW5kb25lZCB3aG9sZSwgd2l0aDoKLSBgRXJyKEVycm9yOjpJbnZhbGlkU3dhcFBhcmFtcylgLCBgRXJyKEVycm9yOjpTd2FwRGVhZGxpbmVFeHBpcmVkKWAsCmBFcnIoRXJyb3I6OkRleE5vdFJlZ2lzdGVyZWQpYCwgYEVycihFcnJvcjo6U3dhcEZhaWxlZClgLCBvcgpgRXJyKEVycm9yOjpTbGlwcGFnZUV4Y2VlZGVkKWAgZm9yIHN3YXAtc3BlY2lmaWMgcHJvYmxlbXMsCi0gdGhlIHNhbWUgYEVycmAgdmFyaWFudHMgYXMgYHJvdXRlX3BheW1lbnRgIG90aGVyd2lzZS4KCiMgUGFuaWNzClBhbmljcyBpZiBgcGF5bWVudC5zZW5kZXJgIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbCwgb3IgaWYgYSB0b2tlbgp0cmFuc2ZlciBvdXQgb2YgdGhpcyBjb250cmFjdCBmYWlscy4AAAAAF3JvdXRlX3BheW1lbnRfd2l0aF9zd2FwAAAAAAEAAAAAAAAAB3BheW1lbnQAAAAH0AAAAAtTd2FwUGF5bWVudAAAAAABAAAD6QAAAAsAAAAD",
         "AAAAAAAAAjJTZXRzIHRoZSBtYXhpbXVtIGFnZSAoaW4gc2Vjb25kcykgYSBwcmljZSByZWFkaW5nIG1heSBoYXZlIGJlZm9yZSBpdCBpcwpjb25zaWRlcmVkIHN0YWxlLiBDb21wbGlhbmNlT2ZmaWNlci1wcm90ZWN0ZWQuCgpXaGVuIGEgcHJpY2UgdGltZXN0YW1wIGlzIG9sZGVyIHRoYW4gYChjdXJyZW50X2xlZGdlcl90aW1lIC0gdGhyZXNob2xkKWAKdGhlIHJlYWRpbmcgaXMgcmVqZWN0ZWQgd2l0aCBbYEVycm9yOjpPcmFjbGVQcmljZVN0YWxlYF0gYW5kIHRoZQpmYWxsYmFjayBwcmljZSAoaWYgY29uZmlndXJlZCkgaXMgdXNlZCBpbnN0ZWFkLgoKIyBQYXJhbWV0ZXJzCi0gYHRocmVzaG9sZF9zZWNzYDogTWF4aW11bSBhbGxvd2VkIGFnZSBpbiBzZWNvbmRzLiBBIHZhbHVlIG9mIGAwYApkaXNhYmxlcyB0aGUgc3RhbGVuZXNzIGNoZWNrIGVudGlyZWx5IChldmVyeSBwcmljZSBpcyBhY2NlcHRlZCkuCgojIFJldHVybnMKYE9rKCgpKWAgb24gc3VjY2Vzcy4KCiMgUGFuaWNzClBhbmljcyBpZiB0aGUgY3VycmVudCBDb21wbGlhbmNlT2ZmaWNlciBkb2VzIG5vdCBhdXRob3JpemUgdGhlIGNhbGwuAAAAAAAXc2V0X3N0YWxlbmVzc190aHJlc2hvbGQAAAAAAQAAAAAAAAAOdGhyZXNob2xkX3NlY3MAAAAAAAYAAAABAAAD6QAAA+0AAAAAAAAAAw==",
-        "AAAAAAAAAmRSb3V0ZXMgc2V2ZXJhbCBzd2FwLXJvdXRlZCBwYXltZW50cyBpbiBhIHNpbmdsZSB0cmFuc2FjdGlvbi4gSWYgYW55CnBheW1lbnQgZmFpbHMsIHRoZSBlbnRpcmUgYmF0Y2ggaXMgcmV2ZXJ0ZWQgYXRvbWljYWxseSwgaW5jbHVkaW5nIGFueQpzd2FwcyB0aGF0IGFscmVhZHkgZXhlY3V0ZWQgZWFybGllciBpbiB0aGUgYmF0Y2guCgojIFBhcmFtZXRlcnMKLSBgcGF5bWVudHNgOiBCYXRjaCBvZiBzd2FwLXJvdXRlZCB0cmFuc2ZlcnMgdG8gYXBwbHkgaW4gb3JkZXIuIFNlZQpbYFN3YXBQYXltZW50YF0gZm9yIHBlci1pdGVtIGNvbnN0cmFpbnRzLgoKIyBSZXR1cm5zClRoZSB0b3RhbCBhbW91bnQgb2YgYGJ1eV90b2tlbmAgZGVsaXZlcmVkIGFjcm9zcyB0aGUgYmF0Y2gsIG9yIHRoZQpmaXJzdCBlcnJvciBlbmNvdW50ZXJlZCAoc2VlIGByb3V0ZV9wYXltZW50X3dpdGhfc3dhcGAgZm9yIHRoZQpwb3NzaWJsZSB2YXJpYW50cyBhbmQgdGhlaXIgY2F1c2VzKS4KCiMgUGFuaWNzClBhbmljcyBpZiBhbnkgcGF5bWVudCdzIGBzZW5kZXJgIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbCwgb3IgaWYgYQp0b2tlbiB0cmFuc2ZlciBvdXQgb2YgdGhpcyBjb250cmFjdCBmYWlscy4AAAAYcm91dGVfcGF5bWVudHNfd2l0aF9zd2FwAAAAAQAAAAAAAAAIcGF5bWVudHMAAAPqAAAH0AAAAAtTd2FwUGF5bWVudAAAAAABAAAD6QAAAAsAAAAD" ]),
+        "AAAAAAAAAmRSb3V0ZXMgc2V2ZXJhbCBzd2FwLXJvdXRlZCBwYXltZW50cyBpbiBhIHNpbmdsZSB0cmFuc2FjdGlvbi4gSWYgYW55CnBheW1lbnQgZmFpbHMsIHRoZSBlbnRpcmUgYmF0Y2ggaXMgcmV2ZXJ0ZWQgYXRvbWljYWxseSwgaW5jbHVkaW5nIGFueQpzd2FwcyB0aGF0IGFscmVhZHkgZXhlY3V0ZWQgZWFybGllciBpbiB0aGUgYmF0Y2guCgojIFBhcmFtZXRlcnMKLSBgcGF5bWVudHNgOiBCYXRjaCBvZiBzd2FwLXJvdXRlZCB0cmFuc2ZlcnMgdG8gYXBwbHkgaW4gb3JkZXIuIFNlZQpbYFN3YXBQYXltZW50YF0gZm9yIHBlci1pdGVtIGNvbnN0cmFpbnRzLgoKIyBSZXR1cm5zClRoZSB0b3RhbCBhbW91bnQgb2YgYGJ1eV90b2tlbmAgZGVsaXZlcmVkIGFjcm9zcyB0aGUgYmF0Y2gsIG9yIHRoZQpmaXJzdCBlcnJvciBlbmNvdW50ZXJlZCAoc2VlIGByb3V0ZV9wYXltZW50X3dpdGhfc3dhcGAgZm9yIHRoZQpwb3NzaWJsZSB2YXJpYW50cyBhbmQgdGhlaXIgY2F1c2VzKS4KCiMgUGFuaWNzClBhbmljcyBpZiBhbnkgcGF5bWVudCdzIGBzZW5kZXJgIGRvZXMgbm90IGF1dGhvcml6ZSB0aGUgY2FsbCwgb3IgaWYgYQp0b2tlbiB0cmFuc2ZlciBvdXQgb2YgdGhpcyBjb250cmFjdCBmYWlscy4AAAAYcm91dGVfcGF5bWVudHNfd2l0aF9zd2FwAAAAAQAAAAAAAAAIcGF5bWVudHMAAAPqAAAH0AAAAAtTd2FwUGF5bWVudAAAAAABAAAD6QAAAAsAAAAD",
+        "AAAAAQAAATxBIHNpbmdsZSBhcmNoaXZlIGxlYWYgZGVzY3JpcHRvciBwYXNzZWQgaW50byBgY29tbWl0X2FyY2hpdmVfcm9vdGAgYW5kCmBwcnVuZV9hcmNoaXZlZF9lbnRyaWVzYC4KClRoZSBjb250cmFjdCB1c2VzIGByZWNvcmRfdHlwZSArIHByaW1hcnlfa2V5ICgrIHNlY29uZGFyeV9rZXkpYCB0byBsb2NhdGUKdGhlIGNvcnJlc3BvbmRpbmcgYERhdGFLZXlgIHRvIGRlbGV0ZSBkdXJpbmcgYSBwcnVuZS4gSXQgZG9lcyBub3QgcmUtaGFzaAp0aGUgbGVhdmVzIOKAlCB0aGUgTWVya2xlIHJvb3QgaXMgY29tcHV0ZWQgYW5kIHRydXN0ZWQgZnJvbSBvZmYtY2hhaW4uAAAAAAAAAAtBcmNoaXZlTGVhZgAAAAADAAAAd1ByaW1hcnkga2V5IGFkZHJlc3M6Ci0gYFVzZXJWb2x1bWVgIC8gYFVzZXJTcGVuZGluZ2A6IHRoZSBzZW5kZXIgYWRkcmVzcy4KLSBgUmVmdW5kQmFsYW5jZWA6IHRoZSB1c2VyIChzZW5kZXIpIGFkZHJlc3MuAAAAAAtwcmltYXJ5X2tleQAAAAATAAAAKldoaWNoIHR5cGUgb2YgcmVjb3JkIHRoaXMgbGVhZiByZXByZXNlbnRzLgAAAAAAC3JlY29yZF90eXBlAAAAB9AAAAARQXJjaGl2ZVJlY29yZFR5cGUAAAAAAAByU2Vjb25kYXJ5IGtleSBhZGRyZXNzOgotIGBSZWZ1bmRCYWxhbmNlYDogdGhlIHRva2VuIGNvbnRyYWN0IGFkZHJlc3MuCi0gT3RoZXIgdHlwZXM6IGlnbm9yZWQgKG1heSBiZSBhbnkgYWRkcmVzcykuAAAAAAANc2Vjb25kYXJ5X2tleQAAAAAAABM=",
+        "AAAAAQAAACxNZXRhZGF0YSBzdG9yZWQgYWxvbmdzaWRlIGVhY2ggYXJjaGl2ZSByb290LgAAAAAAAAAPQXJjaGl2ZU1ldGFkYXRhAAAAAAMAAAA/VW5peCB0aW1lc3RhbXAgKHNlY29uZHMpIHdoZW4gdGhpcyBhcmNoaXZlIGVwb2NoIHdhcyBjb21taXR0ZWQuAAAAAAxjb21taXR0ZWRfYXQAAAAGAAAAOUZyZWUtZm9ybSBkZXNjcmlwdGlvbiB0YWcgKGUuZy4gYCJ1c2VyX3ZvbHVtZToyMDI2LTA5ImApLgAAAAAAAAtkZXNjcmlwdGlvbgAAAAAQAAAANlRvdGFsIG51bWJlciBvZiBsZWFmIHJlY29yZHMgaW5jbHVkZWQgaW4gdGhpcyBhcmNoaXZlLgAAAAAADHJlY29yZF9jb3VudAAAAAQ=",
+        "AAAAAwAAAJRSZWNvcmQgdHlwZXMgc3VwcG9ydGVkIGJ5IHRoZSBhcmNoaXZhbCBzeXN0ZW0uCgpUaGUgYHJlcHIodTMyKWAgZGlzY3JpbWluYW50IGRvdWJsZXMgYXMgdGhlIHRhZyBieXRlIHByZXBlbmRlZCB3aGVuCmNvbXB1dGluZyBsZWFmIGhhc2hlcyBvZmYtY2hhaW4uAAAAAAAAABFBcmNoaXZlUmVjb3JkVHlwZQAAAAAAAAMAAABFYERhdGFLZXk6OlVzZXJWb2x1bWUoYWRkcmVzcylgIOKAlCBjdW11bGF0aXZlIGxpZmV0aW1lIHJvdXRlZCB2b2x1bWUuAAAAAAAAClVzZXJWb2x1bWUAAAAAAAEAAABEYERhdGFLZXk6OlVzZXJTcGVuZGluZyhhZGRyZXNzKWAg4oCUIHBhY2tlZCAyNC1ob3VyIHNwZW5kaW5nIHdpbmRvdy4AAAAMVXNlclNwZW5kaW5nAAAAAgAAAENgRGF0YUtleTo6UmVmdW5kQmFsYW5jZSh1c2VyLCB0b2tlbilgIOKAlCB1bmNsYWltZWQgcmVmdW5kIGJhbGFuY2UuAAAAAA1SZWZ1bmRCYWxhbmNlAAAAAAAAAw==" ]),
       options
     )
   }
@@ -1640,10 +1750,12 @@ export class Client extends ContractClient {
         withdraw_refund: this.txFromJSON<Result<void>>,
         deposit_to_yield: this.txFromJSON<Result<void>>,
         emergency_freeze: this.txFromJSON<Result<void>>,
+        get_archive_info: this.txFromJSON<Option<readonly [Buffer, ArchiveMetadata]>>,
         get_fee_proposal: this.txFromJSON<Option<FeeProposal>>,
         set_price_oracle: this.txFromJSON<Result<void>>,
         blacklist_address: this.txFromJSON<Result<void>>,
         claim_all_refunds: this.txFromJSON<Result<i128>>,
+        get_archive_epoch: this.txFromJSON<u64>,
         get_kyc_threshold: this.txFromJSON<Option<i128>>,
         get_queued_action: this.txFromJSON<Result<TimelockEntry>>,
         is_dex_registered: this.txFromJSON<boolean>,
@@ -1657,6 +1769,7 @@ export class Client extends ContractClient {
         set_fallback_price: this.txFromJSON<Result<void>>,
         set_yield_protocol: this.txFromJSON<Result<void>>,
         add_supported_token: this.txFromJSON<Result<void>>,
+        commit_archive_root: this.txFromJSON<Result<u64>>,
         migrate_user_record: this.txFromJSON<boolean>,
         unblacklist_address: this.txFromJSON<Result<void>>,
         withdraw_from_yield: this.txFromJSON<Result<void>>,
@@ -1667,6 +1780,7 @@ export class Client extends ContractClient {
         get_effective_fee_bps: this.txFromJSON<i128>,
         set_fee_config_legacy: this.txFromJSON<Result<void>>,
         set_platform_treasury: this.txFromJSON<Result<void>>,
+        prune_archived_entries: this.txFromJSON<Result<u32>>,
         route_payment_with_swap: this.txFromJSON<Result<i128>>,
         set_staleness_threshold: this.txFromJSON<Result<void>>,
         route_payments_with_swap: this.txFromJSON<Result<i128>>
