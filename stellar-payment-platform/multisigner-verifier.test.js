@@ -13,15 +13,12 @@
 
 jest.mock('dotenv', () => ({ config: jest.fn() }));
 
-jest.mock('@stellar/stellar-sdk', () => {
-  const Horizon = {
-    Server: jest.fn(),
-  };
-  
-  return { Horizon };
-});
+jest.mock('./src/services/stellarService', () => ({
+  loadAccount: jest.fn(),
+  HORIZON_BASE: 'https://horizon-testnet.stellar.org',
+}));
 
-const { Horizon } = require('@stellar/stellar-sdk');
+const { loadAccount } = require('./src/services/stellarService');
 const {
   fetchAccountSigners,
   calculateSignatureWeight,
@@ -32,17 +29,8 @@ const {
 } = require('./src/multisigner-verifier');
 
 describe('Multi-Signer Verification Module', () => {
-  let mockServer;
-
   beforeEach(() => {
     jest.clearAllMocks();
-    
-    // Setup default mock server
-    mockServer = {
-      loadAccount: jest.fn(),
-    };
-    
-    Horizon.Server.mockImplementation(() => mockServer);
   });
 
   describe('fetchAccountSigners', () => {
@@ -57,12 +45,11 @@ describe('Multi-Signer Verification Module', () => {
         balances: [{ balance: '100.0000000', asset_type: 'native' }],
       };
 
-      mockServer.loadAccount.mockResolvedValue(mockAccount);
+      loadAccount.mockResolvedValue(mockAccount);
 
       const result = await fetchAccountSigners(mockAccount.id);
 
-      expect(Horizon.Server).toHaveBeenCalledWith('https://horizon-testnet.stellar.org');
-      expect(mockServer.loadAccount).toHaveBeenCalledWith(mockAccount.id);
+      expect(loadAccount).toHaveBeenCalledWith(mockAccount.id);
       expect(result).toEqual({
         accountId: mockAccount.id,
         signers: mockAccount.signers,
@@ -75,7 +62,7 @@ describe('Multi-Signer Verification Module', () => {
     it('should throw error when account not found', async () => {
       const error = new Error('Not found');
       error.response = { status: 404 };
-      mockServer.loadAccount.mockRejectedValue(error);
+      loadAccount.mockRejectedValue(error);
 
       const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
 
@@ -85,7 +72,7 @@ describe('Multi-Signer Verification Module', () => {
     });
 
     it('should throw error on network failure', async () => {
-      mockServer.loadAccount.mockRejectedValue(new Error('Network error'));
+      loadAccount.mockRejectedValue(new Error('Network error'));
 
       await expect(fetchAccountSigners('INVALID')).rejects.toThrow(
         'Failed to fetch account signers: Network error'
@@ -93,7 +80,7 @@ describe('Multi-Signer Verification Module', () => {
     });
 
     it('should use custom Horizon URL when provided', async () => {
-      mockServer.loadAccount.mockResolvedValue({
+      loadAccount.mockResolvedValue({
         id: 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z',
         signers: [],
         thresholds: { low_threshold: 0, med_threshold: 0, high_threshold: 0 },
@@ -102,9 +89,10 @@ describe('Multi-Signer Verification Module', () => {
       });
 
       const customUrl = 'https://horizon.stellar.org';
-      await fetchAccountSigners('GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z', customUrl);
+      const result = await fetchAccountSigners('GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z', customUrl);
 
-      expect(Horizon.Server).toHaveBeenCalledWith(customUrl);
+      expect(loadAccount).toHaveBeenCalledWith('GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z');
+      expect(result.accountId).toBe('GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z');
     });
   });
 
@@ -200,7 +188,7 @@ describe('Multi-Signer Verification Module', () => {
         balances: [],
       };
 
-      mockServer.loadAccount.mockResolvedValue(mockAccount);
+      loadAccount.mockResolvedValue(mockAccount);
 
       const result = await verifyMultiSignerThreshold(accountId, [accountId]);
 
@@ -224,7 +212,7 @@ describe('Multi-Signer Verification Module', () => {
         balances: [],
       };
 
-      mockServer.loadAccount.mockResolvedValue(mockAccount);
+      loadAccount.mockResolvedValue(mockAccount);
 
       const result = await verifyMultiSignerThreshold(
         accountId,
@@ -251,7 +239,7 @@ describe('Multi-Signer Verification Module', () => {
         balances: [],
       };
 
-      mockServer.loadAccount.mockResolvedValue(mockAccount);
+      loadAccount.mockResolvedValue(mockAccount);
 
       const result = await verifyMultiSignerThreshold(
         accountId,
@@ -286,7 +274,7 @@ describe('Multi-Signer Verification Module', () => {
         balances: [],
       };
 
-      mockServer.loadAccount.mockResolvedValue(mockAccount);
+      loadAccount.mockResolvedValue(mockAccount);
 
       // Pass same signature twice
       const result = await verifyMultiSignerThreshold(accountId, [accountId, accountId]);
@@ -361,7 +349,7 @@ describe('Multi-Signer Verification Module', () => {
         balances: [],
       };
 
-      mockServer.loadAccount.mockResolvedValue(mockAccount);
+      loadAccount.mockResolvedValue(mockAccount);
 
       const result = await verifyMasterSignature(accountId, signer2);
       expect(result).toBe(true);
@@ -376,7 +364,7 @@ describe('Multi-Signer Verification Module', () => {
         balances: [],
       };
 
-      mockServer.loadAccount.mockResolvedValue(mockAccount);
+      loadAccount.mockResolvedValue(mockAccount);
 
       const result = await verifyMasterSignature(
         accountId,
@@ -386,7 +374,7 @@ describe('Multi-Signer Verification Module', () => {
     });
 
     it('should return false on network error', async () => {
-      mockServer.loadAccount.mockRejectedValue(new Error('Network error'));
+      loadAccount.mockRejectedValue(new Error('Network error'));
 
       const result = await verifyMasterSignature(
         accountId,

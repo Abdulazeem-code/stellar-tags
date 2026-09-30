@@ -1,0 +1,50 @@
+name: Testnet CD Pipeline
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy-testnet:
+    name: Deploy to Testnet
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli
+
+      - name: Build contract to WASM
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Deploy to Testnet
+        run: |
+          # Generate deployer keypair
+          stellar keys generate deployer --network testnet
+          
+          # Fund the deployer account
+          stellar keys fund deployer --network testnet
+          
+          # Deploy contract
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm target/wasm32-unknown-unknown/release/payment_router.wasm \
+            --source deployer \
+            --network testnet)
+          
+          # Output to GitHub Step Summary
+          echo "### 🚀 Output from Testnet Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "**Contract ID**: \`$CONTRACT_ID\`" >> $GITHUB_STEP_SUMMARY

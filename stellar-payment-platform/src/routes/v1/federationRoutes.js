@@ -1,38 +1,53 @@
 const express = require('express');
 const { prisma } = require('../../../prismaClient');
 const { normalizeNameTag, etagCache, USER_DATABASE } = require('../../db');
+const { PRIMARY_USERNAME_ORDER } = require('../../utils');
 const {
   federationNameKey,
   federationIdKey,
   federationLookupCached,
 } = require('../../cache');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { ApiError } = require('../../errors');
+const { federationQuerySchema } = require('../../schemas');
+const { asyncHandler } = require('../../middleware/asyncHandler');
 
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/federation', etagCache, async (req, res, next) => {
-    const { q, type } = req.query;
-    const queryValue = typeof q === 'string' ? q.trim() : '';
-
-    if (!queryValue) {
-      const error = new Error("Missing 'q' parameter");
-      error.statusCode = 400;
-      return next(error);
-    }
+  
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
+    const { q: queryValue, type } = req.query;
 
     try {
       if (type === 'id') {
         const cacheKey = federationIdKey(queryValue);
         const cached = await federationLookupCached(cacheKey, async () => {
+          // #613 — an address can have several usernames; a reverse lookup
+          // resolves to the primary one.
           const row = await prisma.user.findFirst({
-            where: { address: { equals: queryValue, mode: 'insensitive' } },
+            where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
             select: { username: true, address: true, memoType: true, memo: true },
+            orderBy: PRIMARY_USERNAME_ORDER,
           });
 
           if (!row) return null;
 
+          const domain = process.env.DOMAIN || 'localhost';
+          const stellar_address = row.username.includes('*') ? row.username : `${row.username}*${domain}`;
           const response = {
-            stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
+            stellar_address,
             account_id: row.address,
           };
           if (row.memoType) {
@@ -55,16 +70,16 @@ module.exports = (redisClient) => {
         const cacheKey = federationNameKey(queryName);
 
         const cached = await federationLookupCached(cacheKey, async () => {
-          const row = await prisma.user.findUnique({
-            where: { username: queryName },
-            select: { address: true, memoType: true, memo: true },
+          const row = await prisma.user.findFirst({
+            where: { username: queryName, deletedAt: null },
+            select: { username: true, address: true, memoType: true, memo: true },
           });
 
           const address = row?.address || USER_DATABASE[queryName];
           if (!address) return null;
 
           const response = {
-            stellar_address: address,
+            stellar_address: queryName,
             account_id: address,
           };
           if (row?.memoType) {
@@ -82,16 +97,17 @@ module.exports = (redisClient) => {
 
         return res.json(cached);
       } else {
-        return res.status(400).json({
-          error: "Unsupported query type. Supported types: 'id', 'name'",
-        });
+        return next(
+          new ApiError('INVALID_INPUT', "Unsupported query type. Supported types: 'id', 'name'"),
+        );
       }
     } catch (error) {
+      console.log("FEDERATION LOOKUP ERROR:", error);
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
     }
-  });
+  }));
 
   return router;
 };

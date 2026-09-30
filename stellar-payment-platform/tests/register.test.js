@@ -12,6 +12,7 @@ jest.mock('../prismaClient', () => ({
     user: {
       findUnique: jest.fn().mockResolvedValue(null),
       findFirst: jest.fn().mockResolvedValue(null),
+      count: jest.fn().mockResolvedValue(0),
       create: jest.fn().mockResolvedValue({
         username: 'alice123',
         address: 'GABC123',
@@ -22,11 +23,11 @@ jest.mock('../prismaClient', () => ({
   },
 }));
 
-// Mock the pool functions
+// Mock db.js (now only exports etagCache and utility re-exports after Prisma migration)
 jest.mock('../src/db', () => ({
-  poolGet: jest.fn().mockResolvedValue(null),
-  poolRun: jest.fn().mockResolvedValue({ changes: 1 }),
-  poolAll: jest.fn().mockResolvedValue([]),
+  normalizeNameTag: (v) => v,
+  USER_DATABASE: {},
+  etagCache: (_req, _res, next) => next(),
 }));
 
 // Mock the v1 routes (factory function since v1/index.js now exports a function)
@@ -93,11 +94,11 @@ describe('POST /register - Express Validator Tests', () => {
 
       expect(res.statusCode).toBe(422);
       expect(res.body).toHaveProperty('success', false);
-      expect(res.body).toHaveProperty('errors');
-      expect(res.body.errors).toBeInstanceOf(Array);
-      expect(res.body.errors.length).toBeGreaterThan(0);
-      expect(res.body.errors[0]).toHaveProperty('field', 'username');
-      expect(res.body.errors[0]).toHaveProperty('message');
+      expect(res.body).toHaveProperty('error.details');
+      expect(res.body.error.details).toBeInstanceOf(Array);
+      expect(res.body.error.details.length).toBeGreaterThan(0);
+      expect(res.body.error.details[0]).toHaveProperty('field', 'username');
+      expect(res.body.error.details[0]).toHaveProperty('message');
     });
   });
 
@@ -113,9 +114,9 @@ describe('POST /register - Express Validator Tests', () => {
         });
 
       expect(res.statusCode).toBe(422);
-      expect(res.body).toHaveProperty('errors');
-      expect(res.body.errors[0]).toHaveProperty('field', 'username');
-      expect(res.body.errors[0].message).toContain('3');
+      expect(res.body).toHaveProperty('error.details');
+      expect(res.body.error.details[0]).toHaveProperty('field', 'username');
+      expect(res.body.error.details[0].message).toContain('3');
     });
 
     // d) username_too_long_returns_422
@@ -129,9 +130,9 @@ describe('POST /register - Express Validator Tests', () => {
         });
 
       expect(res.statusCode).toBe(422);
-      expect(res.body).toHaveProperty('errors');
-      expect(res.body.errors[0]).toHaveProperty('field', 'username');
-      expect(res.body.errors[0].message).toContain('20');
+      expect(res.body).toHaveProperty('error.details');
+      expect(res.body.error.details[0]).toHaveProperty('field', 'username');
+      expect(res.body.error.details[0].message).toContain('20');
     });
   });
 
@@ -147,9 +148,9 @@ describe('POST /register - Express Validator Tests', () => {
         });
 
       expect(res.statusCode).toBe(422);
-      expect(res.body).toHaveProperty('errors');
-      expect(res.body.errors[0]).toHaveProperty('field', 'username');
-      expect(res.body.errors[0].message).toContain('letters and numbers');
+      expect(res.body).toHaveProperty('error.details');
+      expect(res.body.error.details[0]).toHaveProperty('field', 'username');
+      expect(res.body.error.details[0].message).toContain('letters and numbers');
     });
   });
 
@@ -164,8 +165,8 @@ describe('POST /register - Express Validator Tests', () => {
         });
 
       expect(res.statusCode).toBe(422);
-      expect(res.body).toHaveProperty('errors');
-      expect(res.body.errors[0]).toHaveProperty('field', 'address');
+      expect(res.body).toHaveProperty('error.details');
+      expect(res.body.error.details[0]).toHaveProperty('field', 'address');
     });
 
     // g) empty_address_returns_422
@@ -179,8 +180,8 @@ describe('POST /register - Express Validator Tests', () => {
         });
 
       expect(res.statusCode).toBe(422);
-      expect(res.body).toHaveProperty('errors');
-      expect(res.body.errors[0]).toHaveProperty('field', 'address');
+      expect(res.body).toHaveProperty('error.details');
+      expect(res.body.error.details[0]).toHaveProperty('field', 'address');
     });
   });
 
@@ -196,11 +197,11 @@ describe('POST /register - Express Validator Tests', () => {
         });
 
       expect(res.statusCode).toBe(422);
-      expect(res.body).toHaveProperty('errors');
-      expect(res.body.errors).toBeInstanceOf(Array);
-      expect(res.body.errors.length).toBeGreaterThan(0);
+      expect(res.body).toHaveProperty('error.details');
+      expect(res.body.error.details).toBeInstanceOf(Array);
+      expect(res.body.error.details.length).toBeGreaterThan(0);
 
-      res.body.errors.forEach((error) => {
+      res.body.error.details.forEach((error) => {
         expect(error).toHaveProperty('field');
         expect(error).toHaveProperty('message');
         expect(typeof error.field).toBe('string');

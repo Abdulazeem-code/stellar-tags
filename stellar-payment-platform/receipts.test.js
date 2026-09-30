@@ -100,14 +100,14 @@ describe('GET /api/v1/receipts/:txHash', () => {
     const res = await request(app).get('/api/v1/receipts/not-a-real-hash');
 
     expect(res.status).toBe(400);
-    expect(res.body.detail).toBe('Invalid transaction hash format');
+    expect(res.body.error.message).toBe('Invalid transaction hash format');
   });
 
   test('hash with invalid chars returns 400', async () => {
     const res = await request(app).get(`/api/v1/receipts/${'z'.repeat(64)}`);
 
     expect(res.status).toBe(400);
-    expect(res.body.detail).toBe('Invalid transaction hash format');
+    expect(res.body.error.message).toBe('Invalid transaction hash format');
   });
 
   test('nonexistent hash returns 404', async () => {
@@ -116,16 +116,16 @@ describe('GET /api/v1/receipts/:txHash', () => {
     const res = await request(app).get(`/api/v1/receipts/${VALID_HASH}`);
 
     expect(res.status).toBe(404);
-    expect(res.body.detail).toBe('Transaction not found');
+    expect(res.body.error.message).toBe('Transaction not found');
   });
 
-  test('SDK network failure returns 500', async () => {
+  test('SDK network failure returns 502', async () => {
     mockTxImpl = () => Promise.reject(new Error('Network timeout'));
 
     const res = await request(app).get(`/api/v1/receipts/${VALID_HASH}`);
 
-    expect(res.status).toBe(500);
-    expect(res.body.detail).toBe('Failed to fetch transaction');
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe('UPSTREAM_ERROR');
   });
 
   test('Soroban tx with no native payment op falls back gracefully', async () => {

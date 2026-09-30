@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { API_BASE, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
+import { API_BASE, apiErrorMessage, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -82,7 +82,6 @@ function RegistrationPage({
     
     event.preventDefault();
     const cleaned = username.trim();
-    const normalizedUsername = normalizeNameTag(cleaned);
 
     if (!userPublicKey) {
       setStatusMessage("Connect a wallet before registering.", "error");
@@ -127,7 +126,7 @@ function RegistrationPage({
     let signature;
     let signerAddress;
     try {
-      const message = `register:${normalizedUsername}:${userPublicKey}`;
+      const message = `register:${cleaned.toLowerCase()}:${userPublicKey}`;
       
       // 4. Use walletKit to sign the data dynamically based on the selected wallet
       // Note: Some wallet kit versions wrap this differently. If signBlob is unavailable, 
@@ -138,7 +137,34 @@ function RegistrationPage({
       
       if (result && result.error) throw new Error(result.error);
       
-      signature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
+      let rawSignature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
+      
+      // walletKit might return a Uint8Array or Buffer object. Convert to base64 string.
+      if (typeof rawSignature === 'object' && rawSignature !== null) {
+        let uint8;
+        if (rawSignature.type === 'Buffer' && Array.isArray(rawSignature.data)) {
+          uint8 = new Uint8Array(rawSignature.data);
+        } else if (rawSignature instanceof Uint8Array) {
+          uint8 = rawSignature;
+        } else if (rawSignature.buffer instanceof ArrayBuffer) {
+          uint8 = new Uint8Array(rawSignature.buffer);
+        } else {
+          uint8 = new Uint8Array(Object.values(rawSignature));
+        }
+        let binary = '';
+        for (let i = 0; i < uint8.length; i++) {
+          binary += String.fromCharCode(uint8[i]);
+        }
+        // If the walletKit accidentally returned the ASCII bytes of the base64 string,
+        // 'binary' will just be the base64 string itself. We shouldn't double-encode it.
+        if (binary.length >= 80 && binary.length <= 90 && /^[a-zA-Z0-9+/]+={0,2}$/.test(binary)) {
+          signature = binary;
+        } else {
+          signature = btoa(binary);
+        }
+      } else {
+        signature = rawSignature;
+      }
       
       if (!signature) {
         throw new Error("Failed to capture signature from wallet.");
@@ -170,7 +196,7 @@ function RegistrationPage({
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          username: normalizedUsername,
+          username: cleaned.toLowerCase(),
           address: userPublicKey,
           signature,
           signerAddress,
@@ -181,7 +207,7 @@ function RegistrationPage({
           const data = await response.json().catch(() => null);
           if (!response.ok) {
             throw new Error(
-              (data && (data.error || data.detail || data.message)) || "Registration failed.",
+              apiErrorMessage(data, "Registration failed."),
             );
           }
           return data;
