@@ -46,6 +46,7 @@
     "Webhooks",
     "WASM",
     "wasm",
+    "MiMC",
     "Prisma",
     "prisma",
     "Dockerfile",
@@ -90,6 +91,13 @@
     "mtls",
     "MTLS",
     "POSIX",
-    "ZIPKIN"
+    "ZIPKIN",
+    "MiMC",
+    "COOLDOWN",
+    "SOROSWAP",
+    "CQRS",
+    "XADD",
+    "XREADGROUP",
+    "XTRIM"
   ]
 }

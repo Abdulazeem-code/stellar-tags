@@ -3,6 +3,7 @@ const { Queue, Worker } = require('bullmq');
 const { createRedisConnection, withRedisRetry } = require('./config/redis');
 const { logger } = require('./logger');
 const { shouldFallbackToLocalRegistry } = require('./utils');
+const { context, propagation, trace } = require('@opentelemetry/api');
 const { internalFetch } = require('./utils/internalClient');
 const { routeToDlq, isDlqAvailable, DLQ_QUEUE_NAME } = require('./dlq');
 
@@ -157,7 +158,7 @@ const markWebhookFailure = async (prisma, webhookId, now) => {
   });
 };
 
-const processWebhookJob = async (job, { prisma }) => {
+const processWebhookJobImpl = async (job, { prisma }) => {
   const { webhook, payload } = job.data;
   const now = new Date();
 
@@ -185,6 +186,26 @@ const processWebhookJob = async (job, { prisma }) => {
   logger.info(
     `[webhook-worker] Delivered event=${payload.event_id} webhook=${webhook.id} attempt=${job.attemptsMade + 1}`,
   );
+};
+
+const processWebhookJob = async (job, options) => {
+  const parentContext = propagation.extract(context.active(), job.data?.otelContext || {});
+  const tracer = trace.getTracer('stellar-tags-webhook-worker');
+  return context.with(parentContext, () => tracer.startActiveSpan(
+    'webhook.process',
+    { attributes: { 'messaging.system': 'bullmq', 'messaging.destination.name': WEBHOOK_QUEUE_NAME } },
+    async (span) => {
+      try {
+        return await processWebhookJobImpl(job, options);
+      } catch (error) {
+        span.recordException(error);
+        span.setStatus({ code: 2, message: error.message });
+        throw error;
+      } finally {
+        span.end();
+      }
+    },
+  ));
 };
 
 const getWebhookQueue = () => {
@@ -263,10 +284,12 @@ const buildJobId = (webhookId, eventId) => {
 };
 
 const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
+  const otelContext = {};
+  propagation.inject(context.active(), otelContext);
   return withRedisRetry(
     () => queue.add(
       'deliver',
-      { webhook, payload },
+      { webhook, payload, otelContext },
       {
         ...WEBHOOK_JOB_OPTIONS,
         backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },

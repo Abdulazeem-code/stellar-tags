@@ -31,7 +31,7 @@ RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
 FROM base AS backend
 ENV NODE_ENV=production
 
-# Runtime write targets (LOG_DIR and the sqlite fallback DB) are created up
+# Runtime write target (LOG_DIR and the sqlite fallback DB) are created up
 # front and owned by the unprivileged `node` user that ships with the image.
 # /app/certs is the mount point for internal PKI material when mTLS is enabled
 # (see docker-compose.yml); certificates arrive as a volume, never as a layer.

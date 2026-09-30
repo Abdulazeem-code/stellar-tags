@@ -26,11 +26,20 @@ jest.mock('../src/fraudDetection', () => ({ PAYMENT_STREAM: 'payments' }));
 jest.mock('../src/webhookWorker', () => ({
   dispatchPaymentWebhooks: jest.fn(),
   scheduleWebhookRetryJob: jest.fn(),
+  closeWebhookQueue: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../src/services/stellarService', () => ({
   horizon: { payments: jest.fn() },
   createBreaker: jest.fn(() => ({ fire: jest.fn().mockResolvedValue(true) })),
+}));
+
+jest.mock('../src/websocket', () => ({
+  publishPaymentUpdate: jest.fn().mockResolvedValue(undefined),
+  initWebSocket: jest.fn(),
+  closeWebSocket: jest.fn().mockResolvedValue(undefined),
+  emitPaymentUpdate: jest.fn(),
+  getIO: jest.fn().mockReturnValue(null),
 }));
 
 const { horizon } = require('../src/services/stellarService');
