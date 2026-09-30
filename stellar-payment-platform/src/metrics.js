@@ -25,6 +25,9 @@ const httpRequestDuration = new client.Histogram({
 // they are registered later via setMetricsSources and read at scrape time.
 let prismaSource = null;
 let redisSource = null;
+// The DLQ lives in Redis, which is optional, so its depth is read through a
+// reader the DLQ module registers rather than a client this module creates.
+let dlqDepthSource = null;
 
 /**
  * Registers the live clients the connection gauges report on. Passing a null
@@ -33,6 +36,14 @@ let redisSource = null;
 function setMetricsSources({ prisma, redisClient } = {}) {
   if (prisma !== undefined) prismaSource = prisma;
   if (redisClient !== undefined) redisSource = redisClient;
+}
+
+/**
+ * Registers the function the DLQ depth gauge reads on each scrape. Passing null
+ * leaves the gauge reporting zero.
+ */
+function setDlqDepthSource(readDepth) {
+  if (readDepth !== undefined) dlqDepthSource = readDepth;
 }
 
 const EMPTY_POOL = { active: 0, idle: 0, size: 0, waiters: 0 };
@@ -104,21 +115,24 @@ const redisConnectionsActive = new client.Gauge({
   },
 });
 
-// #730 — Gauge: browsers currently holding an open SSE status stream. Spikes
-// alongside rising RSS would indicate clients are not being released on
-// disconnect; a healthy deployment tracks concurrent dashboard users.
-let sseClientCountFn = null;
-
-function setSseClientSource(fn) {
-  sseClientCountFn = typeof fn === 'function' ? fn : null;
-}
-
-const sseClientsConnected = new client.Gauge({
-  name: 'stellar_tags_sse_clients_connected',
-  help: 'Number of currently connected SSE (Server-Sent Events) clients',
-  collect() {
-    this.set(sseClientCountFn ? sseClientCountFn() : 0);
+// Gauge: payment retry jobs currently parked in the dead letter queue. Read on
+// every scrape so the value is never stale, and 0 when Redis is unconfigured.
+const dlqDepth = new client.Gauge({
+  name: 'stellar_tags_dlq_depth',
+  help: 'Payment retry jobs currently waiting in the dead letter queue',
+  async collect() {
+    if (!dlqDepthSource) {
+      this.set(0);
+      return;
+    }
+    this.set(await dlqDepthSource());
   },
+});
+
+// Counter: payment retry jobs routed to the dead letter queue since boot.
+const dlqMessagesTotal = new client.Counter({
+  name: 'stellar_tags_dlq_messages_total',
+  help: 'Total payment retry jobs moved to the dead letter queue',
 });
 
 /**
@@ -169,11 +183,12 @@ module.exports = {
   getMetrics,
   getContentType,
   setMetricsSources,
-  setSseClientSource,
+  setDlqDepthSource,
   dbPoolConnectionsOpen,
   dbPoolConnectionsBusy,
   dbPoolConnectionsIdle,
   dbPoolQueriesWaiting,
   redisConnectionsActive,
-  sseClientsConnected,
+  dlqDepth,
+  dlqMessagesTotal,
 };

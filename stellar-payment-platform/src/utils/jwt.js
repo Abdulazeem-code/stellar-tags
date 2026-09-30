@@ -30,7 +30,9 @@ const normalizeKey = (raw) =>
 const PRIVATE_KEY = normalizeKey(process.env.JWT_PRIVATE_KEY);
 const PUBLIC_KEY = normalizeKey(process.env.JWT_PUBLIC_KEY);
 
-const DEFAULT_EXPIRY = process.env.JWT_EXPIRY || '1h';
+// Access tokens are deliberately short-lived. Refresh sessions are rotated by
+// the auth routes and are kept in an HttpOnly cookie instead.
+const DEFAULT_EXPIRY = process.env.JWT_EXPIRY || '15m';
 
 // ---------------------------------------------------------------------------
 // Sign

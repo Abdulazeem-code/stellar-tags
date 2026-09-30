@@ -21,8 +21,6 @@ jest.mock('redis', () => ({
   createClient: jest.fn(() => null),
 }));
 
-jest.mock('rate-limit-redis', () => jest.fn());
-
 jest.mock('bad-words', () =>
   jest.fn().mockImplementation(() => ({
     isProfane: jest.fn(() => false),
@@ -87,7 +85,7 @@ jest.mock('../src/metrics', () => ({
   getMetrics: jest.fn().mockResolvedValue(''),
   getContentType: jest.fn(() => 'text/plain'),
   setMetricsSources: jest.fn(),
-  setSseClientSource: jest.fn(),
+  setDlqDepthSource: jest.fn(),
 }));
 
 jest.mock('@sentry/node', () => ({
@@ -102,7 +100,7 @@ global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
 
 const VALID_ADDRESS = 'GBCDEFGHIJKLMNOPQRSTUVWXYZ';
 
-describe('Rate Limiting — express-rate-limit', () => {
+describe('Rate Limiting - sliding window', () => {
   let app;
 
   beforeEach(() => {

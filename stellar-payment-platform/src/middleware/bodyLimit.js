@@ -9,7 +9,8 @@ const express = require('express');
  * type, so the cap travels with the request regardless of mount point:
  *
  *   - Auth / register endpoints: 1kb  (tighter, to blunt abuse)
- *   - Bulk endpoints (/payments, /webhooks): 100kb (legitimate large payloads)
+ *   - Bulk endpoints (/payments, /webhooks) and /graphql: 100kb (legitimate
+ *     large payloads)
  *   - Everything else: 10kb (standard)
  *
  * body-parser already answers an oversized payload with a 413
@@ -38,6 +39,8 @@ const AUTH_PATTERNS = [
 const BULK_PATTERNS = [
   /\/payments(\/|$)/i,
   /\/webhooks(\/|$)/i,
+  // A dashboard query plus its variables is comfortably larger than 10kb.
+  /^\/graphql(\/|$)/i,
 ];
 
 /**
