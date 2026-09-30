@@ -1059,7 +1059,7 @@ impl PaymentRouter {
     /// * `platform_treasury` - The address where the platform fee will be deposited.
     /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
     /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
-    pub fn route_payment(
+    pub fn initialize(
         env: Env,
         admin: Address,
         platform_treasury: Address,
@@ -3637,7 +3637,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_tiered_fee_discount_applied_after_volume_threshold() {
         let (env, client, _) = setup_env();
 
