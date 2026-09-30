@@ -7,7 +7,11 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
-# Keep the fuzz package isolated from the repository's root Cargo workspace.
+# `cargo fuzz` builds this manifest directly, outside the root workspace.
+# Declaring it as its own workspace root keeps the `[patch.crates-io]` and
+# `[profile.release]` tables below honored (Cargo ignores both on a non-root
+# package) and stops Cargo erroring that the package is in a workspace it is
+# not a member of.
 [workspace]
 
 [dependencies]

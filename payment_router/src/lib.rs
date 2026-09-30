@@ -1,8 +1,10 @@
 #![no_std]
+mod archival;
+use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
-    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, Symbol, Vec,
+    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, String, Symbol, Vec,
 };
 
 // ── Packed UserRecord helpers ───────────────────────────────────────────────
@@ -133,6 +135,18 @@ pub struct Payment {
     pub token_address: Address,
     /// Amount to route, denominated in the token's smallest unit. Must be
     /// positive and within the contract's configured min/max bounds.
+    pub amount: i128,
+}
+
+/// Structured payload for meta-transactions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaPayment {
+    pub nonce: u64,
+    pub deadline: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
     pub amount: i128,
 }
 
@@ -418,6 +432,12 @@ pub enum DataKey {
     GovernanceProposal(u64),
     /// Recorded yes/no vote weight for a fee proposal.
     GovernanceVote(u64, Address),
+    /// Current archival epoch counter, stored in instance storage.
+    ArchiveEpoch,
+    /// Merkle root committed for an archival epoch.
+    ArchiveRoot(u64),
+    /// Metadata committed alongside an archival root.
+    ArchiveMeta(u64),
     /// Lending protocol contract used for treasury yield operations.
     YieldProtocol,
     /// Principal currently deposited into the yield protocol per token.
@@ -892,10 +912,7 @@ impl PaymentRouter {
     }
 
     /// Builds the domain-separated message for meta-transactions.
-    /// Binds `current_contract_address` + all call args + `signer_pubkey` +
-    /// `nonce` + `deadline`, then returns `SHA256(payload)` as `Bytes`
-    /// for `ed25519_verify`. Off-chain signers must sign these exact bytes.
-    #[allow(clippy::too_many_arguments)]
+    /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
     fn build_meta_message(
         env: &Env,
         sender: &Address,
@@ -1170,20 +1187,12 @@ impl PaymentRouter {
     /// in instance storage. Must be called before `route_payment`.
     ///
     /// # Parameters
-    /// - `admin`: Address granted admin rights over the contract; must
-    ///   authorize this call.
-    /// - `platform_treasury`: Address that receives collected platform fees.
-    /// - `fee_bps`: Platform fee rate, in basis points.
-    /// - `fee_cap`: Maximum fee (in the token's smallest unit) taken from a
-    ///   single payment.
-    /// - `max_amount`: Maximum amount accepted by a single payment.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or `Err(Error::AlreadyInitialized)` if the
-    /// contract already has an admin set.
-    ///
-    /// # Panics
-    /// Panics if `admin` does not authorize the call.
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the payment. Must authorize the transaction.
+    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
+    /// * `platform_treasury` - The address where the platform fee will be deposited.
+    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
+    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -3487,6 +3496,176 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+}
+
+// ── Archival extension ────────────────────────────────────────────────────────
+//
+// A second #[contractimpl] block keeps the archival surface separate and avoids
+// hitting the soroban-sdk per-impl function-count ceiling.
+#[contractimpl]
+impl PaymentRouter {
+    /// Commits a SHA-256 Merkle root of a batch of payment-record snapshots
+    /// into persistent storage, opening a new archive epoch.
+    ///
+    /// Call this before `prune_archived_entries`. Requires TreasuryManager.
+    /// Returns the new epoch number.
+    ///
+    /// Errors: NotInitialized, ContractFrozen.
+    pub fn commit_archive_root(
+        env: Env,
+        root: BytesN<32>,
+        leaves: Vec<ArchiveLeaf>,
+        description: String,
+    ) -> Result<u64, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        let current_epoch: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0u64);
+        let new_epoch = current_epoch + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ArchiveEpoch, &new_epoch);
+
+        let record_count = leaves.len() as u32;
+        let committed_at = env.ledger().timestamp();
+
+        // Persist the Merkle root.
+        let root_key = DataKey::ArchiveRoot(new_epoch);
+        env.storage().persistent().set(&root_key, &root);
+        env.storage().persistent().extend_ttl(
+            &root_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Persist metadata.
+        let meta = ArchiveMetadata {
+            committed_at,
+            record_count,
+            description,
+        };
+        let meta_key = DataKey::ArchiveMeta(new_epoch);
+        env.storage().persistent().set(&meta_key, &meta);
+        env.storage().persistent().extend_ttl(
+            &meta_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        archival::emit_archive_committed(&env, new_epoch, &root, record_count);
+        log!(
+            &env,
+            "Archive epoch {} committed: {} records",
+            new_epoch,
+            record_count
+        );
+
+        Ok(new_epoch)
+    }
+
+    /// Returns the Merkle root and metadata for an archive epoch, or `None`
+    /// if no archive exists for that epoch.
+    pub fn get_archive_info(env: Env, epoch: u64) -> Option<(BytesN<32>, ArchiveMetadata)> {
+        let root: Option<BytesN<32>> = env.storage().persistent().get(&DataKey::ArchiveRoot(epoch));
+        let meta: Option<ArchiveMetadata> =
+            env.storage().persistent().get(&DataKey::ArchiveMeta(epoch));
+        match (root, meta) {
+            (Some(r), Some(m)) => Some((r, m)),
+            _ => None,
+        }
+    }
+
+    /// Returns the current archive epoch counter (0 = no epochs committed yet).
+    pub fn get_archive_epoch(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0)
+    }
+
+    /// Deletes on-chain ledger entries committed via `commit_archive_root`.
+    ///
+    /// Requires the epoch from a prior commit call. Silently skips absent
+    /// entries. Returns the count of entries removed.
+    ///
+    /// Supported: UserVolume, UserSpending, RefundBalance.
+    /// Errors: NotInitialized, ContractFrozen, TimelockNotFound (unknown epoch).
+    /// Requires TreasuryManager.
+    pub fn prune_archived_entries(
+        env: Env,
+        committed_epoch: u64,
+        leaves: Vec<ArchiveLeaf>,
+    ) -> Result<u32, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        // Guard: a committed root must exist for this epoch.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::ArchiveRoot(committed_epoch))
+        {
+            return Err(Error::TimelockNotFound);
+        }
+
+        let mut removed: u32 = 0;
+
+        for leaf in leaves.iter() {
+            match leaf.record_type {
+                ArchiveRecordType::UserVolume => {
+                    let key = DataKey::UserVolume(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::UserSpending => {
+                    let key = DataKey::UserSpending(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::RefundBalance => {
+                    let key = DataKey::RefundBalance(
+                        leaf.primary_key.clone(),
+                        leaf.secondary_key.clone(),
+                    );
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "entries_pruned"), committed_epoch),
+            (removed, env.ledger().timestamp()),
+        );
+
+        log!(
+            &env,
+            "Pruned {} entries for archive epoch {}",
+            removed,
+            committed_epoch
+        );
+
+        Ok(removed)
     }
 }
 
@@ -5841,13 +6020,6 @@ mod test {
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
     }
-
-    // ── Token swaps: cross-contract DEX routing ──────────────────────────────
-    //
-    // Issue #665.  These tests drive `route_payment_with_swap` and
-    // `route_payments_with_swap` against a mock DEX that implements the
-    // adapter interface the router expects, and assert both the happy path
-    // and that every failure mode leaves the sender whole.
 
     /// Instance-storage keys for [`MockDex`].
     #[contracttype]

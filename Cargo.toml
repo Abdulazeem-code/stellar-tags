@@ -7,9 +7,11 @@
 # pulls in network-only dependencies (tokio, reqwest, soroban-client) that
 # require a live Stellar node.
 members = [
+    "flash_loan",
     "payment_router",
     "pausable_token",
     "payment_proxy",
+    "timelock_escrow",
 ]
 
 # Edition 2021 members require resolver v2.
