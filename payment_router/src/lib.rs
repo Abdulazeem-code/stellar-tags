@@ -3489,6 +3489,184 @@ impl PaymentRouter {
     }
 }
 
+// ── Archival extension ────────────────────────────────────────────────────────
+//
+// A second #[contractimpl] block keeps the archival surface separate and avoids
+// hitting the soroban-sdk per-impl function-count ceiling.
+#[contractimpl]
+impl PaymentRouter {
+    /// Commits a SHA-256 Merkle root of a batch of payment-record snapshots
+    /// into persistent storage, opening a new archive epoch.
+    ///
+    /// Call this before `prune_archived_entries`. Requires TreasuryManager.
+    /// Returns the new epoch number.
+    ///
+    /// Errors: NotInitialized, ContractFrozen.
+    pub fn commit_archive_root(
+        env: Env,
+        root: BytesN<32>,
+        leaves: Vec<ArchiveLeaf>,
+        description: String,
+    ) -> Result<u64, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        let current_epoch: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0u64);
+        let new_epoch = current_epoch + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ArchiveEpoch, &new_epoch);
+
+        let record_count = leaves.len() as u32;
+        let committed_at = env.ledger().timestamp();
+
+        // Persist the Merkle root.
+        let root_key = DataKey::ArchiveRoot(new_epoch);
+        env.storage().persistent().set(&root_key, &root);
+        env.storage().persistent().extend_ttl(
+            &root_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Persist metadata.
+        let meta = ArchiveMetadata {
+            committed_at,
+            record_count,
+            description,
+        };
+        let meta_key = DataKey::ArchiveMeta(new_epoch);
+        env.storage().persistent().set(&meta_key, &meta);
+        env.storage().persistent().extend_ttl(
+            &meta_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        archival::emit_archive_committed(&env, new_epoch, &root, record_count);
+        log!(
+            &env,
+            "Archive epoch {} committed: {} records",
+            new_epoch,
+            record_count
+        );
+
+        Ok(new_epoch)
+    }
+
+    /// Returns the Merkle root and metadata for an archive epoch, or `None`
+    /// if no archive exists for that epoch.
+    pub fn get_archive_info(
+        env: Env,
+        epoch: u64,
+    ) -> Option<(BytesN<32>, ArchiveMetadata)> {
+        let root: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArchiveRoot(epoch));
+        let meta: Option<ArchiveMetadata> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArchiveMeta(epoch));
+        match (root, meta) {
+            (Some(r), Some(m)) => Some((r, m)),
+            _ => None,
+        }
+    }
+
+    /// Returns the current archive epoch counter (0 = no epochs committed yet).
+    pub fn get_archive_epoch(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0)
+    }
+
+    /// Deletes on-chain ledger entries committed via `commit_archive_root`.
+    ///
+    /// Requires the epoch from a prior commit call. Silently skips absent
+    /// entries. Returns the count of entries removed.
+    ///
+    /// Supported: UserVolume, UserSpending, RefundBalance.
+    /// Errors: NotInitialized, ContractFrozen, TimelockNotFound (unknown epoch).
+    /// Requires TreasuryManager.
+    pub fn prune_archived_entries(
+        env: Env,
+        committed_epoch: u64,
+        leaves: Vec<ArchiveLeaf>,
+    ) -> Result<u32, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        // Guard: a committed root must exist for this epoch.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::ArchiveRoot(committed_epoch))
+        {
+            return Err(Error::TimelockNotFound);
+        }
+
+        let mut removed: u32 = 0;
+
+        for leaf in leaves.iter() {
+            match leaf.record_type {
+                ArchiveRecordType::UserVolume => {
+                    let key = DataKey::UserVolume(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::UserSpending => {
+                    let key = DataKey::UserSpending(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::RefundBalance => {
+                    let key = DataKey::RefundBalance(
+                        leaf.primary_key.clone(),
+                        leaf.secondary_key.clone(),
+                    );
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "entries_pruned"), committed_epoch),
+            (removed, env.ledger().timestamp()),
+        );
+
+        log!(
+            &env,
+            "Pruned {} entries for archive epoch {}",
+            removed,
+            committed_epoch
+        );
+
+        Ok(removed)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
