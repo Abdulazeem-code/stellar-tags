@@ -14,6 +14,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 // ---------------------------------------------------------------------------
 
 const DEFAULT_RETRY_MS = 25_000;
+// Module-level so the default value keeps one stable identity across renders;
+// an inline default would make the effect deps change on every render and
+// thrash the EventSource subscription.
+const DEFAULT_EVENTS = ['payment.created', 'payment.received'];
 
 /**
  * @param {object} [options]
@@ -28,7 +32,7 @@ export const usePaymentEvents = ({
   address = null,
   apiBase,
   onEvent,
-  events = ['payment.created', 'payment.received'],
+  events = DEFAULT_EVENTS,
 } = {}) => {
   const resolvedBase = apiBase ?? (
     typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE
@@ -36,7 +40,14 @@ export const usePaymentEvents = ({
       : 'https://stellar-tags.onrender.com'
   );
 
-  const [status, setStatus] = useState('idle');
+  // Start in 'connecting' on the browser so the subscribe effect never has to
+  // call setState synchronously (react-hooks/set-state-in-effect). There is
+  // nothing to connect to outside the browser, so that case stays 'idle'.
+  const [status, setStatus] = useState(() =>
+    typeof window !== 'undefined' && typeof EventSource !== 'undefined'
+      ? 'connecting'
+      : 'idle',
+  );
   const [lastEvent, setLastEvent] = useState(null);
   const [connectedAt, setConnectedAt] = useState(null);
 
@@ -47,7 +58,7 @@ export const usePaymentEvents = ({
   }, [onEvent]);
 
   const handleEvent = useCallback((messageEvent) => {
-    let data = null;
+    let data;
     try {
       data = JSON.parse(messageEvent.data);
     } catch {
@@ -67,7 +78,6 @@ export const usePaymentEvents = ({
     if (address) params.set('address', address);
     const url = `${resolvedBase}/api/v1/events/status${params.size ? `?${params}` : ''}`;
 
-    setStatus('connecting');
     const source = new EventSource(url);
 
     source.onopen = () => {
@@ -90,7 +100,9 @@ export const usePaymentEvents = ({
 
     return () => {
       source.close();
-      setStatus('closed');
+      // Re-subscription case (a dep changed): signal the fresh attempt. On
+      // unmount React drops this state, so nothing observes it there.
+      setStatus('connecting');
       setConnectedAt(null);
     };
   }, [address, resolvedBase, handleEvent, events]);
