@@ -6,11 +6,11 @@ pub struct AdvancedFeature35Contract;
 
 #[contractimpl]
 impl AdvancedFeature35Contract {
-    pub fn hello(env: Env, to: Symbol) -> (Symbol, Symbol) {
+    pub fn hello(_env: Env, to: Symbol) -> (Symbol, Symbol) {
         (symbol_short!("Hello"), to)
     }
 
-    pub fn secure_action(env: Env) -> u32 {
+    pub fn secure_action(_env: Env) -> u32 {
         // Implement an advanced security action
         // For demonstration, returns a secure status code
         42
