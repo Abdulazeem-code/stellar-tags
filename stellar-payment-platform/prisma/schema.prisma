@@ -34,6 +34,7 @@ model User {
   deletedAt DateTime? @map("deleted_at")
   webhooks  Webhook[] // <-- add this line
   activity  ActivityLog[]
+  balances  WalletBalance[]
 
   @@index([username])
   // Reverse federation lookups (type=id) and /lookup?address= filter by
@@ -88,11 +89,40 @@ model Payment {
   assetCode       String?  @map("asset_code")
   transactionHash String?  @map("transaction_hash")
   status          String   @default("completed")
+  riskScore       Float?   @map("risk_score")
+  fraudStatus     String   @default("clear") @map("fraud_status")
+  fraudFlaggedAt  DateTime? @map("fraud_flagged_at")
 
   @@index([createdAt])
   @@index([fromAddress])
   @@index([toAddress])
+  // /admin/export keyset walk (issue #677): ORDER BY created_at, id with a
+  // cursor predicate becomes a backward index scan + seek instead of an
+  // OFFSET walk, keeping deep pages O(log n).
+  @@index([createdAt, id])
   @@map("payments")
+}
+
+// Durable result of the fraud stream consumer. Keeping the raw event and the
+// model score makes decisions auditable without coupling the worker to the
+// payment ingestion path.
+model FraudAlert {
+  id              String   @id @default(uuid())
+  eventId         String   @unique @map("event_id")
+  transactionHash String?  @map("transaction_hash")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  riskScore       Float    @map("risk_score")
+  status          String   @default("open")
+  reason          String
+  rawEvent        Json     @map("raw_event")
+  createdAt       DateTime @default(now()) @map("created_at")
+  resolvedAt      DateTime? @map("resolved_at")
+
+  @@index([toAddress, createdAt])
+  @@index([status, createdAt])
+  @@map("fraud_alerts")
 }
 
 // Dead-letter queue: holds webhook delivery attempts that have permanently
@@ -254,4 +284,19 @@ model RoutingRule {
   @@index([active, priority])
   @@index([clientOrg])
   @@map("routing_rules")
+}
+
+// WalletBalance tracks multi-currency balances per user
+model WalletBalance {
+  id        String   @id @default(uuid())
+  username  String
+  user      User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  assetCode String   @map("asset_code") // e.g., 'XLM', 'USDC'
+  amount    Float    @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@unique([username, assetCode])
+  @@index([username])
+  @@map("wallet_balances")
 }

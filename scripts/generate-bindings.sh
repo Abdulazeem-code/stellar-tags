@@ -45,11 +45,21 @@ echo "Using CLI: $CLI"
 echo "Building payment_router contract (wasm32-unknown-unknown, release)..."
 cargo build --manifest-path "$CONTRACT_DIR/Cargo.toml" --target wasm32-unknown-unknown --release
 
-WASM="$CONTRACT_DIR/$WASM_REL"
-if [[ ! -f "$WASM" ]]; then
-  echo "error: expected WASM artifact not found at $WASM" >&2
+# `payment_router` is a workspace member, so cargo writes the artifact to the
+# workspace target directory rather than to one under the crate. Look in both
+# places so the script works either way.
+WASM=""
+for candidate in "$CONTRACT_DIR/$WASM_REL" "$ROOT/$WASM_REL"; do
+  if [[ -f "$candidate" ]]; then
+    WASM="$candidate"
+    break
+  fi
+done
+if [[ -z "$WASM" ]]; then
+  echo "error: could not find payment_router.wasm under $CONTRACT_DIR or $ROOT." >&2
   exit 1
 fi
+echo "Using WASM: $WASM"
 
 # --- 3. Generate bindings into a temp dir -----------------------------------
 # The CLI names the package after the output directory, so generate into a
