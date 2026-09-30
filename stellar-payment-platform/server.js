@@ -22,6 +22,7 @@ const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { metricsMiddleware, getMetrics, getContentType } = require('./src/metrics');
 const { registerValidator } = require('./src/validators/registerValidator');
 const { validate } = require('./src/middleware/validate');
+const { securityHeaders } = require('./src/middleware/security');
 const { validationResult } = require('express-validator');
 const Sentry = require('@sentry/node');
 const {
@@ -53,6 +54,7 @@ const app = express();
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+app.use(securityHeaders);
 
 app.use(timeout('10s'));
 app.use((err, req, res, next) => {
@@ -831,16 +833,17 @@ app.get('/api/v1/time', (_req, res) => {
   res.status(200).json({ time: new Date().toISOString() });
 });
 
-app.get('/health', async (_req, res) => {
+app.get('/health', async (req, res) => {
   const checks = { database: null, redis: null };
   let allOk = true;
   const errors = [];
 
   try {
     await prisma.$queryRaw`SELECT 1`;
-    checks.database = 'ok';
-  } catch {
-    checks.database = 'error';
+    checks.database = 'connected';
+  } catch (err) {
+    logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
+    checks.database = 'disconnected';
     allOk = false;
     errors.push('Database unavailable');
   }
@@ -848,9 +851,9 @@ app.get('/health', async (_req, res) => {
   if (redisClient) {
     try {
       await redisClient.ping();
-      checks.redis = 'ok';
-    } catch {
-      checks.redis = 'error';
+      checks.redis = 'connected';
+    } catch (err) {
+      checks.redis = 'disconnected';
       allOk = false;
       errors.push('Redis unavailable');
     }
@@ -859,20 +862,9 @@ app.get('/health', async (_req, res) => {
   }
 
   if (allOk) {
-    res.json({ status: 'ok', ...checks });
+    res.status(200).json({ status: 'ok', ...checks });
   } else {
-    res.status(503).json({ status: 'error', ...checks, message: errors.join(', ') });
-  }
-});
-
-app.get('/health', async (req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: 'ok', database: 'connected' });
-  } catch (err) {
-    logger.error(`[Correlation ID: ${req.correlationId}] Database unavailable`, err);
-    res.status(503).json({ status: 'error', database: 'disconnected', correlation_id: req.correlationId });
-
+    res.status(503).json({ status: 'error', ...checks, message: errors.join(', '), correlation_id: req.correlationId });
   }
 });
 
