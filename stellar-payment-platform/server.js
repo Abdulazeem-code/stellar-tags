@@ -1,4 +1,4 @@
-﻿require("./src/utils/tracing");
+require("./src/utils/tracing");
 require("./config/envCheck");
 const express = require("express");
 const pinoHttp = require("pino-http");
@@ -6,6 +6,7 @@ const cors = require("cors");
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
+const { maintenanceMiddleware } = require("./src/middleware/maintenance");
 const crypto = require("crypto");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
@@ -133,6 +134,7 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
 app.disable("x-powered-by");
 app.use(securityMiddleware);
+app.use(maintenanceMiddleware);
 
 app.use(timeout("10s"));
 app.use((err, req, res, next) => {
