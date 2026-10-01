@@ -101,13 +101,13 @@
     "XTRIM",
     "axelar",
     "AXELAR",
-    "alloc",
     "GDEST",
     "CTOKEN",
     "GABC",
     "GXYZ",
     "webauthn",
-    "WEBAUTHN",
-    "timelock"
+    "timelock",
+    "alloc",
+    "bdff"
   ]
 }
