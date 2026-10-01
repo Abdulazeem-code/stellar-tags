@@ -1,16 +1,19 @@
 #![cfg(test)]
 
-use crate::{TimelockEscrow, TimelockEscrowClient, Error};
+use crate::{Error, TimelockEscrow, TimelockEscrowClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env,
 };
 
-fn create_token_contract<'a>(e: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
+fn create_token_contract<'a>(
+    e: &Env,
+    admin: &Address,
+) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
     let address = e.register_stellar_asset_contract(admin.clone());
     (
         token::Client::new(e, &address),
-        token::StellarAssetClient::new(e, &address)
+        token::StellarAssetClient::new(e, &address),
     )
 }
 
@@ -21,10 +24,10 @@ fn test_escrow_lifecycle() {
 
     let depositor = Address::generate(&env);
     let recipient = Address::generate(&env);
-    
+
     let token_admin = Address::generate(&env);
     let (token, token_admin) = create_token_contract(&env, &token_admin);
-    
+
     let escrow_contract_id = env.register_contract(None, TimelockEscrow);
     let escrow_client = TimelockEscrowClient::new(&env, &escrow_contract_id);
 
@@ -42,7 +45,7 @@ fn test_escrow_lifecycle() {
     // Deposit
     let id = escrow_client.deposit(&depositor, &recipient, &token.address, &500, &release_time);
     assert_eq!(id, 1);
-    
+
     assert_eq!(token.balance(&depositor), 500);
     assert_eq!(token.balance(&escrow_contract_id), 500);
 
@@ -87,7 +90,7 @@ fn test_escrow_early_claim_fails() {
     env.ledger().with_mut(|li| {
         li.timestamp = 1500;
     });
-    
+
     let res = escrow_client.try_claim(&id);
     assert_eq!(res.unwrap_err().unwrap(), Error::StillLocked);
 }

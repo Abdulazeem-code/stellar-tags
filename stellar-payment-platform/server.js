@@ -77,6 +77,7 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  RESERVED_USERNAMES,
   MAX_USERNAMES_PER_ADDRESS,
   PRIMARY_USERNAME_ORDER,
   USER_DATABASE,
@@ -368,15 +369,7 @@ scheduleSoftDeletePurgeJob(prisma);
 scheduleReconciliationJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
-const RESERVED_USERNAMES = [
-  "admin",
-  "root",
-  "stellar",
-  "system",
-  "superuser",
-  "administrator",
-  "support",
-];
+// RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
 
 // ---------------------------------------------------------------------------
 // #51 ΓÇö ETag Caching Middleware for Federation Endpoint

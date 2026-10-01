@@ -12,6 +12,8 @@ members = [
     "pausable_token",
     "payment_proxy",
     "timelock_escrow",
+    "advanced_feature_35",
+    "twap_oracle",
 ]
 
 # Edition 2021 members require resolver v2.

@@ -86,3 +86,4 @@ fuzz_target!(|input: FuzzInput| {
     // rejection, which is the behavior this fuzz target verifies.
     let _ = client.try_route_payments(&payments);
 });
+
