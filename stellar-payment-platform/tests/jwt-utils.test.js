@@ -66,8 +66,10 @@ describe('jwt utils (configured keys)', () => {
       const token = jwtUtils.signToken({ username: 'alice' });
       const [header, payload, signature] = token.split('.');
       const lastChar = signature.slice(-1);
-      const replacementChar = lastChar === 'a' ? 'b' : 'a';
-      const tampered = `${header}.${payload}.${signature.slice(0, -1)}${replacementChar}`;
+      const mid = Math.floor(signature.length / 2);
+      const midChar = signature[mid];
+      const replacementChar = midChar === 'a' ? 'b' : 'a';
+      const tampered = `${header}.${payload}.${signature.slice(0, mid)}${replacementChar}${signature.slice(mid + 1)}`;
       expect(() => jwtUtils.verifyToken(tampered)).toThrow();
     });
   });

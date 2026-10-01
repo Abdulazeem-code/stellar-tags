@@ -46,6 +46,7 @@
     "Webhooks",
     "WASM",
     "wasm",
+    "MiMC",
     "Prisma",
     "prisma",
     "Dockerfile",
@@ -83,6 +84,20 @@
     "postgresql",
     "gitignore",
     "monorepo",
-    "repo"
+    "repo",
+    "libc",
+    "noout",
+    "keyid",
+    "mtls",
+    "MTLS",
+    "POSIX",
+    "ZIPKIN",
+    "MiMC",
+    "COOLDOWN",
+    "SOROSWAP",
+    "CQRS",
+    "XADD",
+    "XREADGROUP",
+    "XTRIM"
   ]
 }
