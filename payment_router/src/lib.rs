@@ -267,6 +267,8 @@ pub enum ActionType {
     DeregisterDex(Address),
     /// Update the maximum tolerated swap slippage.
     SetMaxSlippageBps(i128),
+    /// Configure the multi-signature admin group for contract upgrades.
+    SetMultisigConfig(Vec<Address>, u32),
 }
 
 /// A pending timelock entry stored in persistent ledger storage.
@@ -364,6 +366,16 @@ pub struct FeeProposal {
     pub executed: bool,
 }
 
+/// Multi-signature configuration for contract upgrades.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    /// The list of authorized signers.
+    pub signers: Vec<Address>,
+    /// The minimum number of signers required to approve an upgrade.
+    pub threshold: u32,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -453,6 +465,21 @@ pub enum DataKey {
     /// Maximum tolerated swap slippage in basis points, applied against a
     /// caller-supplied quote.  Stored as `i128` in instance storage.
     MaxSlippageBps,
+    /// The N addresses of the multi-signature admin group that authorize
+    /// contract upgrades.  Stored as `Vec<Address>` in instance storage.
+    ///
+    /// Absent until the admin calls `set_multisig_config`; while absent every
+    /// upgrade attempt fails closed with `Error::MultisigNotInitialized`.
+    MultisigSigners,
+    /// The M signers of the multi-signature admin group that must approve a
+    /// WASM hash before an upgrade is authorized.  Stored as `u32` in
+    /// instance storage, always alongside `MultisigSigners`.
+    MultisigThreshold,
+    /// The addresses that have already signed off on upgrading to a specific
+    /// WASM hash.  Keyed by that hash so approvals for concurrent upgrade
+    /// proposals are tracked independently.  Stored as `Vec<Address>` in
+    /// persistent storage and cleared once the upgrade is applied.
+    UpgradeApproval(BytesN<32>),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -534,6 +561,28 @@ pub enum Error {
     /// A payment above the configured KYC threshold was made by a sender the
     /// configured oracle does not recognise.
     KycRequired = 34,
+    /// A swap path is empty, malformed, or does not connect the requested assets.
+    InvalidSwapPath = 35,
+    /// The DEX returned less than the caller's minimum acceptable output.
+    SlippageExceededSwap = 36,
+    /// The multi-signature configuration is unusable: the signer set is empty,
+    /// contains a duplicate address, the threshold is zero, or the threshold
+    /// exceeds the number of signers (so the upgrade could never be authorized).
+    InvalidMultisigConfig = 37,
+    /// The calling address is not a member of the multi-signature admin group.
+    NotMultisigSigner = 38,
+    /// The number of collected upgrade approvals is below the configured
+    /// threshold, so the upgrade is not authorized yet.
+    InsufficientApprovals = 39,
+    /// No multi-signature admin group has been configured yet.  Upgrades fail
+    /// closed until `set_multisig_config` has been called, so a freshly
+    /// deployed contract can never be upgraded through the single admin key
+    /// that the group was introduced to de-risk.
+    MultisigNotInitialized = 40,
+    /// The calling address has already approved this WASM hash.  Duplicate
+    /// approvals are rejected rather than ignored so that a replayed signature
+    /// can never inflate the approval count towards the threshold.
+    AlreadyApproved = 41,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -816,6 +865,28 @@ impl PaymentRouter {
         );
 
         Ok((platform_treasury, fee_bps, fee_cap))
+    }
+
+    /// Validates that a swap path is well-formed and connects the expected tokens.
+    fn validate_swap_path(
+        token_in: &Address,
+        token_out: &Address,
+        path: &Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if path.is_empty() {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.first().is_none_or(|a| a != *token_in) {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.last().is_none_or(|a| a != *token_out) {
+            return Err(Error::InvalidSwapPath);
+        }
+        if min_amount_out <= 0 {
+            return Err(Error::InvalidSwapParams);
+        }
+        Ok(())
     }
 
     fn get_refund_balance_internal(env: &Env, user: &Address, token: &Address) -> i128 {
@@ -2896,6 +2967,92 @@ impl PaymentRouter {
         )
     }
 
+    /// Swaps `token_in` through a caller-supplied DEX path and routes the
+    /// resulting `token_out` to the recipient. The DEX adapter must return the
+    /// received output and any unused input as `[received, unused]`; unused
+    /// input is credited to the sender's refund balance.
+    ///
+    /// # Panics
+    /// Panics if the DEX router returns a swap result with fewer than 2 elements,
+    /// or if `swap_result.get(0)` or `swap_result.get(1)` returns `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_payment_with_swap_raw(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex_router: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        Self::validate_swap_path(&token_in, &token_out, &path, min_amount_out)?;
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let token_in_client = token::Client::new(&env, &token_in);
+        token_in_client.transfer(&sender, &dex_router, &amount_in);
+
+        let swap_result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
+            &token_in,
+            &token_out,
+            &amount_in,
+            &min_amount_out,
+            &path,
+            &env.current_contract_address(),
+        );
+        if swap_result.len() != 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        let amount_received: i128 = swap_result.get(0).unwrap();
+        let unused_input: i128 = swap_result.get(1).unwrap();
+        if amount_received < min_amount_out || amount_received <= 0 || unused_input < 0 {
+            return Err(Error::SlippageExceeded);
+        }
+        if unused_input > 0 {
+            token_in_client.transfer(&env.current_contract_address(), &sender, &unused_input);
+        }
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_out,
+            amount_received,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
+    }
+
     /// Routes multiple payments in a single transaction. If any payment fails,
     /// the entire batch is reverted atomically.
     ///
@@ -2933,6 +3090,8 @@ impl PaymentRouter {
             .get(&DataKey::MinLimit)
             .unwrap_or(0);
 
+        // Collect unique senders to require auth only once per sender.
+        let mut seen_senders = Vec::new(&env);
         for payment in payments.iter() {
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
@@ -2948,7 +3107,18 @@ impl PaymentRouter {
             }
             Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
 
-            payment.sender.require_auth();
+            // Track unique senders for auth
+            let mut is_new = true;
+            for seen in seen_senders.iter() {
+                if seen == payment.sender {
+                    is_new = false;
+                    break;
+                }
+            }
+            if is_new {
+                seen_senders.push_back(payment.sender.clone());
+                payment.sender.require_auth();
+            }
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -4013,7 +4183,7 @@ impl PaymentRouter {
             .instance()
             .set(&DataKey::ArchiveEpoch, &new_epoch);
 
-        let record_count = leaves.len() as u32;
+        let record_count = leaves.len();
         let committed_at = env.ledger().timestamp();
 
         // Persist the Merkle root.
