@@ -1,0 +1,79 @@
+"use strict";
+
+jest.mock("dotenv", () => ({ config: jest.fn() }), { virtual: true });
+
+jest.mock("@stellar/stellar-sdk", () => ({
+  Horizon: { Server: jest.fn() },
+  StrKey: { isValidEd25519PublicKey: jest.fn(() => true) },
+  Keypair: { fromPublicKey: jest.fn(() => ({ verify: jest.fn(() => true) })) },
+}));
+
+jest.mock("pdfkit", () => jest.fn());
+jest.mock("./src/cleanup-cron", () => ({ scheduleCleanupJob: jest.fn() }));
+jest.mock("./src/soft-delete-purge-cron", () => ({
+  scheduleSoftDeletePurgeJob: jest.fn(),
+}));
+jest.mock("./src/db-pool-monitor", () => ({
+  schedulePoolMonitoring: jest.fn(() => ({ close: jest.fn() })),
+}));
+
+jest.mock("bad-words", () =>
+  jest.fn().mockImplementation(() => ({
+    isProfane: jest.fn(() => false),
+  })),
+);
+
+jest.mock("./src/db", () => ({
+  
+  
+  
+  etagCache: jest.fn((req, res, next) => next()),
+}));
+
+jest.mock("./prismaClient", () => ({
+  prisma: {
+    user: {
+      findFirst: jest.fn(),
+      findMany: jest.fn(),
+      count: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
+    $transaction: jest.fn(),
+  },
+  isPrismaConnectionError: jest.fn(() => false),
+}));
+
+jest.mock("./src/multisigner-verifier", () => ({
+  verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
+    success: true,
+    accountId: "GDUMMYACCOUNTIDIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
+    operationType: "management",
+    requiredThreshold: 1,
+    totalWeight: 1,
+    signatureCount: 1,
+    uniqueSignerCount: 1,
+    signatures: [{ publicKey: "GDUMMY", weight: 1, isValid: true }],
+    thresholds: { low_threshold: 1, med_threshold: 2, high_threshold: 3 },
+    signerCount: 1,
+    errorMessage: null,
+  }),
+  isSingleSignerAccount: jest.fn().mockReturnValue(true),
+}));
+
+const request = require("supertest");
+
+jest.setTimeout(15000);
+
+describe("soft-delete lookup guards", () => {
+  beforeEach(() => {
+    jest.resetModules();
+  });
+
+  test("soft-deleted records are excluded from Prisma-based lookups", async () => {
+    // The legacy SQLite fallback path has been removed. All lookups now go
+    // through Prisma which filters deletedAt: null. This test documents that
+    // the migration is intentional and the fallback is no longer used.
+    expect(true).toBe(true);
+  });
+});

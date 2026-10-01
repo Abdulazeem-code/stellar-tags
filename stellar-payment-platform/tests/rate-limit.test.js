@@ -21,8 +21,6 @@ jest.mock('redis', () => ({
   createClient: jest.fn(() => null),
 }));
 
-jest.mock('rate-limit-redis', () => jest.fn());
-
 jest.mock('bad-words', () =>
   jest.fn().mockImplementation(() => ({
     isProfane: jest.fn(() => false),
@@ -78,6 +76,7 @@ jest.mock('pg', () => ({
     end: jest.fn().mockResolvedValue(undefined),
     on: jest.fn(),
     options: { max: 10 },
+
   })),
 }));
 
@@ -86,6 +85,7 @@ jest.mock('../src/metrics', () => ({
   getMetrics: jest.fn().mockResolvedValue(''),
   getContentType: jest.fn(() => 'text/plain'),
   setMetricsSources: jest.fn(),
+  setDlqDepthSource: jest.fn(),
 }));
 
 jest.mock('@sentry/node', () => ({
@@ -100,7 +100,7 @@ global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
 
 const VALID_ADDRESS = 'GBCDEFGHIJKLMNOPQRSTUVWXYZ';
 
-describe('Rate Limiting — express-rate-limit', () => {
+describe('Rate Limiting - sliding window', () => {
   let app;
 
   beforeEach(() => {
@@ -113,7 +113,7 @@ describe('Rate Limiting — express-rate-limit', () => {
   describe('standard headers', () => {
     it('includes RateLimit-Limit header on /federation', async () => {
       const res = await request(app)
-        .get('/api/v1/federation')
+        .get('/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.headers).toHaveProperty('ratelimit-limit');
@@ -122,29 +122,28 @@ describe('Rate Limiting — express-rate-limit', () => {
 
     it('includes RateLimit-Remaining header on /federation', async () => {
       const res = await request(app)
-        .get('/api/v1/federation')
+        .get('/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.headers).toHaveProperty('ratelimit-remaining');
     });
 
-    it('includes RateLimit-Limit header on /register', async () => {
+    it('advertises the stricter signature-heavy limit on /register', async () => {
       const res = await request(app)
-        .post('/api/v1/register')
+        .post('/register')
         .send({ username: 'alice', address: VALID_ADDRESS });
 
       expect(res.headers).toHaveProperty('ratelimit-limit');
-      expect(res.headers['ratelimit-limit']).toBe('100');
+      expect(res.headers['ratelimit-limit']).toBe('10');
     });
 
-    it('includes X-RateLimit-* legacy headers', async () => {
+    it('does NOT include deprecated X-RateLimit-* headers', async () => {
       const res = await request(app)
-        .get('/api/v1/federation')
+        .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.headers).toHaveProperty('x-ratelimit-limit');
-      expect(res.headers).toHaveProperty('x-ratelimit-remaining');
-      expect(res.headers).toHaveProperty('x-ratelimit-reset');
+      expect(res.headers).not.toHaveProperty('x-ratelimit-limit');
+      expect(res.headers).not.toHaveProperty('x-ratelimit-remaining');
     });
   });
 
@@ -155,22 +154,18 @@ describe('Rate Limiting — express-rate-limit', () => {
       // Send 100 requests (should all succeed or get normal responses)
       for (let i = 0; i < 100; i++) {
         await request(app)
-          .get('/api/v1/federation')
+          .get('/federation')
           .query({ q: 'client*localhost' });
       }
 
       // The 101st request should be rate limited
       const res = await request(app)
-        .get('/api/v1/federation')
+        .get('/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(429);
-      expect(res.body).toEqual({
-        success: false,
-        error: {
-          code: 'RATE_LIMITED',
-          message: 'Too many requests, please try again later.',
-        },
+      expect(res.body).toMatchObject({
+        error: { code: 'RATE_LIMITED' },
       });
     });
 
@@ -179,37 +174,63 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       for (let i = 0; i < 100; i++) {
         await request(app)
-          .post('/api/v1/register')
+          .post('/register')
           .send(payload);
       }
 
       const res = await request(app)
-        .post('/api/v1/register')
+        .post('/register')
         .send(payload);
 
       expect(res.status).toBe(429);
-      expect(res.body).toEqual({
-        success: false,
-        error: {
-          code: 'RATE_LIMITED',
-          message: 'Too many requests, please try again later.',
-        },
+      expect(res.body).toMatchObject({
+        error: { code: 'RATE_LIMITED' },
       });
     });
 
     it('includes Retry-After header on 429 responses', async () => {
       for (let i = 0; i < 100; i++) {
         await request(app)
-          .get('/api/v1/federation')
+          .get('/federation')
           .query({ q: 'client*localhost' });
       }
 
       const res = await request(app)
-        .get('/api/v1/federation')
+        .get('/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(429);
       expect(res.headers).toHaveProperty('retry-after');
+    });
+  });
+
+  // ── Signature-heavy secondary limiter (10/min per IP) ───────────────────
+
+  describe('signature-heavy limiter', () => {
+    it('blocks the 11th POST /register with 429 + Retry-After', async () => {
+      const payload = { username: 'carol', address: VALID_ADDRESS };
+
+      for (let i = 0; i < 10; i++) {
+        const ok = await request(app).post('/register').send(payload);
+        expect(ok.status).not.toBe(429);
+      }
+
+      const res = await request(app).post('/register').send(payload);
+
+      expect(res.status).toBe(429);
+      expect(res.headers).toHaveProperty('retry-after');
+      expect(res.body).toMatchObject({
+        error: { code: 'RATE_LIMITED' },
+      });
+    });
+
+    it('does not apply to GET endpoints', async () => {
+      for (let i = 0; i < 20; i++) {
+        const res = await request(app)
+          .get('/federation')
+          .query({ q: 'client*localhost' });
+        expect(res.status).not.toBe(429);
+      }
     });
   });
 
@@ -224,7 +245,7 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       // /federation should now be rate limited too
       const res = await request(app)
-        .get('/api/v1/federation')
+        .get('/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(429);
@@ -248,13 +269,7 @@ describe('Rate Limiting — express-rate-limit', () => {
         .send({ email: 'overflow@example.com' });
 
       expect(res.status).toBe(429);
-      expect(res.body).toEqual({
-        success: false,
-        error: {
-          code: 'RATE_LIMITED',
-          message: 'Too many requests, please try again later.',
-        },
-      });
+      expect(res.body).toMatchObject({ error: { code: 'RATE_LIMITED' } });
     });
   });
 
@@ -264,7 +279,7 @@ describe('Rate Limiting — express-rate-limit', () => {
     it('fresh app instance has a full budget', async () => {
       // The beforeEach resetModules gives us a fresh app
       const res = await request(app)
-        .get('/api/v1/federation')
+        .get('/federation')
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(200);

@@ -20,9 +20,12 @@ const {
   adminBlockBodySchema,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
+  adminDlqQuerySchema,
+  adminDlqReplayBodySchema,
 } = require('../../schemas');
 const { streamAdminExport } = require('../../utils/exporter');
 const { getRoutingStats } = require('../../services/statsService');
+const { getRoutingStatsFromAnalytics, getAnalyticsPool } = require('../../analytics/analyticsRepository');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
@@ -32,9 +35,16 @@ const {
   parseCursorQuery,
   paginateByKeyset,
   cursorPaginatedResponse,
-  keysetWhereDesc
+  keysetWhereDesc,
+  keysetWhereAscById
 } = require('../../pagination');
-const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
+const {
+  listDlqMessages,
+  getDlqMessage,
+  replayDlqMessage,
+  replayDlqMessages,
+  discardDlqMessage,
+} = require('../../dlq');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const { PRIMARY_USERNAME_ORDER } = require('../../utils');
 
@@ -114,17 +124,23 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
 
     const { prisma } = getPrisma();
-    let skip = 0;
+    // Keyset walk (issue #677): pages seek strictly past the last row's
+    // (createdAt, id) tuple instead of skipping OFFSET rows, so deep pages
+    // cost the same as the first. The id tie-breaker also guarantees stable
+    // ordering when rows share a timestamp.
+    let cursor = null;
     let headerWritten = false;
 
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const where = dateFilter ? { createdAt: dateFilter } : {};
+        const baseWhere = dateFilter ? { createdAt: dateFilter } : {};
+        const where = cursor
+          ? { AND: [baseWhere, keysetWhereAscById(cursor)] }
+          : baseWhere;
         const records = await prisma.payment.findMany({
           where,
-          orderBy: { createdAt: 'asc' },
-          skip,
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
           take: EXPORT_PAGE_SIZE,
         });
 
@@ -152,7 +168,9 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
         }
 
         if (records.length < EXPORT_PAGE_SIZE) break;
-        skip += EXPORT_PAGE_SIZE;
+
+        const last = records[records.length - 1];
+        cursor = { createdAt: last.createdAt, id: last.id };
       }
 
       return res.end();
@@ -227,97 +245,98 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
   }));
 
   // ── Dead Letter Queue (DLQ) ────────────────────────────────────────────
+  //
+  // Payment retry jobs that exhausted their attempts are parked in a dedicated
+  // BullMQ queue so an operator can inspect and replay them. The routes below
+  // sit inside the router-level auditLogMiddleware, so every mutating call
+  // (replay, bulk replay, discard) is recorded with its body redacted.
 
   /**
    * GET /admin/dlq
-   * List dead-letter-queue entries.  Supports optional `?username=` filter,
-   * `?limit=` (default 50, max 200), and `?offset=` (default 0).
+   * One page of dead-letter-queue messages, newest first.
+   *
+   * Query parameters:
+   *  - limit    (optional) page size, clamped to 1-100 (default 20)
+   *  - page     (optional) 1-based page number (default 1)
+   *  - username (optional) narrow the listing to one merchant
+   *
+   * Payloads are redacted with the same helper the audit log uses, so a
+   * merchant secret never leaves the process through this route.
    */
   router.get(
     '/admin/dlq',
     adminAuth,
-    asyncHandler(async (req, res, next) => {
-      const { prisma } = getPrisma();
-      const username =
-        typeof req.query.username === 'string'
-          ? req.query.username.trim()
-          : undefined;
-      const limit = Math.min(
-        Math.max(parseInt(req.query.limit, 10) || 50, 1),
-        200,
-      );
-      const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    validateSchema({ query: adminDlqQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { limit, page, username } = req.query;
+      const { available, messages, total } = await listDlqMessages({ limit, page, username });
 
-      try {
-        const { entries, total } = await listDLQEntries(
-          prisma,
-          async (sql, params) => {
-            // Fallback path not used in normal operation; provide empty impl
-            return [];
-          },
-          { username, limit, offset },
-        );
+      return res.status(200).json({
+        success: true,
+        available,
+        messages,
+        meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+      });
+    }),
+  );
 
-        return res.status(200).json({
-          ok: true,
-          total,
-          limit,
-          offset,
-          entries: entries.map((e) => ({
-            id: e.id,
-            webhook_id: e.webhookId,
-            webhook_url: e.webhookUrl,
-            username: e.username,
-            event_type: e.eventType,
-            failure_reason: e.failureReason,
-            delivery_attempts: e.deliveryAttempts,
-            moved_at: (e.movedAt instanceof Date
-              ? e.movedAt
-              : new Date(e.movedAt)
-            ).toISOString(),
-            replayed: e.replayed,
-            replayed_at: e.replayedAt
-              ? (e.replayedAt instanceof Date
-                  ? e.replayedAt
-                  : new Date(e.replayedAt)
-                ).toISOString()
-              : null,
-          })),
-        });
-      } catch (error) {
-        return next(error);
-      }
+  /**
+   * GET /admin/dlq/:id
+   * A single dead-letter-queue message, payload redacted.
+   */
+  router.get(
+    '/admin/dlq/:id',
+    adminAuth,
+    asyncHandler(async (req, res) => {
+      return res.status(200).json({ success: true, message: await getDlqMessage(req.params.id) });
     }),
   );
 
   /**
    * POST /admin/dlq/:id/replay
-   * Manually replay a dead-letter-queue entry — retries delivery once.
+   * Re-enqueue one message onto the main queue it came from with a fresh
+   * attempt budget, then drop it from the DLQ.
    */
   router.post(
     '/admin/dlq/:id/replay',
     adminAuth,
-    asyncHandler(async (req, res, next) => {
-      const { prisma } = getPrisma();
-      const id =
-        typeof req.params?.id === 'string' ? req.params.id.trim() : '';
+    asyncHandler(async (req, res) => {
+      const result = await replayDlqMessage(req.params.id);
+      return res.status(200).json({ success: true, replayed: true, ...result });
+    }),
+  );
 
-      if (!id) {
-        return res.status(400).json({ error: 'DLQ entry id is required in URL path.' });
-      }
+  /**
+   * POST /admin/dlq/replay
+   * Replay a batch of messages, optionally narrowed to one merchant. The batch
+   * size is capped so a single request cannot flood the main queue.
+   */
+  router.post(
+    '/admin/dlq/replay',
+    adminAuth,
+    validateSchema({ body: adminDlqReplayBodySchema }),
+    asyncHandler(async (req, res) => {
+      const { limit, username } = req.body;
+      const result = await replayDlqMessages({ limit, username });
 
-      try {
-        const result = await replayFromDLQ(prisma, async (sql, params) => [], id);
+      return res.status(200).json({
+        success: true,
+        replayed: result.replayed.length,
+        failed: result.failed,
+        capped: result.capped,
+      });
+    }),
+  );
 
-        if (!result.ok) {
-          const status = result.error === 'DLQ entry not found' ? 404 : 409;
-          return res.status(status).json({ error: result.error });
-        }
-
-        return res.status(200).json({ ok: true, replayed: true });
-      } catch (error) {
-        return next(error);
-      }
+  /**
+   * DELETE /admin/dlq/:id
+   * Permanently drop one message without replaying it.
+   */
+  router.delete(
+    '/admin/dlq/:id',
+    adminAuth,
+    asyncHandler(async (req, res) => {
+      return res.status(200).json({ success: true, ...(await discardDlqMessage(req.params.id)) });
     }),
   );
 
@@ -340,20 +359,33 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
-      const { prisma } = getPrisma();
+      const selectedInterval = interval || groupBy || 'day';
 
+      // Prefer the analytics read model (TimescaleDB) when available.
+      // Falls back to the primary Prisma DB when ANALYTICS_DATABASE_URL is
+      // not configured so development without TimescaleDB keeps working.
+      const analyticsPool = getAnalyticsPool();
+      if (analyticsPool) {
+        const stats = await getRoutingStatsFromAnalytics({
+          startDate,
+          endDate,
+          groupBy: selectedInterval,
+          assetCode,
+          pool: analyticsPool,
+        });
+        return res.status(200).json({ success: true, ...stats });
+      }
+
+      // Fallback: query the transactional Prisma DB directly.
+      const { prisma } = getPrisma();
       const stats = await getRoutingStats({
         prisma,
         startDate,
         endDate,
-        groupBy: interval || groupBy || 'day',
+        groupBy: selectedInterval,
         assetCode,
       });
-
-      return res.status(200).json({
-        success: true,
-        ...stats,
-      });
+      return res.status(200).json({ success: true, ...stats });
     }),
   );
 
@@ -463,6 +495,42 @@ router.get(
       });
     }),
   );
+
+  // ── GET /admin/webhooks/health ───────────────────────────────────────────
+  // Aggregates webhook delivery health so ops can spot broken merchant
+  // integrations: total/healthy/failing counts, a rolling 24h success rate,
+  // and the URLs that have been failing for more than 24h.
+  router.get('/admin/webhooks/health', adminAuth, asyncHandler(async (req, res) => {
+    const { prisma } = getPrisma();
+    const username = typeof req.query.username === 'string' ? req.query.username.trim() : '';
+    const where = username ? { username } : {};
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const [total, failing, activeLast24h, failingLast24h, failingOver24h] = await Promise.all([
+      prisma.webhook.count({ where }),
+      prisma.webhook.count({ where: { ...where, failingSince: { not: null } } }),
+      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo } } }),
+      prisma.webhook.count({ where: { ...where, lastSentAt: { gte: dayAgo }, failingSince: { not: null } } }),
+      prisma.webhook.findMany({
+        where: { ...where, failingSince: { lte: dayAgo } },
+        select: { id: true, username: true, url: true, failingSince: true },
+        orderBy: { failingSince: 'asc' },
+      }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      summary: {
+        total,
+        healthy: total - failing,
+        failing,
+        successRate24h: activeLast24h
+          ? Number((((activeLast24h - failingLast24h) / activeLast24h) * 100).toFixed(2))
+          : null,
+      },
+      failingOver24h,
+    });
+  }));
 
   return router;
 };

@@ -1,9 +1,9 @@
 const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
-const { prisma, withTransaction } = require('../../../prismaClient');
+const { prisma } = require('../../../prismaClient');
+const { getBalances } = require('../../services/ledgerService');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
-const { poolGet, poolRun, poolAll, etagCache } = require('../../db');
 const { logger } = require('../../logger');
 const { transferAccount } = require('../../services/registrationService');
 const { lookupCached, invalidateFederationCache } = require('../../cache');
@@ -15,15 +15,13 @@ const {
   paginateByKeyset,
   cursorPaginatedResponse,
 } = require('../../pagination');
+const { authenticateUsernameOwner } = require('../../services/ownershipService');
+const { listActivity, serializeActivity, ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
-  RESERVED_USERNAMES,
-  MAX_USERNAMES_PER_ADDRESS,
-  PRIMARY_USERNAME_ORDER,
-  shouldFallbackToLocalRegistry,
 } = require('../../utils');
 const Filter = require('bad-words');
 const profanityFilter = new Filter();
@@ -31,14 +29,6 @@ const { verifyFreighterRegistrationSignature } = require('../../services/signatu
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
-const { authenticateUsernameOwner } = require('../../services/ownershipService');
-const {
-  ACTIVITY_ACTIONS,
-  recordActivity,
-  listActivity,
-  parseDateRange,
-  serializeActivity,
-} = require('../../services/activityService');
 const {
   registerBodySchema,
   federationQuerySchema,
@@ -63,89 +53,13 @@ const buildUserSearchWhere = (search) => {
   };
 };
 
-const serializeUser = (user) => ({
+const serializeUser = (user, balances = {}) => ({
   username: user.username,
   address: user.address,
   created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+  balances,
 });
 
-const getLocalUserByAddress = async (address) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE address = $1 LIMIT 1',
-    [address],
-  );
-
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    'SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1',
-    [username],
-  );
-
-const listLocalUsers = async (search, page, limit) => {
-  const searchPattern = `%${search}%`;
-  const skip = (page - 1) * limit;
-  const rows = await poolAll(
-    `SELECT username, address, created_at
-     FROM username_registry
-     WHERE username ILIKE $1 OR address ILIKE $1
-     ORDER BY created_at DESC
-     LIMIT $2 OFFSET $3`,
-    [searchPattern, limit, skip],
-  );
-
-  const countRow = await poolGet(
-    `SELECT COUNT(*) AS "totalCount"
-     FROM username_registry
-     WHERE username ILIKE $1 OR address ILIKE $1`,
-    [searchPattern],
-  );
-
-  const totalCount = Number(countRow?.totalCount || 0);
-  return paginatedResponse(
-    rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.created_at,
-    })),
-    totalCount,
-    { page, limit },
-  );
-};
-
-const registerLocalUser = async ({ username, address }) => {
-  const existingByAddress = await getLocalUserByAddress(address);
-  if (existingByAddress) {
-    const conflictError = new Error('Address already registered');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  const existingByUsername = await getLocalUserByUsername(username);
-  if (existingByUsername) {
-    const conflictError = new Error('Username is already taken. Please choose another.');
-    conflictError.statusCode = 409;
-    throw conflictError;
-  }
-
-  await poolRun(
-    `INSERT INTO username_registry (username, address, created_at)
-     VALUES ($1, $2, $3)`,
-    [username, address, new Date().toISOString()],
-  );
-};
-
-
-/**
- * @openapi
- * /register:
- *   post:
- *     tags:
- *       - v1
- *     description: POST /register
- *     responses:
- *       200:
- *         description: Success
- */
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
@@ -189,22 +103,13 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   }
 
   try {
-    // #613 — an address may carry several usernames (aliases). Registration
-    // adds another while the address is under the cap; the first username
-    // registered for an address becomes its primary.
-    const usernameCount = await prisma.user.count({
-      where: { address, deletedAt: null },
+    const existingCount = await prisma.user.count({
+      where: { address, deletedAt: null }
     });
 
-    if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
-      return next(
-        new ApiError(
-          'CONFLICT',
-          `This address already has the maximum of ${MAX_USERNAMES_PER_ADDRESS} federation usernames.`,
-        ),
-      );
+    if (existingCount >= 5) {
+      return next(new ApiError('CONFLICT', 'Address already registered - maximum of 5 usernames allowed per address'));
     }
-    const isPrimary = usernameCount === 0;
 
     let verificationResult = null;
     if (signature) {
@@ -261,24 +166,19 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       data: {
         username: normalizedUsername,
         address,
-        isPrimary,
+        isPrimary: existingCount === 0,
         ...(memoType && { memoType, memo }),
       },
     });
-
-    await recordActivity(prisma, {
-      username: normalizedUsername,
-      action: ACTIVITY_ACTIONS.USER_REGISTERED,
-      metadata: { address, is_primary: isPrimary, ...(memoType && { memo_type: memoType }) },
-      req,
-    });
+    // Invalidate any stale federation cache entries for this username/address
+    invalidateFederationCache(normalizedUsername, address);
 
     return res.status(201).json({
       ok: true,
       username: normalizedUsername,
       address,
-      is_primary: isPrimary,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      is_primary: existingCount === 0,
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,
@@ -292,7 +192,8 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     });
 
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT' || error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
+    // Prisma unique constraint violation (PostgreSQL error code 23505)
+    if (error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
       return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
     }
     
@@ -328,13 +229,6 @@ router.post('/users/:username/transfer', async (req, res, next) => {
       newSignature
     );
 
-    await recordActivity(prisma, {
-      username: updatedUser.username,
-      action: ACTIVITY_ACTIONS.USER_TRANSFERRED,
-      metadata: { from_address: oldAddress, to_address: updatedUser.address },
-      req,
-    });
-
     return res.status(200).json({
       ok: true,
       message: 'Account transferred successfully',
@@ -351,18 +245,6 @@ router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWE
 
 // #18 — Soft-delete endpoint. Sets deleted_at to now() instead of running a
 // hard DELETE so the row is preserved for historical auditing.
-
-/**
- * @openapi
- * /register/:username:
- *   delete:
- *     tags:
- *       - v1
- *     description: DELETE /register/:username
- *     responses:
- *       200:
- *         description: Success
- */
 router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   const username = normalizeNameTag(
     typeof req.params.username === 'string' ? req.params.username.trim() : '',
@@ -385,22 +267,13 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
       return next(notFoundError);
     }
 
-    await withTransaction(async (tx) => {
-      await tx.user.update({
-        where: { username },
-        data: { deletedAt: new Date() },
-      });
-
-      // Invalidate any stale federation cache entries
-      invalidateFederationCache(username, existing.address);
+    await prisma.user.update({
+      where: { username },
+      data: { deletedAt: new Date() },
     });
-
-    await recordActivity(prisma, {
-      username,
-      action: ACTIVITY_ACTIONS.USER_UNREGISTERED,
-      metadata: { address: existing.address },
-      req,
-    });
+    
+    // Invalidate any stale federation cache entries
+    invalidateFederationCache(username, existing.address);
 
     return res.status(200).json({ ok: true, username, deleted: true });
   } catch (error) {
@@ -411,77 +284,19 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
   }
 }));
 
-// #599 — A user's own activity trail. Ownership is proven the same way the
-// webhook endpoints prove it: a signature over `activity:<username>` made with
-// the account key, passed in the X-Stellar-Signature header (or the body, as
-// the webhook routes accept it).
-router.get(
-  '/users/:username/activity',
-  validateSchema({ query: activityQuerySchema }),
-  asyncHandler(async (req, res, next) => {
-    const username = normalizeNameTag(
-      typeof req.params.username === 'string' ? req.params.username.trim() : '',
-    ).toLowerCase();
-
-    if (!username) {
-      return next(new ApiError('INVALID_INPUT', 'Missing username parameter.'));
-    }
-
-    let owner;
-    try {
-      owner = await authenticateUsernameOwner({
-        username,
-        signature: req.get('X-Stellar-Signature') || req.body?.signature,
-        signerAddress: req.get('X-Stellar-Signer') || req.body?.signerAddress,
-        operation: 'activity',
-      });
-    } catch (error) {
-      return next(error);
-    }
-
-    const { range, error: dateError } = parseDateRange(req.query);
-    if (dateError) {
-      return next(new ApiError('INVALID_INPUT', dateError));
-    }
-
-    const { page, limit } = req.query;
-    const { rows, total } = await listActivity(prisma, {
-      username: owner.username,
-      page,
-      limit,
-      range,
-    });
-
-    return res
-      .status(200)
-      .json(paginatedResponse(rows.map(serializeActivity), total, { page, limit }));
-  }),
-);
-
-/**
- * @openapi
- * /lookup:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /lookup
- *     responses:
- *       200:
- *         description: Success
- */
-router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
+router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler(async (req, res, next) => {
   const { address = '', search = '' } = req.query;
 
   if (address) {
     try {
       const result = await lookupCached(address, async () => {
-        // #613 — an address can have several usernames; return the primary.
         const row = await prisma.user.findFirst({
           where: { address, deletedAt: null },
           select: { username: true },
-          orderBy: PRIMARY_USERNAME_ORDER,
         });
-        return row ? { username: row.username, address } : null;
+        if (!row) return null;
+        const balances = await getBalances(row.username);
+        return { username: row.username, address, balances };
       });
 
       if (!result) {
@@ -506,37 +321,61 @@ router.get('/lookup', etagCache, validateSchema({ query: lookupQuerySchema }), a
   const where = buildUserSearchWhere(search);
 
   try {
-    const result = await lookupUser(req.query.address, req.query.search, req.query);
-    return res.json(result);
+    if (cursor) {
+      // Keyset mode: seek straight past the cursor row instead of skipping
+      // every preceding row, so deep pages cost the same as page one.
+      const candidates = await prisma.user.findMany({
+        where: { AND: [where, keysetWhereDesc(cursor)] },
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        take: cursorLimit + 1,
+      });
+      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt.toISOString(),
+          balances,
+        };
+      }));
+      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
+    }
+
+    const [totalCount, rows] = await prisma.$transaction([
+      prisma.user.count({ where }),
+      prisma.user.findMany({
+        where,
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    const totalPages = Math.ceil(totalCount / limit);
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt.toISOString(),
+        balances,
+      };
+    }));
+
+    return res.json({ data, totalCount, totalPages, currentPage: page });
   } catch (error) {
     return next(error);
   }
 }));
 
-
-/**
- * @openapi
- * /users:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /users
- *     responses:
- *       200:
- *         description: Success
- */
-/**
- * @openapi
- * /users:
- *   get:
- *     tags:
- *       - v1
- *     description: GET /users
- *     responses:
- *       200:
- *         description: Success
- */
-router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
+router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
   const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
   const { page, limit, skip } = parsePagination(req.query);
   if (invalidCursor) {
@@ -546,11 +385,137 @@ router.get('/users', etagCache, validateSchema({ query: usersQuerySchema }), asy
   const where = search ? buildUserSearchWhere(search) : { deletedAt: null };
 
   try {
-    const result = await listUsers(req.query);
-    return res.json(result);
+    if (cursor) {
+      // Keyset mode: seek straight past the cursor row instead of skipping
+      // every preceding row, so deep pages cost the same as page one.
+      const candidates = await prisma.user.findMany({
+        where: { AND: [where, keysetWhereDesc(cursor)] },
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        take: cursorLimit + 1,
+      });
+      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+          balances,
+        };
+      }));
+      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
+    }
+
+    const [totalCount, rows] = await prisma.$transaction([
+      prisma.user.count({ where }),
+      prisma.user.findMany({
+        where,
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    const totalPages = Math.ceil(totalCount / limit);
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+        balances,
+      };
+    }));
+
+    res.json({
+      data,
+      meta: {
+        total: totalCount,
+        totalCount,
+        page,
+        currentPage: page,
+        limit,
+        totalPages,
+      },
+      totalCount,
+      totalPages,
+      currentPage: page,
+    });
   } catch (error) {
     return next(error);
   }
 }));
+
+
+
+router.get(
+  '/users/:username/activity',
+  validateSchema({ query: activityQuerySchema }),
+  asyncHandler(async (req, res, next) => {
+    const rawUsername = typeof req.params.username === 'string' ? req.params.username : '';
+    const username = normalizeNameTag(rawUsername);
+    if (!username) {
+      return next(new ApiError('INVALID_INPUT', 'Missing username parameter'));
+    }
+
+    let user;
+    try {
+      const signature = req.headers['x-stellar-signature'] || req.body?.signature;
+      const signerAddress = req.headers['x-stellar-signer'] || req.body?.signerAddress;
+      
+      user = await authenticateUsernameOwner({
+        username,
+        signature,
+        signerAddress,
+        operation: 'activity'
+      });
+    } catch (err) {
+      if (err.statusCode) return next(err);
+      const e = new Error(err.message || 'Failed to authenticate');
+      e.statusCode = 401;
+      return next(e);
+    }
+
+    const { page, limit, skip } = parsePagination(req.query);
+    const range = req.query.startDate || req.query.endDate ? {
+      ...(req.query.startDate && { gte: new Date(req.query.startDate) }),
+      ...(req.query.endDate && { lte: new Date(req.query.endDate) }),
+    } : null;
+    
+    if (range && (
+      (range.gte && isNaN(range.gte.getTime())) || 
+      (range.lte && isNaN(range.lte.getTime())) ||
+      (range.gte && range.lte && range.gte > range.lte)
+    )) {
+       const e = new Error('Invalid date range');
+       e.statusCode = 400;
+       return next(e);
+    }
+
+    try {
+      const { rows, total } = await listActivity(prisma, {
+        username: user.username,
+        page,
+        limit,
+        range,
+      });
+
+      return res.status(200).json(
+        paginatedResponse(rows.map(serializeActivity), total, { page, limit }),
+      );
+    } catch (err) {
+      logger.error('[activity] error listing activity:', err);
+      const e = new Error('Failed to load activity');
+      e.statusCode = 500;
+      return next(e);
+    }
+  }),
+);
 
 module.exports = router;
