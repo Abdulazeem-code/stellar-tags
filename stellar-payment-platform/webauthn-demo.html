@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebAuthn/Passkeys Demo - Stellar Tags</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      background: white;
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 500px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    }
+    h1 {
+      color: #667eea;
+      margin-bottom: 10px;
+      font-size: 28px;
+    }
+    .subtitle {
+      color: #666;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    .section {
+      margin-bottom: 30px;
+      padding: 20px;
+      background: #f8f9fa;
+      border-radius: 8px;
+    }
+    h2 {
+      font-size: 18px;
+      margin-bottom: 15px;
+      color: #333;
+    }
+    input {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 14px;
+      margin-bottom: 10px;
+      transition: border-color 0.3s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #667eea;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    button:hover {
+      background: #5568d3;
+    }
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    .message {
+      padding: 12px;
+      border-radius: 8px;
+      margin-top: 15px;
+      font-size: 14px;
+    }
+    .success {
+      background: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+    }
+    .error {
+      background: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+    }
+    .info {
+      background: #d1ecf1;
+      color: #0c5460;
+      border: 1px solid #bee5eb;
+    }
+    .credentials-list {
+      margin-top: 15px;
+    }
+    .credential-item {
+      background: white;
+      padding: 12px;
+      border-radius: 6px;
+      margin-bottom: 8px;
+      border: 1px solid #e0e0e0;
+    }
+    .credential-name {
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 4px;
+    }
+    .credential-info {
+      font-size: 12px;
+      color: #666;
+    }
+    .loading {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-right: 8px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🔐 WebAuthn/Passkeys Demo</h1>
+    <p class="subtitle">Passwordless authentication for Stellar Tags</p>
+
+    <!-- Registration Section -->
+    <div class="section">
+      <h2>Register New Passkey</h2>
+      <input type="email" id="regEmail" placeholder="Enter your email" value="demo@example.com">
+      <input type="text" id="regName" placeholder="Friendly name (optional)" value="My Device">
+      <button onclick="registerPasskey()">Register Passkey</button>
+      <div id="regMessage"></div>
+    </div>
+
+    <!-- Authentication Section -->
+    <div class="section">
+      <h2>Authenticate with Passkey</h2>
+      <input type="email" id="authEmail" placeholder="Enter your email" value="demo@example.com">
+      <button onclick="authenticatePasskey()">Sign In</button>
+      <div id="authMessage"></div>
+    </div>
+
+    <!-- Credentials Section -->
+    <div class="section">
+      <h2>Your Passkeys</h2>
+      <input type="email" id="listEmail" placeholder="Enter your email" value="demo@example.com">
+      <button onclick="listCredentials()">Load Credentials</button>
+      <div id="credentialsList"></div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = 'http://localhost:5001/api/v1/webauthn';
+
+    // Helper to convert base64url to Uint8Array
+    function base64urlToUint8Array(base64url) {
+      const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    // Helper to convert Uint8Array to base64url
+    function uint8ArrayToBase64url(uint8Array) {
+      let binary = '';
+      const len = uint8Array.byteLength;
+      for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(uint8Array[i]);
+      }
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    }
+
+    // Show message helper
+    function showMessage(elementId, message, type = 'info') {
+      const el = document.getElementById(elementId);
+      el.innerHTML = `<div class="message ${type}">${message}</div>`;
+    }
+
+    // Register Passkey
+    async function registerPasskey() {
+      const email = document.getElementById('regEmail').value;
+      const friendlyName = document.getElementById('regName').value;
+      
+      if (!email) {
+        showMessage('regMessage', 'Please enter your email', 'error');
+        return;
+      }
+
+      try {
+        showMessage('regMessage', '<span class="loading"></span>Requesting registration options...', 'info');
+
+        // 1. Get registration options from server
+        const optionsRes = await fetch(`${API_BASE}/register/options`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: email,
+            userName: email,
+            userDisplayName: email
+          })
+        });
+
+        const { options } = await optionsRes.json();
+        
+        // Convert base64url to Uint8Array
+        options.challenge = base64urlToUint8Array(options.challenge);
+        options.user.id = new TextEncoder().encode(options.user.id);
+
+        showMessage('regMessage', '<span class="loading"></span>Touch your authenticator...', 'info');
+
+        // 2. Create credential
+        const credential = await navigator.credentials.create({ publicKey: options });
+
+        showMessage('regMessage', '<span class="loading"></span>Verifying registration...', 'info');
+
+        // 3. Verify registration
+        const verifyRes = await fetch(`${API_BASE}/register/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: email,
+            registrationResponse: {
+              id: credential.id,
+              rawId: uint8ArrayToBase64url(new Uint8Array(credential.rawId)),
+              response: {
+                clientDataJSON: uint8ArrayToBase64url(new Uint8Array(credential.response.clientDataJSON)),
+                attestationObject: uint8ArrayToBase64url(new Uint8Array(credential.response.attestationObject)),
+                transports: credential.response.getTransports ? credential.response.getTransports() : []
+              },
+              type: credential.type
+            },
+            friendlyName: friendlyName || 'My Device'
+          })
+        });
+
+        const result = await verifyRes.json();
+        
+        if (result.success) {
+          showMessage('regMessage', '✅ Passkey registered successfully!', 'success');
+        } else {
+          showMessage('regMessage', '❌ Registration failed', 'error');
+        }
+      } catch (error) {
+        console.error(error);
+        showMessage('regMessage', `❌ Error: ${error.message}`, 'error');
+      }
+    }
+
+    // Authenticate with Passkey
+    async function authenticatePasskey() {
+      const email = document.getElementById('authEmail').value;
+      
+      if (!email) {
+        showMessage('authMessage', 'Please enter your email', 'error');
+        return;
+      }
+
+      try {
+        showMessage('authMessage', '<span class="loading"></span>Requesting authentication options...', 'info');
+
+        // 1. Get authentication options
+        const optionsRes = await fetch(`${API_BASE}/authenticate/options`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: email })
+        });
+
+        const { options } = await optionsRes.json();
+        
+        // Convert challenge
+        options.challenge = base64urlToUint8Array(options.challenge);
+        
+        // Convert allowCredentials if present
+        if (options.allowCredentials) {
+          options.allowCredentials = options.allowCredentials.map(cred => ({
+            ...cred,
+            id: base64urlToUint8Array(cred.id)
+          }));
+        }
+
+        showMessage('authMessage', '<span class="loading"></span>Touch your authenticator...', 'info');
+
+        // 2. Get credential
+        const credential = await navigator.credentials.get({ publicKey: options });
+
+        showMessage('authMessage', '<span class="loading"></span>Verifying authentication...', 'info');
+
+        // 3. Verify authentication
+        const verifyRes = await fetch(`${API_BASE}/authenticate/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            authenticationResponse: {
+              id: credential.id,
+              rawId: uint8ArrayToBase64url(new Uint8Array(credential.rawId)),
+              response: {
+                clientDataJSON: uint8ArrayToBase64url(new Uint8Array(credential.response.clientDataJSON)),
+                authenticatorData: uint8ArrayToBase64url(new Uint8Array(credential.response.authenticatorData)),
+                signature: uint8ArrayToBase64url(new Uint8Array(credential.response.signature)),
+                userHandle: credential.response.userHandle ? uint8ArrayToBase64url(new Uint8Array(credential.response.userHandle)) : null
+              },
+              type: credential.type,
+              challenge: options.challenge
+            }
+          })
+        });
+
+        const result = await verifyRes.json();
+        
+        if (result.success) {
+          showMessage('authMessage', `✅ Authentication successful!<br>Token: ${result.token.substring(0, 30)}...`, 'success');
+        } else {
+          showMessage('authMessage', '❌ Authentication failed', 'error');
+        }
+      } catch (error) {
+        console.error(error);
+        showMessage('authMessage', `❌ Error: ${error.message}`, 'error');
+      }
+    }
+
+    // List Credentials
+    async function listCredentials() {
+      const email = document.getElementById('listEmail').value;
+      
+      if (!email) {
+        showMessage('credentialsList', 'Please enter your email', 'error');
+        return;
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/credentials?userId=${encodeURIComponent(email)}`);
+        const result = await res.json();
+        
+        if (result.success && result.data.length > 0) {
+          let html = '<div class="credentials-list">';
+          result.data.forEach(cred => {
+            const created = new Date(cred.createdAt).toLocaleDateString();
+            const lastUsed = new Date(cred.lastUsedAt).toLocaleDateString();
+            html += `
+              <div class="credential-item">
+                <div class="credential-name">${cred.friendlyName || 'Unnamed Device'}</div>
+                <div class="credential-info">
+                  Type: ${cred.deviceType} | Created: ${created} | Last used: ${lastUsed}
+                </div>
+              </div>
+            `;
+          });
+          html += '</div>';
+          document.getElementById('credentialsList').innerHTML = html;
+        } else {
+          showMessage('credentialsList', 'No passkeys registered yet', 'info');
+        }
+      } catch (error) {
+        console.error(error);
+        showMessage('credentialsList', `❌ Error: ${error.message}`, 'error');
+      }
+    }
+  </script>
+</body>
+</html>

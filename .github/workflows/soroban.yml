@@ -10,6 +10,43 @@ jobs:
   contract-checks:
     name: Contract Build & Test
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Run payment_router tests
+        working-directory: ./payment_router
+        run: cargo test --verbose
+
+      - name: Run payment_proxy tests
+        working-directory: ./payment_proxy
+        run: cargo test --features testutils --verbose
+
+      - name: Run pausable_token tests
+        working-directory: ./pausable_token
+        run: cargo test --features testutils --verbose
+
+      - name: Build payment_router to WASM
+        working-directory: ./payment_router
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Build payment_proxy to WASM
+        working-directory: ./payment_proxy
+        run: cargo build --target wasm32-unknown-unknown --release
+
+  benchmarks:
+    name: Storage Gas Benchmarks (issue #663)
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ./payment_router
@@ -27,11 +64,11 @@ jobs:
         with:
           workspaces: ./payment_router
 
-      - name: Run contract tests
-        run: cargo test --verbose
-
-      - name: Build contract to WASM
-        run: cargo build --target wasm32-unknown-unknown --release
+      # Runs the storage-cost benchmark tests (test_benchmark_*). These fail
+      # CI when the packed user-record registration write path is no longer
+      # at least 20% cheaper than the legacy two-entry path.
+      - name: Run storage gas benchmarks
+        run: cargo test benchmark -- --nocapture
 
   yield-escrow-checks:
     name: Yield Escrow Build & Test
@@ -97,9 +134,6 @@ jobs:
   coverage:
     name: Coverage Report (cargo tarpaulin)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./payment_router
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -110,12 +144,23 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ./payment_router
+          workspaces: .
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --locked
 
-      - name: Generate coverage report
+      - name: Generate coverage report (payment_router)
+        working-directory: ./payment_router
+        run: >
+          cargo tarpaulin
+          --features testutils
+          --out Xml
+          --out Html
+          --output-dir coverage
+          --verbose
+
+      - name: Generate coverage report (payment_proxy)
+        working-directory: ./payment_proxy
         run: >
           cargo tarpaulin
           --features testutils
@@ -128,4 +173,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tarpaulin-coverage-report
-          path: payment_router/coverage/
+          path: |
+            payment_router/coverage/
+            payment_proxy/coverage/
