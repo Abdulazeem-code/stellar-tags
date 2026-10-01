@@ -15,6 +15,7 @@ module.exports = (redisClient) => {
 
   const adminRoutes = require('./adminRoutes')(redisClient);
   const routingRuleRoutes = require('./routingRuleRoutes')();
+  const settlementRoutes = require('./settlementRoutes')(redisClient);
 
   router.use('/', userRoutes);
   router.use('/', receiptRoutes);
@@ -22,6 +23,7 @@ module.exports = (redisClient) => {
   router.use('/', historyRoutes);
   router.use('/', exportRoutes);
   router.use('/', routingRuleRoutes);
+  router.use('/settlement', settlementRoutes);
 
   router.use('/', webhookRoutes(redisClient));
   router.use('/', paymentRoutes(redisClient));
