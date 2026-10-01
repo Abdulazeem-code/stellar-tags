@@ -170,7 +170,7 @@ fn observe_prunes_the_oldest_observation_when_full() {
     set_time(&setup.env, 1_000);
 
     let mut index = 0u64;
-    while index < (MAX_OBSERVATIONS as u64) + 1 {
+    while index < u64::from(MAX_OBSERVATIONS) + 1 {
         let timestamp = 1_000 + index * MIN_INTERVAL_SECONDS;
         set_time(&setup.env, timestamp);
         let _ = setup.client.observe(&100, &timestamp);

@@ -123,6 +123,10 @@ impl TwapOracle {
     ///
     /// `timestamp` must not be in the future and must be strictly greater than
     /// the previous observation by at least [`MIN_INTERVAL_SECONDS`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin or if retrieving previous observation fails.
     pub fn observe(env: Env, price: i128, timestamp: u64) -> Result<u32, Error> {
         let admin = read_admin(&env)?;
         admin.require_auth();
@@ -204,6 +208,10 @@ impl TwapOracle {
     ///
     /// The window start is interpolated within the segment that contains it, so
     /// the average is computed over exactly `window_seconds`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if accessing the stored observations fails.
     pub fn twap(env: Env, window_seconds: u64) -> Result<i128, Error> {
         if window_seconds == 0 || window_seconds > MAX_WINDOW_SECONDS {
             return Err(Error::InvalidWindow);
