@@ -65,6 +65,10 @@ const {
   invalidateFederationCache,
 } = require("./src/cache");
 const {
+  paginatedResponse,
+  parsePagination,
+  parseCursorQuery,
+  keysetWhereDesc,
   paginateByKeyset,
   cursorPaginatedResponse,
 } = require("./src/pagination");
@@ -363,15 +367,7 @@ scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
-const RESERVED_USERNAMES = [
-  "admin",
-  "root",
-  "stellar",
-  "system",
-  "superuser",
-  "administrator",
-  "support",
-];
+// RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
 
 // ---------------------------------------------------------------------------
 // #51 ΓÇö ETag Caching Middleware for Federation Endpoint

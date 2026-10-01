@@ -3533,7 +3533,7 @@ impl PaymentRouter {
             .instance()
             .set(&DataKey::ArchiveEpoch, &new_epoch);
 
-        let record_count = leaves.len() as u32;
+        let record_count = leaves.len();
         let committed_at = env.ledger().timestamp();
 
         // Persist the Merkle root.

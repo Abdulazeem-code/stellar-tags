@@ -22,6 +22,7 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  RESERVED_USERNAMES,
 } = require('../../utils');
 const Filter = require('bad-words');
 const profanityFilter = new Filter();
@@ -31,13 +32,11 @@ const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
 const {
   registerBodySchema,
-  federationQuerySchema,
   lookupQuerySchema,
   usersQuerySchema,
   activityQuerySchema,
 } = require('../../schemas');
-const { registerUser } = require('../../services/registrationService');
-const { lookupUser, listUsers } = require('../../services/userService');
+
 
 
 const router = express.Router();

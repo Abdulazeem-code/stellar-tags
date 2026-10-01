@@ -2,9 +2,7 @@
 
 pub mod test;
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env,
-};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -74,7 +72,9 @@ impl TimelockEscrow {
         };
 
         // Escrow can live longer, so use persistent storage
-        env.storage().persistent().set(&DataKey::Escrow(id), &escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(id), &escrow);
 
         Ok(id)
     }
@@ -82,7 +82,11 @@ impl TimelockEscrow {
     /// Claim funds from an escrow.
     pub fn claim(env: Env, id: u64) -> Result<(), Error> {
         let key = DataKey::Escrow(id);
-        let mut escrow: Escrow = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
 
         if escrow.claimed {
             return Err(Error::AlreadyClaimed);
@@ -94,11 +98,15 @@ impl TimelockEscrow {
         }
 
         let token_client = token::Client::new(&env, &escrow.token);
-        token_client.transfer(&env.current_contract_address(), &escrow.recipient, &escrow.amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.recipient,
+            &escrow.amount,
+        );
 
         escrow.claimed = true;
         env.storage().persistent().set(&key, &escrow);
-        
+
         Ok(())
     }
 }
