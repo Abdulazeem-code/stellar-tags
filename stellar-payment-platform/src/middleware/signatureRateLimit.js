@@ -14,6 +14,7 @@ const createSignatureRateLimiter = (redisClient) =>
     windowMs: WINDOW_MS,
     max: MAX_REQUESTS,
     prefix: 'sig-rl:',
+    failClosedOnRedisError: true,
     keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
     message: errorBody("RATE_LIMITED", "Too many requests, please try again later."),
   });
