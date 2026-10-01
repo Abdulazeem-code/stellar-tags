@@ -282,4 +282,111 @@ mod test {
         client.submit(&proof, &commitment, &nullifier);
         assert!(client.try_submit(&proof, &commitment, &nullifier).is_err());
     }
+
+    #[test]
+    fn verify_returns_false_for_a_wrong_commitment() {
+        let env = Env::default();
+        let (verification_key, proof, _commitment, nullifier) = fixture(&env);
+        let client = client(&env, &verification_key);
+        let wrong = Bls12381Fr::from_u256(U256::from_u32(&env, 1));
+
+        assert_eq!(client.try_verify(&proof, &wrong, &nullifier), Ok(Ok(false)));
+    }
+
+    #[test]
+    fn verify_returns_false_for_a_wrong_nullifier() {
+        let env = Env::default();
+        let (verification_key, proof, commitment, _nullifier) = fixture(&env);
+        let client = client(&env, &verification_key);
+        let wrong = Bls12381Fr::from_u256(U256::from_u32(&env, 1));
+
+        assert_eq!(
+            client.try_verify(&proof, &commitment, &wrong),
+            Ok(Ok(false))
+        );
+    }
+
+    #[test]
+    fn verify_does_not_record_state() {
+        let env = Env::default();
+        let (verification_key, proof, commitment, nullifier) = fixture(&env);
+        let client = client(&env, &verification_key);
+
+        assert!(client.verify(&proof, &commitment, &nullifier));
+        assert!(!client.payment_exists(&commitment));
+        assert!(!client.nullifier_used(&nullifier));
+    }
+
+    #[test]
+    fn submit_rejects_a_wrong_nullifier_without_recording_state() {
+        let env = Env::default();
+        let (verification_key, proof, commitment, _nullifier) = fixture(&env);
+        let client = client(&env, &verification_key);
+        let wrong = Bls12381Fr::from_u256(U256::from_u32(&env, 1));
+
+        assert_eq!(
+            client.try_submit(&proof, &commitment, &wrong),
+            Err(Ok(Error::InvalidProof))
+        );
+        assert!(!client.payment_exists(&commitment));
+        assert!(!client.nullifier_used(&wrong));
+    }
+
+    #[test]
+    fn verify_errors_when_not_initialized() {
+        let env = Env::default();
+        let (verification_key, proof, commitment, nullifier) = fixture(&env);
+        let contract_id = env.register(ZkPayment, (verification_key,));
+        let client = ZkPaymentClient::new(&env, &contract_id);
+        env.as_contract(&contract_id, || {
+            env.storage().instance().remove(&DataKey::VerificationKey);
+        });
+
+        assert_eq!(
+            client.try_verify(&proof, &commitment, &nullifier),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(
+            client.try_submit(&proof, &commitment, &nullifier),
+            Err(Ok(Error::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn verify_errors_when_verifying_key_is_malformed() {
+        let env = Env::default();
+        let (verification_key, proof, commitment, nullifier) = fixture(&env);
+        let contract_id = env.register(ZkPayment, (verification_key.clone(),));
+        let client = ZkPaymentClient::new(&env, &contract_id);
+
+        let mut malformed = verification_key;
+        let mut short_ic = Vec::new(&env);
+        short_ic.push_back(malformed.ic.get(0).unwrap());
+        short_ic.push_back(malformed.ic.get(1).unwrap());
+        malformed.ic = short_ic;
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::VerificationKey, &malformed);
+        });
+
+        assert_eq!(
+            client.try_verify(&proof, &commitment, &nullifier),
+            Err(Ok(Error::MalformedVerifyingKey))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Context, InvalidAction)")]
+    fn constructor_rejects_a_malformed_verifying_key() {
+        let env = Env::default();
+        let (verification_key, _proof, _commitment, _nullifier) = fixture(&env);
+
+        let mut malformed = verification_key;
+        let mut short_ic = Vec::new(&env);
+        short_ic.push_back(malformed.ic.get(0).unwrap());
+        malformed.ic = short_ic;
+
+        env.register(ZkPayment, (malformed,));
+    }
 }
