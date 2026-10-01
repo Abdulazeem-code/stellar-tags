@@ -218,6 +218,23 @@ cd payment_router
 cargo build
 ```
 
+### ZK anonymous tag routing (issue #668)
+
+The `zk_payment/` crate is a standalone Soroban contract (SDK 27) that verifies
+a Groth16/BLS12-381 proof before recording a private payment, using only a
+commitment and a one-time nullifier as public inputs. The research spike is in
+[docs/research-zk-anonymous-routing.md](docs/research-zk-anonymous-routing.md)
+and the contract/circuit usage guide is in
+[docs/zk-private-payments.md](docs/zk-private-payments.md).
+
+```bash
+cd zk_payment
+cargo test
+```
+
+The checked-in setup is for tests only and is not safe for real funds; see the
+research document's limitations section.
+
 ### Contract storage benchmarks (issue #663)
 
 Per-user tag registration writes a single packed `UserRecord` ledger entry

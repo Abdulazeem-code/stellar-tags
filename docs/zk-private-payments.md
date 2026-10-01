@@ -1,5 +1,9 @@
 # Private payment proofs
 
+See [docs/research-zk-anonymous-routing.md](research-zk-anonymous-routing.md) for
+the research spike, threat model, design space, and limitations behind this
+contract.
+
 The `zk_payment` contract verifies a Groth16 proof before it records a private
 payment. The ledger receives only two values:
 
