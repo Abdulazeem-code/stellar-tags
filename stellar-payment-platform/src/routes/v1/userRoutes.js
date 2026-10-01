@@ -2,6 +2,7 @@ const express = require("express");
 const xss = require("xss");
 const { StrKey } = require("@stellar/stellar-sdk");
 const { prisma, withTransaction } = require("../../../prismaClient");
+const { getBalances } = require("../../services/ledgerService");
 const { verifyMultiSignerThreshold } = require("../../multisigner-verifier");
 const { poolGet, poolRun, poolAll, etagCache } = require("../../db");
 const { logger } = require("../../logger");
@@ -60,10 +61,11 @@ const buildUserSearchWhere = (search) => {
   };
 };
 
-const serializeUser = (user) => ({
+const serializeUser = (user, balances = {}) => ({
   username: user.username,
   address: user.address,
   created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+  balances,
 });
 
 const getLocalUserByAddress = async (address) =>
@@ -415,7 +417,7 @@ router.delete(
     }
 
     try {
-      const existing = await prisma.user.findFirst({
+const existing = await prisma.user.findFirst({
         where: { username, deletedAt: null },
       });
 
@@ -468,26 +470,129 @@ router.get(
       typeof req.params.username === "string" ? req.params.username.trim() : "",
     ).toLowerCase();
 
-    if (!username) {
+if (!username) {
       return next(new ApiError("INVALID_INPUT", "Missing username parameter."));
+  try {
+    if (cursor) {
+      // Keyset mode: seek straight past the cursor row instead of skipping
+      // every preceding row, so deep pages cost the same as page one.
+      const candidates = await prisma.user.findMany({
+        where: { AND: [where, keysetWhereDesc(cursor)] },
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        take: cursorLimit + 1,
+      });
+      const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt.toISOString(),
+          balances,
+        };
+      }));
+      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
 
-    let owner;
-    try {
-      owner = await authenticateUsernameOwner({
-        username,
-        signature: req.get("X-Stellar-Signature") || req.body?.signature,
-        signerAddress: req.get("X-Stellar-Signer") || req.body?.signerAddress,
-        operation: "activity",
+const [totalCount, rows] = await prisma.$transaction([
+      prisma.user.count({ where }),
+      prisma.user.findMany({
+        where,
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    const totalPages = Math.ceil(totalCount / limit);
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt.toISOString(),
+        balances,
+      };
+    }));
+
+    return res.json({ data, totalCount, totalPages, currentPage: page });
+  } catch (error) {
+    const dbError = new Error('Database lookup failed', { cause: error });
+    dbError.statusCode = 500;
+    return next(dbError);
+  }
+}));
+
+router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(async (req, res, next) => {
+  const { limit: cursorLimit, cursor, invalid: invalidCursor } = parseCursorQuery(req.query);
+  const { page, limit, skip } = parsePagination(req.query);
+  if (invalidCursor) {
+    return next(new ApiError('INVALID_INPUT', 'Invalid cursor parameter'));
+  }
+  const search = req.query.search ?? null;
+  const where = search ? buildUserSearchWhere(search) : { deletedAt: null };
+
+  try {
+    if (cursor) {
+      // Keyset mode: seek straight past the cursor row instead of skipping
+      // every preceding row, so deep pages cost the same as page one.
+      const candidates = await prisma.user.findMany({
+        where: { AND: [where, keysetWhereDesc(cursor)] },
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        take: cursorLimit + 1,
       });
+const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+          balances,
+        };
+      }));
+      return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     } catch (error) {
       return next(error);
     }
 
-    const { range, error: dateError } = parseDateRange(req.query);
+const { range, error: dateError } = parseDateRange(req.query);
     if (dateError) {
       return next(new ApiError("INVALID_INPUT", dateError));
     }
+
+    const [totalCount, rows] = await prisma.$transaction([
+      prisma.user.count({ where }),
+      prisma.user.findMany({
+        where,
+        orderBy: [
+          { createdAt: 'desc' },
+          { username: 'desc' },
+        ],
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    const totalPages = Math.ceil(totalCount / limit);
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+        balances,
+      };
+    }));
 
     const { page, limit } = req.query;
     const { rows, total } = await listActivity(prisma, {
