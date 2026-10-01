@@ -1148,6 +1148,7 @@ impl PaymentRouter {
 
     /// Builds the domain-separated message for meta-transactions.
     /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
+    #[allow(clippy::too_many_arguments)]
     fn build_meta_message(
         env: &Env,
         sender: &Address,
@@ -3171,6 +3172,7 @@ impl PaymentRouter {
     ///
     /// # Panics
     /// Panics if the signature does not verify.
+    #[allow(clippy::too_many_arguments)]
     pub fn route_payment_meta(
         env: Env,
         sender: Address,
