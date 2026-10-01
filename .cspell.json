@@ -98,6 +98,16 @@
     "CQRS",
     "XADD",
     "XREADGROUP",
-    "XTRIM"
+    "XTRIM",
+    "axelar",
+    "AXELAR",
+    "GDEST",
+    "CTOKEN",
+    "GABC",
+    "GXYZ",
+    "webauthn",
+    "timelock",
+    "alloc",
+    "bdff"
   ]
 }
