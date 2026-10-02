@@ -1,4 +1,5 @@
 const { createTokenBucketLimiter } = require('./tokenBucketLimiter');
+const { errorBody } = require('../errors');
 
 // Stricter secondary limit for endpoints that run signature verification
 // (Horizon lookups + crypto). Keyed by IP so a single client cannot exhaust
@@ -11,7 +12,9 @@ const createSignatureRateLimiter = (redisClient) =>
     capacity: MAX_REQUESTS,
     refillRate: REFILL_RATE,
     prefix: 'sig-rl:',
+    failClosedOnRedisError: true,
     keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+    message: errorBody("RATE_LIMITED", "Too many requests, please try again later."),
   });
 
 module.exports = { createSignatureRateLimiter };

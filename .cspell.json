@@ -46,6 +46,7 @@
     "Webhooks",
     "WASM",
     "wasm",
+    "MiMC",
     "Prisma",
     "prisma",
     "Dockerfile",
@@ -94,6 +95,24 @@
     "SOROSWAP",
     "soroswap",
     "COOLDOWN",
-    "cooldown"
+    "cooldown",
+    "MiMC",
+    "CQRS",
+    "XADD",
+    "XREADGROUP",
+    "XTRIM",
+    "axelar",
+    "AXELAR",
+    "alloc",
+    "GDEST",
+    "CTOKEN",
+    "GABC",
+    "GXYZ",
+    "webauthn",
+    "WEBAUTHN",
+    "timelock",
+    "bdff",
+    "TWAP",
+    "twap"
   ]
 }

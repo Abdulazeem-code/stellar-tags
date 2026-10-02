@@ -82,6 +82,13 @@ jest.mock('pg', () => ({
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
+// closeWebSocket is awaited in gracefulShutdown before server.close() is called.
+// Resolve immediately so tests that check server.close() synchronously still pass.
+jest.mock('./src/websocket', () => ({
+  initWebSocket: jest.fn(),
+  closeWebSocket: jest.fn().mockResolvedValue(undefined),
+}));
+
 describe('gracefulShutdown', () => {
   let gracefulShutdown;
   let mockServer;
@@ -107,13 +114,15 @@ describe('gracefulShutdown', () => {
     jest.restoreAllMocks();
   });
 
-  test('SIGTERM — calls server.close()', () => {
+  test('SIGTERM — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
-  test('SIGINT — calls server.close()', () => {
+  test('SIGINT — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGINT');
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
@@ -140,7 +149,8 @@ describe('gracefulShutdown', () => {
     });
 
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-    await Promise.resolve();
+    await Promise.resolve(); // flush closeWebSocket().then(...)
+    await Promise.resolve(); // flush server.close callback
 
     expect(callOrder).toEqual(['server.close', 'prisma.$disconnect']);
   });
@@ -155,10 +165,10 @@ describe('gracefulShutdown', () => {
     expect(mockPrisma.$disconnect).not.toHaveBeenCalled();
   });
 
-  test('second signal is a no-op (double-invocation guard)', () => {
+  test('second signal is a no-op (double-invocation guard)', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 

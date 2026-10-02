@@ -1,74 +1,83 @@
 #![no_std]
+mod archival;
+use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    BytesN, Env, Error as SdkError, IntoVal, InvokeError, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
+    vec, Address, Bytes, BytesN, Env, Error as SdkError, IntoVal, InvokeError, String, Symbol, Vec,
 };
 
-// ── Packed UserSpending helpers ──────────────────────────────────────────────
+// ── Packed UserRecord helpers ───────────────────────────────────────────────
 //
-// Issue #519: Replace the two-field UserSpending contracttype with a single
-// BytesN<24> value packed with bitwise operations.
+// Issue #519: replace the two-field `UserSpending` contracttype with a single
+// packed value instead of a struct, dropping the XDR type discriminant and
+// field tags Soroban adds to every contracttype.
+//
+// Issue #663: merge the per-user `UserSpending` and `UserVolume` entries into
+// one packed `UserRecord`. A sender's first routed payment used to write two
+// persistent entries — two reads, two writes, two TTL extensions, two XDR
+// envelopes — and it now performs exactly one of each.
 //
 // Layout (big-endian):
-//   bytes  0..8  — last_reset_time  : u64   (8 bytes)
-//   bytes  8..24 — accumulated_amount: i128  (16 bytes)
+//   bytes  0..8  — last_reset_time    : u64  (8 bytes)
+//   bytes  8..24 — accumulated_amount : i128 (16 bytes)
+//   bytes 24..40 — lifetime volume    : i128 (16 bytes)
 //
-// Benefits:
-//  • Eliminates the XDR struct-type overhead (type discriminant + field tags)
-//    that Soroban adds to every contracttype value, shrinking each UserSpending
-//    ledger entry from ~48 bytes to exactly 24 bytes.
-//  • Smaller entries → lower state-rent fee per ledger entry per TTL period.
+// Backward compatibility: the legacy `UserSpending` / `UserVolume` keys are no
+// longer written. `load_user_record` still reads them and combines them on the
+// next write, and the permissionless `migrate_user_record` entry point cleans
+// up any account that has not paid since the upgrade.
 
-/// Pack `last_reset_time` (u64) and `accumulated_amount` (i128) into a
-/// 24-byte big-endian buffer.
-fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> BytesN<24> {
-    let mut buf = [0u8; 24];
+/// Pack `last_reset_time` (u64), `accumulated_amount` (i128) and `volume`
+/// (i128) into a 40-byte big-endian buffer.
+fn pack_user_record(
+    env: &Env,
+    last_reset_time: u64,
+    accumulated_amount: i128,
+    volume: i128,
+) -> BytesN<40> {
+    let mut buf = [0u8; 40];
 
-    // Bytes 0..8 — last_reset_time (u64 big-endian)
-    let t_bytes = last_reset_time.to_be_bytes();
-    buf[0] = t_bytes[0];
-    buf[1] = t_bytes[1];
-    buf[2] = t_bytes[2];
-    buf[3] = t_bytes[3];
-    buf[4] = t_bytes[4];
-    buf[5] = t_bytes[5];
-    buf[6] = t_bytes[6];
-    buf[7] = t_bytes[7];
-
-    // Bytes 8..24 — accumulated_amount (i128 big-endian)
-    let a_bytes = accumulated_amount.to_be_bytes();
-    buf[8] = a_bytes[0];
-    buf[9] = a_bytes[1];
-    buf[10] = a_bytes[2];
-    buf[11] = a_bytes[3];
-    buf[12] = a_bytes[4];
-    buf[13] = a_bytes[5];
-    buf[14] = a_bytes[6];
-    buf[15] = a_bytes[7];
-    buf[16] = a_bytes[8];
-    buf[17] = a_bytes[9];
-    buf[18] = a_bytes[10];
-    buf[19] = a_bytes[11];
-    buf[20] = a_bytes[12];
-    buf[21] = a_bytes[13];
-    buf[22] = a_bytes[14];
-    buf[23] = a_bytes[15];
+    buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
+    buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
+    buf[24..40].copy_from_slice(&volume.to_be_bytes());
 
     BytesN::from_array(env, &buf)
 }
 
-/// Unpack a 24-byte buffer into `(last_reset_time, accumulated_amount)`.
-fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
-    // BytesN::to_array() is available in soroban-sdk v20.
-    let buf: [u8; 24] = packed.to_array();
+/// Unpack a 40-byte buffer into `(last_reset_time, accumulated_amount, volume)`.
+fn unpack_user_record(packed: &BytesN<40>) -> (u64, i128, i128) {
+    let buf: [u8; 40] = packed.to_array();
 
-    // last_reset_time — bytes 0..8
     let last_reset_time = u64::from_be_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
 
-    // accumulated_amount — bytes 8..24
+    let accumulated_amount = i128::from_be_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    ]);
+
+    let volume = i128::from_be_bytes([
+        buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33],
+        buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
+    ]);
+
+    (last_reset_time, accumulated_amount, volume)
+}
+
+/// Unpack a legacy 24-byte `UserSpending` buffer into
+/// `(last_reset_time, accumulated_amount)`.
+///
+/// Kept so the migration fallback in `load_user_record` can still read
+/// pre-#663 ledger state.
+fn unpack_legacy_spending(packed: &BytesN<24>) -> (u64, i128) {
+    let buf: [u8; 24] = packed.to_array();
+
+    let last_reset_time = u64::from_be_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+
     let accumulated_amount = i128::from_be_bytes([
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
         buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
@@ -80,15 +89,15 @@ fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
 // ── Legacy struct kept for test snapshot compatibility ───────────────────────
 //
 // The UserSpending contracttype is retained so existing tests that reference
-// it directly continue to compile.  All runtime code now uses the packed
-// BytesN<24> representation stored under DataKey::UserSpending.
+// it directly continue to compile. All runtime code now uses the packed
+// `BytesN<40>` representation stored under DataKey::UserRecord.
 
 /// A user's rolling 24-hour spending record.
 ///
 /// Retained purely so existing test snapshots that reference this type by
-/// name keep compiling. Live contract state is stored as a packed
-/// `BytesN<24>` (see `pack_spending` / `unpack_spending`); this struct is not
-/// read from or written to storage at runtime.
+/// name keep compiling. Pre-#663 live contract state was stored as a packed
+/// `BytesN<24>` (still readable via `unpack_legacy_spending`); this struct is
+/// not read from or written to storage at runtime.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserSpending {
@@ -96,6 +105,22 @@ pub struct UserSpending {
     pub last_reset_time: u64,
     /// Total amount routed by the user since `last_reset_time`.
     pub accumulated_amount: i128,
+}
+
+/// A user's combined routing stats, unpacked from the packed `BytesN<40>`
+/// `UserRecord` ledger value (issue #663).
+///
+/// Returned by [`PaymentRouter::get_user_record`] so a client can read both
+/// counters in a single view call instead of two.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserRecord {
+    /// Total amount routed by the user in the current 24-hour window.
+    pub accumulated_amount: i128,
+    /// Cumulative lifetime amount routed by the user.
+    pub volume: i128,
+    /// Unix timestamp (seconds) at which the 24-hour window last reset.
+    pub last_reset_time: u64,
 }
 
 /// A single transfer instruction for use with [`PaymentRouter::route_payments`].
@@ -110,6 +135,18 @@ pub struct Payment {
     pub token_address: Address,
     /// Amount to route, denominated in the token's smallest unit. Must be
     /// positive and within the contract's configured min/max bounds.
+    pub amount: i128,
+}
+
+/// Structured payload for meta-transactions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaPayment {
+    pub nonce: u64,
+    pub deadline: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
     pub amount: i128,
 }
 
@@ -218,6 +255,11 @@ pub enum ActionType {
     /// Transfer admin rights to a new address.
     TransferAdmin(Address),
     /// Upgrade the contract WASM.
+    ///
+    /// Executing this action also requires the multi-signature admin group to
+    /// have approved `new_wasm_hash` (see [`PaymentRouter::approve_upgrade`]),
+    /// so the timelock delay and the M-of-N gate compose rather than replace
+    /// each other.
     Upgrade(BytesN<32>),
     /// Allow swap routing to invoke a DEX router contract.
     RegisterDex(Address),
@@ -225,6 +267,8 @@ pub enum ActionType {
     DeregisterDex(Address),
     /// Update the maximum tolerated swap slippage.
     SetMaxSlippageBps(i128),
+    /// Configure the multi-signature admin group for contract upgrades.
+    SetMultisigConfig(Vec<Address>, u32),
 }
 
 /// A pending timelock entry stored in persistent ledger storage.
@@ -259,6 +303,79 @@ pub enum Role {
     FeeManager = 4,
 }
 
+/// Interface implemented by supported Soroban lending protocols.
+///
+/// Keeping the protocol behind this small adapter lets the router integrate
+/// with Blend-compatible deployments while tests use an in-process mock.
+#[contractclient(name = "LendingProtocolClient")]
+pub trait LendingProtocol {
+    fn deposit(env: Env, from: Address, token: Address, amount: i128);
+    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
+    fn harvest(env: Env, to: Address, token: Address) -> i128;
+}
+
+/// Minimal interface for an admin-selected KYC issuer or oracle contract.
+#[contractclient(name = "KycOracleClient")]
+pub trait KycOracle {
+    fn is_verified(env: Env, account: Address) -> bool;
+}
+
+/// Interface implemented by the admin-selected price-feed oracle.
+///
+/// Implementations must return a price quote with a `timestamp` (Unix seconds)
+/// so staleness can be checked against the contract's configured threshold.
+/// The `price` is expressed as a fixed-point integer with the number of
+/// decimal places indicated by `decimals`.  For example, a USD/XLM price of
+/// 0.12500000 with `decimals = 8` would be returned as `price = 12500000`.
+///
+/// Keeping the protocol behind this thin adapter lets the router integrate
+/// with any Soroban-compatible price oracle while tests use an in-process mock.
+#[contractclient(name = "PriceFeedOracleClient")]
+pub trait PriceFeedOracle {
+    /// Returns the latest price of `base_asset` denominated in `quote_asset`.
+    ///
+    /// # Returns
+    /// A `PriceData` struct containing `price`, `decimals`, and `timestamp`.
+    fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData;
+}
+
+/// A single price quote returned by the oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceData {
+    /// Fixed-point price value. The true price is `price / 10^decimals`.
+    pub price: i128,
+    /// Number of decimal places used in `price`.
+    pub decimals: u32,
+    /// Unix timestamp (seconds) when this price was last updated on-chain.
+    pub timestamp: u64,
+}
+
+/// A fee change proposal weighted by governance-token balances.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeProposal {
+    pub proposer: Address,
+    pub fee_bps: i128,
+    pub fee_cap: i128,
+    pub created_at: u64,
+    pub voting_ends_at: u64,
+    pub yes_votes: i128,
+    pub no_votes: i128,
+    pub quorum: i128,
+    pub executed: bool,
+}
+
+/// Multi-signature configuration for contract upgrades.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    /// The list of authorized signers.
+    pub signers: Vec<Address>,
+    /// The minimum number of signers required to approve an upgrade.
+    pub threshold: u32,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,9 +397,18 @@ pub enum DataKey {
     /// Maximum amount accepted by a single payment.
     MaxAmount,
     /// Cumulative lifetime amount routed by a given sender.
-    UserVolume(Address),
-    /// Packed 24-hour spending window for a given sender.
+    /// Packed per-user record (issue #663): the 24-hour spending window plus
+    /// the cumulative lifetime volume, stored as a single 40-byte value so
+    /// registering a sender costs one ledger entry instead of two.
+    UserRecord(Address),
+    /// DEPRECATED (pre-#663): packed 24-hour spending window for a sender.
+    /// No longer written; read only by the `load_user_record` fallback and by
+    /// `migrate_user_record`.
     UserSpending(Address),
+    /// DEPRECATED (pre-#663): cumulative lifetime amount routed by a sender.
+    /// No longer written; read only by the `load_user_record` fallback and by
+    /// `migrate_user_record`.
+    UserVolume(Address),
     /// Whether a given recipient address is blacklisted.
     Blacklist(Address),
     /// Internal refund balance for a (user, token) pair, credited when a
@@ -297,12 +423,63 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    /// Whether an address holds a given role.
+    UserRole(Address, Role),
+    /// The primary address currently holding a role.
+    Role(Role),
+    /// Monotonic nonce for meta-transaction replay protection.
+    MetaNonce(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
+    /// Address of the price-feed oracle used for fiat/crypto lookups.
+    OracleAddress,
+    /// Maximum acceptable age, in seconds, of an oracle price quote.
+    StalenessThreshold,
+    /// Admin-supplied fallback price for a (base, quote) asset pair.
+    FallbackPrice(Address, Address),
+    /// Token whose balances weight fee-governance votes.
+    GovernanceToken,
+    /// Minimum weighted vote share required to pass a fee proposal.
+    GovernanceQuorum,
+    /// Monotonic nonce for fee-proposal ids.
+    GovernanceNonce,
+    /// A pending fee-change proposal keyed by its id.
+    GovernanceProposal(u64),
+    /// Recorded yes/no vote weight for a fee proposal.
+    GovernanceVote(u64, Address),
+    /// Current archival epoch counter, stored in instance storage.
+    ArchiveEpoch,
+    /// Merkle root committed for an archival epoch.
+    ArchiveRoot(u64),
+    /// Metadata committed alongside an archival root.
+    ArchiveMeta(u64),
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited into the yield protocol per token.
+    YieldPrincipal(Address),
     /// Whether a DEX router contract is approved to receive cross-contract
     /// swap calls.  Stored as `bool` in persistent storage.
     RegisteredDex(Address),
     /// Maximum tolerated swap slippage in basis points, applied against a
     /// caller-supplied quote.  Stored as `i128` in instance storage.
     MaxSlippageBps,
+    /// The N addresses of the multi-signature admin group that authorize
+    /// contract upgrades.  Stored as `Vec<Address>` in instance storage.
+    ///
+    /// Absent until the admin calls `set_multisig_config`; while absent every
+    /// upgrade attempt fails closed with `Error::MultisigNotInitialized`.
+    MultisigSigners,
+    /// The M signers of the multi-signature admin group that must approve a
+    /// WASM hash before an upgrade is authorized.  Stored as `u32` in
+    /// instance storage, always alongside `MultisigSigners`.
+    MultisigThreshold,
+    /// The addresses that have already signed off on upgrading to a specific
+    /// WASM hash.  Keyed by that hash so approvals for concurrent upgrade
+    /// proposals are tracked independently.  Stored as `Vec<Address>` in
+    /// persistent storage and cleared once the upgrade is applied.
+    UpgradeApproval(BytesN<32>),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -350,9 +527,62 @@ pub enum Error {
     SlippageExceeded = 17,
     /// The swap was submitted after its `deadline` had already passed.
     SwapDeadlineExpired = 18,
+    /// The supplied role is not one the contract recognises.
+    InvalidRole = 20,
+    /// A governance proposal id is unknown or no longer votable.
+    InvalidProposal = 21,
+    /// A governance operation was attempted before governance was configured.
+    GovernanceNotConfigured = 22,
+    /// The caller has already voted on this proposal.
+    AlreadyVoted = 23,
+    /// The configured KYC threshold is negative.
+    InvalidKycThreshold = 24,
+    /// A yield operation was attempted before the yield protocol was configured.
+    YieldProtocolNotConfigured = 25,
+    /// The yield amount is not positive or exceeds the available principal.
+    InvalidYieldAmount = 26,
+    /// No price-feed oracle is configured for this contract.
+    OracleNotConfigured = 27,
+    /// The oracle cross-contract call reverted or returned an unusable value.
+    OracleCallFailed = 28,
+    /// The oracle quote is older than the configured staleness threshold.
+    OraclePriceStale = 29,
+    /// The oracle quote is not a usable price (zero or negative).
+    OraclePriceInvalid = 30,
+    /// A meta-transaction was submitted after its `deadline` had passed.
+    DeadlineExpired = 31,
+    /// The meta-transaction nonce does not match the sender's stored nonce.
+    InvalidNonce = 32,
+    /// The meta-transaction signature did not verify against the payload.
+    InvalidSignature = 33,
     /// Swap parameters are self-contradictory or unusable (for example
     /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
     InvalidSwapParams = 19,
+    /// A payment above the configured KYC threshold was made by a sender the
+    /// configured oracle does not recognise.
+    KycRequired = 34,
+    /// A swap path is empty, malformed, or does not connect the requested assets.
+    InvalidSwapPath = 35,
+    /// The DEX returned less than the caller's minimum acceptable output.
+    SlippageExceededSwap = 36,
+    /// The multi-signature configuration is unusable: the signer set is empty,
+    /// contains a duplicate address, the threshold is zero, or the threshold
+    /// exceeds the number of signers (so the upgrade could never be authorized).
+    InvalidMultisigConfig = 37,
+    /// The calling address is not a member of the multi-signature admin group.
+    NotMultisigSigner = 38,
+    /// The number of collected upgrade approvals is below the configured
+    /// threshold, so the upgrade is not authorized yet.
+    InsufficientApprovals = 39,
+    /// No multi-signature admin group has been configured yet.  Upgrades fail
+    /// closed until `set_multisig_config` has been called, so a freshly
+    /// deployed contract can never be upgraded through the single admin key
+    /// that the group was introduced to de-risk.
+    MultisigNotInitialized = 40,
+    /// The calling address has already approved this WASM hash.  Duplicate
+    /// approvals are rejected rather than ignored so that a replayed signature
+    /// can never inflate the approval count towards the threshold.
+    AlreadyApproved = 41,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -453,6 +683,165 @@ impl PaymentRouter {
         }
     }
 
+    // ── Multi-signature (M-of-N) upgrade helpers ────────────────────────────
+    //
+    // Contract upgrades used to be gated on a single admin key, which made the
+    // admin both a single point of failure and a single point of
+    // centralization.  Upgrades are now gated on an explicit M-of-N admin
+    // group: each signer authorizes an individual WASM hash by calling
+    // `approve_upgrade`, and the hash only becomes installable once `M`
+    // distinct members of the group have signed off on that exact hash.
+    //
+    // Authorizations are recorded per-hash rather than per-time-window so that
+    // a signature collected for one upgrade can never be replayed to authorize
+    // a different one.
+
+    /// Loads the multi-signature admin group, or fails closed when none has
+    /// been configured.
+    ///
+    /// The signer set and the threshold are written together by
+    /// `set_multisig_config`, so a present `MultisigThreshold` key implies a
+    /// present `MultisigSigners` key; only the threshold has to be probed.
+    fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigThreshold)
+            .ok_or(Error::MultisigNotInitialized)?;
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigSigners)
+            .ok_or(Error::MultisigNotInitialized)?;
+        Ok((signers, threshold))
+    }
+
+    /// Validates a candidate signer set / threshold pair and returns the
+    /// configured threshold.
+    ///
+    /// Rejects configurations that could never authorize an upgrade, and
+    /// duplicate signers, which would otherwise let a single key pad the
+    /// effective signer count.
+    fn validate_multisig_config(signers: &Vec<Address>, threshold: u32) -> Result<u32, Error> {
+        if signers.is_empty() {
+            return Err(Error::InvalidMultisigConfig);
+        }
+        if threshold == 0 || threshold > signers.len() {
+            return Err(Error::InvalidMultisigConfig);
+        }
+        // O(n^2) over a group that is small by design; run once per config
+        // change rather than on the approval hot path.
+        for i in 0..signers.len() {
+            for j in (i + 1)..signers.len() {
+                if signers.get(i) == signers.get(j) {
+                    return Err(Error::InvalidMultisigConfig);
+                }
+            }
+        }
+        Ok(threshold)
+    }
+
+    /// Returns the approvals collected so far for `new_wasm_hash`.
+    fn load_upgrade_approvals(env: &Env, new_wasm_hash: &BytesN<32>) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeApproval(new_wasm_hash.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Returns the approvals for `new_wasm_hash` that still count, i.e. those
+    /// cast by a member of the *current* signer set.
+    ///
+    /// Stored approvals are filtered on read rather than rewritten when the
+    /// group rotates, so dropping a signer immediately strips the weight of any
+    /// approval it had already cast instead of leaving a stale vote behind. The
+    /// scan is over a group and an approval list that are both bounded by the
+    /// group size, so it stays cheap and every stored value is read at most
+    /// once.
+    fn load_effective_approvals(
+        env: &Env,
+        signers: &Vec<Address>,
+        new_wasm_hash: &BytesN<32>,
+    ) -> Vec<Address> {
+        let stored = Self::load_upgrade_approvals(env, new_wasm_hash);
+        let mut effective = Vec::new(env);
+        for i in 0..stored.len() {
+            let approver = stored.get(i).unwrap();
+            if signers.contains(&approver) {
+                effective.push_back(approver);
+            }
+        }
+        effective
+    }
+
+    /// Returns `true` when at least `M` distinct current group members have
+    /// approved `new_wasm_hash`, i.e. when the upgrade is authorized.
+    fn check_upgrade_authorized(env: &Env, new_wasm_hash: &BytesN<32>) -> Result<bool, Error> {
+        let (signers, threshold) = Self::load_multisig_config(env)?;
+        Ok(Self::load_effective_approvals(env, &signers, new_wasm_hash).len() >= threshold)
+    }
+
+    /// The M-of-N gate every upgrade path funnels through.  Returns the
+    /// approval count so callers can emit it in events.
+    fn require_upgrade_authorized(env: &Env, new_wasm_hash: &BytesN<32>) -> Result<u32, Error> {
+        let (signers, threshold) = Self::load_multisig_config(env)?;
+        let approvals = Self::load_effective_approvals(env, &signers, new_wasm_hash);
+        if approvals.len() < threshold {
+            return Err(Error::InsufficientApprovals);
+        }
+        Ok(approvals.len())
+    }
+
+    /// Installs `new_wasm_hash` and consumes the approvals that authorized it.
+    ///
+    /// Clearing the approvals is what makes a threshold reached exactly once
+    /// per set of signatures: after the swap the group has to sign off again
+    /// before any further upgrade can proceed.
+    fn apply_upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UpgradeApproval(new_wasm_hash.clone()));
+    }
+
+    /// Persists a validated signer set / threshold pair.
+    ///
+    /// The signer set is rotated as a whole: a signer that is dropped from the
+    /// group also loses the right to approve, *and* loses the weight of any
+    /// approval it had already cast, because authorization counts only
+    /// approvals made by current members. Outgoing approvals for hashes that
+    /// are still in flight are left in storage untouched — they simply stop
+    /// counting, so a rotation can revoke in-progress upgrades without having
+    /// to walk every hash. A signer that is added starts with no approvals.
+    fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigThreshold, &threshold);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+    }
+
+    /// Pre-flight checks for a queued timelock action, run before the entry is
+    /// removed so a rejected action leaves the queue intact.
+    fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
+        match action {
+            ActionType::Upgrade(new_wasm_hash) => {
+                Self::require_upgrade_authorized(env, new_wasm_hash)?;
+            }
+            ActionType::SetMultisigConfig(signers, threshold) => {
+                Self::validate_multisig_config(signers, *threshold)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
         let platform_treasury: Address = env
             .storage()
@@ -478,6 +867,28 @@ impl PaymentRouter {
         Ok((platform_treasury, fee_bps, fee_cap))
     }
 
+    /// Validates that a swap path is well-formed and connects the expected tokens.
+    fn validate_swap_path(
+        token_in: &Address,
+        token_out: &Address,
+        path: &Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if path.is_empty() {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.first().is_none_or(|a| a != *token_in) {
+            return Err(Error::InvalidSwapPath);
+        }
+        if path.last().is_none_or(|a| a != *token_out) {
+            return Err(Error::InvalidSwapPath);
+        }
+        if min_amount_out <= 0 {
+            return Err(Error::InvalidSwapParams);
+        }
+        Ok(())
+    }
+
     fn get_refund_balance_internal(env: &Env, user: &Address, token: &Address) -> i128 {
         let key = DataKey::RefundBalance(user.clone(), token.clone());
         env.storage().persistent().get(&key).unwrap_or(0)
@@ -500,58 +911,104 @@ impl PaymentRouter {
         );
     }
 
-    /// Rolls the sender's 24-hour spending window forward by `amount` and
-    /// rejects the payment when the daily cap would be exceeded.
+    /// Loads a sender's packed `UserRecord`, falling back to the legacy
+    /// pre-#663 split entries when no packed record exists yet.
     ///
-    /// Shared by the direct and the swap-routed payment paths so both apply the
-    /// same window, reset, and cap rules.
-    fn accrue_daily_spend(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
-        let current_time = env.ledger().timestamp();
-        let spending_key = DataKey::UserSpending(sender.clone());
+    /// Returns `(last_reset_time, accumulated_amount, volume, legacy_found)`.
+    /// When neither format is present — the sender has never routed a payment —
+    /// the 24-hour window is anchored at `current_time` with zeroed counters.
+    /// `legacy_found` is `true` only when the values came from the legacy split
+    /// entries, telling the caller to drop those stale keys after writing the
+    /// packed record.
+    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+        let record_key = DataKey::UserRecord(sender.clone());
 
-        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
+        if let Some(packed) = env
             .storage()
             .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
-            .unwrap_or((current_time, 0));
+            .get::<DataKey, BytesN<40>>(&record_key)
+        {
+            let (last_reset_time, accumulated_amount, volume) = unpack_user_record(&packed);
+            return (last_reset_time, accumulated_amount, volume, false);
+        }
+
+        // Legacy fallback: combine the pre-#663 split entries.
+        let legacy_spending: Option<(u64, i128)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSpending(sender.clone()))
+            .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
+        let legacy_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(sender.clone()))
+            .unwrap_or(0);
+        let (last_reset_time, accumulated_amount) = legacy_spending.unwrap_or((current_time, 0));
+        let legacy_found = legacy_spending.is_some() || legacy_volume != 0;
+        (
+            last_reset_time,
+            accumulated_amount,
+            legacy_volume,
+            legacy_found,
+        )
+    }
+
+    /// Rolls the sender's 24-hour spending window forward by `amount`, adds
+    /// `amount` to their lifetime volume, and persists both in a single packed
+    /// `UserRecord` entry (issue #663). Rejects the payment when the daily cap
+    /// would be exceeded.
+    ///
+    /// Shared by the direct, meta-transaction and swap-routed payment paths so
+    /// all three apply the same window, reset and cap rules.
+    ///
+    /// Returns the sender's volume *before* this payment, which is what the
+    /// tiered fee discount is decided on.
+    fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i128, Error> {
+        let current_time = env.ledger().timestamp();
+        let record_key = DataKey::UserRecord(sender.clone());
+
+        let (mut last_reset_time, mut accumulated_amount, volume, legacy_found) =
+            Self::load_user_record(env, sender, current_time);
 
         if current_time - last_reset_time >= Self::SECONDS_IN_24H {
             last_reset_time = current_time;
             accumulated_amount = 0;
         }
 
-        accumulated_amount += amount;
-        if accumulated_amount > Self::DAILY_MAX_LIMIT {
+        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
+            return Err(Error::LimitExceeded);
+        };
+        if new_accumulated > Self::DAILY_MAX_LIMIT {
             return Err(Error::LimitExceeded);
         }
+        accumulated_amount = new_accumulated;
 
+        let new_volume = volume.saturating_add(amount);
+
+        // One write and one TTL extension for both counters.
         env.storage().persistent().set(
-            &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
+            &record_key,
+            &pack_user_record(env, last_reset_time, accumulated_amount, new_volume),
         );
         env.storage().persistent().extend_ttl(
-            &spending_key,
+            &record_key,
             Self::PERSISTENT_LIFETIME_THRESHOLD,
             Self::PERSISTENT_BUMP_AMOUNT,
         );
 
-        Ok(())
-    }
+        // One-time cleanup: when this write consumed legacy split entries,
+        // drop them so the old keys stop accruing state rent. Steady-state
+        // payments skip both removals entirely.
+        if legacy_found {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UserSpending(sender.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UserVolume(sender.clone()));
+        }
 
-    /// Adds `amount` to the sender's lifetime volume, which drives the tiered
-    /// fee discount.
-    fn record_volume(env: &Env, sender: &Address, amount: i128) {
-        let volume_key = DataKey::UserVolume(sender.clone());
-        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&volume_key, &(prev_volume + amount));
-        env.storage().persistent().extend_ttl(
-            &volume_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+        Ok(volume)
     }
 
     /// Returns whether the contract is currently frozen.
@@ -669,23 +1126,6 @@ impl PaymentRouter {
         }
     }
 
-    fn validate_swap_path(
-        token_in: &Address,
-        token_out: &Address,
-        path: &Vec<Address>,
-        min_amount_out: i128,
-    ) -> Result<(), Error> {
-        if min_amount_out <= 0 || path.len() < 2 {
-            return Err(Error::InvalidSwapPath);
-        }
-        if path.get(0) != Some(token_in.clone())
-            || path.get(path.len() - 1) != Some(token_out.clone())
-        {
-            return Err(Error::InvalidSwapPath);
-        }
-        Ok(())
-    }
-
     /// Allocates and returns the next timelock nonce, incrementing the counter.
     fn next_nonce(env: &Env) -> u64 {
         let current: u64 = env
@@ -707,9 +1147,7 @@ impl PaymentRouter {
     }
 
     /// Builds the domain-separated message for meta-transactions.
-    /// Binds `current_contract_address` + all call args + `signer_pubkey` +
-    /// `nonce` + `deadline`, then returns `SHA256(payload)` as `Bytes`
-    /// for `ed25519_verify`. Off-chain signers must sign these exact bytes.
+    /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
     #[allow(clippy::too_many_arguments)]
     fn build_meta_message(
         env: &Env,
@@ -735,6 +1173,12 @@ impl PaymentRouter {
     }
 
     /// Core payment logic shared by `route_payment` and `route_payments`.
+    ///
+    /// The caller must have already obtained `sender`'s authorization, once
+    /// per distinct sender across the batch (or via `require_auth` for a
+    /// single payment). The transfers below re-check it inside the token
+    /// contract, but doing it here first means an unauthorized payment is
+    /// refused before any state is written.
     #[allow(clippy::too_many_arguments)]
     fn process_single_payment(
         env: &Env,
@@ -753,23 +1197,15 @@ impl PaymentRouter {
 
         // Validations moved to route_payments to prevent rollback panic on Windows testutils
 
-        // Apply tiered fee discount for high-volume users
-        let user_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserVolume(sender.clone()))
-            .unwrap_or(0);
-        let base_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+        // Roll the 24-hour window forward and record the lifetime volume in a
+        // single packed write (issue #663). The returned volume is the
+        // pre-payment one, which is what the tiered discount keys off.
+        let user_volume = Self::accrue_user_record(env, sender, amount)?;
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
             fee_bps
         };
-
-        let effective_fee_bps = base_fee_bps;
-
-        // Check time-based daily spending limits.
-        Self::accrue_daily_spend(env, sender, amount)?;
-
         // Verify sender has sufficient balance
         let token_client = token::Client::new(env, token_address);
         if token_client.balance(sender) < amount {
@@ -819,9 +1255,6 @@ impl PaymentRouter {
                 }
             }
         }
-
-        // Record cumulative volume
-        Self::record_volume(env, sender, amount);
 
         // Emit routed event
         env.events().publish(
@@ -882,49 +1315,14 @@ impl PaymentRouter {
 
         Self::verify_kyc_for_amount(env, sender, amount)?;
 
-        let user_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserVolume(sender.clone()))
-            .unwrap_or(0);
+        // Single packed write covering the 24-hour window and the lifetime
+        // volume (issue #663); the discount keys off the pre-payment volume.
+        let user_volume = Self::accrue_user_record(env, sender, amount)?;
         let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
             fee_bps
         };
-
-        let current_time = env.ledger().timestamp();
-        let spending_key = DataKey::UserSpending(sender.clone());
-
-        let (mut last_reset_time, mut accumulated_amount): (u64, i128) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, BytesN<24>>(&spending_key)
-            .map(|packed| unpack_spending(&packed))
-            .unwrap_or((current_time, 0));
-
-        if current_time - last_reset_time >= Self::SECONDS_IN_24H {
-            last_reset_time = current_time;
-            accumulated_amount = 0;
-        }
-
-        let Some(new_accumulated) = accumulated_amount.checked_add(amount) else {
-            return Err(Error::LimitExceeded);
-        };
-        if new_accumulated > Self::DAILY_MAX_LIMIT {
-            return Err(Error::LimitExceeded);
-        }
-        accumulated_amount = new_accumulated;
-
-        env.storage().persistent().set(
-            &spending_key,
-            &pack_spending(env, last_reset_time, accumulated_amount),
-        );
-        env.storage().persistent().extend_ttl(
-            &spending_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
 
         let router = env.current_contract_address();
         let token_client = token::Client::new(env, token_address);
@@ -975,17 +1373,6 @@ impl PaymentRouter {
             }
         }
 
-        let volume_key = DataKey::UserVolume(sender.clone());
-        let prev_volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&volume_key, &prev_volume.saturating_add(amount));
-        env.storage().persistent().extend_ttl(
-            &volume_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
         env.events().publish(
             (symbol_short!("routed"), sender.clone(), recipient.clone()),
             amount,
@@ -998,24 +1385,62 @@ impl PaymentRouter {
 
     // ── Public contract methods ──────────────────────────────────────────────
 
+    /// Circuit-breaker guard applied to every non-essential operation.
+    ///
+    /// While the pause switch is engaged all operational state changes —
+    /// payments, timelock queue/execute, fee/treasury/governance/min-limit
+    /// configuration, treasury yield movements and token recovery — are
+    /// rejected with `Error::Paused`.
+    ///
+    /// Essential recovery paths (unpausing/unfreezing, cancelling a queued
+    /// action, withdrawing refunds or emergency funds, role and admin
+    /// governance, compliance configuration and upgrades) deliberately bypass
+    /// this guard, so an incident can always be resolved while the breaker is
+    /// open.
+    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+        if Self::is_paused_internal(env) {
+            return Err(Error::Paused);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the circuit breaker (pause switch) is currently open.
+    fn is_paused_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Enforces KYC only after the admin has configured a threshold. This
+    /// preserves existing routing behavior until compliance is enabled.
+    fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
+        let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
+        if threshold.is_none() || amount <= threshold.unwrap_or(0) {
+            return Ok(());
+        }
+
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycOracle)
+            .ok_or(Error::KycRequired)?;
+        if !KycOracleClient::new(env, &oracle).is_verified(sender) {
+            return Err(Error::KycRequired);
+        }
+        Ok(())
+    }
+
     /// One-time setup: records the admin and the initial fee configuration
     /// in instance storage. Must be called before `route_payment`.
     ///
     /// # Parameters
-    /// - `admin`: Address granted admin rights over the contract; must
-    ///   authorize this call.
-    /// - `platform_treasury`: Address that receives collected platform fees.
-    /// - `fee_bps`: Platform fee rate, in basis points.
-    /// - `fee_cap`: Maximum fee (in the token's smallest unit) taken from a
-    ///   single payment.
-    /// - `max_amount`: Maximum amount accepted by a single payment.
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or `Err(Error::AlreadyInitialized)` if the
-    /// contract already has an admin set.
-    ///
-    /// # Panics
-    /// Panics if `admin` does not authorize the call.
+    /// * `env` - The Soroban environment interface.
+    /// * `sender` - The address initiating the payment. Must authorize the transaction.
+    /// * `recipient` - The destination address for the payment (e.g., the Anchor's wallet for fiat withdrawals).
+    /// * `platform_treasury` - The address where the platform fee will be deposited.
+    /// * `token_address` - The contract ID of the token asset being transferred (e.g., NGNC or USDC).
+    /// * `amount` - The total amount of tokens to be routed (inclusive of the fee).
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -1174,9 +1599,15 @@ impl PaymentRouter {
     ///
     /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
     /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
-    /// `upgrade`) must go through the timelock.  Use the direct setter
-    /// functions only for actions that are not sensitive (e.g. `set_pause`
-    /// which can also be called directly for immediate operational pauses).
+    /// `set_multisig_config`, `upgrade`) must go through the timelock.  Use the
+    /// direct setter functions only for actions that are not sensitive (e.g.
+    /// `set_pause` which can also be called directly for immediate operational
+    /// pauses).
+    ///
+    /// Queueing does not pre-authorize anything on its own: `ActionType::Upgrade`
+    /// and `ActionType::SetMultisigConfig` are re-validated at execution time,
+    /// so an upgrade queued today still needs the multi-signature threshold to
+    /// be met for that hash when the delay elapses.
     ///
     /// The contract must not be frozen when queuing, and the admin must
     /// authorize the call.
@@ -1238,6 +1669,8 @@ impl PaymentRouter {
     /// - The admin must authorize.
     /// - The entry identified by `nonce` must exist.
     /// - At least 24 hours (`SECONDS_IN_24H`) must have passed since queuing.
+    /// - For [`ActionType::Upgrade`], the multi-signature threshold must
+    ///   already be met for that WASM hash.
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
@@ -1262,6 +1695,12 @@ impl PaymentRouter {
         if now < entry.queued_at + Self::SECONDS_IN_24H {
             return Err(Error::TimelockNotReady);
         }
+
+        // Validate the action before touching storage so that a rejected entry
+        // stays in the queue for the admin to retry or cancel.  Upgrades are
+        // gated on the M-of-N threshold here as well as in `upgrade`, so
+        // routing an upgrade through the timelock is not a way around it.
+        Self::validate_queued_action(&env, &entry.action)?;
 
         // Remove the entry before applying the action (checks-effects-interactions).
         env.storage().persistent().remove(&key);
@@ -1291,7 +1730,10 @@ impl PaymentRouter {
                 Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
             }
             ActionType::Upgrade(new_wasm_hash) => {
-                env.deployer().update_current_contract_wasm(new_wasm_hash);
+                Self::apply_upgrade(&env, &new_wasm_hash);
+            }
+            ActionType::SetMultisigConfig(signers, threshold) => {
+                Self::store_multisig_config(&env, signers, threshold);
             }
             ActionType::RegisterDex(dex) => {
                 let key = DataKey::RegisteredDex(dex.clone());
@@ -1789,10 +2231,104 @@ impl PaymentRouter {
     /// # Panics
     /// Does not panic.
     pub fn get_user_volume(env: Env, user: Address) -> i128 {
+        Self::get_user_record(env, user).volume
+    }
+
+    /// Returns a sender's combined routing record: the amount accumulated in
+    /// the current 24-hour window and their cumulative lifetime volume
+    /// (issue #663).
+    ///
+    /// Reads the single packed `UserRecord` entry. For a sender that only has
+    /// the legacy pre-#663 split entries, both counters are combined from
+    /// those without writing anything.
+    ///
+    /// # Parameters
+    /// - `user`: Sender address to look up.
+    ///
+    /// # Returns
+    /// A [`UserRecord`] with zeroed counters if `user` has never routed a
+    /// payment; `last_reset_time` is then the current ledger timestamp.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_user_record(env: Env, user: Address) -> UserRecord {
+        let current_time = env.ledger().timestamp();
+        let (last_reset_time, accumulated_amount, volume, _) =
+            Self::load_user_record(&env, &user, current_time);
+
+        UserRecord {
+            accumulated_amount,
+            volume,
+            last_reset_time,
+        }
+    }
+
+    /// Permissionless migration of a sender's legacy pre-#663 split entries
+    /// (`UserSpending` + `UserVolume`) into the single packed `UserRecord`
+    /// (issue #663).
+    ///
+    /// Callable by anyone: it only recombines values that are already on the
+    /// ledger and never invents or destroys value. When the sender's packed
+    /// record was already created by a recent payment, this just removes the
+    /// stale legacy keys and keeps the newer packed values.
+    ///
+    /// # Parameters
+    /// - `user`: The sender whose legacy entries should be migrated.
+    ///
+    /// # Returns
+    /// `true` if legacy state was found and migrated, `false` if `user` has
+    /// no legacy entries to migrate.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn migrate_user_record(env: Env, user: Address) -> bool {
+        let record_key = DataKey::UserRecord(user.clone());
+        let has_packed = env.storage().persistent().has(&record_key);
+
+        let legacy_spending: Option<(u64, i128)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSpending(user.clone()))
+            .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
+        let legacy_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserVolume(user.clone()))
+            .unwrap_or(0);
+
+        if legacy_spending.is_none() && legacy_volume == 0 {
+            return false;
+        }
+
+        if !has_packed {
+            let (last_reset_time, accumulated_amount) =
+                legacy_spending.unwrap_or((env.ledger().timestamp(), 0));
+
+            // The legacy `UserVolume` already counts every amount in the
+            // current window (each payment incremented both counters), so the
+            // window balance must not be added again here.
+            env.storage().persistent().set(
+                &record_key,
+                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
+            );
+            env.storage().persistent().extend_ttl(
+                &record_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
         env.storage()
             .persistent()
-            .get(&DataKey::UserVolume(user))
-            .unwrap_or(0)
+            .remove(&DataKey::UserSpending(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UserVolume(user.clone()));
+
+        env.events()
+            .publish((symbol_short!("migrated"), user), legacy_volume);
+
+        true
     }
 
     /// Adds an address to the blacklist. ComplianceOfficer-protected.
@@ -2267,37 +2803,28 @@ impl PaymentRouter {
             .get(&DataKey::FallbackPrice(base_asset, quote_asset))
     }
 
-    /// Fetches the current exchange rate for a (base, quote) asset pair from
-    /// the configured price-feed oracle, validates it, and returns the result.
+    /// Fetches the current exchange rate for a `(base_asset, quote_asset)`
+    /// pair from the configured price-feed oracle, validates it, and returns
+    /// the result.
+    ///
+    /// Every failure path below first attempts to serve an admin-configured
+    /// fallback price for the pair; the oracle error is only surfaced when no
+    /// fallback exists.
     ///
     /// ## Validation flow
     ///
-    /// 1. **Oracle configured?** — If no oracle address is stored, return
-    ///    `Err(Error::OracleNotConfigured)` (unless a fallback is available).
-    /// 2. **Call oracle** — Invoke the oracle's `get_price` method.  If the
-    ///    call fails (oracle contract unavailable or traps), attempt to return
-    ///    the fallback price.  If there is no fallback either, return
-    ///    `Err(Error::OracleCallFailed)`.
-    /// 3. **Staleness check** — Compare `price_data.timestamp` with the
-    ///    current ledger time.  If older than the configured threshold (default
-    ///    3 600 s), attempt to return the fallback price.  If there is no
-    ///    fallback, return `Err(Error::OraclePriceStale)`.
-    /// 4. **Validity check** — A price ≤ 0 is logically invalid.  Attempt
-    ///    fallback; if unavailable return `Err(Error::OraclePriceInvalid)`.
-    /// 5. **Return** — The validated `PriceData` is returned to the caller.
+    /// 1. **Oracle configured?** - Otherwise `Err(Error::OracleNotConfigured)`.
+    /// 2. **Call oracle** - Invoke the oracle's `get_price`; a trapped or
+    ///    unavailable contract yields `Err(Error::OracleCallFailed)`.
+    /// 3. **Staleness check** - Reject a `price_data.timestamp` older than the
+    ///    configured threshold (default 3 600 s) with
+    ///    `Err(Error::OraclePriceStale)`. A threshold of `0` disables this check.
+    /// 4. **Validity check** - A price <= 0 is invalid
+    ///    (`Err(Error::OraclePriceInvalid)`).
+    /// 5. **Return** - The validated `PriceData` is returned to the caller.
     ///
-    /// A staleness threshold of `0` disables the staleness check entirely.
-    ///
-    /// ## Parameters
-    /// - `base_asset`: Address of the base asset (e.g. XLM native contract).
-    /// - `quote_asset`: Address of the quote asset (e.g. USDC contract).
-    ///
-    /// ## Returns
-    /// `Ok(PriceData)` on success, or one of:
-    /// - `Err(Error::OracleNotConfigured)` — no oracle set and no fallback.
-    /// - `Err(Error::OracleCallFailed)` — oracle call failed and no fallback.
-    /// - `Err(Error::OraclePriceStale)` — data too old and no fallback.
-    /// - `Err(Error::OraclePriceInvalid)` — price ≤ 0 and no fallback.
+    /// `base_asset` is typically the XLM native contract and `quote_asset` the
+    /// USDC contract.
     pub fn get_price(
         env: Env,
         base_asset: Address,
@@ -2329,27 +2856,16 @@ impl PaymentRouter {
             };
 
         // 1. Check oracle is configured.
-        let oracle = match oracle_opt {
-            Some(addr) => addr,
-            None => {
-                return fallback_or_err(
-                    &env,
-                    &base_asset,
-                    &quote_asset,
-                    Error::OracleNotConfigured,
-                );
-            }
+        let Some(oracle) = oracle_opt else {
+            return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleNotConfigured);
         };
 
         // 2. Call the oracle. Use try_get_price to avoid trapping on failure.
-        let price_data = match PriceFeedOracleClient::new(&env, &oracle)
-            .try_get_price(&base_asset, &quote_asset)
-        {
-            Ok(Ok(data)) => data,
-            _ => {
-                log!(&env, "Oracle contract call failed");
-                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleCallFailed);
-            }
+        let Ok(Ok(price_data)) =
+            PriceFeedOracleClient::new(&env, &oracle).try_get_price(&base_asset, &quote_asset)
+        else {
+            log!(&env, "Oracle contract call failed");
+            return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleCallFailed);
         };
 
         // 3. Staleness check (skip when threshold is 0).
@@ -2419,6 +2935,33 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if amount <= 0 || amount > max_amount {
+            return Err(Error::LimitExceeded);
+        }
+        if amount < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount)?;
+
+        sender.require_auth();
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_payment(
@@ -2427,6 +2970,92 @@ impl PaymentRouter {
             &recipient,
             &token_address,
             amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
+    }
+
+    /// Swaps `token_in` through a caller-supplied DEX path and routes the
+    /// resulting `token_out` to the recipient. The DEX adapter must return the
+    /// received output and any unused input as `[received, unused]`; unused
+    /// input is credited to the sender's refund balance.
+    ///
+    /// # Panics
+    /// Panics if the DEX router returns a swap result with fewer than 2 elements,
+    /// or if `swap_result.get(0)` or `swap_result.get(1)` returns `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_payment_with_swap_raw(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex_router: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        min_amount_out: i128,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        Self::validate_swap_path(&token_in, &token_out, &path, min_amount_out)?;
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let token_in_client = token::Client::new(&env, &token_in);
+        token_in_client.transfer(&sender, &dex_router, &amount_in);
+
+        let swap_result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
+            &token_in,
+            &token_out,
+            &amount_in,
+            &min_amount_out,
+            &path,
+            &env.current_contract_address(),
+        );
+        if swap_result.len() != 2 {
+            return Err(Error::InvalidSwapPath);
+        }
+        let amount_received: i128 = swap_result.get(0).unwrap();
+        let unused_input: i128 = swap_result.get(1).unwrap();
+        if amount_received < min_amount_out || amount_received <= 0 || unused_input < 0 {
+            return Err(Error::SlippageExceeded);
+        }
+        if unused_input > 0 {
+            token_in_client.transfer(&env.current_contract_address(), &sender, &unused_input);
+        }
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_out,
+            amount_received,
             &platform_treasury,
             fee_bps,
             fee_cap,
@@ -2457,6 +3086,50 @@ impl PaymentRouter {
             return Err(Error::Paused);
         }
 
+        // Pre-validate the whole batch before authorizing or moving any
+        // funds, so a rejected payment never triggers an auth rollback.
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+
+        // Collect unique senders to require auth only once per sender.
+        let mut seen_senders = Vec::new(&env);
+        for payment in payments.iter() {
+            if payment.sender == payment.recipient {
+                return Err(Error::InvalidRecipient);
+            }
+            if Self::is_blacklisted(env.clone(), payment.recipient.clone()) {
+                return Err(Error::Blacklisted);
+            }
+            if payment.amount <= 0 || payment.amount > max_amount {
+                return Err(Error::LimitExceeded);
+            }
+            if payment.amount < min_limit {
+                return Err(Error::LimitExceeded);
+            }
+            Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
+
+            // Track unique senders for auth
+            let mut is_new = true;
+            for seen in seen_senders.iter() {
+                if seen == payment.sender {
+                    is_new = false;
+                    break;
+                }
+            }
+            if is_new {
+                seen_senders.push_back(payment.sender.clone());
+                payment.sender.require_auth();
+            }
+        }
+
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         for payment in payments.iter() {
@@ -2473,6 +3146,103 @@ impl PaymentRouter {
         }
 
         Ok(())
+    }
+
+    /// Returns the current meta-transaction nonce for a user.
+    ///
+    /// Relayers must use this nonce when building the signed payload.
+    /// The nonce starts at `0` and increments after each successful
+    /// `route_payment_meta`, preventing replay attacks.
+    pub fn get_meta_nonce(env: Env, user: Address) -> u64 {
+        Self::get_meta_nonce_internal(&env, &user)
+    }
+
+    /// Routes a payment authorised by an off-chain relayer's Ed25519 signature
+    /// instead of the sender's on-chain authorization.
+    ///
+    /// The relayer signs a canonical payload binding the sender, recipient,
+    /// token, amount, nonce and deadline. The contract verifies the signature,
+    /// burns the nonce to block replays, and then settles the payment through
+    /// the same accounting as a direct `route_payment`.
+    ///
+    /// # Parameters
+    /// - `sender`: Address whose funds are routed and whose nonce is consumed.
+    /// - `signer_pubkey`: Ed25519 public key that must have signed the payload.
+    /// - `recipient`: Address the funds are delivered to.
+    /// - `token_address`: Contract ID of the token being transferred.
+    /// - `amount`: Amount to route in the token's smallest unit.
+    /// - `nonce`: Must equal the sender's current meta-transaction nonce.
+    /// - `deadline`: Ledger timestamp after which the submission is rejected.
+    /// - `signature`: Ed25519 signature over the canonical payload.
+    ///
+    /// # Returns
+    /// `Ok(())` once the payment has settled.
+    ///
+    /// # Panics
+    /// Panics if the signature does not verify.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_payment_meta(
+        env: Env,
+        sender: Address,
+        signer_pubkey: BytesN<32>,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        if env.ledger().timestamp() > deadline {
+            return Err(Error::DeadlineExpired);
+        }
+
+        let stored = Self::get_meta_nonce_internal(&env, &sender);
+        if stored != nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        let message = Self::build_meta_message(
+            &env,
+            &sender,
+            &signer_pubkey,
+            &recipient,
+            &token_address,
+            amount,
+            nonce,
+            deadline,
+        );
+        // Traps on invalid signature; `Error::InvalidSignature` documents
+        // this failure mode for off-chain integrators.
+        env.crypto()
+            .ed25519_verify(&signer_pubkey, &message, &signature);
+
+        let key = DataKey::MetaNonce(sender.clone());
+        env.storage().persistent().set(&key, &(nonce + 1));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::process_single_payment_no_auth(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
     }
 
     // ── Token swaps: cross-contract DEX routing ──────────────────────────────
@@ -2575,14 +3345,10 @@ impl PaymentRouter {
         }
 
         // Daily limits and lifetime volume are denominated in the sell token,
-        // matching what the sender actually parts with.
-        Self::accrue_daily_spend(env, &swap.sender, swap.amount_in)?;
-
-        let user_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserVolume(swap.sender.clone()))
-            .unwrap_or(0);
+        // matching what the sender actually parts with. A single packed write
+        // covers both counters (issue #663), and the returned volume is the
+        // pre-payment one the tiered discount keys off.
+        let user_volume = Self::accrue_user_record(env, &swap.sender, swap.amount_in)?;
         let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
@@ -2668,8 +3434,6 @@ impl PaymentRouter {
                 }
             }
         }
-
-        Self::record_volume(env, &swap.sender, swap.amount_in);
 
         env.events().publish(
             (
@@ -3068,25 +3832,318 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Replaces this contract's WASM with a previously uploaded version. SuperAdmin-protected.
+    // ── Multi-signature (M-of-N) contract upgrades ───────────────────────────
+    //
+    // Issue #664: upgrades used to be gated on a single admin key, which made
+    // that key both a single point of failure (lose it and the contract can
+    // never be patched) and a single point of centralization (compromise it and
+    // an attacker owns the contract).  Upgrades now require M signatures drawn
+    // from an N-member admin group, so no single key — including the admin's —
+    // can upgrade the contract on its own.
+    //
+    // The flow is:
+    //   1. The admin configures the group once with `set_multisig_config`.
+    //   2. Each signer authorizes a specific WASM hash with `approve_upgrade`.
+    //   3. Once M signatures are collected, `upgrade` (or the timelock's
+    //      `ActionType::Upgrade`) installs that exact hash and the approvals
+    //      are consumed.
+    //
+    // Until step 1 happens every upgrade fails closed with
+    // `Error::MultisigNotInitialized`; there is deliberately no fallback to the
+    // single admin key, because that fallback is the vulnerability being fixed.
+
+    // The admin is the root of trust for this call only: it can re-point the
+    // group but still cannot upgrade the contract by itself. Prefer
+    // `queue_action(ActionType::SetMultisigConfig(…))` to put the 24-hour
+    // timelock in front of a rotation, which this direct setter bypasses.
+    /// Configures the multi-signature admin group that authorizes upgrades.
+    ///
+    /// The signer set is replaced wholesale: addresses that are not in
+    /// `signers` immediately lose the ability to approve, and a threshold
+    /// already reached for a pending hash is re-evaluated against the new
+    /// configuration.
+    ///
+    /// # Parameters
+    /// - `signers`: The N addresses whose signatures count. Must be non-empty
+    ///   and free of duplicates.
+    /// - `threshold`: The M signers required to authorize an upgrade, in
+    ///   `1..=signers.len()`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::InvalidMultisigConfig)` if the signer
+    /// set is empty or holds a duplicate, or the threshold is zero or larger
+    /// than the set, or `Err(Error::NotInitialized)` if the contract has no
+    /// admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_multisig_config(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let validated = Self::validate_multisig_config(&signers, threshold)?;
+        Self::store_multisig_config(&env, signers, validated);
+
+        env.events()
+            .publish((Symbol::new(&env, "multisig_config_set"), admin), validated);
+
+        log!(
+            &env,
+            "Multi-signature upgrade threshold set to {}",
+            validated
+        );
+        Ok(())
+    }
+
+    /// Returns the current multi-signature admin group.
+    ///
+    /// # Returns
+    /// The configured signers and threshold, or `Err(Error::MultisigNotInitialized)`
+    /// if `set_multisig_config` has not been called yet.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, Error> {
+        let (signers, threshold) = Self::load_multisig_config(&env)?;
+        Ok(MultisigConfig { signers, threshold })
+    }
+
+    /// Records `signer`'s authorization of an upgrade to `new_wasm_hash`.
+    ///
+    /// Each group member signs off separately so the M signatures are genuinely
+    /// independent: one compromised key cannot produce a quorum, and every
+    /// approval is bound to one specific WASM hash.
+    ///
+    /// Reaching the threshold does not install the WASM by itself — call
+    /// `upgrade` (or `execute_action` on a queued [`ActionType::Upgrade`]) to
+    /// apply it. Keeping those two steps separate lets the group approve a hash
+    /// and then route the installation through the 24-hour timelock if it wants
+    /// observers to see it coming.
+    ///
+    /// # Parameters
+    /// - `signer`: The group member approving; must authorize this call.
+    /// - `new_wasm_hash`: The WASM hash being approved.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured, `Err(Error::NotMultisigSigner)` if `signer` is not a
+    /// group member, or `Err(Error::AlreadyApproved)` if `signer` already
+    /// approved this hash.
+    ///
+    /// # Panics
+    /// Panics if `signer` does not authorize the call.
+    pub fn approve_upgrade(
+        env: Env,
+        signer: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let (signers, threshold) = Self::load_multisig_config(&env)?;
+        if !signers.contains(&signer) {
+            return Err(Error::NotMultisigSigner);
+        }
+        signer.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if approvals.contains(&signer) {
+            return Err(Error::AlreadyApproved);
+        }
+        approvals.push_back(signer.clone());
+        env.storage().persistent().set(&key, &approvals);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"), signer, new_wasm_hash),
+            (approvals.len(), threshold),
+        );
+
+        log!(
+            &env,
+            "Upgrade approved by signer {}/{}",
+            approvals.len(),
+            threshold
+        );
+        Ok(())
+    }
+
+    /// Withdraws a signer's previously recorded approval of an upgrade.
+    ///
+    /// Lets a signer pull its signature back before the threshold is reached,
+    /// which is the way a group stops an upgrade it no longer wants without
+    /// having to rotate the whole signer set. Idempotent: withdrawing an
+    /// approval that was never recorded is a no-op.
+    ///
+    /// # Parameters
+    /// - `signer`: The group member withdrawing its approval; must authorize
+    ///   this call.
+    /// - `new_wasm_hash`: The WASM hash to withdraw the approval for.
+    ///
+    /// # Returns
+    /// `Ok(())` on success or `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured.
+    ///
+    /// # Panics
+    /// Panics if `signer` does not authorize the call.
+    pub fn revoke_upgrade_approval(
+        env: Env,
+        signer: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let (signers, _) = Self::load_multisig_config(&env)?;
+        if !signers.contains(&signer) {
+            return Err(Error::NotMultisigSigner);
+        }
+        signer.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Vec::first_index_of returns the position of the first match, which
+        // for a duplicate-free set is the one and only approval to drop.
+        if let Some(index) = approvals.first_index_of(&signer) {
+            approvals.remove(index);
+            if approvals.is_empty() {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &approvals);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+
+            env.events().publish(
+                (Symbol::new(&env, "upgrade_revoked"), signer, new_wasm_hash),
+                approvals.len(),
+            );
+
+            log!(&env, "Upgrade approval revoked");
+        }
+
+        Ok(())
+    }
+
+    /// Discards every approval collected for `new_wasm_hash`. Admin-only.
+    ///
+    /// The blunt instrument for a compromised hash: it drops the quorum even
+    /// when the threshold was already met, so the group can force the group
+    /// back to zero signatures. Note that `upgrade` is permissionless once the
+    /// threshold is met, so the admin should prefer having signers revoke their
+    /// own approvals (or rotate the group) while the hash is still in flight.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: The WASM hash to clear approvals for.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract has
+    /// no admin set yet. Clearing a hash with no approvals is a no-op.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn cancel_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_cancelled"), admin),
+            new_wasm_hash,
+        );
+
+        log!(&env, "Pending upgrade approvals cleared by admin");
+        Ok(())
+    }
+
+    /// Returns the signers whose approval of an upgrade to `new_wasm_hash`
+    /// currently counts.
+    ///
+    /// Approvals cast by a signer that has since been rotated out of the group
+    /// are omitted, so this list always agrees with `is_upgrade_authorized`.
+    ///
+    /// # Returns
+    /// The counted approvals in the order they were recorded, or an empty
+    /// vector if the hash has none. Empty when no group is configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_upgrade_approvals(env: Env, new_wasm_hash: BytesN<32>) -> Vec<Address> {
+        match Self::load_multisig_config(&env) {
+            Ok((signers, _)) => Self::load_effective_approvals(&env, &signers, &new_wasm_hash),
+            // Fail closed without erroring: a view of "who approved" is
+            // meaningless when there is no group to have authorized anything.
+            Err(_) => Vec::new(&env),
+        }
+    }
+
+    /// Returns whether an upgrade to `new_wasm_hash` is already authorized.
+    ///
+    /// # Returns
+    /// `true` once `M` group members have approved that exact hash.
+    /// `Err(Error::MultisigNotInitialized)` if no group is configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_upgrade_authorized(env: Env, new_wasm_hash: BytesN<32>) -> Result<bool, Error> {
+        Self::check_upgrade_authorized(&env, &new_wasm_hash)
+    }
+
+    // Deliberately permissionless: the M collected signatures *are* the
+    // authorization, so whoever submits the transaction once the threshold is
+    // met gets the same result, and no additional key — least of all the
+    // admin's — can stand in for a quorum. Approvals are consumed on success,
+    // so reaching the threshold authorizes exactly one installation. The same
+    // gate applies to the timelock path, so queueing an `ActionType::Upgrade`
+    // is not a way around it.
+    /// Replaces this contract's WASM with a previously uploaded version, once
+    /// the multi-signature group has authorized that exact hash.
     ///
     /// # Parameters
     /// - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
-    ///   network, to install as this contract's new executable.
+    ///   network. Must match a hash with at least `threshold` approvals.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Ok(())` on success, `Err(Error::MultisigNotInitialized)` if no group
+    /// is configured, or `Err(Error::InsufficientApprovals)` if fewer than
+    /// `threshold` members have approved this hash.
     ///
     /// # Panics
-    /// Panics if the current SuperAdmin does not authorize the call, or if
-    /// `new_wasm_hash` does not reference a previously uploaded WASM blob.
-    ///
-    /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::Upgrade(…))`.
+    /// Panics if `new_wasm_hash` does not reference an uploaded WASM blob.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
-        Self::require_role(&env, Role::SuperAdmin)?;
+        let approvals = Self::require_upgrade_authorized(&env, &new_wasm_hash)?;
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Self::apply_upgrade(&env, &new_wasm_hash);
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"), new_wasm_hash),
+            approvals,
+        );
+
+        log!(
+            &env,
+            "Contract upgraded with {} multisig approvals",
+            approvals
+        );
         Ok(())
     }
 
@@ -3102,13 +4159,187 @@ impl PaymentRouter {
     }
 }
 
+// ── Archival extension ────────────────────────────────────────────────────────
+//
+// A second #[contractimpl] block keeps the archival surface separate and avoids
+// hitting the soroban-sdk per-impl function-count ceiling.
+#[contractimpl]
+impl PaymentRouter {
+    /// Commits a SHA-256 Merkle root of a batch of payment-record snapshots
+    /// into persistent storage, opening a new archive epoch.
+    ///
+    /// Call this before `prune_archived_entries`. Requires TreasuryManager.
+    /// Returns the new epoch number.
+    ///
+    /// Errors: NotInitialized, ContractFrozen.
+    pub fn commit_archive_root(
+        env: Env,
+        root: BytesN<32>,
+        leaves: Vec<ArchiveLeaf>,
+        description: String,
+    ) -> Result<u64, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        let current_epoch: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0u64);
+        let new_epoch = current_epoch + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ArchiveEpoch, &new_epoch);
+
+        let record_count = leaves.len();
+        let committed_at = env.ledger().timestamp();
+
+        // Persist the Merkle root.
+        let root_key = DataKey::ArchiveRoot(new_epoch);
+        env.storage().persistent().set(&root_key, &root);
+        env.storage().persistent().extend_ttl(
+            &root_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Persist metadata.
+        let meta = ArchiveMetadata {
+            committed_at,
+            record_count,
+            description,
+        };
+        let meta_key = DataKey::ArchiveMeta(new_epoch);
+        env.storage().persistent().set(&meta_key, &meta);
+        env.storage().persistent().extend_ttl(
+            &meta_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        archival::emit_archive_committed(&env, new_epoch, &root, record_count);
+        log!(
+            &env,
+            "Archive epoch {} committed: {} records",
+            new_epoch,
+            record_count
+        );
+
+        Ok(new_epoch)
+    }
+
+    /// Returns the Merkle root and metadata for an archive epoch, or `None`
+    /// if no archive exists for that epoch.
+    pub fn get_archive_info(env: Env, epoch: u64) -> Option<(BytesN<32>, ArchiveMetadata)> {
+        let root: Option<BytesN<32>> = env.storage().persistent().get(&DataKey::ArchiveRoot(epoch));
+        let meta: Option<ArchiveMetadata> =
+            env.storage().persistent().get(&DataKey::ArchiveMeta(epoch));
+        match (root, meta) {
+            (Some(r), Some(m)) => Some((r, m)),
+            _ => None,
+        }
+    }
+
+    /// Returns the current archive epoch counter (0 = no epochs committed yet).
+    pub fn get_archive_epoch(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ArchiveEpoch)
+            .unwrap_or(0)
+    }
+
+    /// Deletes on-chain ledger entries committed via `commit_archive_root`.
+    ///
+    /// Requires the epoch from a prior commit call. Silently skips absent
+    /// entries. Returns the count of entries removed.
+    ///
+    /// Supported: UserVolume, UserSpending, RefundBalance.
+    /// Errors: NotInitialized, ContractFrozen, TimelockNotFound (unknown epoch).
+    /// Requires TreasuryManager.
+    pub fn prune_archived_entries(
+        env: Env,
+        committed_epoch: u64,
+        leaves: Vec<ArchiveLeaf>,
+    ) -> Result<u32, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_role(&env, Role::TreasuryManager)?;
+
+        // Guard: a committed root must exist for this epoch.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::ArchiveRoot(committed_epoch))
+        {
+            return Err(Error::TimelockNotFound);
+        }
+
+        let mut removed: u32 = 0;
+
+        for leaf in leaves.iter() {
+            match leaf.record_type {
+                ArchiveRecordType::UserVolume => {
+                    let key = DataKey::UserVolume(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::UserSpending => {
+                    let key = DataKey::UserSpending(leaf.primary_key.clone());
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+                ArchiveRecordType::RefundBalance => {
+                    let key = DataKey::RefundBalance(
+                        leaf.primary_key.clone(),
+                        leaf.secondary_key.clone(),
+                    );
+                    if env.storage().persistent().has(&key) {
+                        env.storage().persistent().remove(&key);
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "entries_pruned"), committed_epoch),
+            (removed, env.ledger().timestamp()),
+        );
+
+        log!(
+            &env,
+            "Pruned {} entries for archive epoch {}",
+            removed,
+            committed_epoch
+        );
+
+        Ok(removed)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // The crate is `no_std`, but the test harness links std; pull it in so
+    // the benchmark can print its GAS REPORT lines.
+    extern crate std;
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
-        Address, Env, Symbol, TryIntoVal,
+        Address, Bytes, Env, Symbol, TryIntoVal,
     };
 
     #[contracttype]
@@ -3202,6 +4433,14 @@ mod test {
         ShouldFail,
     }
 
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[repr(u32)]
+    pub enum MockOracleError {
+        /// Simulates an unavailable oracle.
+        Unavailable = 1,
+    }
+
     #[contract]
     struct MockPriceFeedOracle;
 
@@ -3234,23 +4473,28 @@ mod test {
         }
 
         /// Implements the PriceFeedOracle interface.
-        pub fn get_price(env: Env, base_asset: Address, quote_asset: Address) -> PriceData {
+        pub fn get_price(
+            env: Env,
+            base_asset: Address,
+            quote_asset: Address,
+        ) -> Result<PriceData, MockOracleError> {
             let should_fail: bool = env
                 .storage()
                 .instance()
                 .get(&MockOracleKey::ShouldFail)
                 .unwrap_or(false);
             if should_fail {
-                panic!("mock oracle failure");
+                return Err(MockOracleError::Unavailable);
             }
-            env.storage()
+            Ok(env
+                .storage()
                 .instance()
                 .get(&MockOracleKey::Price(base_asset, quote_asset))
                 .unwrap_or(PriceData {
                     price: 0,
                     decimals: 7,
                     timestamp: 0,
-                })
+                }))
         }
     }
 
@@ -3267,6 +4511,19 @@ mod test {
     ) {
         let env = Env::default();
         env.mock_all_auths();
+        // The ledger starts at timestamp 0, which `get_price` treats as a
+        // stale quote. Start from a realistic time so "fresh" prices are
+        // actually fresh.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
         let contract_id = env.register_contract(None, PaymentRouter);
         let client = PaymentRouterClient::new(&env, &contract_id);
         let oracle_id = env.register_contract(None, MockPriceFeedOracle);
@@ -3298,7 +4555,7 @@ mod test {
         let now = env.ledger().timestamp();
         oracle_client.set_price(&base, &quote, &1_250_000, &7, &now);
 
-        let price_data = client.get_price(&base, &quote).unwrap();
+        let price_data = client.get_price(&base, &quote);
         assert_eq!(price_data.price, 1_250_000);
         assert_eq!(price_data.decimals, 7);
         assert_eq!(price_data.timestamp, now);
@@ -3334,8 +4591,7 @@ mod test {
 
         // get_price should return the fallback
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 1_000_000);
+        assert_eq!(result.price, 1_000_000);
     }
 
     #[test]
@@ -3361,8 +4617,7 @@ mod test {
         // Add a fallback: should now return the fallback price
         client.set_fallback_price(&base, &quote, &1_800_000, &7);
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 1_800_000);
+        assert_eq!(result.price, 1_800_000);
     }
 
     #[test]
@@ -3403,8 +4658,7 @@ mod test {
         // With fallback configured: should succeed
         client.set_fallback_price(&base, &quote, &5_000_000, &7);
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 5_000_000);
+        assert_eq!(result.price, 5_000_000);
     }
 
     #[test]
@@ -3422,8 +4676,7 @@ mod test {
 
         // Should pass because staleness check is disabled
         let result = client.get_price(&base, &quote);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().price, 3_000_000);
+        assert_eq!(result.price, 3_000_000);
     }
 
     #[test]
@@ -3604,6 +4857,211 @@ mod test {
         assert_eq!(
             client.try_route_payments(&payments),
             Err(Ok(Error::KycRequired))
+        );
+    }
+
+    /// Regression test for the `route_payments` trap on a repeated sender.
+    ///
+    /// Found by the `route_payments` fuzz target: a batch listing the same
+    /// sender twice aborted the whole invocation with a non-unwinding panic
+    /// instead of returning an error. Re-authorizing an address that has
+    /// already authorized the invocation is what trips the host, and splitting
+    /// one payment across several recipients is an ordinary request, so this
+    /// has to succeed rather than trap.
+    ///
+    /// Asserts the transfers actually landed, not just that the call returned:
+    /// an early `Err` would also avoid the panic, so a "did not trap" check
+    /// alone would pass for the wrong reason.
+    #[test]
+    fn test_batch_with_a_repeated_sender_succeeds() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        let starting_balance = 1_000_000_000_i128;
+        token_admin_client.mint(&sender, &starting_balance);
+
+        let mut recipients: Vec<Address> = Vec::new(&env);
+        for _ in 0..3 {
+            recipients.push_back(Address::generate(&env));
+        }
+        let amount = 1_000_000_i128;
+        let fee = amount * 100 / 10_000;
+
+        // One sender, three payments, three distinct recipients.
+        let mut payments: Vec<Payment> = Vec::new(&env);
+        for recipient in recipients.iter() {
+            payments.push_back(Payment {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token_address: token_address.clone(),
+                amount,
+            });
+        }
+
+        client.route_payments(&payments);
+
+        let expected_net = amount - fee;
+        for recipient in recipients.iter() {
+            assert_eq!(
+                token_client.balance(&recipient),
+                expected_net,
+                "recipient was not paid the net amount"
+            );
+        }
+        assert_eq!(token_client.balance(&treasury), fee * 3, "fee mismatch");
+        assert_eq!(
+            token_client.balance(&sender),
+            starting_balance - (expected_net * 3) - (fee * 3),
+            "sender was debited the wrong total"
+        );
+        // The per-sender daily spending record has to accumulate across every
+        // payment in the batch, not just the last one.
+        assert_eq!(client.get_user_volume(&sender), amount * 3);
+    }
+
+    /// A batch that repeats a sender *and* fails a later payment must still be
+    /// a graceful `Err`: the distinct-sender authorization runs before any
+    /// transfer, so a rejected batch leaves no partial state behind.
+    #[test]
+    fn test_batch_with_a_repeated_sender_rejects_gracefully() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        token_admin_client.mint(&sender, &1_000_000_000);
+
+        // First payment is valid and from `sender`; the second is over the
+        // per-payment cap, so the batch is rejected after `sender` has already
+        // been authorized once.
+        let payments = Vec::from_array(
+            &env,
+            [
+                Payment {
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    token_address: token_address.clone(),
+                    amount: 1_000_000,
+                },
+                Payment {
+                    sender,
+                    recipient: recipient.clone(),
+                    token_address,
+                    amount: PaymentRouter::MAX_AMOUNT + 1,
+                },
+            ],
+        );
+
+        assert_eq!(
+            client.try_route_payments(&payments),
+            Err(Ok(Error::LimitExceeded))
+        );
+        // Nothing was moved: validation rejects the whole batch up front.
+        assert_eq!(token_client.balance(&recipient), 0);
+    }
+
+    /// A batch from several distinct senders must pay every one of them.
+    ///
+    /// The authorization pass walks a de-duplicated seen-set, so a sender
+    /// appearing several times is authorized once while a batch of different
+    /// senders is authorized once each.  This had no active coverage at all
+    /// before, which is how an over-eager `require_auth` in the per-payment
+    /// loop could abort every multi-payment batch.
+    #[test]
+    fn test_batch_with_several_distinct_senders_succeeds() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, token_client, token_admin_client) = setup_token(&env);
+        client.initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        let starting_balance = 1_000_000_000_i128;
+        let mut senders: Vec<Address> = Vec::new(&env);
+        for _ in 0..2 {
+            let sender = Address::generate(&env);
+            token_admin_client.mint(&sender, &starting_balance);
+            senders.push_back(sender);
+        }
+
+        let first_recipient = Address::generate(&env);
+        let second_recipient = Address::generate(&env);
+        let amount = 1_000_000_i128;
+        let fee = amount * 100 / 10_000;
+        let expected_net = amount - fee;
+
+        // The first sender pays twice, the second once, so the batch mixes a
+        // repeated sender with a distinct one.
+        let payments = Vec::from_array(
+            &env,
+            [
+                Payment {
+                    sender: senders.get(0).unwrap().clone(),
+                    recipient: first_recipient.clone(),
+                    token_address: token_address.clone(),
+                    amount,
+                },
+                Payment {
+                    sender: senders.get(0).unwrap().clone(),
+                    recipient: second_recipient.clone(),
+                    token_address: token_address.clone(),
+                    amount,
+                },
+                Payment {
+                    sender: senders.get(1).unwrap().clone(),
+                    recipient: first_recipient.clone(),
+                    token_address: token_address.clone(),
+                    amount,
+                },
+            ],
+        );
+
+        client.route_payments(&payments);
+
+        assert_eq!(
+            token_client.balance(&first_recipient),
+            expected_net * 2,
+            "first recipient should be paid for both incoming payments"
+        );
+        assert_eq!(
+            token_client.balance(&second_recipient),
+            expected_net,
+            "second recipient should be paid once"
+        );
+        assert_eq!(token_client.balance(&treasury), fee * 3, "fee mismatch");
+        // The first sender funded two payments, the second only one.
+        assert_eq!(
+            token_client.balance(&senders.get(0).unwrap()),
+            starting_balance - (expected_net * 2) - (fee * 2),
+            "first sender was debited the wrong total"
+        );
+        assert_eq!(
+            token_client.balance(&senders.get(1).unwrap()),
+            starting_balance - expected_net - fee,
+            "second sender was debited the wrong total"
         );
     }
 
@@ -4991,6 +6449,371 @@ mod test {
         );
     }
 
+    /// Rebuilds the pre-#663 packed `UserSpending` value (`BytesN<24>`) so
+    /// tests can emulate legacy ledger state written by the old two-entry
+    /// storage format.
+    fn pack_legacy_spending_for_test(
+        env: &Env,
+        last_reset_time: u64,
+        accumulated_amount: i128,
+    ) -> BytesN<24> {
+        let mut buf = [0u8; 24];
+        buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
+        buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
+        BytesN::from_array(env, &buf)
+    }
+
+    /// Moves the oracle-style test ledger off timestamp 0, which `get_price`
+    /// treats as a stale quote.
+    fn set_realistic_ledger_time(env: &Env) {
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+    }
+
+    /// Issue #663 acceptance benchmark: per-user (tag) registration storage
+    /// cost must drop by at least 20%.
+    ///
+    /// The benchmark isolates the storage write path that registering a
+    /// sender's first payment touches:
+    ///
+    /// * Legacy (pre-#663): two persistent entries (`UserSpending` +
+    ///   `UserVolume`), each with its own write and TTL extension.
+    /// * New (#663): one packed `UserRecord` entry with a single write and
+    ///   TTL extension.
+    ///
+    /// It fails CI if the new path is not at least 20% cheaper in CPU
+    /// instructions, if it uses more memory, or if the deterministic
+    /// entry-count accounting (one entry instead of two) no longer holds.
+    #[test]
+    fn test_benchmark_storage_cost_reduction() {
+        let (env, _client, contract_id) = setup_env();
+
+        // `legacy_sender` emulates the pre-#663 two-entry write path;
+        // `packed_sender` exercises the new single-entry write path.
+        let legacy_sender = Address::generate(&env);
+        let packed_sender = Address::generate(&env);
+
+        let current_time = env.ledger().timestamp();
+        let amount = 5_000i128;
+
+        // Warm-up so lazy host/footprint initialization does not skew the
+        // first measurement window.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Admin, &legacy_sender);
+        });
+        env.budget().reset_default();
+
+        // ── Legacy (pre-#663) registration write path ────────────────────
+        {
+            let legacy_sender = legacy_sender.clone();
+            env.as_contract(&contract_id, || {
+                let spending_key = DataKey::UserSpending(legacy_sender.clone());
+                env.storage().persistent().set(
+                    &spending_key,
+                    &pack_legacy_spending_for_test(&env, current_time, amount),
+                );
+                env.storage().persistent().extend_ttl(
+                    &spending_key,
+                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
+                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
+                );
+
+                let volume_key = DataKey::UserVolume(legacy_sender.clone());
+                env.storage().persistent().set(&volume_key, &amount);
+                env.storage().persistent().extend_ttl(
+                    &volume_key,
+                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
+                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
+                );
+            });
+        }
+        let legacy_cpu = env.budget().cpu_instruction_cost();
+        let legacy_mem = env.budget().memory_bytes_cost();
+
+        env.budget().reset_default();
+
+        // ── New (#663) registration write path ───────────────────────────
+        {
+            let packed_sender = packed_sender.clone();
+            env.as_contract(&contract_id, || {
+                let record_key = DataKey::UserRecord(packed_sender.clone());
+                let record = pack_user_record(&env, current_time, amount, amount);
+                env.storage().persistent().set(&record_key, &record);
+                env.storage().persistent().extend_ttl(
+                    &record_key,
+                    PaymentRouter::PERSISTENT_LIFETIME_THRESHOLD,
+                    PaymentRouter::PERSISTENT_BUMP_AMOUNT,
+                );
+            });
+        }
+        let new_cpu = env.budget().cpu_instruction_cost();
+        let new_mem = env.budget().memory_bytes_cost();
+
+        std::eprintln!(
+            "GAS REPORT: user-registration storage legacy (2 entries) - CPU: {}, Mem: {}",
+            legacy_cpu,
+            legacy_mem
+        );
+        std::eprintln!(
+            "GAS REPORT: user-registration storage packed (1 entry)  - CPU: {}, Mem: {}",
+            new_cpu,
+            new_mem
+        );
+        std::eprintln!(
+            "GAS REPORT: user-registration storage CPU reduction: {}%",
+            100 - (new_cpu * 100) / legacy_cpu
+        );
+
+        // Deterministic accounting: the legacy path leaves two persistent
+        // entries per registered sender, the new path exactly one.
+        env.as_contract(&contract_id, || {
+            assert!(
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::UserSpending(legacy_sender.clone())),
+                "legacy path must write the UserSpending entry"
+            );
+            assert!(
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::UserVolume(legacy_sender.clone())),
+                "legacy path must write the UserVolume entry"
+            );
+            assert!(
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::UserRecord(packed_sender.clone())),
+                "new path must write the packed UserRecord entry"
+            );
+        });
+
+        // Acceptance criterion: >= 20% CPU-instruction reduction.
+        assert!(
+            new_cpu * 10 <= legacy_cpu * 8,
+            "packed registration write path must cost >= 20% less CPU \
+             (legacy: {}, packed: {}, reduction: {}%)",
+            legacy_cpu,
+            new_cpu,
+            100 - (new_cpu * 100) / legacy_cpu
+        );
+        // Memory must not regress either.
+        assert!(
+            new_mem <= legacy_mem,
+            "packed registration write path must not use more memory \
+             (legacy: {}, packed: {})",
+            legacy_mem,
+            new_mem
+        );
+    }
+
+    /// The packed `UserRecord` replaces the two per-user entries and keeps
+    /// every public getter consistent (issue #663).
+    #[test]
+    fn test_user_record_packed_storage_roundtrip() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Fresh sender: zeroed record, window anchored at "now".
+        let before = client.get_user_record(&sender);
+        assert_eq!(before.volume, 0);
+        assert_eq!(before.accumulated_amount, 0);
+        assert_eq!(before.last_reset_time, env.ledger().timestamp());
+
+        // The first payment registers the sender's packed record.
+        client.route_payment(&sender, &recipient, &token_address, &2_000);
+
+        let after_first = client.get_user_record(&sender);
+        assert_eq!(after_first.accumulated_amount, 2_000);
+        assert_eq!(after_first.volume, 2_000);
+
+        // Exactly one persistent user entry now exists — the packed record.
+        env.as_contract(&contract_id, || {
+            let record_key = DataKey::UserRecord(sender.clone());
+            assert!(env.storage().persistent().has(&record_key));
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::UserSpending(sender.clone())));
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::UserVolume(sender.clone())));
+        });
+
+        // A second payment accumulates in both counters.
+        client.route_payment(&sender, &recipient, &token_address, &3_000);
+
+        let after_second = client.get_user_record(&sender);
+        assert_eq!(after_second.accumulated_amount, 5_000);
+        assert_eq!(after_second.volume, 5_000);
+
+        // The pre-existing getters stay consistent with the packed record.
+        assert_eq!(client.get_user_volume(&sender), 5_000);
+    }
+
+    /// Permissionless `migrate_user_record` combines legacy entries into the
+    /// packed format and removes the old keys (issue #663).
+    #[test]
+    fn test_migrate_user_record_combines_legacy_entries() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Give the ledger a realistic timestamp so the legacy window start can
+        // be back-dated.
+        set_realistic_ledger_time(&env);
+
+        // Emulate pre-#663 ledger state: split UserSpending + UserVolume.
+        let legacy_window_start = env.ledger().timestamp() - 60;
+        let spending_key = DataKey::UserSpending(user.clone());
+        let volume_key = DataKey::UserVolume(user.clone());
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(
+                &spending_key,
+                &pack_legacy_spending_for_test(&env, legacy_window_start, 1_200),
+            );
+            env.storage().persistent().set(&volume_key, &7_500i128);
+        });
+
+        // Getters still see the legacy state through the fallback path.
+        assert_eq!(client.get_user_volume(&user), 7_500);
+        let pre = client.get_user_record(&user);
+        assert_eq!(pre.accumulated_amount, 1_200);
+        assert_eq!(pre.volume, 7_500);
+
+        // Migrate: reports success, writes the packed record, drops the
+        // legacy keys.
+        assert!(client.migrate_user_record(&user));
+
+        env.as_contract(&contract_id, || {
+            let record_key = DataKey::UserRecord(user.clone());
+            assert!(env.storage().persistent().has(&record_key));
+            assert!(!env.storage().persistent().has(&spending_key));
+            assert!(!env.storage().persistent().has(&volume_key));
+        });
+
+        let post = client.get_user_record(&user);
+        assert_eq!(post.accumulated_amount, 1_200);
+        assert_eq!(post.volume, 7_500);
+        assert_eq!(post.last_reset_time, legacy_window_start);
+        assert_eq!(client.get_user_volume(&user), 7_500);
+
+        // Migrating again is a no-op.
+        assert!(!client.migrate_user_record(&user));
+
+        // And a fresh payment continues from the migrated record.
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&user, &10_000);
+        let recipient = Address::generate(&env);
+        client.route_payment(&user, &recipient, &token_address, &500);
+
+        let after = client.get_user_record(&user);
+        assert_eq!(after.accumulated_amount, 1_700);
+        assert_eq!(after.volume, 8_000);
+        assert_eq!(client.get_user_volume(&user), 8_000);
+    }
+
+    /// A payment routed by a sender that only has legacy entries transparently
+    /// upgrades them to the packed record (issue #663 migration path).
+    #[test]
+    fn test_route_payment_upgrades_legacy_entries_in_place() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Give the ledger a realistic timestamp so the legacy window start can
+        // be back-dated.
+        set_realistic_ledger_time(&env);
+
+        // Legacy state from before the upgrade.
+        let legacy_window_start = env.ledger().timestamp() - 60;
+        let spending_key = DataKey::UserSpending(sender.clone());
+        let volume_key = DataKey::UserVolume(sender.clone());
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(
+                &spending_key,
+                &pack_legacy_spending_for_test(&env, legacy_window_start, 4_000),
+            );
+            env.storage().persistent().set(&volume_key, &20_000i128);
+        });
+
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &50_000);
+
+        // No explicit migration needed: routing the payment combines the
+        // legacy entries into the packed record on its next write.
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+
+        env.as_contract(&contract_id, || {
+            let record_key = DataKey::UserRecord(sender.clone());
+            assert!(env.storage().persistent().has(&record_key));
+            assert!(!env.storage().persistent().has(&spending_key));
+            assert!(!env.storage().persistent().has(&volume_key));
+        });
+
+        let record = client.get_user_record(&sender);
+        assert_eq!(record.accumulated_amount, 5_000);
+        assert_eq!(record.volume, 21_000);
+        assert_eq!(client.get_user_volume(&sender), 21_000);
+    }
+
+    /// `migrate_user_record` is a safe no-op for unknown senders and for
+    /// senders that already have a packed record (issue #663).
+    #[test]
+    fn test_migrate_user_record_no_op_cases() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let unknown = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Unknown sender: nothing to migrate.
+        assert!(!client.migrate_user_record(&unknown));
+
+        // Sender with a packed record already: nothing to migrate.
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+        assert!(!client.migrate_user_record(&sender));
+
+        // State is untouched.
+        let record = client.get_user_record(&sender);
+        assert_eq!(record.volume, 1_000);
+        assert_eq!(record.accumulated_amount, 1_000);
+    }
+
     #[test]
     #[ignore]
     fn test_refund_ledger_and_withdrawal() {
@@ -5062,13 +6885,6 @@ mod test {
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
     }
-
-    // ── Token swaps: cross-contract DEX routing ──────────────────────────────
-    //
-    // Issue #665.  These tests drive `route_payment_with_swap` and
-    // `route_payments_with_swap` against a mock DEX that implements the
-    // adapter interface the router expects, and assert both the happy path
-    // and that every failure mode leaves the sender whole.
 
     /// Instance-storage keys for [`MockDex`].
     #[contracttype]
@@ -5682,6 +7498,677 @@ mod test {
         assert_eq!(amount_in, 10_000);
         assert_eq!(amount_out, 10_000);
         assert_eq!(min_amount_out, 1);
+    }
+    // ── Multi-signature (M-of-N) upgrade tests ───────────────────────────────
+    //
+    // Issue #664. The whole point of the feature is that no single key — the
+    // admin's included — can install new code, so the tests below are built
+    // around that invariant rather than around the happy path alone: for every
+    // M-of-N combination there is a case proving the (M-1)th signature is not
+    // enough and the Mth one is.
+
+    /// The smallest WASM module the Soroban host will accept as an installable
+    /// contract, so the success path of `upgrade` can be exercised without
+    /// building the real artifact first.
+    ///
+    /// The host refuses to swap a contract's executable unless the module both
+    /// parses and carries a `contractenvmetav0` custom section declaring the
+    /// host interface version it was built against, which is what this blob
+    /// assembles: the 8-byte module header, then one custom section. A custom
+    /// section is `id 0`, its byte length, then the section name as a
+    /// LEB128-prefixed string followed by the contents — here the XDR of
+    /// `SCEnvMetaEntry::SC_ENV_META_KIND_INTERFACE_VERSION(20 << 32 | 0)`,
+    /// which is a 4-byte union discriminant of 0 then the 8-byte big-endian
+    /// interface version. The host accepts contracts built for its own protocol
+    /// version or an older one, and released SDKs are pre-release 0, so this
+    /// stays installable across SDK upgrades.
+    const PLACEHOLDER_WASM: &[u8] = b"\0asm\x01\0\0\0\
+        \x00\x1e\
+        \x11contractenvmetav0\
+        \x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00";
+
+    /// A second, distinguishable copy of [`PLACEHOLDER_WASM`]: byte-for-byte
+    /// identical apart from one extra custom section, which the host ignores
+    /// but which makes the module hash differently. Used to prove that
+    /// approvals collected for one artifact do not carry over to another.
+    const PLACEHOLDER_WASM_ALT: &[u8] = b"\0asm\x01\0\0\0\
+        \x00\x1e\
+        \x11contractenvmetav0\
+        \x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00\
+        \x00\x03\x01t\xff";
+
+    /// Uploads [`PLACEHOLDER_WASM`] and returns the hash `upgrade` installs.
+    fn upload_placeholder_wasm(env: &Env) -> BytesN<32> {
+        env.deployer()
+            .upload_contract_wasm(Bytes::from_slice(env, PLACEHOLDER_WASM))
+    }
+
+    /// Same as [`upload_placeholder_wasm`], for [`PLACEHOLDER_WASM_ALT`].
+    fn upload_alt_placeholder_wasm(env: &Env) -> BytesN<32> {
+        env.deployer()
+            .upload_contract_wasm(Bytes::from_slice(env, PLACEHOLDER_WASM_ALT))
+    }
+
+    /// Reports whether the contract still holds `key` in persistent storage.
+    ///
+    /// The upgrade tests deliberately install a placeholder program that
+    /// exports nothing, so once a swap lands the contract can no longer answer
+    /// its own queries. Reading the ledger directly is the only remaining way
+    /// to observe the state a swap left behind.
+    fn contract_still_stores(env: &Env, contract: &Address, key: &DataKey) -> bool {
+        env.as_contract(contract, || env.storage().persistent().has(key))
+    }
+
+    /// Returns `n` fresh signer addresses.
+    fn signers(env: &Env, n: usize) -> Vec<Address> {
+        let mut out = Vec::new(env);
+        for _ in 0..n {
+            out.push_back(Address::generate(env));
+        }
+        out
+    }
+
+    /// Advances the test ledger past the 24-hour timelock delay.
+    fn advance_past_timelock(env: &Env) {
+        let current_time = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: current_time + PaymentRouter::SECONDS_IN_24H + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+    }
+
+    /// Asserts the approvals recorded for `hash` are exactly `expected`, in
+    /// order. Soroban's `Vec` cannot be compared against a slice, so this
+    /// compares length and then element by element.
+    fn assert_approvals(
+        client: &PaymentRouterClient<'static>,
+        hash: &BytesN<32>,
+        expected: &Vec<Address>,
+    ) {
+        let actual = client.get_upgrade_approvals(hash);
+        assert_eq!(actual.len(), expected.len(), "approval count mismatch");
+        for i in 0..expected.len() {
+            assert_eq!(actual.get(i), expected.get(i));
+        }
+    }
+
+    /// Boots an initialized router with a configured M-of-N admin group and a
+    /// WASM hash ready to be approved. Returns the env, client, admin, the
+    /// signer set and the candidate WASM hash.
+    fn setup_multisig(
+        signer_count: usize,
+        threshold: u32,
+    ) -> (
+        Env,
+        PaymentRouterClient<'static>,
+        Address,
+        Vec<Address>,
+        BytesN<32>,
+    ) {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let signers = signers(&env, signer_count);
+        client.set_multisig_config(&signers, &threshold);
+        let new_wasm_hash = upload_placeholder_wasm(&env);
+
+        (env, client, admin, signers, new_wasm_hash)
+    }
+
+    #[test]
+    fn test_upgrades_fail_closed_before_a_group_is_configured() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let hash = upload_placeholder_wasm(&env);
+        let signer = Address::generate(&env);
+
+        // There is deliberately no fallback to the single admin key here: a
+        // deployment that has not configured a group cannot be upgraded at all
+        // rather than falling back to the key this feature de-risks.
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::MultisigNotInitialized
+        );
+        assert_eq!(
+            client
+                .try_approve_upgrade(&signer, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::MultisigNotInitialized
+        );
+        assert_eq!(
+            client.try_get_multisig_config().unwrap_err().unwrap(),
+            Error::MultisigNotInitialized
+        );
+        assert_eq!(
+            client
+                .try_is_upgrade_authorized(&hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::MultisigNotInitialized
+        );
+    }
+
+    #[test]
+    fn test_set_multisig_config_round_trips() {
+        let (_env, client, _, _, _) = setup_multisig(5, 3);
+
+        let config = client.get_multisig_config();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.signers.len(), 5);
+    }
+
+    #[test]
+    fn test_set_multisig_config_rejects_unsafe_configurations() {
+        let (env, client, _, signers, _) = setup_multisig(3, 2);
+
+        // An empty group could never authorize anything.
+        assert_eq!(
+            client
+                .try_set_multisig_config(&Vec::new(&env), &1)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        // A zero threshold would make the M-of-N gate vacuous.
+        assert_eq!(
+            client
+                .try_set_multisig_config(&signers, &0)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        // A threshold above the signer count could never be reached.
+        assert_eq!(
+            client
+                .try_set_multisig_config(&signers, &4)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        // Duplicates would let one key pad the effective signer count.
+        let dupes = Vec::from_slice(&env, &[signers.get(0).unwrap(), signers.get(0).unwrap()]);
+        assert_eq!(
+            client
+                .try_set_multisig_config(&dupes, &2)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidMultisigConfig
+        );
+
+        // The rejected attempts left the working configuration untouched.
+        assert_eq!(client.get_multisig_config().threshold, 2);
+    }
+
+    #[test]
+    fn test_setting_the_group_requires_the_admin_signature() {
+        let (env, client, admin, _, _) = setup_multisig(3, 2);
+
+        client.set_multisig_config(&signers(&env, 4), &3);
+
+        // `auths()` reports the most recent invocation only, so this is the
+        // signature `set_multisig_config` itself demanded.
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths.first().map(|(addr, _)| addr.clone()), Some(admin));
+    }
+
+    #[test]
+    fn test_admin_alone_cannot_upgrade_the_contract() {
+        // The headline regression test for #664: the admin used to hold the
+        // only key that could install new code. With a 3-of-5 group its
+        // signature is not one of the three.
+        let (_env, client, _admin, _signers, hash) = setup_multisig(5, 3);
+
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_two_of_three_needs_two_signatures_not_one() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+        assert!(!client.is_upgrade_authorized(&hash));
+
+        // One signature short of the threshold.
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // The second distinct signature crosses it.
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_unanimous_two_of_two_rejects_a_single_signature() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(2, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_unanimous_three_of_three_rejects_two_signatures() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 3);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        client.approve_upgrade(&signers.get(2).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_signers_beyond_the_threshold_may_still_approve() {
+        // 3-of-5: the quorum is met after three signatures, and the remaining
+        // two are still legitimate group members rather than being rejected.
+        let (_env, client, _admin, signers, hash) = setup_multisig(5, 3);
+
+        let mut all = Vec::new(&client.env);
+        for i in 0..5u32 {
+            all.push_back(signers.get(i).unwrap());
+        }
+
+        for i in 0..5u32 {
+            client.approve_upgrade(&signers.get(i).unwrap(), &hash);
+        }
+
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 5);
+        assert!(client.is_upgrade_authorized(&hash));
+        assert_approvals(&client, &hash, &all);
+
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_one_of_one_threshold_allows_a_single_signer() {
+        // The degenerate configuration still works, so a solo deployment can
+        // use the same code path rather than needing a special case.
+        let (_env, client, _admin, signers, hash) = setup_multisig(1, 1);
+
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_outsiders_cannot_approve() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+        let outsider = Address::generate(&client.env);
+
+        assert_eq!(
+            client
+                .try_approve_upgrade(&outsider, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::NotMultisigSigner
+        );
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // The group members are unaffected by the rejected attempt.
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+    }
+
+    #[test]
+    fn test_approving_twice_cannot_inflate_the_quorum() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+        let first = signers.get(0).unwrap();
+
+        client.approve_upgrade(&first, &hash);
+        // A replayed signature is an error, never a second vote.
+        assert_eq!(
+            client
+                .try_approve_upgrade(&first, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::AlreadyApproved
+        );
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_approvals_are_scoped_to_one_wasm_hash() {
+        // Signatures authorize a specific artifact, so they must not carry over
+        // to a different one.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+        let other_hash = upload_alt_placeholder_wasm(&env);
+        assert_ne!(hash, other_hash);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+
+        assert!(client.is_upgrade_authorized(&hash));
+        assert_eq!(client.get_upgrade_approvals(&other_hash).len(), 0);
+        assert!(!client.is_upgrade_authorized(&other_hash));
+        assert_eq!(
+            client.try_upgrade(&other_hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_upgrade_consumes_the_approvals_that_authorized_it() {
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(contract_still_stores(
+            &env,
+            &client.address,
+            &DataKey::UpgradeApproval(hash.clone())
+        ));
+
+        client.upgrade(&hash);
+
+        // The quorum that authorized the swap is spent, so replaying the same
+        // hash needs a fresh round of signatures rather than reusing the old
+        // one. The placeholder program installed above exports nothing, so the
+        // cleared record is read straight off the ledger.
+        assert!(
+            !contract_still_stores(&env, &client.address, &DataKey::UpgradeApproval(hash)),
+            "the approvals that authorized an upgrade must not survive it"
+        );
+    }
+
+    #[test]
+    fn test_revoking_an_approval_drops_the_group_back_below_threshold() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+
+        client.revoke_upgrade_approval(&signers.get(1).unwrap(), &hash);
+
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_approvals(
+            &client,
+            &hash,
+            &Vec::from_slice(&client.env, &[signers.get(0).unwrap()]),
+        );
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // A signer that pulled its approval can put it back.
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+    }
+
+    #[test]
+    fn test_revoking_without_a_recorded_approval_is_a_no_op() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.revoke_upgrade_approval(&signers.get(0).unwrap(), &hash);
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.revoke_upgrade_approval(&signers.get(0).unwrap(), &hash);
+        // Revoking the last approval clears the entry entirely.
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+    }
+
+    #[test]
+    fn test_admin_can_cancel_pending_upgrade_approvals() {
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+
+        client.cancel_upgrade(&hash);
+
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_rotating_the_group_stops_removed_signers_from_approving() {
+        let (env, client, _admin, old_signers, hash) = setup_multisig(3, 2);
+
+        let dropped = old_signers.get(2).unwrap();
+        let newcomer = Address::generate(&env);
+        let kept = old_signers.get(0).unwrap();
+
+        // 2-of-2 over the retained signer plus a newcomer.
+        let rotated = Vec::from_slice(&env, &[kept.clone(), newcomer.clone()]);
+        client.set_multisig_config(&rotated, &2);
+
+        assert_eq!(client.get_multisig_config().signers.len(), 2);
+        assert_eq!(
+            client
+                .try_approve_upgrade(&dropped, &hash)
+                .unwrap_err()
+                .unwrap(),
+            Error::NotMultisigSigner
+        );
+
+        // The retained signer carries over; the newcomer starts clean.
+        client.approve_upgrade(&kept, &hash);
+        assert_approvals(&client, &hash, &Vec::from_slice(&env, &[kept]));
+        assert!(!client.is_upgrade_authorized(&hash));
+        client.approve_upgrade(&newcomer, &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_raising_the_threshold_revalidates_in_flight_approvals() {
+        // Two signatures against a 2-of-3 group are enough, but the admin
+        // tightening the group to 3-of-3 must invalidate the collected quorum.
+        let (_env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+
+        client.set_multisig_config(&signers, &3);
+
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        client.approve_upgrade(&signers.get(2).unwrap(), &hash);
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_rotating_out_a_signer_voids_the_approval_it_already_cast() {
+        // The dangerous shape: a lone approval meets a *lower* threshold after
+        // the group is rotated. If rotation left the stale vote counting, the
+        // one removed key would authorize an upgrade by itself.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        let removed = signers.get(0).unwrap();
+        client.approve_upgrade(&removed, &hash);
+        assert!(!client.is_upgrade_authorized(&hash));
+
+        // Drop the signer that approved and lower the threshold to 1, so the
+        // stored approval alone would clear the bar if it still counted.
+        let kept: Vec<Address> =
+            Vec::from_slice(&env, &[signers.get(1).unwrap(), signers.get(2).unwrap()]);
+        client.set_multisig_config(&kept, &1);
+
+        assert!(!client.is_upgrade_authorized(&hash));
+        assert_eq!(client.get_upgrade_approvals(&hash).len(), 0);
+        assert_eq!(
+            client.try_upgrade(&hash).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        // The new group's own member can authorize normally.
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        assert!(client.is_upgrade_authorized(&hash));
+        client.upgrade(&hash);
+    }
+
+    #[test]
+    fn test_approving_an_upgrade_records_the_signers_own_signature() {
+        let (env, client, _, signers, hash) = setup_multisig(3, 2);
+        let signer = signers.get(0).unwrap();
+
+        client.approve_upgrade(&signer, &hash);
+
+        // Proves the contract demands a signature from the address it was told
+        // is approving, rather than trusting the caller's word.
+        let auths = env.auths();
+        assert!(
+            auths.iter().any(|(addr, _)| *addr == signer),
+            "approve_upgrade must require the approving signer to authorize"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_needs_no_signature_once_the_quorum_is_reached() {
+        // The M collected signatures are the whole authorization, so the
+        // installing transaction must not silently demand a seventh key.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        client.upgrade(&hash);
+
+        // `auths()` reports the most recent invocation only: the swap itself
+        // demanded no authorization at all.
+        assert!(
+            env.auths().is_empty(),
+            "upgrade must not require any authorization once the quorum is reached"
+        );
+    }
+
+    #[test]
+    fn test_timelock_upgrade_also_requires_the_multisig_threshold() {
+        // Queueing an upgrade and waiting out the delay must not be a way
+        // around the M-of-N gate.
+        let (env, client, _admin, _signers, hash) = setup_multisig(3, 2);
+
+        let nonce = client.queue_action(&ActionType::Upgrade(hash.clone()));
+        advance_past_timelock(&env);
+
+        assert_eq!(
+            client.try_execute_action(&nonce).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+    }
+
+    #[test]
+    fn test_timelock_upgrade_entry_survives_a_rejected_multisig_check() {
+        // Validation runs before the entry is consumed, so an upgrade that is
+        // not yet authorized stays in the queue instead of being burned.
+        let (env, client, _admin, signers, hash) = setup_multisig(3, 2);
+
+        let nonce = client.queue_action(&ActionType::Upgrade(hash.clone()));
+        advance_past_timelock(&env);
+        assert_eq!(
+            client.try_execute_action(&nonce).unwrap_err().unwrap(),
+            Error::InsufficientApprovals
+        );
+
+        assert_eq!(
+            client.get_queued_action(&nonce).action,
+            ActionType::Upgrade(hash.clone())
+        );
+
+        // Once the group signs off, the same entry executes unchanged.
+        client.approve_upgrade(&signers.get(0).unwrap(), &hash);
+        client.approve_upgrade(&signers.get(1).unwrap(), &hash);
+        client.execute_action(&nonce);
+
+        // Execution consumed the entry and, with it, the quorum that unlocked
+        // the swap. The placeholder program installed by the swap exports
+        // nothing, so both facts are read straight off the ledger.
+        assert!(
+            !contract_still_stores(&env, &client.address, &DataKey::TimelockEntry(nonce)),
+            "a successfully executed entry must not be left in the queue"
+        );
+        assert!(
+            !contract_still_stores(&env, &client.address, &DataKey::UpgradeApproval(hash)),
+            "the approvals that authorized the upgrade must not survive it"
+        );
+    }
+
+    #[test]
+    fn test_timelock_set_multisig_config_is_validated_when_it_executes() {
+        // An invalid rotation queued today must not be applied in 24 hours, and
+        // must not consume the queue slot either.
+        let (env, client, _admin, signers, _) = setup_multisig(3, 2);
+
+        let bad = client.queue_action(&ActionType::SetMultisigConfig(signers.clone(), 9));
+        advance_past_timelock(&env);
+
+        assert_eq!(
+            client.try_execute_action(&bad).unwrap_err().unwrap(),
+            Error::InvalidMultisigConfig
+        );
+        assert_eq!(client.get_multisig_config().threshold, 2);
+    }
+
+    #[test]
+    fn test_timelock_set_multisig_config_applies_after_the_delay() {
+        let (env, client, _admin, old_signers, _) = setup_multisig(3, 2);
+
+        let new_signers = signers(&env, 4);
+        let nonce = client.queue_action(&ActionType::SetMultisigConfig(new_signers.clone(), 3));
+        advance_past_timelock(&env);
+        client.execute_action(&nonce);
+
+        let config = client.get_multisig_config();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.signers.len(), 4);
+        // The old set no longer counts.
+        assert_eq!(
+            client
+                .try_approve_upgrade(&old_signers.get(0).unwrap(), &upload_placeholder_wasm(&env))
+                .unwrap_err()
+                .unwrap(),
+            Error::NotMultisigSigner
+        );
     }
 }
 
