@@ -1098,15 +1098,10 @@ app.use("/api/v1", v1Router);
 // brute-force targets, so they get a much tighter budget than the global
 // limiter. Uses the same Redis-backed store so the limit is shared across
 // all distributed nodes.
-const authLimiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  prefix: "auth-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
+const authLimiter = createTokenBucketLimiter(redisClient, {
+  capacity: 20,
+  refillRate: 20 / (15 * 60), // 20 requests per 15 minutes
+  prefix: 'auth-rl:',
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });

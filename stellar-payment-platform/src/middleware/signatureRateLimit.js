@@ -11,6 +11,7 @@ const createSignatureRateLimiter = (redisClient) =>
     capacity: MAX_REQUESTS,
     refillRate: REFILL_RATE,
     prefix: 'sig-rl:',
+    failClosedOnRedisError: true,
     keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   });
 
