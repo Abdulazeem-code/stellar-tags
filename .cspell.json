@@ -90,6 +90,10 @@
     "mtls",
     "MTLS",
     "POSIX",
-    "ZIPKIN"
+    "ZIPKIN",
+    "SOROSWAP",
+    "soroswap",
+    "COOLDOWN",
+    "cooldown"
   ]
 }

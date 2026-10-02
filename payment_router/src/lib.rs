@@ -387,7 +387,6 @@ impl PaymentRouter {
     const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
     const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
 
-
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn set_role_internal(env: &Env, role: Role, account: &Address) {
@@ -2153,8 +2152,7 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
-        env.events()
-            .publish((symbol_short!("price_cfg"),), oracle);
+        env.events().publish((symbol_short!("price_cfg"),), oracle);
         Ok(())
     }
 
@@ -2306,8 +2304,7 @@ impl PaymentRouter {
         quote_asset: Address,
     ) -> Result<PriceData, Error> {
         // Retrieve the oracle address, falling back gracefully if absent.
-        let oracle_opt: Option<Address> =
-            env.storage().instance().get(&DataKey::OracleAddress);
+        let oracle_opt: Option<Address> = env.storage().instance().get(&DataKey::OracleAddress);
 
         let staleness_threshold: u64 = env
             .storage()
@@ -2322,10 +2319,7 @@ impl PaymentRouter {
                 if let Some(fallback) = env
                     .storage()
                     .persistent()
-                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(
-                        base.clone(),
-                        quote.clone(),
-                    ))
+                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(base.clone(), quote.clone()))
                 {
                     log!(env, "Oracle error; using fallback price");
                     Ok(fallback)
@@ -2338,7 +2332,12 @@ impl PaymentRouter {
         let oracle = match oracle_opt {
             Some(addr) => addr,
             None => {
-                return fallback_or_err(&env, &base_asset, &quote_asset, Error::OracleNotConfigured);
+                return fallback_or_err(
+                    &env,
+                    &base_asset,
+                    &quote_asset,
+                    Error::OracleNotConfigured,
+                );
             }
         };
 
@@ -3274,7 +3273,15 @@ mod test {
         let oracle_client = MockPriceFeedOracleClient::new(&env, &oracle_id);
         let base = Address::generate(&env);
         let quote = Address::generate(&env);
-        (env, client, contract_id, oracle_client, oracle_id, base, quote)
+        (
+            env,
+            client,
+            contract_id,
+            oracle_client,
+            oracle_id,
+            base,
+            quote,
+        )
     }
 
     // ── Oracle tests ─────────────────────────────────────────────────────────

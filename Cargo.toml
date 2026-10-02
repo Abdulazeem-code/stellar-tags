@@ -11,6 +11,9 @@ members = [
     "pausable_token",
     "payment_proxy",
 ]
+exclude = [
+    "payment_router/fuzz"
+]
 
 # Edition 2021 members require resolver v2.
 resolver = "2"
