@@ -20,7 +20,7 @@ impl AdvancedFeature35Contract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{Env, symbol_short};
+    use soroban_sdk::{symbol_short, Env};
 
     #[test]
     fn test_hello() {
