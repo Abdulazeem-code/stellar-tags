@@ -13,6 +13,9 @@ jest.mock('pdfkit', () => jest.fn());
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+jest.mock('./src/graphql', () => ({
+  createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+}));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock the module so the
 // test suite can require server.js without a transform error.
