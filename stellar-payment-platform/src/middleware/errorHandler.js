@@ -129,10 +129,11 @@ const buildErrorHandler = (isPrismaConnectionError) =>
 
     if (statusCode >= 500) {
       const referenceId = crypto.randomUUID();
-      if (req.log) {
-        req.log.error({ err, referenceId }, `[Error ID: ${referenceId}]`);
+      const logMsg = `[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`;
+      if (req.log && typeof req.log.error === 'function') {
+        req.log.error(logMsg, err);
       } else {
-        logger.error({ err, referenceId }, `[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`);
+        logger.error(logMsg, err);
       }
 
       // Programmer errors (isOperational === false or unknown unexpected errors)

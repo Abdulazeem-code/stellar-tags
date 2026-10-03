@@ -13,7 +13,6 @@ jest.mock('pdfkit', () => jest.fn());
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
 jest.mock('./src/graphql', () => ({
   createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
 }));

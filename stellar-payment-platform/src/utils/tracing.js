@@ -6,8 +6,15 @@ const { ZipkinExporter } = require('@opentelemetry/exporter-zipkin');
 const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
 const { PrismaInstrumentation } = require('@prisma/instrumentation');
 
-const serviceName = process.env.OTEL_SERVICE_NAME || 'stellar-tags-api';
-process.env.OTEL_SERVICE_NAME = serviceName; // Let OpenTelemetry auto-detect it
+if (process.env.NODE_ENV === 'test') {
+  module.exports = {
+    sdk: null,
+    sdkStarted: Promise.resolve(),
+    shutdownTracing: () => Promise.resolve(),
+  };
+} else {
+  const serviceName = process.env.OTEL_SERVICE_NAME || 'stellar-tags-api';
+  process.env.OTEL_SERVICE_NAME = serviceName; // Let OpenTelemetry auto-detect it
 
   const exporterName = (process.env.OTEL_TRACES_EXPORTER || 'otlp').toLowerCase();
   const traceExporter = exporterName === 'none'
@@ -29,20 +36,20 @@ process.env.OTEL_SERVICE_NAME = serviceName; // Let OpenTelemetry auto-detect it
             : undefined,
         });
 
-const sdk = new NodeSDK({
-  ...(traceExporter ? { traceExporter } : {}),
-  instrumentations: [
-    getNodeAutoInstrumentations({
-      // Capture incoming/outgoing HTTP, Express, PostgreSQL, Redis and ioredis.
-      '@opentelemetry/instrumentation-express': { enabled: true },
-      '@opentelemetry/instrumentation-http': { enabled: true },
-      '@opentelemetry/instrumentation-pg': { enabled: true },
-      '@opentelemetry/instrumentation-ioredis': { enabled: true },
-      '@opentelemetry/instrumentation-redis-4': { enabled: true },
-    }),
-    new PrismaInstrumentation(),
-  ],
-});
+  const sdk = new NodeSDK({
+    ...(traceExporter ? { traceExporter } : {}),
+    instrumentations: [
+      getNodeAutoInstrumentations({
+        // Capture incoming/outgoing HTTP, Express, PostgreSQL, Redis and ioredis.
+        '@opentelemetry/instrumentation-express': { enabled: true },
+        '@opentelemetry/instrumentation-http': { enabled: true },
+        '@opentelemetry/instrumentation-pg': { enabled: true },
+        '@opentelemetry/instrumentation-ioredis': { enabled: true },
+        '@opentelemetry/instrumentation-redis-4': { enabled: true },
+      }),
+      new PrismaInstrumentation(),
+    ],
+  });
 
   const sdkStarted = sdk.start();
 
