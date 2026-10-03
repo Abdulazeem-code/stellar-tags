@@ -616,7 +616,7 @@ impl<'a> ReentrancyGuard<'a> {
     }
 }
 
-impl<'a> Drop for ReentrancyGuard<'a> {
+impl Drop for ReentrancyGuard<'_> {
     fn drop(&mut self) {
         self.env
             .storage()
@@ -633,7 +633,7 @@ impl PaymentRouter {
     const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
     const VOLUME_THRESHOLD: i128 = 10_000 * Self::XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
     const SECONDS_IN_24H: u64 = 24 * 3600;
-    const VERSION: u32 = 1;
+    const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     /// Default ceiling on how far a swap may move against the caller's quote:
     /// 1 000 bps = 10%.  Applied only when the caller supplies an
@@ -4195,13 +4195,15 @@ impl PaymentRouter {
 
     /// Returns the contract version.
     ///
-    /// # Returns
-    /// The contract's version number, currently `1`.
+    /// This is a read-only view function: it does not write to ledger storage
+    /// and costs only the base invocation fee.  The UI calls this before
+    /// submitting transactions to confirm it is compatible with the deployed
+    /// contract.
     ///
-    /// # Panics
-    /// Does not panic.
-    pub fn version(_env: Env) -> u32 {
-        Self::VERSION
+    /// # Returns
+    /// A [`String`] in the form `"MAJOR.MINOR.PATCH"` (e.g. `"1.0.0"`).
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, Self::CONTRACT_VERSION)
     }
 }
 
@@ -4385,7 +4387,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger as _, LedgerInfo},
         token::StellarAssetClient,
-        Address, Bytes, Env, Symbol, TryIntoVal,
+        Address, Env, Symbol, TryIntoVal,
     };
 
     #[contracttype]
@@ -5427,17 +5429,6 @@ mod test {
         // Update via set_fee_config
         client.set_fee_config(&300, &10000);
         assert_eq!(client.get_fee(), 300);
-    }
-
-    #[test]
-    fn test_version_reports_contract_version() {
-        let (_env, client, _) = setup_env();
-
-        // #269 — the version view is callable without initialization and
-        // returns the compiled-in contract version so a UI can check
-        // compatibility before interacting with the contract.
-        assert_eq!(client.version(), PaymentRouter::VERSION);
-        assert_eq!(client.version(), 1);
     }
 
     #[test]
@@ -7553,27 +7544,6 @@ mod test {
     // M-of-N combination there is a case proving the (M-1)th signature is not
     // enough and the Mth one is.
 
-    /// The smallest WASM module the Soroban host will accept as an installable
-    /// contract, so the success path of `upgrade` can be exercised without
-    /// building the real artifact first.
-    ///
-    /// This is a read-only view function: it does not write to ledger storage
-    /// and costs only the base invocation fee.  The UI calls this before
-    /// submitting transactions to confirm it is compatible with the deployed
-    /// contract.
-    ///
-    /// # Returns
-    /// A [`String`] in the form `"MAJOR.MINOR.PATCH"` (e.g. `"1.0.0"`).
-    pub fn version(env: Env) -> String {
-        String::from_str(&env, CONTRACT_VERSION)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::Env;
-
     /// Verifies that `version()` returns the expected version string and that
     /// the returned value matches the compile-time `CONTRACT_VERSION` constant,
     /// so the two can never drift apart.
@@ -7584,7 +7554,7 @@ mod test {
         let client = PaymentRouterClient::new(&env, &contract_id);
 
         let returned = client.version();
-        let expected = String::from_str(&env, CONTRACT_VERSION);
+        let expected = String::from_str(&env, PaymentRouter::CONTRACT_VERSION);
 
         assert_eq!(returned, expected);
     }
