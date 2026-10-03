@@ -218,28 +218,34 @@ cd payment_router
 cargo build
 ```
 
-### Token swaps (cross-contract DEX routing)
+### ZK anonymous tag routing (issue #668)
 
-A sender can pay in any token they hold and have it swapped into the merchant's
-preferred token during routing. The swap is a cross-contract call into a
-registered DEX adapter, runs inside the same Soroban transaction as the
-transfer, and reverts as a whole if anything goes wrong: the fee, the payment,
-and the state changes are all rolled back together.
+The `zk_payment/` crate is a standalone Soroban contract (SDK 27) that verifies
+a Groth16/BLS12-381 proof before recording a private payment, using only a
+commitment and a one-time nullifier as public inputs. The research spike is in
+[docs/research-zk-anonymous-routing.md](docs/research-zk-anonymous-routing.md)
+and the contract/circuit usage guide is in
+[docs/zk-private-payments.md](docs/zk-private-payments.md).
 
-```text
-route_payment_with_swap   one swap-routed payment
-route_payments_with_swap  a batch, reverted atomically if any leg fails
-quote_swap                price a swap and derive a slippage floor
+```bash
+cd zk_payment
+cargo test
 ```
 
-Slippage is enforced twice: a per-payment `min_amount_out` floor, and a
-contract-level `max_slippage_bps` ceiling against the caller's own quote. Both
-are checked against the tokens the router actually receives, not the number the
-DEX reports. Only DEXes the admin registers through the 24-hour timelock can be
-called.
+The checked-in setup is for tests only and is not safe for real funds; see the
+research document's limitations section.
 
-See [docs/dex-token-swaps.md](docs/dex-token-swaps.md) for the adapter
-interface, the full call list, and an end-to-end example.
+### Contract storage benchmarks (issue #663)
+
+Per-user tag registration writes a single packed `UserRecord` ledger entry
+(24-hour spending window + lifetime volume in one `BytesN<40>`) instead of the
+legacy two-entry `UserSpending` + `UserVolume` split. The benchmark tests fail
+CI if the registration write path ever costs more than 80% of the legacy path:
+
+```bash
+cd payment_router
+cargo test benchmark -- --nocapture
+```
 
 ### Contract TypeScript bindings
 
@@ -751,12 +757,57 @@ The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts
 # Deploy to mainnet
 ./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
 
-# Upgrade an existing contract to newly compiled WASM
-./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S...
-
 # Compile and optimize WASM only
 ./scripts/deploy_contract.sh build
 ```
+
+### Multisig Contract Upgrades
+
+A contract's WASM can only be replaced by an **M-of-N signer group** — no single key, not even the admin, can upgrade it on its own. A contract with no group configured is permanently frozen against upgrades, which is deliberate: an unconfigured deployment fails closed rather than falling back to the admin.
+
+An upgrade proceeds in two steps:
+
+1. **Collect M approvals.** Each signer records their own signature against one exact WASM hash via `approve_upgrade`. Approvals are bound to that artifact, so a different build starts from zero.
+2. **Install.** Once M of the N signers have approved, *anyone* can call `upgrade` with the hash to install it. No further signature is needed at this step, and the approvals are consumed so they cannot be replayed.
+
+```bash
+# Configure a 2-of-3 upgrade group (the admin must sign this once)
+./scripts/deploy_contract.sh set-multisig --contract-id C... --network testnet --source S... \
+  --signer G1...:S1... --signer G2...:S2... --signer G3...:S3... --threshold 2
+
+# Upload new WASM, collect 2 approvals, and install it
+./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S... \
+  --signer G1...:S1... --signer G2...:S2...
+```
+
+When signers coordinate separately, each one can approve on its own and whoever collects the last required signature runs the upgrade:
+
+```bash
+# Each signer runs this for the same hash
+./scripts/deploy_contract.sh approve --contract-id C... --network testnet \
+  --signer G1...:S1... --new-wasm-hash <HASH>
+
+# Then, once the threshold is met
+./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S... \
+  --signer G1...:S1... --signer G2...:S2...
+```
+
+A signer can withdraw their approval before the upgrade lands, and the admin can cancel pending approvals for a hash. Changing the group re-validates approvals already collected against the new threshold.
+
+Rotating the group is a normal admin action, and like other admin powers it can be routed through the timelock (`ActionType::SetMultisigConfig`) so that group changes take effect after a delay instead of instantly.
+
+### Contract Interface for Upgrades
+
+| Function | Purpose |
+| --- | --- |
+| `set_multisig_config(signers, threshold)` | Configure the M-of-N group (admin-gated, or timelocked). |
+| `get_multisig_config() -> MultisigConfig` | Read the current signers and threshold. |
+| `approve_upgrade(signer, new_wasm_hash)` | Record one signer approval for an exact WASM hash. |
+| `revoke_upgrade_approval(signer, new_wasm_hash)` | Withdraw a recorded approval. |
+| `cancel_upgrade(new_wasm_hash)` | Discard all pending approvals for a hash (admin). |
+| `get_upgrade_approvals(new_wasm_hash) -> Vec<Address>` | List who has approved a hash. |
+| `is_upgrade_authorized(new_wasm_hash) -> bool` | Check whether a hash has reached its threshold. |
+| `upgrade(new_wasm_hash)` | Install a hash once its threshold is met. |
 
 ### Automation & Config Updates
 

@@ -37,3 +37,6 @@ stellar-payment-platform@1.0.0
 # Soroban test snapshots
 test_snapshots/
 .kiro/ 
+
+# Rust / Soroban build artifacts
+target/

@@ -92,9 +92,25 @@
     "MTLS",
     "POSIX",
     "ZIPKIN",
+    "MiMC",
+    "COOLDOWN",
+    "SOROSWAP",
     "CQRS",
     "XADD",
-    "COOLDOWN",
-    "SOROSWAP"
+    "XREADGROUP",
+    "XTRIM",
+    "axelar",
+    "AXELAR",
+    "alloc",
+    "GDEST",
+    "CTOKEN",
+    "GABC",
+    "GXYZ",
+    "webauthn",
+    "WEBAUTHN",
+    "timelock",
+    "bdff",
+    "TWAP",
+    "twap"
   ]
 }
