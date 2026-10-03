@@ -18,6 +18,7 @@ const { createGraphQLMiddleware } = require("./src/graphql");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
+const { scheduleReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
 const { correlationId } = require("./middleware/correlation");
 const { idempotencyMiddleware } = require("./middleware/idempotency");
@@ -354,6 +355,7 @@ app.use("/graphql", graphQLMiddleware);
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
+scheduleReconciliationJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
 // RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
