@@ -11,8 +11,16 @@ members = [
     "payment_router",
     "pausable_token",
     "payment_proxy",
-    "timelock_escrow", "advanced_feature_35",
+    "timelock_escrow",
+    "advanced_feature_35",
+    "twap_oracle",
 ]
+
+# yield_escrow owns its own `[patch.crates-io]` / `[profile.release]` sections
+# (it needs the same vendored ethnum pin as payment_router), which cargo only
+# honours in a workspace root.  It is therefore excluded here and built by the
+# dedicated "Yield Escrow Build & Test" job in .github/workflows/soroban.yml.
+exclude = ["yield_escrow"]
 
 # Edition 2021 members require resolver v2.
 resolver = "2"

@@ -22,10 +22,14 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
-  MAX_USERNAMES_PER_ADDRESS,
+MAX_USERNAMES_PER_ADDRESS,
   PRIMARY_USERNAME_ORDER,
   shouldFallbackToLocalRegistry,
+  RESERVED_USERNAMES,
 } = require("../../utils");
+const Filter = require('bad-words');
+const profanityFilter = new Filter();
+const { verifyFreighterRegistrationSignature } = require('../../services/signatureService');
 const { validateSchema } = require("../../middleware/validateSchema");
 const { ApiError } = require("../../errors");
 const { requireJson } = require("../../middleware/requireJson");
@@ -45,6 +49,8 @@ const {
   usersQuerySchema,
   activityQuerySchema,
 } = require("../../schemas");
+
+
 
 const router = express.Router();
 
@@ -121,7 +127,7 @@ const registerLocalUser = async ({ username, address }) => {
     throw conflictError;
   }
 
-  const existingByUsername = await getLocalUserByUsername(username);
+const existingByUsername = await getLocalUserByUsername(username);
   if (existingByUsername) {
     const conflictError = new Error(
       "Username is already taken. Please choose another.",
@@ -182,6 +188,12 @@ router.post(
       );
     }
 
+    const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
+
+    if (profanityFilter.isProfane(usernameLocalPart)) {
+      return next(new ApiError('INVALID_INPUT', 'Username contains restricted words'));
+    }
+
     const BLOCKED_EXCHANGES = [
       "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
       "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
@@ -209,11 +221,17 @@ router.post(
       );
     }
 
-    if (!StrKey.isValidEd25519PublicKey(address)) {
+if (!StrKey.isValidEd25519PublicKey(address)) {
       const error = new Error("Invalid Stellar Public Key format.");
       error.statusCode = 400;
       return next(error);
     }
+  const normalizedUsername = username.toLowerCase();
+  
+  const normalizedLocalPart = normalizedUsername.includes('*') ? normalizedUsername.split('*')[0] : normalizedUsername;
+  if (RESERVED_USERNAMES.includes(normalizedLocalPart)) {
+    return res.status(403).json({ error: "Username is reserved." });
+  }
 
     const memoError = validateMemo(memoType, memo);
     if (memoError) {
@@ -231,7 +249,7 @@ router.post(
       );
     }
 
-    try {
+try {
       // #613 — an address may carry several usernames (aliases). Registration
       // adds another while the address is under the cap; the first username
       // registered for an address becomes its primary.
@@ -239,13 +257,52 @@ router.post(
         where: { address, deletedAt: null },
       });
 
-      if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
+if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
         return next(
           new ApiError(
             "CONFLICT",
             `This address already has the maximum of ${MAX_USERNAMES_PER_ADDRESS} federation usernames.`,
           ),
         );
+      }
+        if (!verificationResult.success) {
+          const verificationError = new Error(
+            verificationResult.errorMessage || 'Signature verification failed'
+          );
+          verificationError.statusCode = 401;
+          throw verificationError;
+        }
+      } else {
+        const claimedSigner = verifyFreighterRegistrationSignature({
+          username: req.body.username,
+          address: req.body.address,
+          signature,
+          signerAddress,
+        });
+
+        verificationResult = {
+          success: true,
+          accountId: claimedSigner,
+          operationType: 'message',
+          requiredThreshold: 1,
+          totalWeight: 1,
+          signatureCount: 1,
+          uniqueSignerCount: 1,
+          signatures: [
+            {
+              publicKey: claimedSigner,
+              weight: 1,
+              isValid: true,
+            },
+          ],
+          thresholds: {
+            low_threshold: 1,
+            med_threshold: 1,
+            high_threshold: 1,
+          },
+          signerCount: 1,
+          errorMessage: null,
+        };
       }
       const isPrimary = usernameCount === 0;
 
@@ -320,19 +377,43 @@ router.post(
         );
       }
 
-      if (error.message && error.message.includes("Account not found")) {
-        const notFoundError = new Error(
-          `Account not found on Horizon: ${address}`,
-        );
-        notFoundError.statusCode = 404;
-        return next(notFoundError);
-      }
+return res.status(201).json({
+      ok: true,
+      username: normalizedUsername,
+      address,
+      federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      is_primary: existingCount === 0,
+      ...(verificationResult && {
+        verification: {
+          accountId: verificationResult.accountId,
+          signerCount: verificationResult.signerCount,
+          thresholdMet: verificationResult.success,
+          requiredThreshold: verificationResult.requiredThreshold,
+          providedWeight: verificationResult.totalWeight,
+        },
+      }),
+      ...(memoType && { memo_type: memoType, memo }),
+    });
+
+  } catch (error) {
+    // Prisma unique constraint violation (PostgreSQL error code 23505)
+    if (error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
+      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
+    }
+    
+    if (error.message && error.message.includes("Account not found")) {
+      const notFoundError = new Error(
+        `Account not found on Horizon: ${address}`,
+      );
+      notFoundError.statusCode = 404;
+      return next(notFoundError);
+    }
 
       if (error.statusCode === 401) {
         return next(error);
       }
 
-      logger.error("Registration error:", error.message);
+logger.error("Registration error:", error.message);
       const registrationError = new Error(
         `Registration verification failed: ${error.message}`,
         { cause: error },
@@ -448,7 +529,7 @@ const existing = await prisma.user.findFirst({
 
       return res.status(200).json({ ok: true, username, deleted: true });
     } catch (error) {
-      logger.error("Failed to unregister account:", error);
+logger.error("Failed to unregister account:", error);
       const dbError = new Error("Failed to unregister account", {
         cause: error,
       });
@@ -523,9 +604,7 @@ const [totalCount, rows] = await prisma.$transaction([
 
     return res.json({ data, totalCount, totalPages, currentPage: page });
   } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 

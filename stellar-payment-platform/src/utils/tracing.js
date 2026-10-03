@@ -5,10 +5,9 @@ const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumenta
 const { ZipkinExporter } = require('@opentelemetry/exporter-zipkin');
 const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
 const { PrismaInstrumentation } = require('@prisma/instrumentation');
-const { Resource } = require('@opentelemetry/resources');
-const { SemanticResourceAttributes } = require('@opentelemetry/semantic-conventions');
 
 const serviceName = process.env.OTEL_SERVICE_NAME || 'stellar-tags-api';
+process.env.OTEL_SERVICE_NAME = serviceName; // Let OpenTelemetry auto-detect it
 
 const exporterName = (process.env.OTEL_TRACES_EXPORTER || 'otlp').toLowerCase();
 const traceExporter = exporterName === 'none'
@@ -32,7 +31,6 @@ const traceExporter = exporterName === 'none'
 
 const sdk = new NodeSDK({
   ...(traceExporter ? { traceExporter } : {}),
-  resource: new Resource({ [SemanticResourceAttributes.SERVICE_NAME]: serviceName }),
   instrumentations: [
     getNodeAutoInstrumentations({
       // Capture incoming/outgoing HTTP, Express, PostgreSQL, Redis and ioredis.
