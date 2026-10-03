@@ -141,7 +141,7 @@ app.use(maintenanceMiddleware);
 app.use(timeout("10s"));
 app.use((err, req, res, next) => {
   if (req.timedout) {
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Request Timeout`);
+    (req.log || logger).error({ err }, "Request Timeout");
     return next(new ApiError("SERVICE_UNAVAILABLE", undefined, { cause: err }));
   }
   next(err);

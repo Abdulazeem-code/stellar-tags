@@ -129,10 +129,12 @@ const buildErrorHandler = (isPrismaConnectionError) =>
 
     if (statusCode >= 500) {
       const referenceId = crypto.randomUUID();
-      if (process.env.NODE_ENV !== 'test') {
-        console.warn(`[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`, err);
+      const logMsg = `[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`;
+      if (req.log && typeof req.log.error === 'function') {
+        req.log.error(logMsg, err);
+      } else {
+        logger.error(logMsg, err);
       }
-      logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`, err);
 
       // Programmer errors (isOperational === false or unknown unexpected errors)
       // trigger a critical alert so the on-call team is paged immediately.
