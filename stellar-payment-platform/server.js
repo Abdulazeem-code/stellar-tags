@@ -8,6 +8,7 @@ const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
 const { maintenanceMiddleware } = require("./src/middleware/maintenance");
 const crypto = require("crypto");
+const { createTokenBucketLimiter } = require("./src/middleware/tokenBucketLimiter");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
 const {
@@ -242,17 +243,10 @@ const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
 const graphQLMiddleware = createGraphQLMiddleware({ prismaClient: prisma });
 
-const limiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  prefix: "global-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
-  // Prometheus scrapes /metrics on a fixed interval from a single address, so
-  // counting those scrapes against the shared quota would 429 the scraper.
+const limiter = createTokenBucketLimiter(redisClient, {
+  capacity: 100,
+  refillRate: 100 / (15 * 60), // 100 requests per 15 minutes
+  prefix: 'global-rl:',
   skip: (req) => req.path === "/metrics",
   // Key by authenticated user identifier when present (address/username),
   // otherwise fall back to client IP. This lets registered/identified users
@@ -304,15 +298,10 @@ const limiter = createSlidingWindowRateLimiter({
 // Per-IP limiter specifically for sensitive, unauthenticated endpoints.
 // Keys strictly by client IP so brute-force/spam from a single source is
 // blocked regardless of how many account ids are rotated in the payload.
-const ipLimiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  prefix: "ip-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
+const ipLimiter = createTokenBucketLimiter(redisClient, {
+  capacity: 100,
+  refillRate: 100 / (15 * 60),
+  prefix: 'ip-rl:',
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });
@@ -1111,15 +1100,10 @@ app.use("/api/v1", v1Router);
 // brute-force targets, so they get a much tighter budget than the global
 // limiter. Uses the same Redis-backed store so the limit is shared across
 // all distributed nodes.
-const authLimiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  prefix: "auth-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
+const authLimiter = createTokenBucketLimiter(redisClient, {
+  capacity: 20,
+  refillRate: 20 / (15 * 60), // 20 requests per 15 minutes
+  prefix: 'auth-rl:',
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });
