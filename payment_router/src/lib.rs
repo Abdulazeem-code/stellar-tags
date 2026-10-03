@@ -480,6 +480,8 @@ pub enum DataKey {
     /// proposals are tracked independently.  Stored as `Vec<Address>` in
     /// persistent storage and cleared once the upgrade is applied.
     UpgradeApproval(BytesN<32>),
+    /// Guard against cross-contract reentrancy attacks.
+    ReentrancyGuard,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -583,6 +585,8 @@ pub enum Error {
     /// approvals are rejected rather than ignored so that a replayed signature
     /// can never inflate the approval count towards the threshold.
     AlreadyApproved = 41,
+    /// A reentrant call was detected.
+    ReentrantCall = 42,
 }
 
 /// Soroban contract that routes token payments between addresses while
