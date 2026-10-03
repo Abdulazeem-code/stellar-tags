@@ -3857,8 +3857,16 @@ impl PaymentRouter {
         let _guard = ReentrancyGuard::new(&env)?;
         let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
+        if amount <= 0 {
+            return Err(Error::LimitExceeded);
+        }
+
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &treasury_mgr, &amount);
+        let contract_address = env.current_contract_address();
+        if amount > token_client.balance(&contract_address) {
+            return Err(Error::InsufficientBalance);
+        }
+        token_client.transfer(&contract_address, &treasury_mgr, &amount);
 
         log!(&env, "Emergency withdraw executed by TreasuryManager");
         Ok(())
