@@ -3,7 +3,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use payment_router::{ActionType, PaymentRouter, PaymentRouterClient};
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
 const NUM_USERS: usize = 4;
 const INITIAL_BALANCE: i128 = i128::MAX / 4;

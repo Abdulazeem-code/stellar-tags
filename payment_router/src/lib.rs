@@ -2954,6 +2954,7 @@ impl PaymentRouter {
         token_address: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3105,6 +3106,7 @@ impl PaymentRouter {
     /// Panics if any payment's `sender` does not authorize the call, or if
     /// a token transfer to `platform_treasury` fails.
     pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3218,6 +3220,7 @@ impl PaymentRouter {
         deadline: u64,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3499,6 +3502,7 @@ impl PaymentRouter {
     /// Panics if `payment.sender` does not authorize the call, or if a token
     /// transfer out of this contract fails.
     pub fn route_payment_with_swap(env: Env, payment: SwapPayment) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3528,6 +3532,7 @@ impl PaymentRouter {
     /// Panics if any payment's `sender` does not authorize the call, or if a
     /// token transfer out of this contract fails.
     pub fn route_payments_with_swap(env: Env, payments: Vec<SwapPayment>) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -3849,6 +3854,7 @@ impl PaymentRouter {
     /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn emergency_withdraw(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
         let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
         let token_client = token::Client::new(&env, &token);
