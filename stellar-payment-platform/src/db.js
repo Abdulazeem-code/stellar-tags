@@ -17,6 +17,10 @@ pool.on('error', (err) => {
 });
 
 (async () => {
+  if (process.env.NODE_ENV === 'test') {
+    logger.warn('PostgreSQL schema init skipped in test environment');
+    return;
+  }
   let retries = 5;
   while (retries > 0) {
     try {
@@ -45,10 +49,6 @@ pool.on('error', (err) => {
       logger.info(`PostgreSQL pool initialised — max ${pool.options.max} connections`);
       return;
     } catch (err) {
-      if (process.env.NODE_ENV === 'test') {
-        logger.warn('PostgreSQL schema init skipped in test environment');
-        return;
-      }
       retries -= 1;
       logger.error(err, `Failed to initialise PostgreSQL schema. Retries left: ${retries}`);
       if (retries === 0) {

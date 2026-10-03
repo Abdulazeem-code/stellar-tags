@@ -13,6 +13,7 @@ jest.mock('pdfkit', () => jest.fn());
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock the module so the
 // test suite can require server.js without a transform error.
@@ -81,6 +82,7 @@ jest.mock('pg', () => ({
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
 
 // closeWebSocket is awaited in gracefulShutdown before server.close() is called.
 // Resolve immediately so tests that check server.close() synchronously still pass.
@@ -330,7 +332,8 @@ describe('GET /lookup — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
 
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
@@ -416,7 +419,8 @@ describe('GET /users — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
 
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
@@ -503,7 +507,8 @@ describe('POST /register — block secret keys', () => {
     }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
 
     ({ app } = require('./server'));
     request = require('supertest');
@@ -804,7 +809,8 @@ describe('API v1 routing', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
 
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
@@ -931,6 +937,8 @@ describe('Database disconnection — 503 handling', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
     jest.mock('./src/multisigner-verifier', () => ({
       verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
         success: true, accountId: 'GDUMMY', operationType: 'management',

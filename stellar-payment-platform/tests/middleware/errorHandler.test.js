@@ -156,8 +156,8 @@ describe('error envelope', () => {
       expect(res.body.error.message).not.toContain('hunter2');
       expect(res.body.reference_id).toEqual(expect.any(String));
       expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error), referenceId: res.body.reference_id }),
         expect.stringContaining(res.body.reference_id),
-        expect.any(Error),
       );
     });
 
