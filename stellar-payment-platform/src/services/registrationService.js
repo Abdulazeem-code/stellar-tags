@@ -28,12 +28,13 @@ async function transferAccount(username, oldAddress, newAddress, oldSignature, n
     throw error;
   }
 
-  // 1. Verify old address exists and matches username
+  // 1. Verify old address exists and matches username. Soft-deleted accounts
+  // are treated as absent so a deleted username cannot be transferred.
   const user = await prisma.user.findUnique({
     where: { username }
   });
 
-  if (!user) {
+  if (!user || user.deletedAt) {
     const error = new Error('User not found');
     error.statusCode = 404;
     throw error;
