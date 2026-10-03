@@ -1,11 +1,5 @@
 require('dotenv').config();
 
-const { NodeSDK } = require('@opentelemetry/sdk-node');
-const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
-const { ZipkinExporter } = require('@opentelemetry/exporter-zipkin');
-const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
-const { PrismaInstrumentation } = require('@prisma/instrumentation');
-
 if (process.env.NODE_ENV === 'test') {
   module.exports = {
     sdk: null,
@@ -13,6 +7,12 @@ if (process.env.NODE_ENV === 'test') {
     shutdownTracing: () => Promise.resolve(),
   };
 } else {
+  const { NodeSDK } = require('@opentelemetry/sdk-node');
+  const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+  const { ZipkinExporter } = require('@opentelemetry/exporter-zipkin');
+  const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+  const { PrismaInstrumentation } = require('@prisma/instrumentation');
+
   const serviceName = process.env.OTEL_SERVICE_NAME || 'stellar-tags-api';
   process.env.OTEL_SERVICE_NAME = serviceName; // Let OpenTelemetry auto-detect it
 

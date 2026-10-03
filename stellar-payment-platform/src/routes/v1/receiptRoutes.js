@@ -3,6 +3,7 @@ const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
 
 const { ApiError } = require('../../errors');
+const { logger } = require('../../logger');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const {
   fetchTransaction,
@@ -93,7 +94,6 @@ router.get('/receipts/:txHash', asyncHandler(async (req, res, next) => {
     doc.image(qrBuffer, xPosition, doc.y, { width: qrSize, height: qrSize });
     doc.y += qrSize + 20;
   } catch (err) {
-    const { logger } = require('../../logger');
     (req.log || logger).error({ err }, 'Failed to generate QR code');
   }
 
