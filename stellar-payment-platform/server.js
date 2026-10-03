@@ -1106,6 +1106,7 @@ const authLimiter = createTokenBucketLimiter(redisClient, {
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });
 
+
 app.use("/api", v1Router);
 app.use("/", v1Router);
 // Auth endpoints (email OTP verification) - uses Redis when available

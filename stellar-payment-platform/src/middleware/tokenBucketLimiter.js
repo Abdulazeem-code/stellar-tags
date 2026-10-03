@@ -54,6 +54,7 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
     prefix = 'tb-rl:',
     keyGenerator = (req) => req.ip || req.connection?.remoteAddress || '',
     skip = () => false,
+    failClosedOnRedisError = false,
   } = options;
 
   return async (req, res, next) => {
@@ -63,6 +64,9 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
 
     if (!redisClient) {
       // Fallback if redis is not available
+      if (failClosedOnRedisError) {
+        return next({ code: "SERVICE_UNAVAILABLE", statusCode: 503 });
+      }
       return next();
     }
 
@@ -101,12 +105,12 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
         );
       }
     } catch (err) {
-      if (options.failClosedOnRedisError) {
-        req.log?.error(err, 'Token bucket rate limiter failed (closing)');
-        return next({ code: 'SERVICE_UNAVAILABLE', statusCode: 503 });
-      }
+      console.error("TOKEN BUCKET ERROR:", err);
       // On error, let the request pass through to avoid blocking legitimate traffic
       req.log?.error(err, 'Token bucket rate limiter failed');
+      if (failClosedOnRedisError) {
+        return next({ code: "SERVICE_UNAVAILABLE", statusCode: 503 });
+      }
       return next();
     }
   };
