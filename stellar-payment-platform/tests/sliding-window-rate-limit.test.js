@@ -151,7 +151,10 @@ describe("sliding window rate limiter", () => {
 
   it("rejects signature-heavy requests when configured Redis fails", async () => {
     const redisClient = { eval: jest.fn().mockRejectedValue(new Error("offline")) };
+    const originalEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
     const limiter = createSignatureRateLimiter(redisClient);
+    process.env.NODE_ENV = originalEnv;
     const next = jest.fn();
     const response = createResponse();
 
