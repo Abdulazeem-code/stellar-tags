@@ -134,7 +134,7 @@ global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
 
 const VALID_ADDRESS = 'GBCDEFGHIJKLMNOPQRSTUVWXYZ';
 
-describe('Rate Limiting - sliding window', () => {
+describe('Rate Limiting - token bucket', () => {
   let app;
 
   beforeEach(() => {
