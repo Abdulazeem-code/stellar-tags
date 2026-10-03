@@ -605,7 +605,9 @@ impl<'a> ReentrancyGuard<'a> {
         if is_locked {
             return Err(Error::ReentrantCall);
         }
-        env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyGuard, &true);
         Ok(Self { env })
     }
 }
@@ -8192,7 +8194,7 @@ mod test {
     }
     #[test]
     fn test_reentrancy_guard_blocks_reentrant_calls() {
-        let (env, client, _contract_id) = setup_env();
+        let (_env, client, _contract_id) = setup_env();
 
         let admin = Address::generate(&client.env);
         let treasury = Address::generate(&client.env);
@@ -8204,7 +8206,11 @@ mod test {
 
         // Manually lock the reentrancy guard in instance storage
         client.env.as_contract(&_contract_id, || {
-            client.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+            client
+                .env
+                .storage()
+                .instance()
+                .set(&DataKey::ReentrancyGuard, &true);
         });
 
         // Now routing a payment should fail with Error::ReentrantCall
