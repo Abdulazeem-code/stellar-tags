@@ -240,11 +240,11 @@ describe('streamAdminExport CSV', () => {
       expect(args.orderBy).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
     }
     // Page 1 has no cursor predicate; page 2 seeks strictly past the last row
-    // of page 1.
-    expect(calls[0].where).toEqual({});
+    // of page 1. Every page stays scoped to live (non soft-deleted) rows.
+    expect(calls[0].where).toEqual({ deletedAt: null });
     expect(calls[1].where).toEqual({
       AND: [
-        {},
+        { deletedAt: null },
         {
           OR: [
             { createdAt: { lt: lastRow.createdAt } },

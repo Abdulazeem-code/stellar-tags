@@ -35,10 +35,22 @@ jest.mock('../src/multisigner-verifier', () => ({
   verifyMultiSignerThreshold: jest.fn(),
 }));
 
+jest.mock('../src/utils', () => {
+  const actual = jest.requireActual('../src/utils');
+  return {
+    ...actual,
+    shouldFallbackToLocalRegistry: jest.fn(),
+  };
+});
+
+jest.mock('../src/db', () => ({
+  poolGet: jest.fn(),
+}));
 
 const { prisma } = require('../prismaClient');
 
 const { verifyMultiSignerThreshold } = require('../src/multisigner-verifier');
+const { poolGet } = require('../src/db');
 const sdk = require('@stellar/stellar-sdk');
 const {
   authenticateUsernameOwner,
