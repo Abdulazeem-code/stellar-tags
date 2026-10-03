@@ -2411,13 +2411,11 @@ impl PaymentRouter {
     pub fn get_effective_fee_bps(env: Env, sender: Address) -> i128 {
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let user_volume = Self::get_user_volume(env.clone(), sender);
-        let base_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+        if user_volume > Self::VOLUME_THRESHOLD {
             fee_bps / 2
         } else {
             fee_bps
-        };
-
-        base_fee_bps
+        }
     }
 
     /// Set a new admin. SuperAdmin-protected.
