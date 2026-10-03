@@ -1209,6 +1209,10 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
   // the shutdown window.
   poolMonitor.stop();
 
+  // #730 — Close SSE streams first so browsers reconnect (with backoff) to
+  // another instance instead of waiting on a dying process.
+  sseService.closeAllClients();
+
   const timer = setTimeout(() => {
     logger.error(
       `Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`,
@@ -1278,7 +1282,6 @@ if (require.main === module) {
         }`,
       );
     });
-
     server.on("error", (e) => {
       if (e.code === "EADDRINUSE") {
         logger.error(
@@ -1301,6 +1304,10 @@ if (require.main === module) {
       gracefulShutdown(server, prisma, sig, redisClient),
     );
   };
+
+  // #730 — Enable cross-instance SSE fan-out when Redis is configured.
+  // Fire-and-forget: the hub runs local-only if Redis is unavailable.
+  sseService.startRedisFanout();
 
   // Verify the database is not out of sync with the Prisma migrations before
   // binding a port, so schema drift surfaces as a clear startup error instead
