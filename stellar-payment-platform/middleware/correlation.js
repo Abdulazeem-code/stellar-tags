@@ -1,5 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
 const { logger } = require('../src/logger');
+const { currentTraceId } = require('../src/utils/traceContext');
 
 const CORRELATION_HEADER = 'X-Correlation-ID';
 
@@ -13,8 +14,20 @@ const correlationId = (req, res, next) => {
 
   req.correlationId = id;
   res.set(CORRELATION_HEADER, id);
+  const traceId = currentTraceId();
+  if (traceId) res.set('X-Trace-ID', traceId);
 
-  // Logging is handled by pino-http in server.js using httpLogger
+  // Tag request logs with the correlation ID so a single API call can be traced
+  // end-to-end across the backend's log output (console and rotating files).
+  res.on('finish', () => {
+    logger.info(`${req.method} ${req.originalUrl} ${res.statusCode}`, {
+      correlationId: id,
+      traceId,
+      method: req.method,
+      url: req.originalUrl,
+      statusCode: res.statusCode,
+    });
+  });
 
   next();
 };

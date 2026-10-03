@@ -1,0 +1,44 @@
+[workspace]
+# Workspace members are all Soroban / Rust crates in this repository.
+# Each crate retains its own Cargo.toml; the workspace just provides a shared
+# dependency resolver and lets `cargo` commands work from the repo root.
+#
+# The integration test crate is excluded from the default build because it
+# pulls in network-only dependencies (tokio, reqwest, soroban-client) that
+# require a live Stellar node.
+members = [
+    "flash_loan",
+    "payment_router",
+    "pausable_token",
+    "payment_proxy",
+    "timelock_escrow",
+    "advanced_feature_35",
+    "twap_oracle",
+]
+
+# yield_escrow owns its own `[patch.crates-io]` / `[profile.release]` sections
+# (it needs the same vendored ethnum pin as payment_router), which cargo only
+# honours in a workspace root.  It is therefore excluded here and built by the
+# dedicated "Yield Escrow Build & Test" job in .github/workflows/soroban.yml.
+exclude = ["yield_escrow"]
+
+# Edition 2021 members require resolver v2.
+resolver = "2"
+
+# The ethnum-patch is a local fork that fixes a transmute-size mismatch in
+# ethnum v1.5.0 when compiled with recent Rust toolchains.  Patch entries
+# must live at the workspace root, not in individual member Cargo.toml files.
+[patch.crates-io]
+ethnum = { path = "payment_router/ethnum-patch" }
+
+# Workspace-level release profile.  Individual crates may override specific
+# settings in their own [profile.release] tables.
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
