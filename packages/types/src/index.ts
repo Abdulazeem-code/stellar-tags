@@ -570,13 +570,15 @@ export interface Client {
    * Construct and simulate a version transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the contract version.
    *
-   * # Returns
-   * The contract's version number, currently `1`.
+   * This is a read-only view function: it does not write to ledger storage
+   * and costs only the base invocation fee.  The UI calls this before
+   * submitting transactions to confirm it is compatible with the deployed
+   * contract.
    *
-   * # Panics
-   * Does not panic.
+   * # Returns
+   * A [`String`] in the form `"MAJOR.MINOR.PATCH"` (e.g. `"1.0.0"`).
    */
-  version: (options?: MethodOptions) => Promise<AssembledTransaction<u32>>
+  version: (options?: MethodOptions) => Promise<AssembledTransaction<string>>
 
   /**
    * Construct and simulate a has_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -1940,7 +1942,7 @@ export class Client extends ContractClient {
   public readonly fromJSON = {
     get_fee: this.txFromJSON<i128>,
         upgrade: this.txFromJSON<Result<void>>,
-        version: this.txFromJSON<u32>,
+        version: this.txFromJSON<string>,
         has_role: this.txFromJSON<boolean>,
         unfreeze: this.txFromJSON<Result<void>>,
         get_price: this.txFromJSON<Result<PriceData>>,
