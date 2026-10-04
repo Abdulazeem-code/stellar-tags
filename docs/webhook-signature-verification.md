@@ -8,20 +8,46 @@ been tampered with in transit.
 
 | Header | Description |
 |---|---|
-| `X-Webhook-Signature` | Hex-encoded HMAC-SHA256 of the raw JSON body, signed with the webhook secret. |
+| `Stellar-Signature` | Hex-encoded HMAC-SHA256 of `timestamp + "." + raw JSON body`, signed with the webhook secret. The dispatch timestamp is cryptographically bound so the header cannot be swapped in transit. Prefer this for new integrations. |
+| `Stellar-Timestamp` | ISO 8601 dispatch timestamp (same value as `payload.timestamp`). Must be within 5 minutes in the past and no more than 1 minute in the future. |
+| `X-Webhook-Signature` | Legacy hex-encoded HMAC-SHA256 of the raw JSON body only. Kept for backward compatibility. |
 | `X-Stellar-Tags-Signature` | Alias for `X-Webhook-Signature` — kept for backward compatibility. |
-| `X-Webhook-Timestamp` | ISO 8601 timestamp (`payload.timestamp`) included in the signed body. |
+| `X-Webhook-Timestamp` | Legacy alias for `Stellar-Timestamp`. |
 
-> Prefer `X-Webhook-Signature` for new integrations.
+> Prefer `Stellar-Signature` / `Stellar-Timestamp` for new integrations.
 
 ## How the signature is computed
+
+Legacy scheme (body only, still sent for backward compatibility):
 
 ```
 HMAC-SHA256( key=<webhook_secret>, message=<raw JSON body> )
 ```
 
-The raw JSON body is the exact byte sequence sent over the wire.  
+Timestamp-bound scheme (`Stellar-Signature`, required for replay protection):
+
+```
+HMAC-SHA256( key=<webhook_secret>, message=<timestamp> + "." + <raw JSON body> )
+```
+
+where `<timestamp>` is the exact value of the `Stellar-Timestamp` header
+(ISO 8601, e.g. `2026-08-25T12:00:00.000Z`, identical to `payload.timestamp`).
+`payload.timestamp` is part of the signed raw body, and additionally binding
+the header timestamp means an attacker cannot strip or swap the header while
+keeping a valid signature.
+
+The raw JSON body is the exact byte sequence sent over the wire.
 The webhook secret is the value you supplied when registering your webhook URL.
+
+## Timestamp format and expiry
+
+- `Stellar-Timestamp` is an **ISO 8601** string in UTC (same as `payload.timestamp`).
+- Verifiers must reject dispatches whose timestamp is **older than 5 minutes
+  (300 seconds)** — treat as `TIMESTAMP_EXPIRED`, possible replay attack.
+- Verifiers must reject dispatches whose timestamp is **more than 1 minute
+  (60 seconds) in the future** — treat as clock skew (`TIMESTAMP_TOO_FAR_IN_FUTURE`).
+- Always check freshness **before** trusting the payload, and verify the
+  `Stellar-Signature` against the received `Stellar-Timestamp` header value.
 
 ## Test verification endpoint
 
@@ -61,30 +87,48 @@ error payload including the expected and received values.
 ```js
 const crypto = require('crypto');
 
+const TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000; // 5 minutes past
+const FUTURE_SKEW_MS = 60 * 1000; // 1 minute future
+
 /**
- * Returns true when the request body matches the signature.
+ * Verifies the timestamp-bound Stellar-Signature.
  *
  * @param {string} secret      - The webhook secret you registered.
  * @param {string} rawBody     - The raw request body (Buffer or string).
- * @param {string} sigHeader   - Value of the X-Webhook-Signature header.
+ * @param {string} timestamp   - Value of the Stellar-Timestamp header.
+ * @param {string} sigHeader   - Value of the Stellar-Signature header.
  */
-function verifySignature(secret, rawBody, sigHeader) {
+function verifyStellarSignature(secret, rawBody, timestamp, sigHeader) {
+  const body = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
   const expected = crypto
     .createHmac('sha256', secret)
-    .update(rawBody)
+    .update(`${timestamp}.${body}`)
     .digest('hex');
 
   // Constant-time comparison prevents timing-oracle attacks.
+  if (expected.length !== sigHeader.length) return false;
   return crypto.timingSafeEqual(
     Buffer.from(expected, 'hex'),
     Buffer.from(sigHeader, 'hex'),
   );
 }
 
+function isFreshTimestamp(isoTimestamp, now = Date.now()) {
+  const ts = Date.parse(isoTimestamp);
+  if (Number.isNaN(ts)) return false;
+  if (now - ts > TIMESTAMP_TOLERANCE_MS) return false; // older than 5 minutes
+  if (ts - now > FUTURE_SKEW_MS) return false; // more than 1 minute in the future
+  return true;
+}
+
 // Express example ─ use express.raw() to keep the body as a Buffer.
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  const sig = req.headers['x-webhook-signature'];
-  if (!sig || !verifySignature(process.env.WEBHOOK_SECRET, req.body, sig)) {
+  const sig = req.headers['stellar-signature'];
+  const timestamp = req.headers['stellar-timestamp'];
+  if (!timestamp || !isFreshTimestamp(timestamp)) {
+    return res.status(401).json({ error: 'Timestamp expired or invalid — possible replay attack' });
+  }
+  if (!sig || !verifyStellarSignature(process.env.WEBHOOK_SECRET, req.body, timestamp, sig)) {
     return res.status(401).json({ error: 'Invalid signature' });
   }
 
@@ -94,23 +138,44 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
 });
 ```
 
+Legacy `X-Webhook-Signature` verifiers keep working with a body-only HMAC
+(`HMAC(secret, rawBody)`), but should still enforce the same 5-minute /
+1-minute freshness window using `X-Webhook-Timestamp` or `payload.timestamp`.
+
 ## Verifying in Python
 
 ```python
 import hashlib
 import hmac
 import json
+import time
+from datetime import datetime, timezone
 from flask import Flask, request, abort
 
 app = Flask(__name__)
 WEBHOOK_SECRET = b"your_webhook_secret"
+TIMESTAMP_TOLERANCE_S = 5 * 60  # 5 minutes past
+FUTURE_SKEW_S = 60  # 1 minute future
+
+def is_fresh_timestamp(iso_timestamp):
+    ts = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00")).timestamp()
+    now = time.time()
+    if now - ts > TIMESTAMP_TOLERANCE_S:
+        return False
+    if ts - now > FUTURE_SKEW_S:
+        return False
+    return True
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     raw_body = request.get_data()  # keep raw bytes before parsing
-    sig = request.headers.get("X-Webhook-Signature", "")
+    timestamp = request.headers.get("Stellar-Timestamp", "")
+    sig = request.headers.get("Stellar-Signature", "")
 
-    expected = hmac.new(WEBHOOK_SECRET, raw_body, hashlib.sha256).hexdigest()
+    if not timestamp or not is_fresh_timestamp(timestamp):
+        abort(401, "Timestamp expired or invalid")
+
+    expected = hmac.new(WEBHOOK_SECRET, f"{timestamp}.".encode() + raw_body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig):
         abort(401, "Invalid signature")
 
@@ -132,55 +197,52 @@ import (
     "net/http"
 )
 
-func verifySignature(secret, rawBody []byte, sigHeader string) bool {
-    mac := hmac.New(sha256.New, secret)
-    mac.Write(rawBody)
-    expected := hex.EncodeToString(mac.Sum(nil))
-    return hmac.Equal([]byte(expected), []byte(sigHeader))
+func verifyStellarSignature(secret, timestamp string, rawBody []byte, sigHeader string) bool {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + "."))
+	mac.Write(rawBody)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(sigHeader))
+}
+
+func isFreshTimestamp(isoTimestamp string, now time.Time) bool {
+	ts, err := time.Parse(time.RFC3339, isoTimestamp)
+	if err != nil {
+		return false
+	}
+	if now.Sub(ts) > 5*time.Minute {
+		return false
+	}
+	if ts.Sub(now) > time.Minute {
+		return false
+	}
+	return true
 }
 
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
-    body, _ := io.ReadAll(r.Body)
-    sig := r.Header.Get("X-Webhook-Signature")
+	body, _ := io.ReadAll(r.Body)
+	timestamp := r.Header.Get("Stellar-Timestamp")
+	sig := r.Header.Get("Stellar-Signature")
 
-    if !verifySignature([]byte("your_webhook_secret"), body, sig) {
-        http.Error(w, "Invalid signature", http.StatusUnauthorized)
-        return
-    }
-    // process payload ...
-    w.WriteHeader(http.StatusOK)
+	if !isFreshTimestamp(timestamp, time.Now().UTC()) {
+		http.Error(w, "Timestamp expired or invalid", http.StatusUnauthorized)
+		return
+	}
+	if !verifyStellarSignature("your_webhook_secret", timestamp, body, sig) {
+		http.Error(w, "Invalid signature", http.StatusUnauthorized)
+		return
+	}
+	// process payload ...
+	w.WriteHeader(http.StatusOK)
 }
 ```
 
 ## Security recommendations
 
-- **Always verify** the signature before trusting the payload.
+- **Always verify** the `Stellar-Signature` against the received
+  `Stellar-Timestamp` header before trusting the payload.
+- **Always enforce freshness**: reject timestamps older than 5 minutes or more
+  than 1 minute in the future.
 - Use **`timingSafeEqual`** (or `hmac.compare_digest` in Python, `hmac.Equal`
   in Go) — regular string equality is vulnerable to timing attacks.
 - Rotate your webhook secret immediately if you suspect it has been leaked.
-- Optionally reject requests whose `X-Webhook-Timestamp` is more than five
-  minutes in the past to defend against replay attacks.
-
-## Replay-attack guard (optional)
-
-```js
-function isRecentTimestamp(isoTimestamp, toleranceMs = 5 * 60 * 1000) {
-  const age = Date.now() - new Date(isoTimestamp).getTime();
-  return Math.abs(age) <= toleranceMs;
-}
-
-app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  const sig = req.headers['x-webhook-signature'];
-  const payload = JSON.parse(req.body.toString());
-
-  if (!isRecentTimestamp(payload.timestamp)) {
-    return res.status(401).json({ error: 'Timestamp too old — possible replay attack' });
-  }
-  if (!verifySignature(process.env.WEBHOOK_SECRET, req.body, sig)) {
-    return res.status(401).json({ error: 'Invalid signature' });
-  }
-
-  console.log('Verified webhook event:', payload.event);
-  res.sendStatus(200);
-});
-```

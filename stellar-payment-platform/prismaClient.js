@@ -51,6 +51,13 @@ try {
       delete: async () => ({}),
       update: async () => ({}),
     },
+    activityLog: {
+      findMany: async () => [],
+      findUnique: async () => null,
+      findFirst: async () => null,
+      create: async (args) => args.data || {},
+      count: async () => 0,
+    },
     auditLog: {
       findMany: async () => [],
       findUnique: async () => null,

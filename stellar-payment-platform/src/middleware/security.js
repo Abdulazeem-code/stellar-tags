@@ -11,8 +11,8 @@ const helmet = require('helmet');
 
 const cspDirectives = {
   defaultSrc: ["'self'"],
-  scriptSrc: ["'self'"],
-  styleSrc: ["'self'"],
+  scriptSrc: ["'self'", "'unsafe-inline'"],
+  styleSrc: ["'self'", "'unsafe-inline'"],
   imgSrc: ["'self'", 'data:', 'https:'],
   fontSrc: ["'self'"],
   objectSrc: ["'none'"],

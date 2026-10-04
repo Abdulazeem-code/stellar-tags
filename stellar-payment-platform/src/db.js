@@ -30,6 +30,10 @@ if (readPool !== pool) {
 }
 
 (async () => {
+  if (process.env.NODE_ENV === 'test') {
+    logger.warn('PostgreSQL schema init skipped in test environment');
+    return;
+  }
   let retries = 5;
   while (retries > 0) {
     try {
@@ -58,10 +62,6 @@ if (readPool !== pool) {
       logger.info(`PostgreSQL pool initialised — max ${pool.options.max} connections`);
       return;
     } catch (err) {
-      if (process.env.NODE_ENV === 'test') {
-        logger.warn('PostgreSQL schema init skipped in test environment');
-        return;
-      }
       retries -= 1;
       logger.error(err, `Failed to initialise PostgreSQL schema. Retries left: ${retries}`);
       if (retries === 0) {
@@ -110,6 +110,49 @@ const etagCache = (req, res, next) => {
   next();
 };
 
+const {
+  setTenantContext,
+  clearTenantContext,
+  withTenantTransaction,
+} = require('./middleware/tenantContext');
+
+/**
+ * Initializes multi-tenant tables and PostgreSQL Row-Level Security (RLS) policies.
+ */
+async function initMultiTenancySchema(dbPool = pool) {
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS tenant_enterprises (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      stellar_address TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS tenant_enterprises_tenant_id_idx ON tenant_enterprises(tenant_id);
+
+    CREATE TABLE IF NOT EXISTS tenant_payment_configs (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      routing_asset TEXT NOT NULL,
+      max_limit NUMERIC NOT NULL DEFAULT 10000,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS tenant_payment_configs_tenant_id_idx ON tenant_payment_configs(tenant_id);
+  `);
+
+  const tables = ['tenant_enterprises', 'tenant_payment_configs'];
+  for (const table of tables) {
+    await dbPool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY;`).catch(() => {});
+    await dbPool.query(`DROP POLICY IF EXISTS ${table}_isolation_policy ON ${table};`).catch(() => {});
+    await dbPool.query(`
+      CREATE POLICY ${table}_isolation_policy ON ${table}
+        FOR ALL
+        USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), ''))
+        WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), ''));
+    `).catch(() => {});
+  }
+}
+
 module.exports = {
   poolGet,
   poolRun,
@@ -118,4 +161,9 @@ module.exports = {
   USER_DATABASE,
   normalizeNameTag,
   etagCache,
+  initMultiTenancySchema,
+  setTenantContext,
+  clearTenantContext,
+  withTenantTransaction,
 };
+
