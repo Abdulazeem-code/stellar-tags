@@ -115,7 +115,7 @@ export interface Client {
    * Construct and simulate a version transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Returns the contract version.
    */
-  version: (options?: MethodOptions) => Promise<AssembledTransaction<u32>>
+  version: (options?: MethodOptions) => Promise<AssembledTransaction<string>>
 
   /**
    * Construct and simulate a is_paused transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -291,7 +291,7 @@ export class Client extends ContractClient {
   public readonly fromJSON = {
     get_fee: this.txFromJSON<i128>,
         upgrade: this.txFromJSON<Result<void>>,
-        version: this.txFromJSON<u32>,
+        version: this.txFromJSON<string>,
         is_paused: this.txFromJSON<boolean>,
         set_admin: this.txFromJSON<Result<void>>,
         set_pause: this.txFromJSON<Result<void>>,
