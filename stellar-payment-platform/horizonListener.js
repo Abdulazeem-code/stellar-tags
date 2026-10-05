@@ -22,9 +22,12 @@
 
 const { prisma } = require('./prismaClient');
 const { logger } = require('./src/logger');
+const { createRedisConnection } = require('./src/config/redis');
+const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
   scheduleWebhookRetryJob,
+  closeWebhookQueue,
 } = require('./src/webhookWorker');
 const {
   horizon,
@@ -334,15 +337,16 @@ const watchAccount = (accountId) => {
 
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
-          dispatchPaymentWebhooks({
-            prisma,
-            payment,
-          }).catch((err) =>
-            logger.error(
-              `[${timestamp()}] ⚠️  Webhook dispatch failed for tx ${payment.transaction_hash}:`,
-              err?.message || err,
-            ),
-          );
+          prisma.payment.create({
+            data: {
+              transactionHash: payment.transaction_hash,
+              fromAddress: payment.from,
+              toAddress: payment.to,
+              amount: parseFloat(payment.amount),
+              assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
+              status: 'completed'
+            }
+          }).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
         }
       },
       onerror: onStreamError,
@@ -519,6 +523,15 @@ const shutdown = async () => {
     forgetAccount(address);
   }
   activeStreams.clear();
+  await closeWebhookQueue();
+  if (redisPublisher) {
+    try {
+      await redisPublisher.quit();
+    } catch (err) {
+      logger.error({ err }, '[listener] Error closing Redis publisher during shutdown');
+    }
+  }
+  if (fraudStream) await fraudStream.quit();
   await prisma.$disconnect();
   process.exit(0);
 };

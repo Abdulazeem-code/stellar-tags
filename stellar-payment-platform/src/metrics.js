@@ -25,6 +25,9 @@ const httpRequestDuration = new client.Histogram({
 // they are registered later via setMetricsSources and read at scrape time.
 let prismaSource = null;
 let redisSource = null;
+// The DLQ lives in Redis, which is optional, so its depth is read through a
+// reader the DLQ module registers rather than a client this module creates.
+let dlqDepthSource = null;
 
 /**
  * Registers the live clients the connection gauges report on. Passing a null
@@ -33,6 +36,14 @@ let redisSource = null;
 function setMetricsSources({ prisma, redisClient } = {}) {
   if (prisma !== undefined) prismaSource = prisma;
   if (redisClient !== undefined) redisSource = redisClient;
+}
+
+/**
+ * Registers the function the DLQ depth gauge reads on each scrape. Passing null
+ * leaves the gauge reporting zero.
+ */
+function setDlqDepthSource(readDepth) {
+  if (readDepth !== undefined) dlqDepthSource = readDepth;
 }
 
 const EMPTY_POOL = { active: 0, idle: 0, size: 0, waiters: 0 };
@@ -158,6 +169,25 @@ const horizonPollFailures = new client.Gauge({
 const horizonLastSuccessTimestamp = new client.Gauge({
   name: 'stellar_tags_horizon_poll_last_success_timestamp_seconds',
   help: 'Unix timestamp of the last successful Horizon poll cycle',
+
+// Gauge: payment retry jobs currently parked in the dead letter queue. Read on
+// every scrape so the value is never stale, and 0 when Redis is unconfigured.
+const dlqDepth = new client.Gauge({
+  name: 'stellar_tags_dlq_depth',
+  help: 'Payment retry jobs currently waiting in the dead letter queue',
+  async collect() {
+    if (!dlqDepthSource) {
+      this.set(0);
+      return;
+    }
+    this.set(await dlqDepthSource());
+  },
+});
+
+// Counter: payment retry jobs routed to the dead letter queue since boot.
+const dlqMessagesTotal = new client.Counter({
+  name: 'stellar_tags_dlq_messages_total',
+  help: 'Total payment retry jobs moved to the dead letter queue',
 });
 
 /**
@@ -208,6 +238,7 @@ module.exports = {
   getMetrics,
   getContentType,
   setMetricsSources,
+  setDlqDepthSource,
   dbPoolConnectionsOpen,
   dbPoolConnectionsBusy,
   dbPoolConnectionsIdle,
@@ -222,4 +253,7 @@ module.exports = {
   horizonPollBackoffSeconds,
   horizonPollFailures,
   horizonLastSuccessTimestamp,
+
+  dlqDepth,
+  dlqMessagesTotal,
 };

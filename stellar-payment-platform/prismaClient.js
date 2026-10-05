@@ -17,9 +17,20 @@ try {
     throw new Error('DATABASE_URL is not set');
   }
   const { PrismaClient } = require('@prisma/client');
-  prisma = new PrismaClient();
+  const basePrisma = new PrismaClient();
+  
+  if (process.env.DATABASE_READ_URL) {
+    const { readReplicas } = require('@prisma/extension-read-replicas');
+    prisma = basePrisma.$extends(
+      readReplicas({
+        url: process.env.DATABASE_READ_URL,
+      })
+    );
+  } else {
+    prisma = basePrisma;
+  }
 } catch (err) {
-  logger.warn('Prisma client not found. Using fallback mock for tests.');
+  logger.warn('Prisma client not found or extension missing. Using fallback mock for tests.', err);
   prisma = {
     user: {
       update: async () => {

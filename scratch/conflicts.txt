@@ -1,0 +1,1630 @@
+﻿--- payment_router/src/lib.rs ---
+Conflict 1:
+<<<<<<< HEAD
+    /// Arm the dead man's switch: nominate a backup admin and its claim
+    /// timeout in seconds (see `set_backup_admin_internal`).
+    SetBackupAdmin(Address, u64),
+=======
+    /// Allow swap routing to invoke a DEX router contract.
+    RegisterDex(Address),
+    /// Stop swap routing from invoking a DEX router contract.
+    DeregisterDex(Address),
+    /// Update the maximum tolerated swap slippage.
+    SetMaxSlippageBps(i128),
+    /// Configure the multi-signature admin group for contract upgrades.
+    SetMultisigConfig(Vec<Address>, u32),
+>>>>>>> origin/main
+
+Conflict 2:
+<<<<<<< HEAD
+    /// Minimum configurable dead man's switch timeout (7 days). Keeps the
+    /// claim window long enough that a briefly-offline admin cannot lose
+    /// the contract, while still guaranteeing recoverability.
+    const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
+
+    // ÔöÇÔöÇ Rate limiting (issue #716) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+    /// Default number of payments one address may settle per ledger sequence.
+    /// Rate limiting is active from the very first payment (and after
+    /// upgrading a deployment that predates this feature) with this cap; the
+    /// admin can raise, lower, or disable it via `set_rate_limit`.
+    ///
+    /// Ten comfortably covers a busy-but-legitimate sender while throttling
+    /// spam floods. Note that `route_payments` counts *each* payment in the
+    /// batch against its sender's cap, so a single batch must not contain
+    /// more than this many payments from any one address.
+    const DEFAULT_RATE_LIMIT: u32 = 10;
+    /// Upper bound for `set_rate_limit`, so a typo or a compromised admin
+    /// cannot turn the limiter off by setting an absurdly large cap.
+    const MAX_RATE_LIMIT: u32 = 1_000_000;
+
+    const VERSION: u32 = 1;
+=======
+    const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+    /// Default ceiling on how far a swap may move against the caller's quote:
+    /// 1 000 bps = 10%.  Applied only when the caller supplies an
+    /// `expected_amount_out`; the `min_amount_out` floor always applies.
+    const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
+    /// Absolute ceiling for the configurable slippage setting (100%).
+    const MAX_SLIPPAGE_BPS_LIMIT: i128 = 10_000;
+>>>>>>> origin/main
+
+Conflict 3:
+<<<<<<< HEAD
+    /// `upgrade`, arming the dead man's switch) must go through the timelock.
+    /// Use the direct setter functions only for actions that are not sensitive
+    /// (e.g. `set_pause` which can also be called directly for immediate
+    /// operational pauses).
+=======
+    /// `set_multisig_config`, `upgrade`) must go through the timelock.  Use the
+    /// direct setter functions only for actions that are not sensitive (e.g.
+    /// `set_pause` which can also be called directly for immediate operational
+    /// pauses).
+    ///
+    /// Queueing does not pre-authorize anything on its own: `ActionType::Upgrade`
+    /// and `ActionType::SetMultisigConfig` are re-validated at execution time,
+    /// so an upgrade queued today still needs the multi-signature threshold to
+    /// be met for that hash when the delay elapses.
+>>>>>>> origin/main
+
+Conflict 4:
+<<<<<<< HEAD
+    /// Admin authorization is required. Works even while the contract is
+    /// frozen so the legitimate admin can keep the switch alive.
+    pub fn ping(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+=======
+    /// # Panics
+    /// Panics if `sender` does not authorize the call, or if the underlying
+    /// token transfer to `platform_treasury` fails.
+    pub fn route_payment(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+>>>>>>> origin/main
+
+--- stellar-payment-platform/horizonListener.js ---
+Conflict 1:
+<<<<<<< HEAD
+// ---------------------------------------------------------------------------
+// SSE Horizon Listener for Real-Time Payment Detection
+// ---------------------------------------------------------------------------
+// This background service connects to the Stellar Horizon network using
+// Server-Sent Events (SSE) to monitor incoming payments for all public keys
+// registered in the local federation database.
+//
+// Horizon is a shared, rate-limited public service, so every request this
+// process makes is scheduled through an exponential-backoff-with-jitter policy
+// (see src/horizonBackoff.js) rather than a fixed interval:
+//   * failed cycles double the delay, up to POLL_MAX_INTERVAL_MS;
+//   * consecutive empty cycles stretch the interval gently;
+//   * every delay is jittered so co-located instances don't retry in lockstep;
+//   * HTTP 429 responses set a hard floor via their Retry-After header.
+//
+// Usage:
+//   npm run listener                  (testnet, default)
+//   HORIZON_NETWORK=public npm run listener  (mainnet)
+// ---------------------------------------------------------------------------
+=======
+// SSE Horizon Listener for Real-Time Payment Detection
+>>>>>>> origin/main
+
+Conflict 2:
+<<<<<<< HEAD
+const {
+  createBackoffController,
+  isRateLimitError,
+} = require('./src/horizonBackoff');
+const metrics = require('./src/metrics');
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+const NETWORK = HORIZON_NETWORK || process.env.HORIZON_NETWORK || 'testnet';
+=======
+const { publishPaymentUpdate } = require('./src/websocket');
+
+
+const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
+>>>>>>> origin/main
+
+Conflict 3:
+<<<<<<< HEAD
+// ---------------------------------------------------------------------------
+// Horizon Reachability Probe + Circuit Breaker
+// ---------------------------------------------------------------------------
+// The probe uses fetch rather than the SDK call builder on purpose: the SDK's
+// `NetworkError` discards the HTTP status, which would make a 429
+// indistinguishable from a generic outage and throw away the Retry-After hint
+// that is the single most effective way to avoid a rate-limit storm.
+const probeHorizon = async () => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HEALTH_PROBE_TIMEOUT_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+
+  try {
+    const response = await fetch(`${HORIZON_URL}/ledgers?limit=1`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+
+    if (response.status === 429) {
+      const error = new Error('Horizon rate limited (HTTP 429)');
+      error.status = 429;
+      error.headers = response.headers;
+      throw error;
+    }
+
+    if (!response.ok) {
+      const error = new Error(`Horizon probe failed with HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+
+    return true;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/**
+ * Wraps the probe so a sustained outage fast-fails subsequent cycles instead of
+ * opening streams (or hitting the DB) that will immediately error.
+ */
+const healthCheckBreaker = createBreaker(probeHorizon, {
+  // Slightly longer than the fetch's own abort so the probe produces a real
+  // error (with a usable status) instead of a breaker timeout.
+  timeout: HEALTH_PROBE_TIMEOUT_MS + 1_000,
+  volumeThreshold: 3,
+});
+
+// ---------------------------------------------------------------------------
+// Backoff Controllers
+// ---------------------------------------------------------------------------
+const pollBackoff = createBackoffController({
+  baseDelayMs: POLL_INTERVAL_MS,
+  maxDelayMs: POLL_MAX_INTERVAL_MS,
+  emptyStreakThreshold: POLL_EMPTY_THRESHOLD,
+  jitter: POLL_JITTER,
+});
+
+/** Per-account SSE reconnect policies, created lazily. */
+const streamBackoffs = new Map();
+
+const getStreamBackoff = (accountId) => {
+  if (!streamBackoffs.has(accountId)) {
+    streamBackoffs.set(
+      accountId,
+      createBackoffController({
+        baseDelayMs: STREAM_RECONNECT_BASE_MS,
+        maxDelayMs: STREAM_RECONNECT_MAX_MS,
+        jitter: POLL_JITTER,
+      }),
+    );
+  }
+  return streamBackoffs.get(accountId);
+};
+
+// ---------------------------------------------------------------------------
+// Stream Management
+// ---------------------------------------------------------------------------
+/** accountId -> stream handle ({ close, disposed }). */
+const activeStreams = new Map();
+/** accountId -> pending reconnect timer. */
+const reconnectTimers = new Map();
+
+=======
+// Dedicated ioredis publisher for cross-process WebSocket payment events.
+// When REDIS_URL is absent real-time updates are silently disabled.
+const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
+if (redisPublisher) {
+  redisPublisher.on('error', (err) =>
+    logger.error({ err }, '[listener] Redis publisher error'),
+  );
+} else {
+  logger.warn(
+    '[listener] REDIS_URL not set ÔÇö real-time WebSocket payment updates are disabled.',
+  );
+}
+
+const healthCheckBreaker = createBreaker(
+  () => horizon.ledgers().latest().call(),
+  { timeout: 5000, volumeThreshold: 3 },
+);
+
+
+const activeStreams = new Map();
+const fraudStream = process.env.REDIS_URL ? createRedisConnection() : null;
+// Handle for the periodic account-sync timer, kept so shutdown can clear it.
+let syncInterval = null;
+// Guards against overlapping syncs opening duplicate streams when one cycle
+// takes longer than the poll interval.
+let isSyncing = false;
+
+
+>>>>>>> origin/main
+
+Conflict 4:
+<<<<<<< HEAD
+/** Cancel a pending reconnect for an account, if one is scheduled. */
+const cancelReconnect = (accountId) => {
+  const timer = reconnectTimers.get(accountId);
+  if (timer) {
+    clearTimeout(timer);
+    reconnectTimers.delete(accountId);
+  }
+};
+
+/**
+ * Close a stream and drop it from the active set.
+ *
+ * The account's backoff state is intentionally preserved: an error-triggered
+ * close must be able to keep escalating the reconnect delay, and only a
+ * genuinely forgotten account (removed, or shutting down) discards it via
+ * `forgetAccount()`.
+ */
+const closeStream = (accountId, reason) => {
+  const handle = activeStreams.get(accountId);
+  if (!handle) return;
+
+  // Mark disposed first: the SDK may emit a late error from this connection as
+  // it shuts down, and that must not disturb a replacement stream.
+  handle.disposed = true;
+  if (typeof handle.close === 'function') {
+    handle.close();
+    metrics.horizonStreams.inc({ event: 'closed' });
+  }
+
+  activeStreams.delete(accountId);
+  if (reason) {
+    logger.info(`[${timestamp()}] ­ƒøæ Closed stream for ${accountId} (${reason})`);
+  }
+};
+
+/** Close a stream and discard all reconnect state for the account. */
+const forgetAccount = (accountId, reason) => {
+  closeStream(accountId, reason);
+  cancelReconnect(accountId);
+  streamBackoffs.delete(accountId);
+};
+
+/**
+ * Schedule a jittered, backed-off reconnect for a dropped stream. Reconnect
+ * timers are tracked per account so a single flapping account cannot be
+ * starved by ÔÇö or starve ÔÇö the rest.
+ */
+const scheduleReconnect = (accountId) => {
+  cancelReconnect(accountId);
+
+  const backoff = getStreamBackoff(accountId);
+  const { delayMs, attempt } = backoff.nextDelay();
+
+  logger.info(
+    `[${timestamp()}] ­ƒöä Reconnecting ${accountId} in ${Math.round(delayMs / 1000)}s ` +
+      `(attempt ${attempt})`,
+  );
+  metrics.horizonPollBackoffSeconds.set({ scope: 'stream' }, delayMs / 1000);
+
+  const timer = setTimeout(() => {
+    reconnectTimers.delete(accountId);
+    watchAccount(accountId);
+  }, delayMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  reconnectTimers.set(accountId, timer);
+};
+
+/**
+ * Open a payment SSE stream for a single Stellar account.
+ *
+ * On error the stream is closed and a jittered reconnect is scheduled. Closing
+ * matters: the SDK's EventSource reconnects on its own, so leaving it open
+ * would let the next poll cycle open a *second* stream for the same account ÔÇö
+ * duplicate webhooks and double the Horizon load.
+ *
+ * @returns {boolean} True when a new stream was opened.
+ */
+=======
+
+
+// ---------------------------------------------------------------------------
+// Stream Management
+// ---------------------------------------------------------------------------
+
+// Open a payment SSE stream for a single Stellar account.
+>>>>>>> origin/main
+
+Conflict 5:
+<<<<<<< HEAD
+  handle.close = horizon
+=======
+  let closeStream = null;
+  let closed = false;
+
+
+  const stopStream = () => {
+    if (closed) return;
+    closed = true;
+    activeStreams.delete(accountId);
+    if (typeof closeStream === 'function') {
+      try {
+        closeStream();
+      } catch (err) {
+        logger.error(
+          `[${timestamp()}] Failed to close stream for ${accountId}:`,
+          err?.message || err,
+        );
+      }
+    }
+  };
+
+  closeStream = horizon
+>>>>>>> origin/main
+
+Conflict 6:
+<<<<<<< HEAD
+      onerror: onStreamError,
+    });
+
+  // `.stream()` can invoke onerror synchronously (e.g. EventSource fails to
+  // construct). In that case the reconnect is already scheduled and registering
+  // the dead handle would block it.
+  if (handle.disposed) return true;
+
+  activeStreams.set(accountId, handle);
+  metrics.horizonStreams.inc({ event: 'opened' });
+  return true;
+};
+
+/**
+ * Query the local database for all registered public keys and reconcile the
+ * set of open streams with it.
+ *
+ * @returns {Promise<{accounts: number, streams: number, opened: number, closed: number}>}
+ *   A summary of the cycle, used to decide whether it was productive.
+ */
+const syncWatchedAccounts = async () => {
+  const rows = await prisma.user.findMany({
+    distinct: ['address'],
+    select: { address: true },
+  });
+
+  const currentAddresses = new Set(rows.map((r) => r.address));
+  let opened = 0;
+  let closed = 0;
+
+  // Start watching new accounts
+  for (const { address } of rows) {
+    if (watchAccount(address)) opened += 1;
+  }
+
+  // Stop watching removed accounts
+  for (const address of [...activeStreams.keys()]) {
+    if (!currentAddresses.has(address)) {
+      forgetAccount(address, 'account removed');
+      closed += 1;
+    }
+  }
+
+  logger.info(
+    `[${timestamp()}] ­ƒôí Actively monitoring ${activeStreams.size} account(s) ` +
+      `(+${opened} opened, -${closed} closed)`,
+  );
+
+  return {
+    accounts: currentAddresses.size,
+    streams: activeStreams.size,
+    opened,
+    closed,
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Poll Loop
+// ---------------------------------------------------------------------------
+// A recursive setTimeout replaces the old fixed setInterval for two reasons:
+// the delay has to be able to change per cycle, and a slow cycle must not be
+// able to overlap the next one.
+let pollTimer = null;
+let pollStopped = false;
+let pollInFlight = false;
+
+/**
+ * Arm the timer for the next cycle.
+ *
+ * The delay is drawn exactly once per cycle and threaded through from
+ * `runPollCycle`, so the value logged here always matches the value actually
+ * scheduled. Drawing twice would jitter the reported number away from the real
+ * one and make the logs impossible to reason about.
+ *
+ * @param {{delayMs: number, attempt: number}} [delay] Pre-drawn backoff info.
+ */
+const scheduleNextPoll = (delay) => {
+  if (pollStopped) return;
+
+  // Exactly one timer may be pending. Without this, a cycle triggered outside
+  // the timer (a manual kick, a health endpoint) would stack a second timer and
+  // double the polling rate.
+  if (pollTimer) clearTimeout(pollTimer);
+
+  const { delayMs, attempt } = delay || pollBackoff.nextDelay();
+  pollTimer = setTimeout(runPollCycle, delayMs);
+  if (typeof pollTimer.unref === 'function') pollTimer.unref();
+
+  metrics.horizonPollBackoffSeconds.set({ scope: 'poll' }, delayMs / 1000);
+  metrics.horizonPollFailures.set(attempt);
+
+  logger.info(
+    `[${timestamp()}] ÔÅ▒´©Å  Next Horizon poll in ${Math.round(delayMs / 1000)}s ` +
+      `(attempt ${attempt})`,
+  );
+};
+
+const runPollCycle = async () => {
+  if (pollStopped) return;
+  // Defensive: the timer is only re-armed after the previous cycle settles, so
+  // this should be unreachable, but a hung dependency must not stack cycles.
+  if (pollInFlight) return;
+
+  pollInFlight = true;
+  const startedAt = Date.now();
+  let next;
+
+  try {
+    // Fast-fail when Horizon is known to be down ÔÇö don't waste resources
+    // opening streams that will immediately error.
+    await healthCheckBreaker.fire();
+
+    const summary = await syncWatchedAccounts();
+    metrics.horizonPollDuration.observe((Date.now() - startedAt) / 1000);
+
+    // An empty cycle means there is genuinely nothing to watch yet. Stretching
+    // the interval there is free: nobody is waiting on a new account stream.
+    if (summary.accounts === 0 && summary.streams === 0) {
+      pollBackoff.onEmpty();
+      metrics.horizonPollCycles.inc({ outcome: 'empty' });
+      next = pollBackoff.nextDelay();
+      logger.info(
+        `[${timestamp()}] ­ƒÿ┤ No accounts registered yet; next poll in ` +
+          `${Math.round(next.delayMs / 1000)}s (attempt ${next.attempt})`,
+      );
+    } else {
+      pollBackoff.onSuccess();
+      metrics.horizonPollCycles.inc({ outcome: 'success' });
+      metrics.horizonLastSuccessTimestamp.set(Date.now() / 1000);
+    }
+  } catch (err) {
+    metrics.horizonPollDuration.observe((Date.now() - startedAt) / 1000);
+    pollBackoff.onFailure(err);
+    recordRateLimit(err);
+
+    const outcome = isRateLimitError(err) ? 'rate_limited' : 'failure';
+    metrics.horizonPollCycles.inc({ outcome });
+
+    next = pollBackoff.nextDelay();
+    logger.error(
+      `[${timestamp()}] ÔØî Horizon poll cycle failed (${outcome}):`,
+      err?.message || err,
+    );
+    logger.warn(
+      `[${timestamp()}] ÔÅ©´©Å  Backing off to ${Math.round(next.delayMs / 1000)}s ` +
+        `before the next poll (attempt ${next.attempt})`,
+    );
+  } finally {
+    pollInFlight = false;
+    scheduleNextPoll(next);
+  }
+};
+
+/** Stop the poll loop. Safe to call more than once. */
+const stopPolling = () => {
+  pollStopped = true;
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  for (const timer of reconnectTimers.values()) clearTimeout(timer);
+  reconnectTimers.clear();
+};
+
+// ---------------------------------------------------------------------------
+// Graceful Shutdown
+// ---------------------------------------------------------------------------
+const shutdown = async () => {
+  logger.info(`\n[${timestamp()}] Shutting down Horizon listener...`);
+  stopPolling();
+  for (const address of [...activeStreams.keys()]) {
+    forgetAccount(address);
+=======
+      onerror: (error) => {
+        logger.error(
+          `[${timestamp()}] ÔÜá´©Å  Stream error for ${accountId}:`,
+          error?.message || error,
+        );
+        // Release dead stream before removing map entry
+        stopStream();
+        logger.info(
+          `[${timestamp()}] ­ƒöä Removed dead stream for ${accountId}; will reconnect on next sync`,
+        );
+      },
+    });
+
+  if (closed) {
+    // Close synchronously-errored stream
+    if (typeof closeStream === 'function') {
+      try {
+        closeStream();
+      } catch (err) {
+        logger.error(
+          `[${timestamp()}] Failed to close stream for ${accountId}:`,
+          err?.message || err,
+        );
+      }
+    }
+    return;
+  }
+
+  activeStreams.set(accountId, stopStream);
+};
+
+// Query the local database for all registered public keys and open streams for any that aren't already being watched.
+const syncWatchedAccounts = async () => {
+  if (isSyncing) return;
+  isSyncing = true;
+
+  try {
+
+    try {
+      await healthCheckBreaker.fire();
+    } catch {
+      logger.warn(
+        `[${timestamp()}] ÔÅ©´©Å  Horizon health check failed; skipping stream sync`,
+      );
+      return;
+    }
+
+    try {
+      const rows = await prisma.user.findMany({
+        distinct: ['address'],
+        select: { address: true },
+      });
+
+      const currentAddresses = new Set(rows.map((r) => r.address));
+
+      // Start watching new accounts
+      for (const { address } of rows) {
+        if (!activeStreams.has(address)) {
+          watchAccount(address);
+        }
+      }
+
+      // Stop watching removed accounts
+      for (const [address, stopFn] of activeStreams) {
+        if (!currentAddresses.has(address)) {
+          logger.info(`[${timestamp()}] ­ƒøæ Stopped watching removed account ${address}`);
+          if (typeof stopFn === 'function') {
+            stopFn();
+          } else {
+            activeStreams.delete(address);
+          }
+        }
+      }
+
+      logger.info(
+        `[${timestamp()}] ­ƒôí Actively monitoring ${activeStreams.size} account(s)`,
+      );
+    } catch (err) {
+      logger.error(`[${timestamp()}] ÔØî Failed to sync watched accounts:`, err.message);
+    }
+  } finally {
+    isSyncing = false;
+  }
+};
+
+
+const shutdown = async () => {
+  logger.info(`\n[${timestamp()}] Shutting down Horizon listener...`);
+
+  if (syncInterval) {
+    clearInterval(syncInterval);
+    syncInterval = null;
+  }
+
+  for (const [address, stopFn] of activeStreams) {
+    if (typeof stopFn === 'function') {
+      stopFn();
+    } else {
+      activeStreams.delete(address);
+    }
+    logger.info(`  Closed stream for ${address}`);
+>>>>>>> origin/main
+
+Conflict 7:
+<<<<<<< HEAD
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+=======
+
+>>>>>>> origin/main
+
+Conflict 8:
+<<<<<<< HEAD
+  // First cycle runs immediately, then reschedules itself on a backoff timer.
+  await runPollCycle();
+};
+
+module.exports = {
+  // Entry points
+  main,
+  probeHorizon,
+  // Polling / scheduling
+  runPollCycle,
+  scheduleNextPoll,
+  stopPolling,
+  // Streams
+  watchAccount,
+  closeStream,
+  forgetAccount,
+  scheduleReconnect,
+  syncWatchedAccounts,
+  // State (exposed for tests and introspection)
+  activeStreams,
+  reconnectTimers,
+  streamBackoffs,
+  pollBackoff,
+  healthCheckBreaker,
+  // Config
+  POLL_INTERVAL_MS,
+  POLL_MAX_INTERVAL_MS,
+  STREAM_RECONNECT_BASE_MS,
+  STREAM_RECONNECT_MAX_MS,
+  HORIZON_URL,
+};
+
+// Only boot when executed directly, so tests can import the module without
+// starting timers or opening Horizon connections.
+if (require.main === module) {
+=======
+  // Periodically check for newly registered accounts.
+  syncInterval = setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
+  if (syncInterval && typeof syncInterval.unref === 'function') {
+    syncInterval.unref();
+  }
+
+  return { syncInterval };
+};
+
+
+if (require.main === module) {
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+>>>>>>> origin/main
+
+Conflict 9:
+<<<<<<< HEAD
+=======
+
+module.exports = {
+  watchAccount,
+  syncWatchedAccounts,
+  shutdown,
+  main,
+  activeStreams,
+};
+>>>>>>> origin/main
+
+--- stellar-payment-platform/src/metrics.js ---
+Conflict 1:
+<<<<<<< HEAD
+// ---------------------------------------------------------------------------
+// Horizon polling metrics
+// ---------------------------------------------------------------------------
+// The listener process reports these. Because it is a separate process from the
+// API server it keeps its own registry, so the numbers are only scrapeable when
+// LISTENER_METRICS_PORT is set (see horizonListener.js). The definitions live
+// here so both processes describe the Horizon poller identically.
+
+// Counter: poll cycles by outcome. `outcome` is one of
+// success | empty | rate_limited | failure.
+const horizonPollCycles = new client.Counter({
+  name: 'stellar_tags_horizon_poll_cycles_total',
+  help: 'Horizon account-sync poll cycles by outcome',
+  labelNames: ['outcome'],
+});
+
+// Counter: HTTP 429 responses received from Horizon.
+const horizonRateLimited = new client.Counter({
+  name: 'stellar_tags_horizon_rate_limited_total',
+  help: 'HTTP 429 (rate limited) responses received from Horizon',
+});
+
+// Counter: SSE streams opened, closed and dropped by the listener.
+const horizonStreams = new client.Counter({
+  name: 'stellar_tags_horizon_streams_total',
+  help: 'Horizon payment SSE streams by event',
+  labelNames: ['event'],
+});
+
+// Histogram: wall-clock duration of a full sync cycle.
+const horizonPollDuration = new client.Histogram({
+  name: 'stellar_tags_horizon_poll_duration_seconds',
+  help: 'Duration of a Horizon account-sync poll cycle in seconds',
+  buckets: [0.05, 0.1, 0.5, 1, 2, 5, 15, 30],
+});
+
+// Gauge: the delay the poller will wait before its next cycle. Rising values
+// are the visible symptom of an unhealthy Horizon.
+const horizonPollBackoffSeconds = new client.Gauge({
+  name: 'stellar_tags_horizon_poll_backoff_seconds',
+  help: 'Delay before the next Horizon poll cycle, in seconds',
+  labelNames: ['scope'],
+});
+
+// Gauge: consecutive failed / empty poll cycles.
+const horizonPollFailures = new client.Gauge({
+  name: 'stellar_tags_horizon_poll_consecutive_failures',
+  help: 'Consecutive unsuccessful Horizon poll cycles',
+});
+
+// Gauge: Unix timestamp of the last poll cycle that talked to Horizon.
+const horizonLastSuccessTimestamp = new client.Gauge({
+  name: 'stellar_tags_horizon_poll_last_success_timestamp_seconds',
+  help: 'Unix timestamp of the last successful Horizon poll cycle',
+=======
+// Gauge: payment retry jobs currently parked in the dead letter queue. Read on
+// every scrape so the value is never stale, and 0 when Redis is unconfigured.
+const dlqDepth = new client.Gauge({
+  name: 'stellar_tags_dlq_depth',
+  help: 'Payment retry jobs currently waiting in the dead letter queue',
+  async collect() {
+    if (!dlqDepthSource) {
+      this.set(0);
+      return;
+    }
+    this.set(await dlqDepthSource());
+  },
+});
+
+// Counter: payment retry jobs routed to the dead letter queue since boot.
+const dlqMessagesTotal = new client.Counter({
+  name: 'stellar_tags_dlq_messages_total',
+  help: 'Total payment retry jobs moved to the dead letter queue',
+>>>>>>> origin/main
+
+Conflict 2:
+<<<<<<< HEAD
+
+  // Horizon polling
+  horizonPollCycles,
+  horizonRateLimited,
+  horizonStreams,
+  horizonPollDuration,
+  horizonPollBackoffSeconds,
+  horizonPollFailures,
+  horizonLastSuccessTimestamp,
+=======
+  dlqDepth,
+  dlqMessagesTotal,
+>>>>>>> origin/main
+
+--- stellar-payment-platform/tests/horizon-listener.test.js ---
+Conflict 1:
+<<<<<<< HEAD
+// ---------------------------------------------------------------------------
+// Tests for the Horizon listener's polling loop (#675)
+//
+// Verifies that the loop applies exponential backoff with jitter, honours
+// Retry-After on 429s, and backs off on empty responses ÔÇö the behaviour the
+// issue asks for ÔÇö instead of hammering Horizon on a fixed interval.
+// ---------------------------------------------------------------------------
+
+jest.mock('../src/logger', () => ({
+  logger: {
+    warn: jest.fn(),
+    info: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+  },
+  httpLogger: (req, res, next) => next(),
+}));
+
+const mockPrisma = {
+  user: { findMany: jest.fn() },
+  $disconnect: jest.fn().mockResolvedValue(undefined),
+};
+
+jest.mock('../prismaClient', () => ({ prisma: mockPrisma }));
+
+jest.mock('../src/db', () => ({
+  poolGet: jest.fn(),
+  poolRun: jest.fn(),
+}));
+
+jest.mock('../src/webhookWorker', () => ({
+  dispatchPaymentWebhooks: jest.fn().mockResolvedValue(undefined),
+  startWebhookWorker: jest.fn(),
+  closeWebhookQueue: jest.fn().mockResolvedValue(undefined),
+}));
+
+// A breaker that never trips on its own, so each cycle is driven explicitly.
+const mockBreaker = { fire: jest.fn() };
+
+jest.mock('../src/services/stellarService', () => ({
+  horizon: {
+    payments: () => ({
+      forAccount: () => ({
+        cursor: () => ({ stream: (options) => mockStream(options) }),
+      }),
+    }),
+  },
+  createBreaker: jest.fn(() => mockBreaker),
+  HORIZON_BASE: 'https://horizon-testnet.stellar.org',
+  HORIZON_NETWORK: 'testnet',
+}));
+
+/** Records every stream opened and lets a test drive its callbacks. */
+let mockStream = () => () => {};
+
+const ACCOUNTS = {
+  alice: { address: 'G_ALICE' },
+  bob: { address: 'G_BOB' },
+};
+
+describe('horizonListener poll loop', () => {
+  let listener;
+  let env;
+
+  beforeEach(() => {
+    // Small intervals keep the fake-timer advances readable.
+    env = { ...process.env };
+    process.env.POLL_INTERVAL_MS = '1000';
+    process.env.POLL_MAX_INTERVAL_MS = '8000';
+    process.env.STREAM_RECONNECT_BASE_MS = '1000';
+    process.env.STREAM_RECONNECT_MAX_MS = '8000';
+    process.env.POLL_EMPTY_THRESHOLD = '2';
+    process.env.HORIZON_POLL_JITTER = 'none';
+
+    mockPrisma.user.findMany.mockReset().mockResolvedValue([ACCOUNTS.alice]);
+    mockBreaker.fire.mockReset().mockResolvedValue(true);
+    mockStream = jest.fn(() => jest.fn());
+    listener = require('../horizonListener');
+  });
+
+  afterEach(() => {
+    listener.stopPolling();
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    process.env = env;
+    jest.resetModules();
+  });
+
+  describe('configuration', () => {
+    it('reads the base and ceiling poll intervals from the environment', () => {
+      expect(listener.POLL_INTERVAL_MS).toBe(1_000);
+      expect(listener.POLL_MAX_INTERVAL_MS).toBe(8_000);
+      expect(listener.STREAM_RECONNECT_BASE_MS).toBe(1_000);
+    });
+
+    it('probes the same Horizon base the SDK client uses', () => {
+      expect(listener.HORIZON_URL).toBe('https://horizon-testnet.stellar.org');
+    });
+  });
+
+  describe('healthy steady state', () => {
+    it('re-polls at the base interval and opens a stream per account', async () => {
+      await listener.runPollCycle();
+
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(1);
+      expect(mockStream).toHaveBeenCalledTimes(1);
+      expect(listener.activeStreams.has('G_ALICE')).toBe(true);
+
+      // Healthy cycle -> backoff stays at the base delay.
+      expect(listener.pollBackoff.failureAttempt).toBe(0);
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(1_000);
+    });
+
+    it('does not reopen a stream it already holds', async () => {
+      await listener.runPollCycle();
+      await listener.runPollCycle();
+      await listener.runPollCycle();
+
+      expect(mockStream).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not slow down when there is nothing new to discover', async () => {
+      // Same account every cycle: the common production steady state.
+      for (let i = 0; i < 5; i += 1) {
+        await listener.runPollCycle();
+      }
+      expect(listener.pollBackoff.failureAttempt).toBe(0);
+      expect(listener.pollBackoff.emptyStreak).toBe(0);
+    });
+
+    it('closes the stream when an account is deregistered', async () => {
+      const close = jest.fn();
+      mockStream.mockReturnValue(close);
+
+      await listener.runPollCycle();
+      expect(listener.activeStreams.has('G_ALICE')).toBe(true);
+
+      mockPrisma.user.findMany.mockResolvedValue([ACCOUNTS.bob]);
+      const summary = await listener.syncWatchedAccounts();
+
+      expect(close).toHaveBeenCalled();
+      expect(listener.activeStreams.has('G_ALICE')).toBe(false);
+      expect(listener.activeStreams.has('G_BOB')).toBe(true);
+      expect(summary).toMatchObject({ closed: 1, opened: 1, accounts: 1 });
+    });
+  });
+
+  describe('backoff on failures', () => {
+    it('backs off exponentially when Horizon is unreachable', async () => {
+      mockBreaker.fire.mockRejectedValue(new Error('ECONNREFUSED'));
+
+      const delays = [];
+      for (let i = 0; i < 4; i += 1) {
+        await listener.runPollCycle();
+        delays.push(listener.pollBackoff.nextDelay().delayMs);
+      }
+
+      // 2s, 4s, 8s, then pinned at the 8s ceiling.
+      expect(delays).toEqual([2_000, 4_000, 8_000, 8_000]);
+    });
+
+    it('never queries the database while the health check is failing', async () => {
+      mockBreaker.fire.mockRejectedValue(new Error('down'));
+
+      await listener.runPollCycle();
+
+      expect(mockPrisma.user.findMany).not.toHaveBeenCalled();
+      expect(mockStream).not.toHaveBeenCalled();
+    });
+
+    it('backs off when the database query fails', async () => {
+      mockPrisma.user.findMany.mockRejectedValue(new Error('db down'));
+
+      await listener.runPollCycle();
+      expect(listener.pollBackoff.failureAttempt).toBe(1);
+
+      await listener.runPollCycle();
+      expect(listener.pollBackoff.failureAttempt).toBe(2);
+    });
+
+    it('recovers to the base interval once Horizon comes back', async () => {
+      mockBreaker.fire.mockRejectedValue(new Error('down'));
+      await listener.runPollCycle();
+      await listener.runPollCycle();
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(4_000);
+
+      mockBreaker.fire.mockResolvedValue(true);
+      await listener.runPollCycle();
+
+      expect(listener.pollBackoff.failureAttempt).toBe(0);
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(1_000);
+    });
+  });
+
+  describe('backoff on empty responses', () => {
+    beforeEach(() => {
+      mockPrisma.user.findMany.mockResolvedValue([]);
+    });
+
+    it('holds the base interval for the first empty cycle', async () => {
+      await listener.runPollCycle();
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(1_000);
+    });
+
+    it('stretches the interval once the empty threshold is crossed', async () => {
+      // Threshold is 2 in this suite.
+      await listener.runPollCycle();
+      await listener.runPollCycle();
+
+      expect(listener.pollBackoff.emptyStreak).toBe(2);
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(2_000);
+
+      await listener.runPollCycle();
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(4_000);
+    });
+
+    it('resets the empty streak as soon as an account appears', async () => {
+      await listener.runPollCycle();
+      await listener.runPollCycle();
+      expect(listener.pollBackoff.emptyStreak).toBe(2);
+
+      mockPrisma.user.findMany.mockResolvedValue([ACCOUNTS.alice]);
+      await listener.runPollCycle();
+
+      expect(listener.pollBackoff.emptyStreak).toBe(0);
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(1_000);
+    });
+  });
+
+  describe('rate limiting (HTTP 429)', () => {
+    it('waits at least as long as the Retry-After header demands', async () => {
+      const rateLimited = new Error('Horizon rate limited (HTTP 429)');
+      rateLimited.status = 429;
+      rateLimited.headers = new Headers({ 'retry-after': '30' });
+      mockBreaker.fire.mockRejectedValue(rateLimited);
+
+      await listener.runPollCycle();
+
+      // Exponential backoff alone would ask for 2s; Retry-After wins.
+      expect(listener.pollBackoff.retryAfterMs).toBe(30_000);
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(30_000);
+    });
+
+    it('keeps honouring Retry-After across consecutive 429s', async () => {
+      const rateLimited = new Error('Horizon rate limited (HTTP 429)');
+      rateLimited.status = 429;
+      rateLimited.headers = new Headers({ 'retry-after': '60' });
+      mockBreaker.fire.mockRejectedValue(rateLimited);
+
+      for (let i = 0; i < 3; i += 1) {
+        await listener.runPollCycle();
+        expect(listener.pollBackoff.nextDelay().delayMs).toBe(60_000);
+      }
+    });
+
+    it('drops the Retry-After floor after a successful cycle', async () => {
+      const rateLimited = new Error('Horizon rate limited (HTTP 429)');
+      rateLimited.status = 429;
+      rateLimited.headers = new Headers({ 'retry-after': '30' });
+      mockBreaker.fire.mockRejectedValue(rateLimited);
+
+      await listener.runPollCycle();
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(30_000);
+
+      mockBreaker.fire.mockResolvedValue(true);
+      await listener.runPollCycle();
+
+      expect(listener.pollBackoff.retryAfterMs).toBe(0);
+      expect(listener.pollBackoff.nextDelay().delayMs).toBe(1_000);
+    });
+
+    it('does not open streams when rate limited', async () => {
+      const rateLimited = new Error('Too Many Requests');
+      rateLimited.status = 429;
+      mockBreaker.fire.mockRejectedValue(rateLimited);
+
+      await listener.runPollCycle();
+
+      expect(mockStream).not.toHaveBeenCalled();
+      expect(listener.activeStreams.size).toBe(0);
+    });
+  });
+
+  describe('SSE stream lifecycle', () => {
+    it('closes the dead stream before scheduling a reconnect', () => {
+      const close = jest.fn();
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return close;
+      });
+
+      listener.watchAccount('G_ALICE');
+      expect(listener.activeStreams.has('G_ALICE')).toBe(true);
+
+      captured.onerror(new Error('stream died'));
+
+      // The SDK's EventSource reconnects on its own, so leaving it open would
+      // let the next cycle open a duplicate stream for the same account.
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(listener.activeStreams.has('G_ALICE')).toBe(false);
+    });
+
+    it('schedules a jittered reconnect after a stream error', () => {
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('stream died'));
+
+      expect(listener.reconnectTimers.has('G_ALICE')).toBe(true);
+      expect(listener.streamBackoffs.get('G_ALICE').failureAttempt).toBe(1);
+    });
+
+    it('escalates the reconnect delay on repeated stream failures', () => {
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      const backoff = () => listener.streamBackoffs.get('G_ALICE');
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('down'));
+      expect(backoff().nextDelay().nominalMs).toBe(2_000);
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('down'));
+      expect(backoff().nextDelay().nominalMs).toBe(4_000);
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('down'));
+      expect(backoff().nextDelay().nominalMs).toBe(8_000);
+
+      // ... and is capped, not unbounded.
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('down'));
+      expect(backoff().nextDelay().delayMs).toBeLessThanOrEqual(8_000);
+    });
+
+    it('honours Retry-After on a rate-limited stream', () => {
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+      const error = new Error('Too Many Requests');
+      error.status = 429;
+      error.headers = new Headers({ 'retry-after': '45' });
+      captured.onerror(error);
+
+      const backoff = listener.streamBackoffs.get('G_ALICE');
+      expect(backoff.retryAfterMs).toBe(45_000);
+      expect(backoff.nextDelay().delayMs).toBe(45_000);
+    });
+
+    it('actually reopens the stream when the reconnect timer fires', () => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('stream died'));
+      expect(mockStream).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(2_000);
+
+      expect(mockStream).toHaveBeenCalledTimes(2);
+      expect(listener.activeStreams.has('G_ALICE')).toBe(true);
+      expect(listener.reconnectTimers.has('G_ALICE')).toBe(false);
+    });
+
+    it('resets the reconnect backoff once the stream delivers a message', () => {
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('down'));
+      expect(listener.streamBackoffs.get('G_ALICE').failureAttempt).toBe(1);
+
+      listener.watchAccount('G_ALICE');
+      captured.onmessage({ type: 'payment', type_i: 1, to: 'G_ALICE' });
+
+      expect(listener.streamBackoffs.get('G_ALICE').failureAttempt).toBe(0);
+    });
+
+    it('ignores a late error from a stream that was already closed', () => {
+      const callbacks = [];
+      mockStream.mockImplementation((options) => {
+        callbacks.push(options);
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE'); // stream A
+      listener.closeStream('G_ALICE'); // A disposed, no longer in activeStreams
+      listener.watchAccount('G_ALICE'); // stream B
+      expect(listener.activeStreams.has('G_ALICE')).toBe(true);
+
+      // A's connection tears down asynchronously and reports an error. It must
+      // not disturb the healthy replacement or schedule a redundant reconnect.
+      callbacks[0].onerror(new Error('late teardown'));
+
+      expect(listener.activeStreams.has('G_ALICE')).toBe(true);
+      expect(listener.reconnectTimers.has('G_ALICE')).toBe(false);
+      expect(mockStream).toHaveBeenCalledTimes(2);
+    });
+
+    it('forgets reconnect state for a deregistered account', async () => {
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('down'));
+      expect(listener.streamBackoffs.has('G_ALICE')).toBe(true);
+      expect(listener.reconnectTimers.has('G_ALICE')).toBe(true);
+
+      listener.forgetAccount('G_ALICE', 'account removed');
+
+      expect(listener.streamBackoffs.has('G_ALICE')).toBe(false);
+      expect(listener.reconnectTimers.has('G_ALICE')).toBe(false);
+    });
+
+    it('cancels a pending reconnect when the poll loop wins the race', () => {
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+      captured.onerror(new Error('down'));
+      expect(listener.reconnectTimers.has('G_ALICE')).toBe(true);
+
+      listener.watchAccount('G_ALICE');
+      expect(listener.reconnectTimers.has('G_ALICE')).toBe(false);
+    });
+  });
+
+  describe('probeHorizon', () => {
+    afterEach(() => {
+      delete global.fetch;
+    });
+
+    const ok = (extra = {}) => ({ ok: true, status: 200, ...extra });
+
+    it('resolves when Horizon is reachable', async () => {
+      global.fetch = jest.fn().mockResolvedValue(ok());
+      await expect(listener.probeHorizon()).resolves.toBe(true);
+    });
+
+    it('queries a cheap ledger endpoint on the configured Horizon base', async () => {
+      global.fetch = jest.fn().mockResolvedValue(ok());
+      await listener.probeHorizon();
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        'https://horizon-testnet.stellar.org/ledgers?limit=1',
+        expect.objectContaining({ headers: { Accept: 'application/json' } }),
+      );
+    });
+
+    // The probe exists mainly so a 429 stays identifiable: the SDK's
+    // NetworkError throws the status away, which would make a rate limit
+    // indistinguishable from an outage and forfeit the Retry-After hint.
+    it('surfaces a 429 as a rate-limit error carrying Retry-After', async () => {
+      const headers = new Headers({ 'retry-after': '45' });
+      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 429, headers });
+
+      await expect(listener.probeHorizon()).rejects.toMatchObject({
+        status: 429,
+        headers,
+      });
+    });
+
+    it('surfaces other HTTP failures with their status', async () => {
+      global.fetch = jest
+        .fn()
+        .mockResolvedValue({ ok: false, status: 503, headers: new Headers() });
+
+      await expect(listener.probeHorizon()).rejects.toMatchObject({ status: 503 });
+    });
+
+    it('propagates a network failure', async () => {
+      global.fetch = jest.fn().mockRejectedValue(new Error('ECONNRESET'));
+      await expect(listener.probeHorizon()).rejects.toThrow('ECONNRESET');
+    });
+  });
+
+  describe('main', () => {
+    it('starts the webhook worker and runs a first poll cycle', async () => {
+      const { startWebhookWorker } = require('../src/webhookWorker');
+      await listener.main();
+
+      expect(startWebhookWorker).toHaveBeenCalledTimes(1);
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(1);
+      expect(listener.activeStreams.has('G_ALICE')).toBe(true);
+    });
+  });
+
+  describe('payment dispatch', () => {
+    it('forwards real payments to the webhook dispatcher and ignores other ops', () => {
+      const { dispatchPaymentWebhooks } = require('../src/webhookWorker');
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+
+      captured.onmessage({ type: 'create_account', type_i: 0, to: 'G_ALICE' });
+      captured.onmessage({ type: 'path_payment_strict_receive', type_i: 2, to: 'G_ALICE' });
+      expect(dispatchPaymentWebhooks).not.toHaveBeenCalled();
+
+      captured.onmessage({
+        type: 'payment',
+        type_i: 1,
+        to: 'G_ALICE',
+        amount: '10',
+        asset_type: 'native',
+        transaction_hash: 'abc',
+      });
+
+      expect(dispatchPaymentWebhooks).toHaveBeenCalledTimes(1);
+      expect(dispatchPaymentWebhooks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payment: expect.objectContaining({ transaction_hash: 'abc' }),
+        }),
+      );
+    });
+
+    it('logs a failed webhook dispatch instead of crashing the stream', async () => {
+      const { dispatchPaymentWebhooks } = require('../src/webhookWorker');
+      dispatchPaymentWebhooks.mockRejectedValueOnce(new Error('queue down'));
+      let captured;
+      mockStream.mockImplementation((options) => {
+        captured = options;
+        return jest.fn();
+      });
+
+      listener.watchAccount('G_ALICE');
+      captured.onmessage({
+        type: 'payment',
+        type_i: 1,
+        to: 'G_ALICE',
+        transaction_hash: 'abc',
+      });
+
+      await new Promise((resolve) => setImmediate(resolve));
+      const { logger } = require('../src/logger');
+      expect(
+        logger.error.mock.calls.some(([msg]) =>
+          String(msg).includes('Webhook dispatch failed'),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe('scheduling', () => {
+    // A cycle resolves through several microtasks before it re-arms its timer,
+    // so advancing the clock has to be interleaved with a macrotask flush.
+    const advance = async (ms) => {
+      jest.advanceTimersByTime(ms);
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    beforeEach(() => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    });
+
+    it('keeps re-arming the timer instead of using a fixed interval', async () => {
+      mockBreaker.fire.mockResolvedValue(true);
+      await listener.runPollCycle();
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(1);
+
+      // Base interval cycle: re-arms itself, so both windows must fire.
+      await advance(1_000);
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(2);
+      await advance(1_000);
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(3);
+    });
+
+    it('leaves a longer gap after a failure, proving the interval is dynamic', async () => {
+      mockBreaker.fire.mockRejectedValue(new Error('down'));
+      // First failure doubles the wait from 1s to 2s.
+      await listener.runPollCycle();
+      mockBreaker.fire.mockClear();
+
+      // A fixed setInterval would have fired here; the backoff must not.
+      await advance(1_000);
+      expect(mockBreaker.fire).not.toHaveBeenCalled();
+
+      await advance(1_000);
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps at most one poll timer pending', async () => {
+      // A cycle kicked outside the timer must not stack a second one and double
+      // the polling rate.
+      await listener.runPollCycle();
+      await listener.runPollCycle();
+      await listener.runPollCycle();
+      mockBreaker.fire.mockClear();
+
+      await advance(1_000);
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs the delay it actually schedules, not a second jittered draw', async () => {
+      jest.useRealTimers();
+
+      // Turn jitter on so a second draw would produce a visibly different
+      // number, then capture the delay the poll timer is actually armed with.
+      jest.resetModules();
+      process.env.HORIZON_POLL_JITTER = 'equal';
+      // resetModules re-runs the logger mock factory, so re-require it to get
+      // the same instance the freshly loaded listener will write to.
+      const { logger } = require('../src/logger');
+      const jittered = require('../horizonListener');
+
+      mockPrisma.user.findMany.mockResolvedValue([]);
+      const timerSpy = jest.spyOn(global, 'setTimeout');
+      logger.info.mockClear();
+
+      await jittered.runPollCycle();
+      // Base is 1000ms with equal jitter, so the poll timer lands in [500, 1000].
+      // The health probe's abort timer is 5000ms and must not be confused for it.
+      const armed = timerSpy.mock.calls
+        .map(([, ms]) => ms)
+        .filter((ms) => ms >= 400 && ms <= 1_100);
+      timerSpy.mockRestore();
+
+      expect(armed).toHaveLength(1);
+      const announced = logger.info.mock.calls
+        .map(([msg]) => String(msg))
+        .find((msg) => msg.includes('Next Horizon poll in'));
+
+      expect(announced).toContain(`${Math.round(armed[0] / 1000)}s`);
+
+      jittered.stopPolling();
+    });
+
+    it('does not overlap cycles when a cycle is still in flight', async () => {
+      let release;
+      mockBreaker.fire.mockReturnValue(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      );
+
+      const first = listener.runPollCycle();
+      // A second entry while the first is pending must be a no-op.
+      const second = listener.runPollCycle();
+      release(true);
+      await Promise.all([first, second]);
+
+      expect(mockBreaker.fire).toHaveBeenCalledTimes(1);
+    });
+
+    it('stopPolling() clears the pending timer', async () => {
+      await listener.runPollCycle();
+      listener.stopPolling();
+      mockBreaker.fire.mockClear();
+
+      await advance(60_000);
+      expect(mockBreaker.fire).not.toHaveBeenCalled();
+    });
+=======
+'use strict';
+
+/**
+ * Regression tests for #683 ÔÇö background SSE stream cleanup.
+ *
+ * The Horizon listener must release the underlying EventSource (socket +
+ * reconnect timer) whenever a stream errors or an account is unregistered.
+ * Dropping the map entry without invoking the SDK close function leaked one
+ * live connection per failed stream.
+ */
+
+jest.mock('../src/logger', () => ({
+  logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+}));
+
+jest.mock('../prismaClient', () => ({
+  prisma: { user: { findMany: jest.fn() }, $disconnect: jest.fn() },
+}));
+
+jest.mock('../src/config/redis', () => ({
+  createRedisConnection: jest.fn(() => ({ quit: jest.fn() })),
+}));
+
+jest.mock('../src/fraudDetection', () => ({ PAYMENT_STREAM: 'payments' }));
+
+jest.mock('../src/webhookWorker', () => ({
+  dispatchPaymentWebhooks: jest.fn(),
+  scheduleWebhookRetryJob: jest.fn(),
+  closeWebhookQueue: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock('../src/services/stellarService', () => ({
+  horizon: { payments: jest.fn() },
+  createBreaker: jest.fn(() => ({ fire: jest.fn().mockResolvedValue(true) })),
+}));
+
+jest.mock('../src/websocket', () => ({
+  publishPaymentUpdate: jest.fn().mockResolvedValue(undefined),
+  initWebSocket: jest.fn(),
+  closeWebSocket: jest.fn().mockResolvedValue(undefined),
+  emitPaymentUpdate: jest.fn(),
+  getIO: jest.fn().mockReturnValue(null),
+}));
+
+const { horizon } = require('../src/services/stellarService');
+const { prisma } = require('../prismaClient');
+const {
+  watchAccount,
+  syncWatchedAccounts,
+  shutdown,
+  activeStreams,
+} = require('../horizonListener');
+
+const mockCloseStream = jest.fn();
+const mockStream = jest.fn(() => mockCloseStream);
+const mockCursor = jest.fn(() => ({ stream: mockStream }));
+const mockForAccount = jest.fn(() => ({ cursor: mockCursor }));
+
+describe('Horizon listener stream cleanup (#683)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    activeStreams.clear();
+    mockStream.mockImplementation(() => mockCloseStream);
+    horizon.payments.mockReturnValue({ forAccount: mockForAccount });
+  });
+
+  it('registers exactly one stream per account', () => {
+    watchAccount('GACCOUNT1');
+    watchAccount('GACCOUNT1'); // duplicate must be a no-op
+
+    expect(mockStream).toHaveBeenCalledTimes(1);
+    expect(activeStreams.has('GACCOUNT1')).toBe(true);
+  });
+
+  it('closes the underlying stream when it errors', () => {
+    watchAccount('GACCOUNT2');
+    const options = mockStream.mock.calls[0][0];
+
+    options.onerror(new Error('stream dropped'));
+
+    expect(mockCloseStream).toHaveBeenCalledTimes(1);
+    expect(activeStreams.has('GACCOUNT2')).toBe(false);
+
+    // A second error must not double-close.
+    options.onerror(new Error('stream dropped again'));
+    expect(mockCloseStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes streams for accounts removed from the registry', async () => {
+    watchAccount('GSTALE');
+    prisma.user.findMany.mockResolvedValue([]);
+
+    await syncWatchedAccounts();
+
+    expect(mockCloseStream).toHaveBeenCalledTimes(1);
+    expect(activeStreams.has('GSTALE')).toBe(false);
+  });
+
+  it('re-opens a stream after an error on the next sync', async () => {
+    watchAccount('GRECONNECT');
+    mockStream.mock.calls[0][0].onerror(new Error('boom'));
+    expect(activeStreams.has('GRECONNECT')).toBe(false);
+
+    prisma.user.findMany.mockResolvedValue([{ address: 'GRECONNECT' }]);
+    await syncWatchedAccounts();
+
+    expect(mockStream).toHaveBeenCalledTimes(2);
+    expect(activeStreams.has('GRECONNECT')).toBe(true);
+  });
+
+  it('shutdown closes every stream and disconnects Prisma', async () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    watchAccount('GSHUT');
+
+    await shutdown();
+
+    expect(mockCloseStream).toHaveBeenCalledTimes(1);
+    expect(activeStreams.size).toBe(0);
+    expect(prisma.$disconnect).toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(0);
+
+    exitSpy.mockRestore();
+>>>>>>> origin/main
+

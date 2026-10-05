@@ -1,4 +1,4 @@
-﻿require("./src/utils/tracing");
+require("./src/utils/tracing");
 require("./config/envCheck");
 const express = require("express");
 const pinoHttp = require("pino-http");
@@ -6,7 +6,9 @@ const cors = require("cors");
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const { securityMiddleware } = require("./src/middleware/security");
+const { maintenanceMiddleware } = require("./src/middleware/maintenance");
 const crypto = require("crypto");
+const { createTokenBucketLimiter } = require("./src/middleware/tokenBucketLimiter");
 const { createClient } = require("redis");
 const { createSignatureRateLimiter } = require("./src/middleware/signatureRateLimit");
 const {
@@ -16,6 +18,7 @@ const { createGraphQLMiddleware } = require("./src/graphql");
 const { prisma, isPrismaConnectionError } = require("./prismaClient");
 const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
+const { scheduleReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
 const { correlationId } = require("./middleware/correlation");
 const { idempotencyMiddleware } = require("./middleware/idempotency");
@@ -32,7 +35,9 @@ const {
   getMetrics,
   getContentType,
   setMetricsSources,
+  setDlqDepthSource,
 } = require("./src/metrics");
+const { closeDlqQueue, getDlqDepth, hasOpenDlqQueues } = require("./src/dlq");
 const { validateSchema } = require("./src/middleware/validateSchema");
 const {
   buildErrorHandler,
@@ -73,11 +78,18 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  RESERVED_USERNAMES,
   MAX_USERNAMES_PER_ADDRESS,
   PRIMARY_USERNAME_ORDER,
   USER_DATABASE,
 } = require("./src/utils");
 const { getCachedApprovedOrigins } = require("./src/originCache");
+const {
+  initWebSocket,
+  closeWebSocket,
+} = require("./src/websocket");
+const { createHttpServer, describeTlsStatus } = require("./src/config/tls");
+const { requireMutualTls, serviceIdentity } = require("./src/middleware/mtls");
 
 dotenv.config();
 
@@ -106,19 +118,31 @@ const swaggerOptions = {
   apis: ["./server.js", "./src/routes/v1/*.js"],
 };
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
-app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-// #31 ΓÇö Attach a correlation ID to every request before anything else runs so
+// #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+
+// #736 — Mutual TLS. `serviceIdentity` names the calling service from its
+// client certificate so request logs and audit trails can attribute internal
+// traffic, and `requireMutualTls` rejects anything that arrived without one.
+// Both are no-ops while MTLS_ENABLED is false, and the /api-docs mount is
+// deliberately below them so no route is reachable on an internal listener
+// without a certificate.
+app.use(serviceIdentity);
+app.use(requireMutualTls);
+
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
 app.disable("x-powered-by");
 app.use(securityMiddleware);
+app.use(maintenanceMiddleware);
 
 app.use(timeout("10s"));
 app.use((err, req, res, next) => {
   if (req.timedout) {
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Request Timeout`);
+    (req.log || logger).error({ err }, "Request Timeout");
     return next(new ApiError("SERVICE_UNAVAILABLE", undefined, { cause: err }));
   }
   next(err);
@@ -212,22 +236,17 @@ if (redisClient) {
 }
 
 setMetricsSources({ prisma, redisClient });
+// Lets /metrics report DLQ depth without the metrics module importing BullMQ.
+setDlqDepthSource(getDlqDepth);
 
 const v1Router = require("./src/routes/v1")(redisClient);
 const v2Router = require("./src/routes/v2")(redisClient);
 const graphQLMiddleware = createGraphQLMiddleware({ prismaClient: prisma });
 
-const limiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  prefix: "global-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
-  // Prometheus scrapes /metrics on a fixed interval from a single address, so
-  // counting those scrapes against the shared quota would 429 the scraper.
+const limiter = createTokenBucketLimiter(redisClient, {
+  capacity: 100,
+  refillRate: 100 / (15 * 60), // 100 requests per 15 minutes
+  prefix: 'global-rl:',
   skip: (req) => req.path === "/metrics",
   // Key by authenticated user identifier when present (address/username),
   // otherwise fall back to client IP. This lets registered/identified users
@@ -279,15 +298,10 @@ const limiter = createSlidingWindowRateLimiter({
 // Per-IP limiter specifically for sensitive, unauthenticated endpoints.
 // Keys strictly by client IP so brute-force/spam from a single source is
 // blocked regardless of how many account ids are rotated in the payload.
-const ipLimiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  prefix: "ip-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
+const ipLimiter = createTokenBucketLimiter(redisClient, {
+  capacity: 100,
+  refillRate: 100 / (15 * 60),
+  prefix: 'ip-rl:',
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });
@@ -341,17 +355,10 @@ app.use("/graphql", graphQLMiddleware);
 
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
+scheduleReconciliationJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
-const RESERVED_USERNAMES = [
-  "admin",
-  "root",
-  "stellar",
-  "system",
-  "superuser",
-  "administrator",
-  "support",
-];
+// RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
 
 // ---------------------------------------------------------------------------
 // #51 ΓÇö ETag Caching Middleware for Federation Endpoint
@@ -376,12 +383,6 @@ const etagCache = (req, res, next) => {
 
   next();
 };
-
-const getLocalUserByUsername = async (username) =>
-  poolGet(
-    "SELECT username, address FROM username_registry WHERE username = $1 LIMIT 1",
-    [username],
-  );
 
 // Expose /metrics endpoint for Prometheus to scrape
 
@@ -1099,18 +1100,14 @@ app.use("/api/v1", v1Router);
 // brute-force targets, so they get a much tighter budget than the global
 // limiter. Uses the same Redis-backed store so the limit is shared across
 // all distributed nodes.
-const authLimiter = createSlidingWindowRateLimiter({
-  redisClient,
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  prefix: "auth-rl:",
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
+const authLimiter = createTokenBucketLimiter(redisClient, {
+  capacity: 20,
+  refillRate: 20 / (15 * 60), // 20 requests per 15 minutes
+  prefix: 'auth-rl:',
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });
+
 
 app.use("/api", v1Router);
 app.use("/", v1Router);
@@ -1222,21 +1219,34 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
-  server.close(async () => {
-    clearTimeout(timer);
-    try {
-      await prismaClient.$disconnect();
-    } catch (err) {
-      logger.error(err, "Error disconnecting Prisma during shutdown:");
-    }
-    if (redis) {
+  // Gracefully close Socket.io before closing the underlying HTTP server so
+  // existing WebSocket connections can finish in-flight before being dropped.
+  closeWebSocket().then(() => {
+    server.close(async () => {
+      clearTimeout(timer);
       try {
-        await redis.quit();
+        await prismaClient.$disconnect();
       } catch (err) {
-        logger.error(err, "Error disconnecting Redis during shutdown:");
+        logger.error(err, "Error disconnecting Prisma during shutdown:");
       }
-    }
-    process.exit(0);
+      if (redis) {
+        try {
+          await redis.quit();
+        } catch (err) {
+          logger.error(err, "Error disconnecting Redis during shutdown:");
+        }
+      }
+      // Only await when the DLQ was actually used, so a process that never
+      // opened it does not pay for an extra async hop during shutdown.
+      if (hasOpenDlqQueues()) {
+        try {
+          await closeDlqQueue();
+        } catch (err) {
+          logger.error(err, "Error closing the DLQ queues during shutdown:");
+        }
+      }
+      process.exit(0);
+    });
   });
 };
 
@@ -1247,8 +1257,29 @@ if (require.main === module) {
   } = require("./src/migrate-check");
 
   const startServer = () => {
-    const server = app.listen(PORT, "0.0.0.0", () => {
+    // createHttpServer returns an https listener that demands a client
+    // certificate when mTLS is enabled, and a plain http listener otherwise.
+    let server;
+    try {
+      server = createHttpServer(app);
+    } catch (err) {
+      // Refuse to start rather than silently serving in clear when the
+      // certificate material is unusable.
+      logger.error({ err: err.message }, "[mtls] Refusing to start: invalid TLS configuration.");
+      process.exit(1);
+    }
+    const tlsStatus = describeTlsStatus();
+
+    server.listen(PORT, "0.0.0.0", () => {
       logger.info(`Server successfully initialized on port ${PORT}`);
+      logger.info(
+        { tls: tlsStatus },
+        `Transport: ${tlsStatus.transport.toUpperCase()}${
+          tlsStatus.clientCertificateRequired
+            ? " with mandatory client certificates"
+            : ""
+        }`,
+      );
     });
 
     server.on("error", (e) => {
@@ -1260,6 +1291,11 @@ if (require.main === module) {
         process.exit(1);
       }
     });
+
+    // Attach Socket.io to the same HTTP server so WebSocket upgrades are
+    // handled on the same port as the REST API. Pass the existing CORS
+    // allow-list so WebSocket handshakes respect the same origin policy.
+    initWebSocket(server, allowedOrigins);
 
     process.on("SIGTERM", (sig) =>
       gracefulShutdown(server, prisma, sig, redisClient),
@@ -1296,4 +1332,11 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
+module.exports = {
+  app,
+  createHttpServer,
+  gracefulShutdown,
+  rejectNestedObjects,
+  validateMemo,
+  normalizeNameTag,
+};

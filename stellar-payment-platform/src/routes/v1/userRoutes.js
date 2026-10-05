@@ -2,6 +2,7 @@ const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
+const { getBalances } = require('../../services/ledgerService');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { transferAccount } = require('../../services/registrationService');
@@ -21,7 +22,11 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  RESERVED_USERNAMES,
 } = require('../../utils');
+const Filter = require('bad-words');
+const profanityFilter = new Filter();
+const { verifyFreighterRegistrationSignature } = require('../../services/signatureService');
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
@@ -31,6 +36,8 @@ const {
   usersQuerySchema,
   activityQuerySchema,
 } = require('../../schemas');
+
+
 
 const router = express.Router();
 
@@ -45,10 +52,11 @@ const buildUserSearchWhere = (search) => {
   };
 };
 
-const serializeUser = (user) => ({
+const serializeUser = (user, balances = {}) => ({
   username: user.username,
   address: user.address,
   created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+  balances,
 });
 
 router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
@@ -65,23 +73,10 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     );
   }
 
-  if (!username || !address) {
-    return next(new ApiError('INVALID_INPUT', 'Missing required fields: username and address are both required.'));
-  }
-
-  const BLOCKED_EXCHANGES = [
-    "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
-    "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
-    "GBV4ZDEPNQ2FKSPKGJP2YKDAIZWQ2XKRQD4V4ACH3TCTXTGLWEBDU3OS"
-  ];
-
-  if (BLOCKED_EXCHANGES.includes(address) && !memo) {
-    return next(new ApiError('INVALID_INPUT', "Cannot map federation addresses directly to custodial exchange master wallets."));
-  }
-
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-  if (usernameLocalPart.length < 3) {
-    return next(new ApiError('INVALID_INPUT', "Username must be at least 3 characters long."));
+
+  if (profanityFilter.isProfane(usernameLocalPart)) {
+    return next(new ApiError('INVALID_INPUT', 'Username contains restricted words'));
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -96,6 +91,11 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   }
 
   const normalizedUsername = username.toLowerCase();
+  
+  const normalizedLocalPart = normalizedUsername.includes('*') ? normalizedUsername.split('*')[0] : normalizedUsername;
+  if (RESERVED_USERNAMES.includes(normalizedLocalPart)) {
+    return res.status(403).json({ error: "Username is reserved." });
+  }
 
   if (RESERVED_NAMES.includes(normalizedUsername)) {
     return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
@@ -111,18 +111,53 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     }
 
     let verificationResult = null;
-    const signerToVerify = signerAddress || address;
-    if (signerToVerify) {
-      verificationResult = await verifyMultiSignerThreshold(address, [signerToVerify], {
-        operationType: 'management',
-      });
+    if (signature) {
+      const isLegacyPublicKeyFlow =
+        StrKey.isValidEd25519PublicKey(signature) && !signerAddress;
 
-      if (!verificationResult.success) {
-        const verificationError = new Error(
-          verificationResult.errorMessage || 'Signature verification failed'
-        );
-        verificationError.statusCode = 401;
-        throw verificationError;
+      if (isLegacyPublicKeyFlow) {
+        verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+          operationType: 'management',
+        });
+
+        if (!verificationResult.success) {
+          const verificationError = new Error(
+            verificationResult.errorMessage || 'Signature verification failed'
+          );
+          verificationError.statusCode = 401;
+          throw verificationError;
+        }
+      } else {
+        const claimedSigner = verifyFreighterRegistrationSignature({
+          username: req.body.username,
+          address: req.body.address,
+          signature,
+          signerAddress,
+        });
+
+        verificationResult = {
+          success: true,
+          accountId: claimedSigner,
+          operationType: 'message',
+          requiredThreshold: 1,
+          totalWeight: 1,
+          signatureCount: 1,
+          uniqueSignerCount: 1,
+          signatures: [
+            {
+              publicKey: claimedSigner,
+              weight: 1,
+              isValid: true,
+            },
+          ],
+          thresholds: {
+            low_threshold: 1,
+            med_threshold: 1,
+            high_threshold: 1,
+          },
+          signerCount: 1,
+          errorMessage: null,
+        };
       }
     }
 
@@ -154,6 +189,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       }),
       ...(memoType && { memo_type: memoType, memo }),
     });
+
   } catch (error) {
     // Prisma unique constraint violation (PostgreSQL error code 23505)
     if (error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
@@ -170,10 +206,7 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       return next(error);
     }
 
-    logger.error('Registration error:', error.message);
-    const registrationError = new Error(`Registration verification failed: ${error.message}`, { cause: error });
-    registrationError.statusCode = 500;
-    return next(registrationError);
+    return next(error);
   }
 }));
 
@@ -260,7 +293,9 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
           where: { address, deletedAt: null },
           select: { username: true },
         });
-        return row ? { username: row.username, address } : null;
+        if (!row) return null;
+        const balances = await getBalances(row.username);
+        return { username: row.username, address, balances };
       });
 
       if (!result) {
@@ -271,7 +306,6 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
 
       return res.json(result);
     } catch (error) {
-      console.warn('USER ROUTES ERROR:', error);
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
@@ -298,10 +332,14 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt.toISOString(),
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt.toISOString(),
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -320,17 +358,19 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
     ]);
 
     const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt.toISOString(),
+        balances,
+      };
     }));
 
     return res.json({ data, totalCount, totalPages, currentPage: page });
   } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
@@ -356,10 +396,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -378,10 +422,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
     ]);
 
     const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+        balances,
+      };
     }));
 
     res.json({
@@ -399,9 +447,7 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
       currentPage: page,
     });
   } catch (error) {
-    const dbError = new Error('Database error', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
