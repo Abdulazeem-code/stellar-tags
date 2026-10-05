@@ -315,7 +315,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "UserRecord"
+                  "symbol": "RateLimitCounter"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -335,7 +335,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "UserRecord"
+                      "symbol": "RateLimitCounter"
                     },
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -344,7 +344,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "000000000000000000000000000000000000000005f5e10000000000000000000000000005f5e100"
+                  "bytes": "0000000000000001"
                 }
               }
             },

@@ -86,6 +86,65 @@ fn unpack_legacy_spending(packed: &BytesN<24>) -> (u64, i128) {
     (last_reset_time, accumulated_amount)
 }
 
+// ── Packed RateLimitCounter helpers (issue #714) ─────────────────────────────
+//
+// Issue #714: the #716 rate limiter reused the `BytesN<24>` UserSpending layout
+// (u64 window + i128 count), but neither field ever needs that width.
+//
+//  • The window marker is a *ledger sequence*, not a timestamp. A u32 sequence
+//    is exhausted after 2^32 ledgers; at Stellar's ~5 s close cadence that is
+//    roughly 680 years of chain history, so 4 bytes is ample.
+//  • The counter is a call count bounded by `RateLimitConfig`, which is itself
+//    a `u32`, so 4 bytes can hold any reachable cap.
+//
+// Layout (big-endian):
+//   bytes 0..4 — window_ledger : u32 (4 bytes)
+//   bytes 4..8 — invocations   : u32 (4 bytes)
+//
+// Benefit: 24 bytes -> 8 bytes, a 67% reduction on one persistent entry per
+// active sender, on top of the contracttype overhead that was already removed
+// when #716 packed the value out of its struct form.
+
+/// Pack the rate-limit window marker and invocation count into an 8-byte
+/// big-endian buffer.
+fn pack_rate_counter(env: &Env, window_ledger: u32, invocations: u32) -> BytesN<8> {
+    let mut buf = [0u8; 8];
+
+    let s = window_ledger.to_be_bytes();
+    buf[0] = s[0];
+    buf[1] = s[1];
+    buf[2] = s[2];
+    buf[3] = s[3];
+
+    let c = invocations.to_be_bytes();
+    buf[4] = c[0];
+    buf[5] = c[1];
+    buf[6] = c[2];
+    buf[7] = c[3];
+
+    BytesN::from_array(env, &buf)
+}
+
+/// Unpack an 8-byte buffer into `(window_ledger, invocations)`.
+fn unpack_rate_counter(packed: &BytesN<8>) -> (u32, u32) {
+    let buf: [u8; 8] = packed.to_array();
+
+    let window_ledger = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let invocations = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+    (window_ledger, invocations)
+}
+
+/// Returns the current ledger sequence narrowed to the packed window width.
+///
+/// `Env::ledger().sequence()` is already a `u32` in soroban-sdk v20, so this is
+/// a straight read with no truncation. The explicit signature documents the
+/// invariant the packed layout depends on: the window marker is exactly as wide
+/// as a ledger sequence, which is what makes 4 bytes sufficient.
+fn current_window(env: &Env) -> u32 {
+    env.ledger().sequence()
+}
+
 // ── Legacy struct kept for test snapshot compatibility ───────────────────────
 //
 // The UserSpending contracttype is retained so existing tests that reference
@@ -441,6 +500,30 @@ pub enum DataKey {
     KycOracle,
     /// Payments strictly above this amount require a valid KYC claim.
     KycThreshold,
+    
+    /// The backup admin that can claim ownership via the dead man's switch.
+    /// Stored as `Address` in instance storage.
+    BackupAdmin,
+    /// Unix timestamp of the last admin heartbeat (see `ping`).
+    /// Stored as `u64` in instance storage.
+    LastHeartbeat,
+    /// Inactivity window (seconds) after which the backup admin may claim.
+    /// Stored as `u64` in instance storage.
+    DmsTimeout,
+    // ── Rate limiting (issue #716) ───────────────────────────────────────
+    /// Per-address payment invocation cap per ledger sequence.
+    /// Stored as `u32` in instance storage (`0` disables rate limiting).
+    /// Absent storage falls back to `DEFAULT_RATE_LIMIT` so upgraded
+    /// deployments are protected without re-running `initialize`.
+    RateLimitConfig,
+    /// Packed invocation counter for a given sender (issue #714: repacked from
+    /// `BytesN<24>` to `BytesN<8>`): bytes 0..4 hold the `u32` ledger sequence
+    /// the window started at, bytes 4..8 the `u32` number of payment
+    /// invocations made in that window.
+    RateLimitCounter(Address),
+    /// Whether a given sender is whitelisted and therefore exempt from the
+    /// rate limiter.
+    RateLimitWhitelist(Address),
     /// Address of the price-feed oracle used for fiat/crypto lookups.
     OracleAddress,
     /// Maximum acceptable age, in seconds, of an oracle price quote.
@@ -539,6 +622,14 @@ pub enum Error {
     SwapDeadlineExpired = 18,
     /// The supplied role is not one the contract recognises.
     InvalidRole = 20,
+    /// No backup admin has been armed, so the dead man's switch cannot fire.
+    NoBackupAdmin = 43,
+    /// The dead man's switch timeout has not elapsed since the last heartbeat.
+    DmsNotReady = 44,
+    /// A dead man's switch configuration value is out of the allowed range.
+    InvalidDmsConfig = 45,
+    /// The sender exceeded the per-ledger payment invocation cap.
+    RateLimited = 46,
     /// A governance proposal id is unknown or no longer votable.
     InvalidProposal = 21,
     /// A governance operation was attempted before governance was configured.
@@ -1175,6 +1266,110 @@ impl PaymentRouter {
             .get(&DataKey::Frozen)
             .unwrap_or(false)
     }
+
+    /// Records an admin heartbeat (`now`) if the dead man's switch has a
+    /// timeout configured, so the claim clock restarts from the current
+    /// ledger timestamp. Cheap no-op when no backup admin is configured.
+    fn bump_heartbeat(env: &Env) {
+        if env.storage().instance().has(&DataKey::BackupAdmin) {
+            env.storage()
+                .instance()
+                .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        }
+    }
+
+    // ── Rate limiting (issue #716) ───────────────────────────────────────
+    //
+    // A spammer who can settle arbitrarily many payments per ledger bloats
+    // contract state and degrades performance. The limiter is keyed on the
+    // ledger *sequence* rather than wall-clock time: the window is simply
+    // "this ledger", so no time bookkeeping is needed and the counter
+    // resets automatically when the next ledger is sealed.
+    //
+    // Scope of the protection, precisely: the cap bounds the number of
+    // *successful* payments a single address can settle per ledger, and that
+    // is the only thing a Soroban contract can bound. It cannot charge for or
+    // throttle *rejected* transactions, because a contract function that
+    // returns `Err` has its entire invocation rolled back by the host -
+    // including this counter. A rejected attempt therefore costs the spammer
+    // the transaction fee but leaves no state behind, and reverts the counter
+    // increment. Callers must not rely on this to throttle failing traffic.
+
+    /// Returns the stored per-ledger invocation cap, or `None` when no
+    /// configuration has been written yet.
+    fn get_rate_limit_config(env: &Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::RateLimitConfig)
+    }
+
+    /// Returns the effective per-ledger invocation cap. Falls back to
+    /// `DEFAULT_RATE_LIMIT` when no configuration is stored so deployments
+    /// upgraded from before this feature are protected immediately.
+    fn rate_limit_raw(env: &Env) -> u32 {
+        Self::get_rate_limit_config(env).unwrap_or(Self::DEFAULT_RATE_LIMIT)
+    }
+
+    /// Returns whether `address` is whitelisted (exempt from rate limiting).
+    /// Performs no authorization and never touches missing storage.
+    fn is_whitelisted(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateLimitWhitelist(address.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Returns how many payment invocations `sender` has already consumed in
+    /// the current ledger window. A counter stamped with an earlier ledger
+    /// sequence reads as `0`, which is what makes the window roll over on its
+    /// own when the next ledger seals - no time bookkeeping required.
+    fn rate_limit_used(env: &Env, sender: &Address) -> u32 {
+        let packed = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<8>>(&DataKey::RateLimitCounter(sender.clone()));
+
+        match packed {
+            Some(packed) => {
+                let (window_ledger, count) = unpack_rate_counter(&packed);
+                if window_ledger == current_window(env) {
+                    count
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Enforces the per-address, per-ledger invocation cap for one payment.
+    ///
+    /// Whitelisted senders bypass the check entirely and never touch the
+    /// counter. Everyone else consumes one slot per payment invocation that
+    /// is part of a *successful* invocation; a payment that is later rejected
+    /// has its slot returned, since the host reverts the whole call.
+    ///
+    /// Storage overhead is one packed 8-byte persistent entry per active
+    /// sender (issue #714: narrowed from 24 bytes), overwritten in place on
+    /// every payment.
+    fn check_rate_limit(env: &Env, sender: &Address) -> Result<(), Error> {
+        let limit = Self::rate_limit_raw(env);
+        if limit == 0 || Self::is_whitelisted(env, sender) {
+            return Ok(());
+        }
+
+        let used = Self::rate_limit_used(env, sender);
+        if used >= limit {
+            log!(env, "Rate limit exceeded for sender this ledger");
+            return Err(Error::RateLimited);
+        }
+
+        let key = DataKey::RateLimitCounter(sender.clone());
+        let updated = pack_rate_counter(env, current_window(env), used + 1);
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
 
     /// Returns whether the contract is currently paused.
     fn is_paused_internal(env: &Env) -> bool {
@@ -1822,7 +2017,7 @@ impl PaymentRouter {
     ///
     /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
     /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
-    /// `set_multisig_config`, `upgrade`) must go through the timelock.  Use the
+    /// `set_multisig_config`, `upgrade`, arming the dead man's switch) must go through the timelock.  Use the
     /// direct setter functions only for actions that are not sensitive (e.g.
     /// `set_pause` which can also be called directly for immediate operational
     /// pauses).
@@ -2227,12 +2422,11 @@ impl PaymentRouter {
             return u32::MAX;
         }
 
-        // The remainder is at most the cap, and `set_rate_limit` refuses any
-        // cap above `MAX_RATE_LIMIT`, so the narrowing conversion back to
-        // `u32` cannot fail. `saturating_sub` keeps it at 0 if a counter
-        // were somehow ahead of the cap.
-        u32::try_from(i128::from(limit).saturating_sub(Self::rate_limit_used(&env, &sender)))
-            .unwrap_or(0)
+        // Both operands are `u32`: the cap is read from `RateLimitConfig` and
+        // the counter from the packed `BytesN<8>`, so the remainder is at most
+        // the cap and needs no widening. `saturating_sub` pins it at 0 if a
+        // counter were somehow ahead of the cap.
+        limit.saturating_sub(Self::rate_limit_used(&env, &sender))
     }
 
     /// Returns whether the contract is currently frozen.
@@ -2855,11 +3049,12 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
+    /// Arms the dead man's switch directly (bypassing the timelock).
     ///
     /// # Parameters
-    /// - `token`: Contract ID of the token to recover.
-    /// - `amount`: Amount to transfer from the contract's balance to the treasury manager.
+    /// - `backup`: Address allowed to claim admin rights after the timeout.
+    /// - `timeout_seconds`: Inactivity window in seconds. Must be at least
+    ///   `MIN_DMS_TIMEOUT` (7 days).
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
@@ -2868,6 +3063,16 @@ impl PaymentRouter {
     /// current admin.
     ///
     /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_backup_admin_internal(
+        env: Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        Self::apply_set_backup_admin(&env, backup, timeout_seconds)
+    }
     /// Panics if the current TreasuryManager does not authorize the call, or if the
     /// token transfer fails (e.g. the contract's balance is below `amount`).
     pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
@@ -2876,9 +3081,35 @@ impl PaymentRouter {
         Self::require_circuit_closed(&env)?;
         let treasury_mgr = Self::require_role(&env, Role::TreasuryManager)?;
 
-        let contract_address = env.current_contract_address();
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&contract_address, &treasury_mgr, &amount);
+    /// Shared implementation for arming the dead man's switch: validates the
+    /// configuration, stores the backup admin and timeout, and starts the
+    /// claim clock. Performs NO authorization; callers must do that first
+    /// (direct admin call or timelock execution).
+    fn apply_set_backup_admin(
+        env: &Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        if timeout_seconds < Self::MIN_DMS_TIMEOUT {
+            return Err(Error::InvalidDmsConfig);
+        }
+        let admin = Self::require_admin(env)?;
+        if backup == admin {
+            return Err(Error::InvalidDmsConfig);
+        }
+
+        env.storage().instance().set(&DataKey::BackupAdmin, &backup);
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsTimeout, &timeout_seconds);
+        // The claim clock starts ticking from the moment the switch is armed.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
 
         env.events().publish(
             (Symbol::new(env, "backup_admin_set"), admin),
@@ -3323,6 +3554,211 @@ impl PaymentRouter {
     pub fn ping(env: Env) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
+
+        Self::bump_heartbeat(&env);
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("ping"), admin), env.ledger().timestamp());
+
+        log!(&env, "Admin heartbeat recorded");
+        Ok(())
+    }
+
+    /// Dead man's switch claim: transfers admin rights to `claimant` if they
+    /// are the configured backup admin and the admin has not pinged (directly
+    /// or via routing a payment) for at least the configured timeout.
+    ///
+    /// Deliberately NOT timelocked and NOT blocked by a contract freeze: if
+    /// the primary admin is gone there is nobody left to execute a queued
+    /// action, and freezing must not be able to brick recovery.
+    ///
+    /// # Parameters
+    /// - `claimant`: Address claiming admin rights. Must be the configured
+    ///   backup admin and must authorize the call.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::NoBackupAdmin)` if no backup is
+    /// configured, `Err(Error::Unauthorized)` if `claimant` is not the
+    /// backup, or `Err(Error::DmsNotReady)` if the timeout has not elapsed.
+    pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
+        claimant.require_auth();
+
+        let backup: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackupAdmin)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if claimant != backup {
+            return Err(Error::Unauthorized);
+        }
+
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .ok_or(Error::InvalidDmsConfig)?;
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .ok_or(Error::InvalidDmsConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < last_heartbeat.saturating_add(timeout) {
+            return Err(Error::DmsNotReady);
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &claimant);
+        // Fully disarm the switch: the backup is consumed and the clock is
+        // cleared so the new admin starts from a clean slate (re-arm via the
+        // timelock if desired).
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().remove(&DataKey::DmsTimeout);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_claimed"), claimant.clone()), now);
+
+        log!(&env, "Admin claimed via dead man's switch");
+        Ok(())
+    }
+
+    /// Returns the current admin address.
+    ///
+    /// # Returns
+    /// `Some(admin)` if the contract is initialized, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Returns the dead man's switch configuration.
+    ///
+    /// # Returns
+    /// `(backup_admin, timeout_seconds, last_heartbeat, seconds_since_heartbeat)`.
+    /// `backup_admin` is `None` and the timestamps `0` when no backup is
+    /// configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_dead_mans_switch(env: Env) -> (Option<Address>, u64, u64, u64) {
+        let backup = env.storage().instance().get(&DataKey::BackupAdmin);
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let elapsed = if backup.is_some() {
+            now.saturating_sub(last)
+        } else {
+            0
+        };
+        (backup, timeout, last, elapsed)
+    }
+
+    /// Returns `true` if the dead man's switch is armed (a backup admin is
+    /// configured) and the timeout has elapsed, i.e. `claim_admin` would
+    /// currently succeed for the backup.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_dead_mans_switch_expired(env: Env) -> bool {
+        let backup_set = env.storage().instance().has(&DataKey::BackupAdmin);
+        if !backup_set {
+            return false;
+        }
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        env.ledger().timestamp().saturating_sub(last) >= timeout
+    }
+
+    /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to recover.
+    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
+    pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &admin, &amount);
+
+        Ok(())
+    }
+
+    /// Records a token as supported (no-op; routing accepts any token contract ID).
+    ///
+    /// # Parameters
+    /// - `_token`: Ignored; present for API compatibility.
+    ///
+    /// # Returns
+    /// Always `Ok(())`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// # Parameters
+    /// - `sender`: Address the funds are debited from; must authorize the call.
+    /// - `recipient`: Address to receive the funds (minus the platform fee).
+    /// - `token_address`: Contract ID of the token being transferred.
+    /// - `amount`: Amount to route, in the token's smallest unit. Must be
+    ///   positive and within the configured min/max and daily-limit bounds.
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Returns `Err(Error::Paused)` if routing is
+    /// paused, `Err(Error::NotInitialized)` if the contract has no admin
+    /// set, `Err(Error::InvalidRecipient)` if `sender == recipient`,
+    /// `Err(Error::Blacklisted)` if `recipient` is blacklisted,
+    /// `Err(Error::RateLimited)` if the sender's per-ledger cap (#716) is
+    /// exhausted, `Err(Error::LimitExceeded)` if `amount` is out of bounds,
+    /// or `Err(Error::InsufficientBalance)` if the balance is too low.
+    ///
+    /// Admin authorization is required. Works even while the contract is
+    /// frozen so the legitimate admin can keep the switch alive.
+    pub fn ping(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
     /// # Panics
     /// Panics if `sender` does not authorize the call, or if the underlying
     /// token transfer to `platform_treasury` fails.
@@ -3352,6 +3788,10 @@ impl PaymentRouter {
             .get(&DataKey::MinLimit)
             .unwrap_or(0);
 
+        // Validate everything that can be checked without auth first: a
+        // `require_auth` abort rolls back the whole invocation, so rejecting
+        // bad input before authenticating avoids turning ordinary validation
+        // errors into an opaque host rollback panic.
         if sender == recipient {
             return Err(Error::InvalidRecipient);
         }
@@ -3367,6 +3807,10 @@ impl PaymentRouter {
         Self::verify_kyc_for_amount(&env, &sender, amount)?;
 
         sender.require_auth();
+
+        // Contract-level rate limiting (issue #716): one invocation slot per
+        // payment, consumed after auth so only authorized senders are counted.
+        Self::check_rate_limit(&env, &sender)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3744,6 +4188,11 @@ impl PaymentRouter {
                 return Err(Error::LimitExceeded);
             }
             Self::verify_kyc_for_amount(&env, &payment.sender, payment.amount)?;
+            // Contract-level rate limiting (issue #716): one invocation slot
+            // per payment, so a batch costs the sender one slot per item.
+            // Charged here, after auth, so only authorized senders are counted.
+            // A later failure reverts the whole batch and refunds every slot.
+            Self::check_rate_limit(&env, &payment.sender)?;
 
             // Track unique senders for auth
             let mut is_new = true;
@@ -5158,6 +5607,13 @@ mod test {
         }
     }
 
+    /// Rewrites the ledger info so `sequence_number` becomes `sequence`,
+    /// advancing the per-ledger rate-limit window (issue #716).
+    fn advance_ledger(env: &Env, sequence: u32) {
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp(),
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: sequence,
     // ── Mock price-feed oracle ───────────────────────────────────────────────
 
     #[contracttype]
@@ -8398,6 +8854,539 @@ mod test {
         Reverted = 1,
     }
 
+    #[test]
+    fn test_rbac_treasury_manager_gates_treasury_operations() {
+        let (env, client, contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let treasurer = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign dedicated TreasuryManager
+        client.assign_role(&treasurer, &Role::TreasuryManager);
+
+        // TreasuryManager sets new platform treasury
+        client.set_platform_treasury(&new_treasury);
+
+        // Recover accidentally sent tokens
+        let (token_address, _token_client, sac) = setup_token(&env);
+        sac.mint(&contract_id, &5_000);
+        client.recover_tokens(&token_address, &2_000);
+    }
+
+    #[test]
+    fn test_rbac_compliance_officer_gates_compliance_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let compliance = Address::generate(&env);
+        let bad_user = Address::generate(&env);
+        let oracle = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign compliance officer
+        client.assign_role(&compliance, &Role::ComplianceOfficer);
+
+        // Compliance officer blacklists and unblacklists
+        client.blacklist_address(&bad_user);
+        assert!(client.is_blacklisted(&bad_user));
+
+        client.unblacklist_address(&bad_user);
+        assert!(!client.is_blacklisted(&bad_user));
+
+        // Compliance officer configures KYC
+        client.set_kyc_config(&oracle, &50_000);
+        assert_eq!(client.get_kyc_threshold(), Some(50_000));
+
+        // Compliance officer pauses and unpauses
+        client.set_pause(&true);
+        assert!(client.is_paused());
+        client.set_paused(&false);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_rbac_fee_manager_gates_fee_operations() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let fee_mgr = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Assign fee manager
+        client.assign_role(&fee_mgr, &Role::FeeManager);
+
+        // Fee manager updates fee bps
+        client.set_fee_bps(&350);
+        assert_eq!(client.get_fee(), 350);
+
+        // Fee manager updates fee config
+        client.set_fee_config(&400, &5_000);
+        assert_eq!(client.get_fee(), 400);
+
+        // Fee manager sets min limit
+        client.set_min_limit(&10_000);
+    }
+    // ── Issue #714: packed-representation round trips ───────────────────
+    //
+    // The rate limiter stores its window marker and invocation counter as a
+    // hand-packed `BytesN<8>`. Packing is only safe if it is lossless, so
+    // these tests pin the exact width and the exact round trip rather than
+    // trusting the implementation implicitly.
+
+    /// The packed counter must be exactly 8 bytes, not 24.
+    ///
+    /// This is the assertion that actually encodes the optimization: if a
+    /// future change widens the layout, or reverts to the old `BytesN<24>`
+    /// UserSpending layout, the on-disk size stops shrinking and this fails.
+    #[test]
+    fn test_packed_rate_counter_is_eight_bytes() {
+        let env = Env::default();
+        let packed = pack_rate_counter(&env, 1, 1);
+        assert_eq!(packed.to_array().len(), 8);
+    }
+
+    /// `pack_rate_counter` / `unpack_rate_counter` must be exactly inverse
+    /// across the full `u32` range, including both endpoints and the values
+    /// either side of a byte boundary.
+    #[test]
+    fn test_packed_rate_counter_round_trips() {
+        let env = Env::default();
+        let cases: [(u32, u32); 9] = [
+            (0, 0),
+            (1, 1),
+            (255, 256),
+            (256, 255),
+            (65_535, 65_536),
+            (65_536, 65_535),
+            (1_000_000, 1_000_000),
+            (u32::MAX - 1, u32::MAX),
+            (u32::MAX, u32::MAX),
+        ];
+
+        for (window, invocations) in cases {
+            let packed = pack_rate_counter(&env, window, invocations);
+            assert_eq!(
+                unpack_rate_counter(&packed),
+                (window, invocations),
+                "round trip failed for ({window}, {invocations})"
+            );
+        }
+    }
+
+    /// The two halves must not bleed into each other: a counter near `u32::MAX`
+    /// must not corrupt the window marker, and vice versa.
+    #[test]
+    fn test_packed_rate_counter_fields_are_independent() {
+        let env = Env::default();
+
+        // Large counter, small window: the high bytes of the counter must not
+        // overflow into the window field.
+        let packed = pack_rate_counter(&env, 1, u32::MAX);
+        assert_eq!(unpack_rate_counter(&packed), (1, u32::MAX));
+
+        // Large window, small counter: the window must not be truncated.
+        let packed = pack_rate_counter(&env, u32::MAX, 0);
+        assert_eq!(unpack_rate_counter(&packed), (u32::MAX, 0));
+    }
+
+    /// Big-endian layout, asserted on the raw bytes so a change of endianness
+    /// (which would silently reinterpret every already-stored entry) is caught.
+    #[test]
+    fn test_packed_rate_counter_is_big_endian() {
+        let env = Env::default();
+        let buf = pack_rate_counter(&env, 0x0102_0304, 0x0506_0708).to_array();
+        assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// The window marker must track the ledger sequence exactly, so a
+    /// counter stamped in one ledger does not carry over into the next.
+    #[test]
+    fn test_current_window_tracks_ledger_sequence() {
+        let env = Env::default();
+        assert_eq!(current_window(&env), env.ledger().sequence());
+
+        advance_ledger(&env, 7);
+        assert_eq!(current_window(&env), 7);
+    }
+
+    /// A contract deployed before this feature existed carries no
+    /// `RateLimitConfig`, and `initialize` is not re-run on upgrade. The
+    /// limiter must therefore fall back to the default cap rather than
+    /// reading the cap as absent or zero.
+    #[test]
+    fn test_rate_limit_falls_back_to_default_without_config() {
+        let (env, client, _) = setup_env();
+
+        // No `initialize` call, so nothing has ever written the config.
+        assert_eq!(client.get_rate_limit(), PaymentRouter::DEFAULT_RATE_LIMIT);
+
+        let sender = Address::generate(&env);
+        assert_eq!(
+            client.get_rate_limit_remaining(&sender),
+            PaymentRouter::DEFAULT_RATE_LIMIT
+        );
+        assert!(!client.is_rate_limit_whitelisted(&sender));
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_after_cap_and_resets_next_ledger() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _, sac) = setup_token(&env);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // Rate limiting is on by default right after initialize.
+        assert_eq!(client.get_rate_limit(), PaymentRouter::DEFAULT_RATE_LIMIT);
+        assert_eq!(
+            client.get_rate_limit_remaining(&sender),
+            PaymentRouter::DEFAULT_RATE_LIMIT
+        );
+
+        // The default cap allows exactly this many payments, then rejects
+        // gracefully with a dedicated error instead of panicking.
+        for _ in 0..PaymentRouter::DEFAULT_RATE_LIMIT {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+        assert_eq!(client.get_rate_limit_remaining(&sender), 0);
+
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+
+        // The cap is per ledger sequence: a new ledger resets the window.
+        advance_ledger(&env, env.ledger().sequence() + 1);
+        assert_eq!(
+            client.get_rate_limit_remaining(&sender),
+            PaymentRouter::DEFAULT_RATE_LIMIT
+        );
+        client.route_payment(&sender, &recipient, &token_address, &100);
+    }
+
+    #[test]
+    fn test_rate_limit_whitelist_is_exempt() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // Fill the counter exactly to the default cap in this ledger.
+        for _ in 0..PaymentRouter::DEFAULT_RATE_LIMIT {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+
+        // Whitelisting a high-volume sender exempts it entirely: payments
+        // beyond the cap succeed without touching the counter.
+        client.set_rate_limit_whitelist(&sender);
+        assert!(client.is_rate_limit_whitelisted(&sender));
+        assert_eq!(client.get_rate_limit_remaining(&sender), u32::MAX);
+
+        for _ in 0..2 {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+
+        // Removing the exemption restores the standard cap (the counter is
+        // untouched by whitelisted activity, so the current window is full).
+        client.remove_rate_limit_whitelist(&sender);
+        assert!(!client.is_rate_limit_whitelisted(&sender));
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+    }
+
+    /// Builds a one-payment batch for `sender`.
+    fn single_payment_batch(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token_address: &Address,
+    ) -> Vec<Payment> {
+        let mut payments = Vec::new(env);
+        payments.push_back(Payment {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        payments
+    }
+
+    /// A rate-limited payment inside a batch reverts the whole batch.
+    ///
+    /// Each address appears at most once per batch here on purpose: calling
+    /// `require_auth` twice for the same address in a single contract frame
+    /// is rejected by the host's auth machinery, which is a separate
+    /// pre-existing limitation of `route_payments` (see issue #716 notes).
+    #[test]
+    fn test_rate_limit_batch_rejection_is_atomic() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let throttled = Address::generate(&env);
+        let other = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&throttled, &1_000_000);
+        sac.mint(&other, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        client.set_rate_limit(&1);
+
+        // Exhaust the first sender's allowance for this ledger.
+        client.route_payment(&throttled, &recipient, &token_address, &100);
+        let res = client.try_route_payment(&throttled, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+
+        // A batch whose *last* payment is throttled must revert in full: the
+        // earlier payment must not settle, and no counter may be consumed.
+        let mut payments = single_payment_batch(&env, &other, &recipient, &token_address);
+        payments.push_back(Payment {
+            sender: throttled.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        let res = client.try_route_payments(&payments);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+        assert_eq!(token_client.balance(&other), 1_000_000);
+        assert_eq!(token_client.balance(&throttled), 1_000_000 - 100);
+        assert_eq!(client.get_rate_limit_remaining(&other), 1);
+
+        // `other` was not charged by the reverted batch, so its single
+        // payment still settles in this ledger.
+        client.route_payments(&single_payment_batch(
+            &env,
+            &other,
+            &recipient,
+            &token_address,
+        ));
+        assert_eq!(token_client.balance(&other), 1_000_000 - 100);
+    }
+
+    /// Every payment in a batch counts against its own sender's per-ledger
+    /// cap, and the caps are tracked independently per address.
+    #[test]
+    fn test_rate_limit_batch_counts_each_sender_independently() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&a, &1_000_000);
+        sac.mint(&b, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        client.set_rate_limit(&1);
+
+        // One payment each: both senders are now at their own cap.
+        let mut payments = single_payment_batch(&env, &a, &recipient, &token_address);
+        payments.push_back(Payment {
+            sender: b.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        client.route_payments(&payments);
+        assert_eq!(token_client.balance(&a), 1_000_000 - 100);
+        assert_eq!(token_client.balance(&b), 1_000_000 - 100);
+        assert_eq!(client.get_rate_limit_remaining(&a), 0);
+        assert_eq!(client.get_rate_limit_remaining(&b), 0);
+
+        // A second batch in the same ledger is rejected, and the rejection
+        // does not leak across addresses: a fresh sender is still allowed.
+        let mut payments = single_payment_batch(&env, &a, &recipient, &token_address);
+        payments.push_back(Payment {
+            sender: b.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 100,
+        });
+        let res = client.try_route_payments(&payments);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+        assert_eq!(token_client.balance(&a), 1_000_000 - 100);
+        assert_eq!(token_client.balance(&b), 1_000_000 - 100);
+
+        let fresh = Address::generate(&env);
+        sac.mint(&fresh, &1_000);
+        client.route_payments(&single_payment_batch(
+            &env,
+            &fresh,
+            &recipient,
+            &token_address,
+        ));
+        assert_eq!(token_client.balance(&fresh), 1_000 - 100);
+
+        // The next ledger opens a fresh window for everyone.
+        advance_ledger(&env, env.ledger().sequence() + 1);
+        assert_eq!(client.get_rate_limit_remaining(&a), 1);
+        assert_eq!(client.get_rate_limit_remaining(&b), 1);
+    }
+
+    /// A rejected payment does not consume rate-limit budget.
+    ///
+    /// The Soroban host rolls back the whole invocation when a contract
+    /// returns `Err`, which includes the counter written by
+    /// `check_rate_limit`. This pins that behaviour down, because the
+    /// limiter's protection scope depends on it: only successful payments
+    /// are throttled.
+    #[test]
+    fn test_rate_limit_rejected_payment_keeps_allowance() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+        client.set_rate_limit(&2);
+
+        // A zero-value payment is rejected by the amount bounds, which run
+        // after the rate-limit check has already reserved a slot.
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &0);
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+        assert_eq!(client.get_rate_limit_remaining(&sender), 2);
+
+        // The full allowance is therefore still available in this ledger.
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(client.get_rate_limit_remaining(&sender), 0);
+        assert_eq!(token_client.balance(&sender), 1_000_000 - 200);
+
+        // A rate-limit rejection is likewise not charged to the sender: the
+        // next ledger opens with the full allowance rather than a stale
+        // counter.
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+        advance_ledger(&env, env.ledger().sequence() + 1);
+        assert_eq!(client.get_rate_limit_remaining(&sender), 2);
+    }
+
+    #[test]
+    fn test_rate_limit_admin_config_and_disable() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, _, sac) = setup_token(&env);
+        sac.mint(&sender, &1_000_000);
+
+        client.initialize(
+            &admin,
+            &treasury,
+            &0,
+            &i128::MAX,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // Tighten the cap to 2; the third payment in the same ledger fails.
+        client.set_rate_limit(&2);
+        assert_eq!(client.get_rate_limit(), 2);
+
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        client.route_payment(&sender, &recipient, &token_address, &100);
+        let res = client.try_route_payment(&sender, &recipient, &token_address, &100);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
+
+        // A cap above MAX_RATE_LIMIT is rejected.
+        let res = client.try_set_rate_limit(&(PaymentRouter::MAX_RATE_LIMIT + 1));
+        assert_eq!(res.unwrap_err().unwrap(), Error::LimitExceeded);
+
+        // Zero disables the limiter entirely.
+        client.set_rate_limit(&0);
+        assert_eq!(client.get_rate_limit(), 0);
+        for _ in 0..(PaymentRouter::DEFAULT_RATE_LIMIT * 2) {
+            client.route_payment(&sender, &recipient, &token_address, &100);
+        }
+        assert_eq!(client.get_rate_limit_remaining(&sender), u32::MAX);
+    }
+
+}
+
+/// Property-based tests for fee calculation logic.
+///
+/// These tests exercise the pure arithmetic used in `process_single_payment`
+/// without touching the Soroban environment so they can run as ordinary host
+/// tests powered by proptest.
+///
+/// The invariants verified across 10,000 random inputs are:
+/// 1. **Conservation**: `fee_amount + remainder == amount`
+/// 2. **Non-negative fee**: `fee_amount >= 0`
+/// 3. **Non-negative remainder**: `remainder >= 0`
+/// 4. **Cap enforcement**: `fee_amount <= fee_cap`
+/// 5. **Fee never exceeds amount**: `fee_amount <= amount`
+#[cfg(test)]
+mod prop_tests {
+    use proptest::prelude::*;
+
+    // --- constants mirrored from the contract ---
+    const BPS_DIVISOR: i128 = 10_000;
+    /// Maximum valid fee in basis points (100% = 10 000 bps).
+    const MAX_FEE_BPS: i128 = 10_000;
+    /// Upper bound for a single payment amount (matches contract MAX_AMOUNT).
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000;
+
+    // --- pure fee calculation logic (mirrors process_single_payment) ---
+
+    /// Computes `(fee_amount, remainder)` exactly as the contract does.
     /// Minimal stand-in for a Soroban DEX, exposing the adapter interface the
     /// payment router expects:
     /// `swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> i128`
