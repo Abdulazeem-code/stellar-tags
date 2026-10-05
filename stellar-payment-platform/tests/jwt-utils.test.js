@@ -65,9 +65,13 @@ describe('jwt utils (configured keys)', () => {
     it('rejects tampered tokens', () => {
       const token = jwtUtils.signToken({ username: 'alice' });
       const [header, payload, signature] = token.split('.');
-      const replacementChar = signature[0] === 'a' ? 'b' : 'a';
-      const tampered = `${header}.${payload}.${replacementChar}${signature.slice(1)}`;
-      expect(() => jwtUtils.verifyToken(tampered)).toThrow();
+      const flipped = signature[0] === 'A' ? 'B' : 'A';
+      const tamperedSig = `${header}.${payload}.${flipped}${signature.slice(1)}`;
+      expect(() => jwtUtils.verifyToken(tamperedSig)).toThrow();
+
+      // Tamper with payload
+      const tamperedPayload = `${header}.${Buffer.from('{"username":"hacked"}').toString('base64url')}.${signature}`;
+      expect(() => jwtUtils.verifyToken(tamperedPayload)).toThrow();
     });
   });
 

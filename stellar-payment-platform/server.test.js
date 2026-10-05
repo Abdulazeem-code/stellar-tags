@@ -13,6 +13,9 @@ jest.mock('pdfkit', () => jest.fn());
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+jest.mock('./src/graphql', () => ({
+  createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+}));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock the module so the
 // test suite can require server.js without a transform error.
@@ -81,6 +84,17 @@ jest.mock('pg', () => ({
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+jest.mock('./src/graphql', () => ({
+  createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+}));
+
+// closeWebSocket is awaited in gracefulShutdown before server.close() is called.
+// Resolve immediately so tests that check server.close() synchronously still pass.
+jest.mock('./src/websocket', () => ({
+  initWebSocket: jest.fn(),
+  closeWebSocket: jest.fn().mockResolvedValue(undefined),
+}));
 
 describe('gracefulShutdown', () => {
   let gracefulShutdown;
@@ -107,13 +121,15 @@ describe('gracefulShutdown', () => {
     jest.restoreAllMocks();
   });
 
-  test('SIGTERM — calls server.close()', () => {
+  test('SIGTERM — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
-  test('SIGINT — calls server.close()', () => {
+  test('SIGINT — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGINT');
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
@@ -140,7 +156,8 @@ describe('gracefulShutdown', () => {
     });
 
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-    await Promise.resolve();
+    await Promise.resolve(); // flush closeWebSocket().then(...)
+    await Promise.resolve(); // flush server.close callback
 
     expect(callOrder).toEqual(['server.close', 'prisma.$disconnect']);
   });
@@ -155,10 +172,10 @@ describe('gracefulShutdown', () => {
     expect(mockPrisma.$disconnect).not.toHaveBeenCalled();
   });
 
-  test('second signal is a no-op (double-invocation guard)', () => {
+  test('second signal is a no-op (double-invocation guard)', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-
+    await Promise.resolve(); // flush closeWebSocket().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
@@ -320,7 +337,11 @@ describe('GET /lookup — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+    }));
 
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
@@ -406,7 +427,11 @@ describe('GET /users — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+    }));
 
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
@@ -493,7 +518,11 @@ describe('POST /register — block secret keys', () => {
     }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+    }));
 
     ({ app } = require('./server'));
     request = require('supertest');
@@ -794,7 +823,11 @@ describe('API v1 routing', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+    }));
 
     jest.mock('pg', () => ({
       Pool: jest.fn().mockImplementation(() => ({
@@ -921,6 +954,11 @@ describe('Database disconnection — 503 handling', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+    }));
     jest.mock('./src/multisigner-verifier', () => ({
       verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
         success: true, accountId: 'GDUMMY', operationType: 'management',

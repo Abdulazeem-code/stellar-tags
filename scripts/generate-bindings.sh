@@ -23,7 +23,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACT_DIR="$ROOT/payment_router"
 PACKAGE_DIR="$ROOT/packages/types"
 PACKAGE_NAME="@stellar-tags/payment-router"
-WASM_REL="target/wasm32-unknown-unknown/release/payment_router.wasm"
+WASM_REL="../target/wasm32-unknown-unknown/release/payment_router.wasm"
 
 # --- 1. Locate the CLI ------------------------------------------------------
 CLI="${STELLAR_CLI:-}"
@@ -45,15 +45,21 @@ echo "Using CLI: $CLI"
 echo "Building payment_router contract (wasm32-unknown-unknown, release)..."
 cargo build --manifest-path "$CONTRACT_DIR/Cargo.toml" --target wasm32-unknown-unknown --release
 
-WASM="$ROOT/$WASM_REL"
-if [[ ! -f "$WASM" ]]; then
-  # Fall back to a crate-local target dir for standalone checkouts.
-  WASM="$CONTRACT_DIR/$WASM_REL"
-fi
-if [[ ! -f "$WASM" ]]; then
-  echo "error: expected WASM artifact not found at $ROOT/$WASM_REL" >&2
+# `payment_router` is a workspace member, so cargo writes the artifact to the
+# workspace target directory rather than to one under the crate. Look in both
+# places so the script works either way.
+WASM=""
+for candidate in "$CONTRACT_DIR/$WASM_REL" "$ROOT/$WASM_REL"; do
+  if [[ -f "$candidate" ]]; then
+    WASM="$candidate"
+    break
+  fi
+done
+if [[ -z "$WASM" ]]; then
+  echo "error: could not find payment_router.wasm under $CONTRACT_DIR or $ROOT." >&2
   exit 1
 fi
+echo "Using WASM: $WASM"
 
 # --- 3. Generate bindings into a temp dir -----------------------------------
 # The CLI names the package after the output directory, so generate into a
@@ -74,6 +80,10 @@ mkdir -p "$(dirname "$PACKAGE_DIR")"
 cp -R "$TMP_OUT" "$PACKAGE_DIR"
 rm -rf "$TMP_ROOT"
 trap - EXIT
+
+# Rustdoc emits a trailing space for empty documentation lines; trim it so
+# generated bindings pass repository whitespace checks.
+sed -i 's/[[:blank:]]*$//' "$PACKAGE_DIR/src/index.ts"
 
 # --- 5. Normalize package metadata ------------------------------------------
 # The generated package.json points at a compiled dist/ that only exists after
