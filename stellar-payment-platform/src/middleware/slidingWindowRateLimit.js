@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { ApiError } = require("../errors");
 
 // One atomic operation removes expired requests, checks the current window,
 // conditionally adds this request, and returns the oldest surviving timestamp.
@@ -32,25 +33,46 @@ return { allowed, count, oldest_timestamp }
 `;
 
 class MemorySlidingWindowStore {
-  constructor() {
+  constructor({ maxKeys = 10_000 } = {}) {
+    if (!Number.isInteger(maxKeys) || maxKeys <= 0) {
+      throw new TypeError("maxKeys must be a positive integer");
+    }
+    this.maxKeys = maxKeys;
     this.requests = new Map();
   }
 
   async hit(key, now, windowMs, maximum) {
     const cutoff = now - windowMs;
-    const active = (this.requests.get(key) || []).filter(
+    for (const [oldestKey, entry] of this.requests) {
+      if (entry.expiresAt > now) break;
+      this.requests.delete(oldestKey);
+    }
+
+    const previous = this.requests.get(key);
+    const active = (previous?.timestamps || []).filter(
       (timestamp) => timestamp > cutoff,
     );
     const allowed = active.length < maximum;
-    if (allowed) active.push(now);
+    if (allowed && !previous && this.requests.size >= this.maxKeys) {
+      return {
+        allowed: false,
+        count: maximum,
+        resetAt: this.requests.values().next().value.expiresAt,
+      };
+    }
 
-    if (active.length > 0) this.requests.set(key, active);
-    else this.requests.delete(key);
+    if (allowed) {
+      active.push(now);
+      this.requests.delete(key);
+      this.requests.set(key, { timestamps: active, expiresAt: now + windowMs });
+    } else {
+      this.requests.set(key, { timestamps: active, expiresAt: previous.expiresAt });
+    }
 
     return {
       allowed,
       count: active.length,
-      resetAt: (active[0] ?? now) + windowMs,
+      resetAt: active[0] + windowMs,
     };
   }
 }
@@ -91,6 +113,7 @@ const createSlidingWindowRateLimiter = ({
   message,
   now = () => Date.now(),
   memoryStore = new MemorySlidingWindowStore(),
+  failClosedOnRedisError = false,
 }) => {
   if (!Number.isFinite(windowMs) || windowMs <= 0) {
     throw new TypeError("windowMs must be a positive number");
@@ -113,10 +136,10 @@ const createSlidingWindowRateLimiter = ({
       if (redisStore) {
         try {
           result = await redisStore.hit(key, timestamp, windowMs, max);
-        } catch (_error) {
-          // Keep protection active during a Redis outage with process-local
-          // sliding windows. Distributed accuracy resumes on the next request
-          // where Redis is available.
+        } catch (error) {
+          if (failClosedOnRedisError) {
+            throw new ApiError("SERVICE_UNAVAILABLE", "Rate limiting is unavailable", { cause: error });
+          }
           result = await memoryStore.hit(key, timestamp, windowMs, max);
         }
       } else {
