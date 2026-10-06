@@ -17,9 +17,20 @@ try {
     throw new Error('DATABASE_URL is not set');
   }
   const { PrismaClient } = require('@prisma/client');
-  prisma = new PrismaClient();
+  const basePrisma = new PrismaClient();
+  
+  if (process.env.DATABASE_READ_URL) {
+    const { readReplicas } = require('@prisma/extension-read-replicas');
+    prisma = basePrisma.$extends(
+      readReplicas({
+        url: process.env.DATABASE_READ_URL,
+      })
+    );
+  } else {
+    prisma = basePrisma;
+  }
 } catch (err) {
-  logger.warn('Prisma client not found. Using fallback mock for tests.');
+  logger.warn('Prisma client not found or extension missing. Using fallback mock for tests.', err);
   prisma = {
     user: {
       update: async () => {
@@ -27,6 +38,7 @@ try {
         e.code = 'P2025';
         throw e;
       },
+      updateMany: async () => ({ count: 0 }),
       findUnique: async () => null,
       findFirst: async () => null,
       findMany: async () => [],
@@ -59,6 +71,8 @@ try {
       findUnique: async () => null,
       findFirst: async () => null,
       create: async () => ({}),
+      update: async () => ({}),
+      updateMany: async () => ({ count: 0 }),
       count: async () => 0,
       aggregate: async () => ({ _sum: { amount: 0, fee: 0 }, _count: { id: 0 } }),
       groupBy: async () => [],

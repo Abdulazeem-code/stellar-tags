@@ -1,121 +1,164 @@
+'use strict';
+
 const crypto = require('crypto');
 const { logger } = require('../src/logger');
 const { ApiError } = require('../src/errors');
 
 const IDEMPOTENCY_HEADER = 'Idempotency-Key';
-const CACHE_EXPIRATION_SECONDS = 24 * 60 * 60; // 24 hours
+const CACHE_EXPIRATION_SECONDS = 24 * 60 * 60;
+const PENDING_EXPIRATION_SECONDS = 5 * 60;
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
-// Methods that create or mutate server-side state and therefore benefit from
-// idempotency protection against retries/double-clicks. Read-only methods
-// (GET, HEAD, OPTIONS) are never idempotency-protected.
-const MUTATING_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
+const requestFingerprint = (req) => digest(JSON.stringify([
+  req.originalUrl,
+  req.body,
+  req.get('authorization') || '',
+  req.get('x-api-key') || '',
+  req.get('cookie') || '',
+]));
 
-/**
- * Idempotency Middleware Factory
- * 
- * If an Idempotency-Key header is provided, this middleware:
- * 1. Checks Redis (or an in-memory Map fallback) for a cached response.
- * 2. Returns the cached response immediately if found.
- * 3. Otherwise, intercepts res.json() to save successful responses (2xx) for future identical requests.
- * 
- * @param {import('redis').RedisClientType | null} redisClient 
- */
+const releaseScript = `
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+  end
+  return 0
+`;
+
+const completeScript = `
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  end
+  return 0
+`;
+
 const idempotencyMiddleware = (redisClient, options = {}) => {
-  // Fallback memory cache if redis is not available
   const memoryCache = new Map();
 
   return async (req, res, next) => {
-    // 1. Only process requests that mutate state
-    if (!MUTATING_METHODS.includes(req.method)) {
-      return next();
-    }
+    if (!MUTATING_METHODS.has(req.method)) return next();
 
-    const idempotencyKey = req.get(IDEMPOTENCY_HEADER);
-    if (!idempotencyKey || typeof idempotencyKey !== 'string') {
+    const rawKey = req.get(IDEMPOTENCY_HEADER);
+    if (!rawKey) {
       if (options.enforce) {
         return next(new ApiError('INVALID_INPUT', `Missing required header: ${IDEMPOTENCY_HEADER}`));
       }
       return next();
     }
 
-    // 2. Validate the key (basic length check to prevent massive keys)
-    const key = idempotencyKey.trim();
+    const key = rawKey.trim();
     if (!key || key.length > 128) {
       return next(new ApiError('INVALID_INPUT', 'Invalid or too long Idempotency-Key'));
     }
 
-    // Include the method and path in the cache key so identical keys on
-    // different endpoints/methods do not collide.
-    const cacheKey = `idempotency:${req.method}:${req.path}:${crypto.createHash('sha256').update(key).digest('hex')}`;
+    const cacheKey = `idempotency:${req.method}:${req.path}:${digest(key)}`;
+    const fingerprint = requestFingerprint(req);
+    const pending = JSON.stringify({ state: 'pending', fingerprint, token: crypto.randomUUID() });
+    const usesRedis = Boolean(redisClient);
+    let existing;
 
     try {
-      // 3. Check for existing cached response
-      if (redisClient && redisClient.isReady) {
-        const cached = await redisClient.get(cacheKey);
-        if (cached) {
-          const { status, body } = JSON.parse(cached);
-          res.setHeader('X-Idempotent-Replay', 'true');
-          return res.status(status).json(body);
+      if (usesRedis) {
+        if (!redisClient.isReady) throw new Error('Redis is unavailable');
+        const claimed = await redisClient.set(cacheKey, pending, {
+          NX: true,
+          EX: PENDING_EXPIRATION_SECONDS,
+        });
+        if (!claimed) {
+          const stored = await redisClient.get(cacheKey);
+          if (!stored) throw new Error('Idempotency claim disappeared');
+          existing = JSON.parse(stored);
         }
       } else {
-        const cached = memoryCache.get(cacheKey);
-        if (cached) {
-          // Check expiration for memory cache manually
-          if (Date.now() > cached.expiresAt) {
-            memoryCache.delete(cacheKey);
-          } else {
-            res.setHeader('X-Idempotent-Replay', 'true');
-            return res.status(cached.status).json(cached.body);
+        const saved = memoryCache.get(cacheKey);
+        if (saved && saved.expiresAt > Date.now()) existing = saved.record;
+        else memoryCache.delete(cacheKey);
+        if (!existing) {
+          if (memoryCache.size >= 1000) {
+            for (const [storedKey, value] of memoryCache) {
+              if (value.expiresAt <= Date.now()) memoryCache.delete(storedKey);
+            }
           }
+          if (memoryCache.size >= 1000) {
+            return next(new ApiError('SERVICE_UNAVAILABLE', 'Idempotency cache is full'));
+          }
+          memoryCache.set(cacheKey, {
+            record: JSON.parse(pending),
+            expiresAt: Date.now() + PENDING_EXPIRATION_SECONDS * 1000,
+          });
         }
       }
     } catch (err) {
-      logger.error('Error reading idempotency key from cache:', err);
-      // Fail open: proceed with request if cache is unavailable
+      logger.error('Failed to claim idempotency key:', err);
+      return next(new ApiError('SERVICE_UNAVAILABLE', 'Idempotency protection is unavailable'));
     }
 
-    // 4. Intercept the response
-    const originalJson = res.json.bind(res);
-
-    res.json = (body) => {
-      // Only cache successful responses (2xx status codes)
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        const cacheData = {
-          status: res.statusCode,
-          body
-        };
-
-        try {
-          if (redisClient && redisClient.isReady) {
-            // Save to redis asynchronously
-            redisClient.setEx(cacheKey, CACHE_EXPIRATION_SECONDS, JSON.stringify(cacheData)).catch((err) => {
-              logger.error('Error saving idempotency key to redis:', err);
-            });
-          } else {
-            memoryCache.set(cacheKey, {
-              ...cacheData,
-              expiresAt: Date.now() + CACHE_EXPIRATION_SECONDS * 1000
-            });
-
-            // Very basic memory cleanup to prevent memory leaks (probabilistic)
-            if (memoryCache.size > 1000) {
-              const now = Date.now();
-              for (const [k, v] of memoryCache.entries()) {
-                if (now > v.expiresAt) {
-                  memoryCache.delete(k);
-                }
-              }
-            }
-          }
-        } catch (err) {
-          logger.error('Error saving idempotency key to cache:', err);
-        }
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        return next(new ApiError('CONFLICT', 'Idempotency-Key was used for a different request'));
       }
+      if (existing.state === 'pending') {
+        return next(new ApiError('CONFLICT', 'Request with this Idempotency-Key is still processing'));
+      }
+      if (existing.state === 'complete') {
+        res.setHeader('X-Idempotent-Replay', 'true');
+        if (existing.contentType) res.setHeader('Content-Type', existing.contentType);
+        return res.status(existing.status).send(existing.body);
+      }
+      return next(new ApiError('SERVICE_UNAVAILABLE', 'Invalid idempotency record'));
+    }
 
-      // Restore original json method to prevent recursive loops if body modification happens
-      res.json = originalJson;
-      return originalJson(body);
+    const release = async () => {
+      if (usesRedis) {
+        await redisClient.eval(releaseScript, { keys: [cacheKey], arguments: [pending] });
+      } else if (JSON.stringify(memoryCache.get(cacheKey)?.record) === pending) {
+        memoryCache.delete(cacheKey);
+      }
     };
+
+    const complete = async (status, body, contentType) => {
+      const record = { state: 'complete', fingerprint, status, body, contentType };
+      if (usesRedis) {
+        const saved = await redisClient.eval(completeScript, {
+          keys: [cacheKey],
+          arguments: [pending, JSON.stringify(record), String(CACHE_EXPIRATION_SECONDS)],
+        });
+        if (!saved) throw new Error('Idempotency claim expired before completion');
+      } else {
+        if (JSON.stringify(memoryCache.get(cacheKey)?.record) !== pending) {
+          throw new Error('Idempotency claim expired before completion');
+        }
+        memoryCache.set(cacheKey, {
+          record,
+          expiresAt: Date.now() + CACHE_EXPIRATION_SECONDS * 1000,
+        });
+      }
+    };
+
+    const originalSend = res.send.bind(res);
+    let settled = false;
+    res.send = (body) => {
+      settled = true;
+      res.send = originalSend;
+
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        complete(res.statusCode, body, res.getHeader('Content-Type'))
+          .then(() => originalSend(body))
+          .catch((err) => {
+            logger.error('Failed to save idempotency response:', err);
+            next(new ApiError('SERVICE_UNAVAILABLE', 'Idempotency protection is unavailable'));
+          });
+      } else {
+        release()
+          .catch((err) => logger.error('Failed to release idempotency key:', err))
+          .finally(() => originalSend(body));
+      }
+      return res;
+    };
+
+    res.once('close', () => {
+      if (!settled) release().catch((err) => logger.error('Failed to release idempotency key:', err));
+    });
 
     next();
   };

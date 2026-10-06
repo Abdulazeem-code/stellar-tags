@@ -150,12 +150,13 @@ describe('migration chain (real PostgreSQL)', () => {
   it('creates the indexes the query plans depend on', async () => {
     expect(await indexNames('payments')).toEqual(
       expect.arrayContaining([
-        'payments_created_at_idx',
         'payments_created_at_id_idx',
+        'payments_asset_code_created_at_idx',
         'payments_from_address_idx',
         'payments_to_address_idx',
       ]),
     );
+    expect(await indexNames('payments')).not.toContain('payments_created_at_idx');
     expect(await indexNames('username_registry')).toEqual(
       expect.arrayContaining([
         'username_registry_address_idx',

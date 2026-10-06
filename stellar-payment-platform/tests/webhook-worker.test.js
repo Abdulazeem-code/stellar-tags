@@ -76,7 +76,11 @@ describe('webhook BullMQ delivery', () => {
 
     expect(queue.add).toHaveBeenCalledWith(
       'deliver',
-      { webhook, payload },
+      expect.objectContaining({
+        webhook,
+        payload,
+        otelContext: expect.any(Object),
+      }),
       expect.objectContaining({
         attempts: MAX_WEBHOOK_ATTEMPTS,
         backoff: {

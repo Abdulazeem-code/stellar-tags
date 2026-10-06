@@ -175,8 +175,9 @@ describe('Redis-backed middleware (real Redis)', () => {
       expect(ttl).toBeLessThanOrEqual(86_400);
 
       const cached = JSON.parse(await client.get(keys[0]));
+      expect(cached.state).toBe('complete');
       expect(cached.status).toBe(201);
-      expect(cached.body).toMatchObject({ username: 'hashed*localhost' });
+      expect(JSON.parse(cached.body)).toMatchObject({ username: 'hashed*localhost' });
     });
 
     it('does not replay a failed response', async () => {
