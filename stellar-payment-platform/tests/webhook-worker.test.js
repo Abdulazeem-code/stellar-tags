@@ -76,7 +76,11 @@ describe('webhook BullMQ delivery', () => {
 
     expect(queue.add).toHaveBeenCalledWith(
       'deliver',
-      { webhook, payload },
+      expect.objectContaining({
+        webhook,
+        payload,
+        otelContext: expect.any(Object),
+      }),
       expect.objectContaining({
         attempts: MAX_WEBHOOK_ATTEMPTS,
         backoff: {
@@ -139,7 +143,7 @@ describe('webhook BullMQ delivery', () => {
 
     await processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 0 },
-      { prisma, poolRunFn: jest.fn() },
+      { prisma,  },
     );
 
     expect(global.fetch).toHaveBeenCalledTimes(1);

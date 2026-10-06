@@ -20,9 +20,12 @@ const {
   adminBlockBodySchema,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
+  adminDlqQuerySchema,
+  adminDlqReplayBodySchema,
 } = require('../../schemas');
 const { streamAdminExport } = require('../../utils/exporter');
 const { getRoutingStats } = require('../../services/statsService');
+const { getRoutingStatsFromAnalytics, getAnalyticsPool } = require('../../analytics/analyticsRepository');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { logger } = require('../../logger');
@@ -32,11 +35,27 @@ const {
   parseCursorQuery,
   paginateByKeyset,
   cursorPaginatedResponse,
-  keysetWhereDesc
+  keysetWhereDesc,
+  keysetWhereAscById
 } = require('../../pagination');
-const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
+const {
+  listDlqMessages,
+  getDlqMessage,
+  replayDlqMessage,
+  replayDlqMessages,
+  discardDlqMessage,
+} = require('../../dlq');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
-const { PRIMARY_USERNAME_ORDER } = require('../../utils');
+const {
+  softDeletePayment,
+  restorePayment,
+  restoreUser,
+  findDeletedUser,
+  findDeletedPayment,
+  listDeletedUsers,
+  listDeletedPayments,
+} = require('../../services/softDeleteService');
+const { PRIMARY_USERNAME_ORDER, normalizeNameTag } = require('../../utils');
 
 // PAGE_SIZE for the admin export cursor-based pagination
 const EXPORT_PAGE_SIZE = 500;
@@ -114,17 +133,25 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
 
     const { prisma } = getPrisma();
-    let skip = 0;
+    // Keyset walk (issue #677): pages seek strictly past the last row's
+    // (createdAt, id) tuple instead of skipping OFFSET rows, so deep pages
+    // cost the same as the first. The id tie-breaker also guarantees stable
+    // ordering when rows share a timestamp.
+    let cursor = null;
     let headerWritten = false;
 
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const where = dateFilter ? { createdAt: dateFilter } : {};
+        const baseWhere = dateFilter
+          ? { createdAt: dateFilter, deletedAt: null }
+          : { deletedAt: null };
+        const where = cursor
+          ? { AND: [baseWhere, keysetWhereAscById(cursor)] }
+          : baseWhere;
         const records = await prisma.payment.findMany({
           where,
-          orderBy: { createdAt: 'asc' },
-          skip,
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
           take: EXPORT_PAGE_SIZE,
         });
 
@@ -152,7 +179,9 @@ router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
         }
 
         if (records.length < EXPORT_PAGE_SIZE) break;
-        skip += EXPORT_PAGE_SIZE;
+
+        const last = records[records.length - 1];
+        cursor = { createdAt: last.createdAt, id: last.id };
       }
 
       return res.end();
@@ -227,97 +256,98 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
   }));
 
   // ── Dead Letter Queue (DLQ) ────────────────────────────────────────────
+  //
+  // Payment retry jobs that exhausted their attempts are parked in a dedicated
+  // BullMQ queue so an operator can inspect and replay them. The routes below
+  // sit inside the router-level auditLogMiddleware, so every mutating call
+  // (replay, bulk replay, discard) is recorded with its body redacted.
 
   /**
    * GET /admin/dlq
-   * List dead-letter-queue entries.  Supports optional `?username=` filter,
-   * `?limit=` (default 50, max 200), and `?offset=` (default 0).
+   * One page of dead-letter-queue messages, newest first.
+   *
+   * Query parameters:
+   *  - limit    (optional) page size, clamped to 1-100 (default 20)
+   *  - page     (optional) 1-based page number (default 1)
+   *  - username (optional) narrow the listing to one merchant
+   *
+   * Payloads are redacted with the same helper the audit log uses, so a
+   * merchant secret never leaves the process through this route.
    */
   router.get(
     '/admin/dlq',
     adminAuth,
-    asyncHandler(async (req, res, next) => {
-      const { prisma } = getPrisma();
-      const username =
-        typeof req.query.username === 'string'
-          ? req.query.username.trim()
-          : undefined;
-      const limit = Math.min(
-        Math.max(parseInt(req.query.limit, 10) || 50, 1),
-        200,
-      );
-      const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    validateSchema({ query: adminDlqQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { limit, page, username } = req.query;
+      const { available, messages, total } = await listDlqMessages({ limit, page, username });
 
-      try {
-        const { entries, total } = await listDLQEntries(
-          prisma,
-          async (sql, params) => {
-            // Fallback path not used in normal operation; provide empty impl
-            return [];
-          },
-          { username, limit, offset },
-        );
+      return res.status(200).json({
+        success: true,
+        available,
+        messages,
+        meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+      });
+    }),
+  );
 
-        return res.status(200).json({
-          ok: true,
-          total,
-          limit,
-          offset,
-          entries: entries.map((e) => ({
-            id: e.id,
-            webhook_id: e.webhookId,
-            webhook_url: e.webhookUrl,
-            username: e.username,
-            event_type: e.eventType,
-            failure_reason: e.failureReason,
-            delivery_attempts: e.deliveryAttempts,
-            moved_at: (e.movedAt instanceof Date
-              ? e.movedAt
-              : new Date(e.movedAt)
-            ).toISOString(),
-            replayed: e.replayed,
-            replayed_at: e.replayedAt
-              ? (e.replayedAt instanceof Date
-                  ? e.replayedAt
-                  : new Date(e.replayedAt)
-                ).toISOString()
-              : null,
-          })),
-        });
-      } catch (error) {
-        return next(error);
-      }
+  /**
+   * GET /admin/dlq/:id
+   * A single dead-letter-queue message, payload redacted.
+   */
+  router.get(
+    '/admin/dlq/:id',
+    adminAuth,
+    asyncHandler(async (req, res) => {
+      return res.status(200).json({ success: true, message: await getDlqMessage(req.params.id) });
     }),
   );
 
   /**
    * POST /admin/dlq/:id/replay
-   * Manually replay a dead-letter-queue entry — retries delivery once.
+   * Re-enqueue one message onto the main queue it came from with a fresh
+   * attempt budget, then drop it from the DLQ.
    */
   router.post(
     '/admin/dlq/:id/replay',
     adminAuth,
-    asyncHandler(async (req, res, next) => {
-      const { prisma } = getPrisma();
-      const id =
-        typeof req.params?.id === 'string' ? req.params.id.trim() : '';
+    asyncHandler(async (req, res) => {
+      const result = await replayDlqMessage(req.params.id);
+      return res.status(200).json({ success: true, replayed: true, ...result });
+    }),
+  );
 
-      if (!id) {
-        return res.status(400).json({ error: 'DLQ entry id is required in URL path.' });
-      }
+  /**
+   * POST /admin/dlq/replay
+   * Replay a batch of messages, optionally narrowed to one merchant. The batch
+   * size is capped so a single request cannot flood the main queue.
+   */
+  router.post(
+    '/admin/dlq/replay',
+    adminAuth,
+    validateSchema({ body: adminDlqReplayBodySchema }),
+    asyncHandler(async (req, res) => {
+      const { limit, username } = req.body;
+      const result = await replayDlqMessages({ limit, username });
 
-      try {
-        const result = await replayFromDLQ(prisma, async (sql, params) => [], id);
+      return res.status(200).json({
+        success: true,
+        replayed: result.replayed.length,
+        failed: result.failed,
+        capped: result.capped,
+      });
+    }),
+  );
 
-        if (!result.ok) {
-          const status = result.error === 'DLQ entry not found' ? 404 : 409;
-          return res.status(status).json({ error: result.error });
-        }
-
-        return res.status(200).json({ ok: true, replayed: true });
-      } catch (error) {
-        return next(error);
-      }
+  /**
+   * DELETE /admin/dlq/:id
+   * Permanently drop one message without replaying it.
+   */
+  router.delete(
+    '/admin/dlq/:id',
+    adminAuth,
+    asyncHandler(async (req, res) => {
+      return res.status(200).json({ success: true, ...(await discardDlqMessage(req.params.id)) });
     }),
   );
 
@@ -340,20 +370,33 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
-      const { prisma } = getPrisma();
+      const selectedInterval = interval || groupBy || 'day';
 
+      // Prefer the analytics read model (TimescaleDB) when available.
+      // Falls back to the primary Prisma DB when ANALYTICS_DATABASE_URL is
+      // not configured so development without TimescaleDB keeps working.
+      const analyticsPool = getAnalyticsPool();
+      if (analyticsPool) {
+        const stats = await getRoutingStatsFromAnalytics({
+          startDate,
+          endDate,
+          groupBy: selectedInterval,
+          assetCode,
+          pool: analyticsPool,
+        });
+        return res.status(200).json({ success: true, ...stats });
+      }
+
+      // Fallback: query the transactional Prisma DB directly.
+      const { prisma } = getPrisma();
       const stats = await getRoutingStats({
         prisma,
         startDate,
         endDate,
-        groupBy: interval || groupBy || 'day',
+        groupBy: selectedInterval,
         assetCode,
       });
-
-      return res.status(200).json({
-        success: true,
-        ...stats,
-      });
+      return res.status(200).json({ success: true, ...stats });
     }),
   );
 
@@ -498,6 +541,116 @@ router.get(
       },
       failingOver24h,
     });
+  }));
+
+  // ── Soft delete / restore (#731) ─────────────────────────────────────────
+  // Deleting stamps `deletedAt` instead of removing the row. The matching
+  // restore endpoint clears the stamp, and the listing endpoints expose what
+  // is currently deleted so an operator can find it again.
+
+  const isoOrNull = (value) =>
+    value instanceof Date ? value.toISOString() : value || null;
+
+  const parseDeletedPage = (query) => ({
+    skip: Math.max(parseInt(query.skip, 10) || 0, 0),
+    take: parseInt(query.take, 10) || undefined,
+  });
+
+  router.get('/admin/users/deleted', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const users = await listDeletedUsers(prisma, parseDeletedPage(req.query));
+
+    return res.status(200).json({
+      ok: true,
+      count: users.length,
+      data: users.map((user) => ({
+        username: user.username,
+        address: user.address,
+        deleted_at: isoOrNull(user.deletedAt),
+      })),
+    });
+  }));
+
+  router.post('/admin/users/:username/restore', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const username = normalizeNameTag(
+      typeof req.params.username === 'string' ? req.params.username.trim() : '',
+    ).toLowerCase();
+
+    if (!username) {
+      return res.status(400).json({ error: 'Missing username parameter' });
+    }
+
+    const target = await findDeletedUser(prisma, username);
+    if (!target) {
+      return res.status(404).json({ error: 'Soft-deleted username not found' });
+    }
+
+    await restoreUser(prisma, username);
+    await invalidateFederationCache(redisClient, target.address, username);
+    await invalidateStatsCache(redisClient);
+    await recordActivity(prisma, {
+      username,
+      action: ACTIVITY_ACTIONS.USER_RESTORED,
+      metadata: { address: target.address },
+      req,
+    });
+
+    return res.status(200).json({ ok: true, username, restored: true });
+  }));
+
+  router.get('/admin/payments/deleted', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const payments = await listDeletedPayments(prisma, parseDeletedPage(req.query));
+
+    return res.status(200).json({
+      ok: true,
+      count: payments.length,
+      data: payments.map((payment) => ({
+        id: payment.id,
+        created_at: isoOrNull(payment.createdAt),
+        from_address: payment.fromAddress,
+        to_address: payment.toAddress,
+        amount: payment.amount,
+        status: payment.status,
+        deleted_at: isoOrNull(payment.deletedAt),
+      })),
+    });
+  }));
+
+  router.delete('/admin/payments/:id', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const id = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+
+    if (!id) {
+      return res.status(400).json({ error: 'Missing payment id parameter' });
+    }
+
+    const deleted = await softDeletePayment(prisma, id);
+    if (!deleted) {
+      return res.status(404).json({ error: 'Payment not found or already deleted' });
+    }
+
+    await invalidateStatsCache(redisClient);
+    return res.status(200).json({ ok: true, id, deleted: true });
+  }));
+
+  router.post('/admin/payments/:id/restore', adminAuth, asyncHandler(async (req, res, next) => {
+    const { prisma } = getPrisma();
+    const id = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+
+    if (!id) {
+      return res.status(400).json({ error: 'Missing payment id parameter' });
+    }
+
+    const target = await findDeletedPayment(prisma, id);
+    if (!target) {
+      return res.status(404).json({ error: 'Soft-deleted payment not found' });
+    }
+
+    await restorePayment(prisma, id);
+    await invalidateStatsCache(redisClient);
+    return res.status(200).json({ ok: true, id, restored: true });
   }));
 
   return router;

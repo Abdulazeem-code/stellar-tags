@@ -13,7 +13,8 @@ const crypto = require('crypto');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../multisigner-verifier');
-const { normalizeNameTag } = require('../utils');
+const { poolGet } = require('../db');
+const { normalizeNameTag, shouldFallbackToLocalRegistry } = require('../utils');
 
 const httpError = (message, statusCode) => {
   const error = new Error(message);
@@ -56,10 +57,21 @@ const verifyFreighterSignedMessage = ({ message, signature, signerAddress, publi
 };
 
 const findUserRecord = async (username) => {
-  return await prisma.user.findUnique({
-    where: { username },
-    select: { username: true, address: true },
-  });
+  try {
+    // A soft-deleted account must not authenticate, so the lookup is scoped to
+    // live rows (the legacy pool fallback below applies the same predicate).
+    return await prisma.user.findFirst({
+      where: { username, deletedAt: null },
+      select: { username: true, address: true },
+    });
+  } catch (err) {
+    if (!shouldFallbackToLocalRegistry(err)) throw err;
+    const localRow = await poolGet(
+      'SELECT username, address FROM username_registry WHERE username = $1 AND deleted_at IS NULL LIMIT 1',
+      [username],
+    );
+    return localRow ? { username: localRow.username, address: localRow.address } : null;
+  }
 };
 
 /**

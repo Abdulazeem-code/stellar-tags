@@ -102,6 +102,23 @@ describe('transferAccount', () => {
     ).rejects.toMatchObject({ message: 'User not found', statusCode: 404 });
   });
 
+  it('treats a soft-deleted user as not found', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      username: 'alice',
+      address: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+      deletedAt: new Date(),
+    });
+    await expect(
+      transferAccount(
+        'alice',
+        'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+        VALID_NEW_ADDRESS,
+        's1',
+        's2',
+      ),
+    ).rejects.toMatchObject({ message: 'User not found', statusCode: 404 });
+  });
+
   it('rejects an address that does not match the current record', async () => {
     await expect(
       transferAccount('alice', 'GDIFFERENTADDRESS', VALID_NEW_ADDRESS, 's1', 's2'),
