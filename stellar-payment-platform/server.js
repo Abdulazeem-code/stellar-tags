@@ -122,6 +122,7 @@ const swaggerSpec = swaggerJsdoc(swaggerOptions);
 // #31 — Attach a correlation ID to every request before anything else runs so
 // all downstream middleware, handlers and logs can reference the same trace.
 app.use(correlationId);
+app.use(securityHeaders);
 
 // #736 — Mutual TLS. `serviceIdentity` names the calling service from its
 // client certificate so request logs and audit trails can attribute internal
