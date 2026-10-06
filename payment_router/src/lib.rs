@@ -3694,6 +3694,11 @@ impl PaymentRouter {
     /// exhausted, `Err(Error::LimitExceeded)` if `amount` is out of bounds,
     /// or `Err(Error::InsufficientBalance)` if the balance is too low.
     ///
+    /// Admin authorization is required. Works even while the contract is
+    /// frozen so the legitimate admin can keep the switch alive.
+    pub fn ping(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
     /// # Panics
     /// Panics if `sender` does not authorize the call, or if the underlying
     /// token transfer to `platform_treasury` fails.
@@ -3746,6 +3751,222 @@ impl PaymentRouter {
         // Contract-level rate limiting (issue #716): one invocation slot per
         // payment, consumed after auth so only authorized senders are counted.
         Self::check_rate_limit(&env, &sender)?;
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("ping"), admin), env.ledger().timestamp());
+
+        log!(&env, "Admin heartbeat recorded");
+        Ok(())
+    }
+
+    /// Dead man's switch claim: transfers admin rights to `claimant` if they
+    /// are the configured backup admin and the admin has not pinged (directly
+    /// or via routing a payment) for at least the configured timeout.
+    ///
+    /// Deliberately NOT timelocked and NOT blocked by a contract freeze: if
+    /// the primary admin is gone there is nobody left to execute a queued
+    /// action, and freezing must not be able to brick recovery.
+    ///
+    /// # Parameters
+    /// - `claimant`: Address claiming admin rights. Must be the configured
+    ///   backup admin and must authorize the call.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::NoBackupAdmin)` if no backup is
+    /// configured, `Err(Error::Unauthorized)` if `claimant` is not the
+    /// backup, or `Err(Error::DmsNotReady)` if the timeout has not elapsed.
+    pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
+        claimant.require_auth();
+
+        let backup: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackupAdmin)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if claimant != backup {
+            return Err(Error::Unauthorized);
+        }
+
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .ok_or(Error::InvalidDmsConfig)?;
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .ok_or(Error::InvalidDmsConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < last_heartbeat.saturating_add(timeout) {
+            return Err(Error::DmsNotReady);
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &claimant);
+        // Fully disarm the switch: the backup is consumed and the clock is
+        // cleared so the new admin starts from a clean slate (re-arm via the
+        // timelock if desired).
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().remove(&DataKey::DmsTimeout);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_claimed"), claimant.clone()), now);
+
+        log!(&env, "Admin claimed via dead man's switch");
+        Ok(())
+    }
+
+    /// Returns the current admin address.
+    ///
+    /// # Returns
+    /// `Some(admin)` if the contract is initialized, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Returns the dead man's switch configuration.
+    ///
+    /// # Returns
+    /// `(backup_admin, timeout_seconds, last_heartbeat, seconds_since_heartbeat)`.
+    /// `backup_admin` is `None` and the timestamps `0` when no backup is
+    /// configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_dead_mans_switch(env: Env) -> (Option<Address>, u64, u64, u64) {
+        let backup = env.storage().instance().get(&DataKey::BackupAdmin);
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let elapsed = if backup.is_some() {
+            now.saturating_sub(last)
+        } else {
+            0
+        };
+        (backup, timeout, last, elapsed)
+    }
+
+    /// Returns `true` if the dead man's switch is armed (a backup admin is
+    /// configured) and the timeout has elapsed, i.e. `claim_admin` would
+    /// currently succeed for the backup.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_dead_mans_switch_expired(env: Env) -> bool {
+        let backup_set = env.storage().instance().has(&DataKey::BackupAdmin);
+        if !backup_set {
+            return false;
+        }
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        env.ledger().timestamp().saturating_sub(last) >= timeout
+    }
+
+    /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    ///
+    /// # Parameters
+    /// - `token`: Contract ID of the token to recover.
+    /// - `amount`: Amount to transfer from the contract's balance to the admin.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call, or if the
+    /// token transfer fails (e.g. the contract's balance is below `amount`).
+    pub fn recover_tokens(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&contract_address, &admin, &amount);
+
+        Ok(())
+    }
+
+    /// Records a token as supported (no-op; routing accepts any token contract ID).
+    ///
+    /// # Parameters
+    /// - `_token`: Ignored; present for API compatibility.
+    ///
+    /// # Returns
+    /// Always `Ok(())`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Routes a payment from a sender to a recipient, deducting a platform fee.
+    ///
+    /// # Parameters
+    /// - `sender`: Address the funds are debited from; must authorize the call.
+    /// - `recipient`: Address to receive the funds (minus the platform fee).
+    /// - `token_address`: Contract ID of the token being transferred.
+    /// - `amount`: Amount to route, in the token's smallest unit. Must be
+    ///   positive and within the configured min/max and daily-limit bounds.
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Returns `Err(Error::Paused)` if routing is
+    /// paused, `Err(Error::NotInitialized)` if the contract has no admin
+    /// set, `Err(Error::InvalidRecipient)` if `sender == recipient`,
+    /// `Err(Error::Blacklisted)` if `recipient` is blacklisted,
+    /// `Err(Error::RateLimited)` if the sender's per-ledger cap (#716) is
+    /// exhausted, `Err(Error::LimitExceeded)` if `amount` is out of bounds,
+    /// or `Err(Error::InsufficientBalance)` if the balance is too low.
+    ///
+    /// # Panics
+    /// Panics if `sender` does not authorize the call, or if the underlying
+    /// token transfer to `platform_treasury` fails.
+    pub fn route_payment(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 

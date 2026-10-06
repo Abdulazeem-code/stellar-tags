@@ -18,7 +18,25 @@ const { logger } = require('../logger');
 // ---------------------------------------------------------------------------
 // Configuration (env-overridable)
 // ---------------------------------------------------------------------------
-const HORIZON_BASE = process.env.HORIZON_BASE || 'https://horizon-testnet.stellar.org';
+
+const DEFAULT_HORIZON_NETWORK = 'testnet';
+
+/**
+ * Public Horizon endpoints per network. `HORIZON_BASE` always wins, so an
+ * explicit URL (a proxy, a local stack, a test fixture) is never overridden.
+ */
+const HORIZON_URLS = Object.freeze({
+  testnet: 'https://horizon-testnet.stellar.org',
+  public: 'https://horizon.stellar.org',
+  futurenet: 'https://horizon-futurenet.stellar.org',
+});
+
+const HORIZON_NETWORK = process.env.HORIZON_NETWORK || DEFAULT_HORIZON_NETWORK;
+
+const HORIZON_BASE =
+  process.env.HORIZON_BASE ||
+  HORIZON_URLS[HORIZON_NETWORK] ||
+  HORIZON_URLS[DEFAULT_HORIZON_NETWORK];
 
 const BREAKER_THRESHOLD = parseInt(process.env.CB_THRESHOLD, 10) || 5;
 const BREAKER_TIMEOUT = parseInt(process.env.CB_TIMEOUT_MS, 10) || 10000;
@@ -167,6 +185,8 @@ module.exports = {
 
   // Configuration (useful for tests / introspection)
   HORIZON_BASE,
+  HORIZON_NETWORK,
+  HORIZON_URLS,
   BREAKER_THRESHOLD,
   BREAKER_TIMEOUT,
   BREAKER_RESET_TIMEOUT,
