@@ -2638,71 +2638,11 @@ impl PaymentRouter {
         Ok(id)
     }
 
-    /// Casts one weighted vote on an open fee proposal.
-    pub fn vote_fee_proposal(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        support: bool,
-    ) -> Result<(), Error> {
-        voter.require_auth();
-        let token_address: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::GovernanceToken)
-            .ok_or(Error::GovernanceNotConfigured)?;
-        let key = DataKey::GovernanceProposal(proposal_id);
-        let mut proposal: FeeProposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::InvalidProposal)?;
-        if proposal.executed || env.ledger().timestamp() >= proposal.voting_ends_at {
-            return Err(Error::InvalidProposal);
-        }
-        let vote_key = DataKey::GovernanceVote(proposal_id, voter.clone());
-        if env.storage().persistent().has(&vote_key) {
-            return Err(Error::AlreadyVoted);
-        }
-        let weight = token::Client::new(&env, &token_address).balance(&voter);
-        if weight <= 0 {
-            return Err(Error::InvalidProposal);
-        }
-        if support {
-            proposal.yes_votes = proposal.yes_votes.saturating_add(weight);
-        } else {
-            proposal.no_votes = proposal.no_votes.saturating_add(weight);
-        }
-        env.storage().persistent().set(&key, &proposal);
-        env.storage().persistent().set(&vote_key, &true);
-        Ok(())
-    }
+        // 4. Transfer the platform fee to your treasury
+        token_client.transfer(&sender, &platform_treasury, &fee_amount);
 
-    /// Finalizes a successful fee proposal after its voting period ends.
-    pub fn execute_fee_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
-        let key = DataKey::GovernanceProposal(proposal_id);
-        let mut proposal: FeeProposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::InvalidProposal)?;
-        if proposal.executed
-            || env.ledger().timestamp() < proposal.voting_ends_at
-            || proposal.yes_votes <= proposal.no_votes
-            || proposal.yes_votes.saturating_add(proposal.no_votes) < proposal.quorum
-        {
-            return Err(Error::InvalidProposal);
-        }
-        proposal.executed = true;
-        env.storage().persistent().set(&key, &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeBps, &proposal.fee_bps);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCap, &proposal.fee_cap);
-        Ok(())
-    }
+        // 5. Transfer the remaining balance to the recipient
+        token_client.transfer(&sender, &recipient, &recipient_amount);
 
     pub fn get_fee_proposal(env: Env, proposal_id: u64) -> Option<FeeProposal> {
         env.storage()
@@ -7900,7 +7840,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let admin = Address::generate(&env);
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
         let platform_treasury = Address::generate(&env);
