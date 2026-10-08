@@ -7,6 +7,7 @@ const statsRoutes = require('./statsRoutes');
 const historyRoutes = require('./historyRoutes');
 const exportRoutes = require('./exportRoutes');
 const paymentRoutes = require('./paymentRoutes');
+const sseRoutes = require('./sseRoutes');
 const contractRoutes = require('./contractRoutes');
 const federationRoutes = require('./federationRoutes');
 
@@ -26,6 +27,9 @@ module.exports = (redisClient) => {
   router.use('/settlement', settlementRoutes);
 
   router.use('/', webhookRoutes(redisClient));
+  // SSE status streams mount before paymentRoutes so the long-lived stream
+  // never passes through the payment router's idempotency middleware.
+  router.use('/', sseRoutes(redisClient));
   router.use('/', paymentRoutes(redisClient));
   router.use('/', statsRoutes(redisClient));
   router.use('/', federationRoutes(redisClient));
