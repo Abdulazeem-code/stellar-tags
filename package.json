@@ -25,7 +25,7 @@
   },
   "lint-staged": {
     "stellar-payment-platform/**/*.js": "eslint",
-    "payment-dashboard/**/*.{js,jsx}": "npm --prefix payment-dashboard run lint"
+    "payment-dashboard/**/*.{js,jsx}": "eslint --config payment-dashboard/eslint.config.js"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^2.5.0",

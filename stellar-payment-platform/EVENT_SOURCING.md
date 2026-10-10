@@ -253,5 +253,6 @@ This compares the current read model with state rebuilt from events.
 - Snapshotting for performance
 - Event replay with filters
 - Multiple read models (analytics, reporting, etc.)
-- Event streaming via WebSocket or SSE
+- Event streaming for command-side events (payment status updates already
+  stream to clients via SSE, see #730)
 - Integration with external event buses (Kafka, RabbitMQ)

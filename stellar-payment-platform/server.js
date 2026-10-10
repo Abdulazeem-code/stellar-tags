@@ -85,9 +85,10 @@ const {
 } = require("./src/utils");
 const { getCachedApprovedOrigins } = require("./src/originCache");
 const {
-  initWebSocket,
-  closeWebSocket,
-} = require("./src/websocket");
+  initSse,
+  closeSse,
+  isSseStreamPath,
+} = require("./src/sse");
 const { createHttpServer, describeTlsStatus } = require("./src/config/tls");
 const { requireMutualTls, serviceIdentity } = require("./src/middleware/mtls");
 
@@ -247,7 +248,10 @@ const limiter = createTokenBucketLimiter(redisClient, {
   capacity: 100,
   refillRate: 100 / (15 * 60), // 100 requests per 15 minutes
   prefix: 'global-rl:',
-  skip: (req) => req.path === "/metrics",
+  // SSE streams are exempt: an EventSource reconnect loop must not consume a
+  // caller's REST quota. They are bounded separately by a per-IP limiter on
+  // the stream route itself (src/routes/v1/sseRoutes.js).
+  skip: (req) => req.path === "/metrics" || isSseStreamPath(req.path),
   // Key by authenticated user identifier when present (address/username),
   // otherwise fall back to client IP. This lets registered/identified users
   // get a per-account quota rather than being grouped by IP.
@@ -1219,9 +1223,9 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
-  // Gracefully close Socket.io before closing the underlying HTTP server so
-  // existing WebSocket connections can finish in-flight before being dropped.
-  closeWebSocket().then(() => {
+  // Close every open SSE stream before the HTTP server so the long-lived
+  // streaming responses do not keep sockets (and server.close()) alive.
+  closeSse().then(() => {
     server.close(async () => {
       clearTimeout(timer);
       try {
@@ -1292,10 +1296,12 @@ if (require.main === module) {
       }
     });
 
-    // Attach Socket.io to the same HTTP server so WebSocket upgrades are
-    // handled on the same port as the REST API. Pass the existing CORS
-    // allow-list so WebSocket handshakes respect the same origin policy.
-    initWebSocket(server, allowedOrigins);
+    // Subscribe to the Redis payment channel so status changes published by
+    // other processes (e.g. the Horizon listener) are forwarded to connected
+    // EventSource clients. SSE itself needs no server attachment — the stream
+    // routes are ordinary Express handlers and CORS is enforced by the
+    // regular cors() middleware already in the chain.
+    initSse();
 
     process.on("SIGTERM", (sig) =>
       gracefulShutdown(server, prisma, sig, redisClient),
