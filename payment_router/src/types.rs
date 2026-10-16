@@ -57,6 +57,18 @@ pub struct MetaPayment {
     pub amount: i128,
 }
 
+/// A single leg in a split swap route.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitRoute {
+    /// DEX contract address for this split.
+    pub dex_address: Address,
+    /// Basis points weight allocated to this split (out of 10,000 total).
+    pub weight_bps: u32,
+    /// Minimum acceptable output tokens from this split swap.
+    pub min_amount_out: i128,
+}
+
 /// A single swap-routed transfer instruction for use with
 /// [`PaymentRouter::route_payment_with_swap`] and
 /// [`PaymentRouter::route_payments_with_swap`].

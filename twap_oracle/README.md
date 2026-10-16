@@ -15,11 +15,14 @@ change when the oracle evolves.
 | --- | --- |
 | `initialize(admin)` | One-time setup. Records the admin allowed to write observations. Requires `admin` authorization. |
 | `admin()` | Returns the configured admin, if initialized. |
-| `observe(price, timestamp)` | Appends an observation and returns the retained count. Admin-only. |
-| `observation_count()` | Number of retained observations. |
-| `latest_observation()` | Most recent observation, if any. |
-| `observations()` | All retained observations, oldest first. |
-| `twap(window_seconds)` | Time-weighted average price over the window ending at the latest observation. |
+| `set_max_staleness(base, quote, max_staleness_seconds)` | Configures max staleness threshold for a specific token pair. Admin-only. |
+| `get_max_staleness(base, quote)` | Returns configured max staleness for a pair, defaulting to 3600 seconds. |
+| `observe(base, quote, price, timestamp)` | Appends an observation for a pair and returns the retained count. Admin-only. |
+| `observation_count(base, quote)` | Number of retained observations for a pair. |
+| `latest_observation(base, quote)` | Most recent observation for a pair, if any. |
+| `observations(base, quote)` | All retained observations for a pair, oldest first. |
+| `twap(base, quote, window_seconds)` | Time-weighted average price for a pair over the window ending at the latest observation. |
+| `consult(base, quote, window_seconds)` | TWAP price for a pair over the window, enforcing heartbeat freshness check (`Error::PriceStale`). |
 
 Prices are `i128` in whatever unit the caller uses (for example, stroops of a
 reference asset). No scaling is applied by the contract.
