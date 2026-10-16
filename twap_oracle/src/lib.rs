@@ -35,6 +35,9 @@ pub const MIN_INTERVAL_SECONDS: u64 = 60;
 /// Largest permitted TWAP window (7 days).
 pub const MAX_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+/// Default staleness threshold (1 hour) if not explicitly set for a pair.
+pub const DEFAULT_MAX_STALENESS_SECONDS: u64 = 3600;
+
 /// Upper bound for a single observation price. Keeps `price * elapsed` well
 /// inside `i128` for any realistic ledger gap.
 pub const MAX_PRICE: i128 = i128::MAX / 1_000_000_000;
@@ -56,7 +59,8 @@ pub struct Observation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
-    Observations,
+    Pair(Address, Address),
+    Staleness(Address, Address),
 }
 
 /// Oracle errors surfaced to callers.
@@ -74,6 +78,7 @@ pub enum Error {
     InvalidWindow = 8,
     InsufficientHistory = 9,
     NoObservations = 10,
+    PriceStale = 11,
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -83,10 +88,10 @@ fn read_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)
 }
 
-fn read_observations(env: &Env) -> Vec<Observation> {
+fn read_observations(env: &Env, base: &Address, quote: &Address) -> Vec<Observation> {
     env.storage()
         .instance()
-        .get(&DataKey::Observations)
+        .get(&DataKey::Pair(base.clone(), quote.clone()))
         .unwrap_or_else(|| Vec::new(env))
 }
 
@@ -106,9 +111,6 @@ impl TwapOracle {
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::Observations, &Vec::<Observation>::new(&env));
 
         Ok(())
     }
@@ -118,8 +120,36 @@ impl TwapOracle {
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// Append a price observation, returning the number of retained
-    /// observations after the write.
+    /// Configure the maximum staleness threshold in seconds for a specific token pair.
+    ///
+    /// Admin authorization required.
+    pub fn set_max_staleness(
+        env: Env,
+        base: Address,
+        quote: Address,
+        max_staleness_seconds: u64,
+    ) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(
+            &DataKey::Staleness(base, quote),
+            &max_staleness_seconds,
+        );
+
+        Ok(())
+    }
+
+    /// Get configured maximum staleness for a pair, returning DEFAULT_MAX_STALENESS_SECONDS if not set.
+    pub fn get_max_staleness(env: Env, base: Address, quote: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Staleness(base, quote))
+            .unwrap_or(DEFAULT_MAX_STALENESS_SECONDS)
+    }
+
+    /// Append a price observation for a specific token pair, returning the number
+    /// of retained observations after the write.
     ///
     /// `timestamp` must not be in the future and must be strictly greater than
     /// the previous observation by at least [`MIN_INTERVAL_SECONDS`].
@@ -127,7 +157,13 @@ impl TwapOracle {
     /// # Panics
     ///
     /// Panics if the caller is not the admin or if retrieving previous observation fails.
-    pub fn observe(env: Env, price: i128, timestamp: u64) -> Result<u32, Error> {
+    pub fn observe(
+        env: Env,
+        base: Address,
+        quote: Address,
+        price: i128,
+        timestamp: u64,
+    ) -> Result<u32, Error> {
         let admin = read_admin(&env)?;
         admin.require_auth();
 
@@ -138,7 +174,7 @@ impl TwapOracle {
             return Err(Error::TimestampInFuture);
         }
 
-        let mut observations = read_observations(&env);
+        let mut observations = read_observations(&env, &base, &quote);
 
         let mut cumulative_price = 0i128;
         if !observations.is_empty() {
@@ -182,28 +218,28 @@ impl TwapOracle {
         let count = observations.len();
         env.storage()
             .instance()
-            .set(&DataKey::Observations, &observations);
+            .set(&DataKey::Pair(base, quote), &observations);
 
         Ok(count)
     }
 
-    /// Number of retained observations.
-    pub fn observation_count(env: Env) -> u32 {
-        read_observations(&env).len()
+    /// Number of retained observations for a pair.
+    pub fn observation_count(env: Env, base: Address, quote: Address) -> u32 {
+        read_observations(&env, &base, &quote).len()
     }
 
-    /// The most recent observation, if any have been recorded.
-    pub fn latest_observation(env: Env) -> Option<Observation> {
-        let observations = read_observations(&env);
+    /// The most recent observation for a pair, if any have been recorded.
+    pub fn latest_observation(env: Env, base: Address, quote: Address) -> Option<Observation> {
+        let observations = read_observations(&env, &base, &quote);
         observations.get(observations.len().saturating_sub(1))
     }
 
-    /// All retained observations, oldest first.
-    pub fn observations(env: Env) -> Vec<Observation> {
-        read_observations(&env)
+    /// All retained observations for a pair, oldest first.
+    pub fn observations(env: Env, base: Address, quote: Address) -> Vec<Observation> {
+        read_observations(&env, &base, &quote)
     }
 
-    /// Time-weighted average price over the `window_seconds` ending at the most
+    /// Time-weighted average price for a pair over `window_seconds` ending at the most
     /// recent observation.
     ///
     /// The window start is interpolated within the segment that contains it, so
@@ -212,12 +248,12 @@ impl TwapOracle {
     /// # Panics
     ///
     /// Panics if accessing the stored observations fails.
-    pub fn twap(env: Env, window_seconds: u64) -> Result<i128, Error> {
+    pub fn twap(env: Env, base: Address, quote: Address, window_seconds: u64) -> Result<i128, Error> {
         if window_seconds == 0 || window_seconds > MAX_WINDOW_SECONDS {
             return Err(Error::InvalidWindow);
         }
 
-        let observations = read_observations(&env);
+        let observations = read_observations(&env, &base, &quote);
         let length = observations.len();
         if length == 0 {
             return Err(Error::NoObservations);
@@ -246,17 +282,17 @@ impl TwapOracle {
             index += 1;
         }
 
-        let base = observations.get(base_index).unwrap();
-        let cumulative_at_target = if base.timestamp == target {
-            base.cumulative_price
+        let base_obs = observations.get(base_index).unwrap();
+        let cumulative_at_target = if base_obs.timestamp == target {
+            base_obs.cumulative_price
         } else {
             // Interpolate to the exact window start inside the base segment.
-            let elapsed = i128::from(target - base.timestamp);
-            let increment = base
+            let elapsed = i128::from(target - base_obs.timestamp);
+            let increment = base_obs
                 .price
                 .checked_mul(elapsed)
                 .ok_or(Error::PriceOverflow)?;
-            base.cumulative_price
+            base_obs.cumulative_price
                 .checked_add(increment)
                 .ok_or(Error::PriceOverflow)?
         };
@@ -267,6 +303,31 @@ impl TwapOracle {
             .ok_or(Error::PriceOverflow)?;
 
         Ok(accumulated / i128::from(window_seconds))
+    }
+
+    /// Consult the TWAP price for a token pair over `window_seconds`, enforcing
+    /// a heartbeat freshness check rejecting prices older than `max_staleness_seconds`.
+    pub fn consult(
+        env: Env,
+        base: Address,
+        quote: Address,
+        window_seconds: u64,
+    ) -> Result<i128, Error> {
+        let observations = read_observations(&env, &base, &quote);
+        let length = observations.len();
+        if length == 0 {
+            return Err(Error::NoObservations);
+        }
+
+        let latest = observations.get(length - 1).unwrap();
+        let max_staleness = Self::get_max_staleness(env.clone(), base.clone(), quote.clone());
+
+        let current_time = env.ledger().timestamp();
+        if current_time.saturating_sub(latest.timestamp) > max_staleness {
+            return Err(Error::PriceStale);
+        }
+
+        Self::twap(env, base, quote, window_seconds)
     }
 }
 
