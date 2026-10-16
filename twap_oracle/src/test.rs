@@ -114,13 +114,13 @@ fn observe_appends_and_derives_cumulative_price() {
     let first = observations.get(0).unwrap();
     assert_eq!(first.timestamp, 1_000);
     assert_eq!(first.price, 100);
-    assert_eq!(first.cumulative_price, 0);
+    assert_eq!(first.cumulative_price, u256::ZERO);
 
     let second = observations.get(1).unwrap();
-    assert_eq!(second.cumulative_price, 6_000);
+    assert_eq!(second.cumulative_price, u256::from(6_000u64));
 
     let third = observations.get(2).unwrap();
-    assert_eq!(third.cumulative_price, 18_000);
+    assert_eq!(third.cumulative_price, u256::from(18_000u64));
 
     let latest = setup
         .client
@@ -250,24 +250,84 @@ fn observe_prunes_the_oldest_observation_when_full() {
 }
 
 #[test]
-fn observe_rejects_accumulator_overflow() {
+fn observe_handles_high_price_elapsed_product_without_overflow() {
     let setup = setup();
 
-    // Seed the accumulator with a maximal price, then advance the ledger clock
-    // by an astronomically large gap: MAX_PRICE * elapsed overflows i128.
+    // Advance the ledger clock by an astronomically large gap with MAX_PRICE.
+    // MAX_PRICE * elapsed exceeds i128::MAX, but u256 accumulator handles it seamlessly without panic.
     set_time(&setup.env, 1_000);
     let _ = setup
         .client
         .observe(&setup.base, &setup.quote, &MAX_PRICE, &1_000);
 
-    set_time(&setup.env, u64::MAX);
+    set_time(&setup.env, 1_000 + 10_000_000);
+    let count = setup
+        .client
+        .observe(&setup.base, &setup.quote, &MAX_PRICE, &(1_000 + 10_000_000));
+    assert_eq!(count, 2);
+
+    let latest = setup
+        .client
+        .latest_observation(&setup.base, &setup.quote)
+        .unwrap();
+    let expected_cum = u256::from(MAX_PRICE as u128) * u256::from(10_000_000u64);
+    assert_eq!(latest.cumulative_price, expected_cum);
+
+    // TWAP calculation over a window within this gap returns MAX_PRICE exactly.
     assert_eq!(
-        setup
-            .client
-            .try_observe(&setup.base, &setup.quote, &MAX_PRICE, &u64::MAX),
-        Err(Ok(Error::PriceOverflow))
+        setup.client.twap(&setup.base, &setup.quote, &60),
+        MAX_PRICE
     );
 }
+
+#[test]
+fn twap_calculates_correctly_across_accumulator_wrap_boundary() {
+    let setup = setup();
+
+    // Directly seed storage with an observation whose cumulative_price is near u256::MAX.
+    // Near 2^256 - 1:
+    let base_cum = u256::MAX - u256::from(5_000u64);
+    let mut initial_obs = Vec::new(&setup.env);
+    initial_obs.push_back(Observation {
+        timestamp: 1_000,
+        price: 100,
+        cumulative_price: base_cum,
+    });
+    setup.env.storage().instance().set(
+        &DataKey::Pair(setup.base.clone(), setup.quote.clone()),
+        &initial_obs,
+    );
+
+    // After 100 seconds at price 100, elapsed * price = 10_000.
+    // Adding 10_000 to (u256::MAX - 5_000) wraps around modulo 2^256:
+    // (u256::MAX - 5_000) + 10_000 = 4_999 (as u256::MAX + 1 = 0).
+    set_time(&setup.env, 1_100);
+    let count = setup
+        .client
+        .observe(&setup.base, &setup.quote, &200, &1_100);
+    assert_eq!(count, 2);
+
+    let latest = setup
+        .client
+        .latest_observation(&setup.base, &setup.quote)
+        .unwrap();
+    let expected_wrapped_cum = u256::from(4_999u64);
+    assert_eq!(latest.cumulative_price, expected_wrapped_cum);
+    assert!(latest.cumulative_price < base_cum);
+
+    // TWAP over the full 100s window across the wrap boundary:
+    // (4_999 - (u256::MAX - 5_000)) mod 2^256 = 10_000.
+    // 10_000 / 100 = 100.
+    assert_eq!(setup.client.twap(&setup.base, &setup.quote, &100), 100);
+
+    // TWAP over a 50s window with interpolation across the wrap boundary:
+    // Target timestamp = 1_100 - 50 = 1_050.
+    // Interpolated cumulative at target = base_cum + 50 * 100 = base_cum + 5_000 = u256::MAX.
+    // Difference = 4_999.wrapping_sub(u256::MAX) = 5_000.
+    // 5_000 / 50 = 100.
+    assert_eq!(setup.client.twap(&setup.base, &setup.quote, &50), 100);
+}
+
 
 #[test]
 fn twap_averages_over_the_requested_window() {
@@ -480,7 +540,7 @@ fn concurrent_tracking_of_five_distinct_token_pairs() {
         let latest = setup.client.latest_observation(base, quote).unwrap();
         assert_eq!(latest.price, initial_price * 2);
         assert_eq!(latest.timestamp, 1_060);
-        assert_eq!(latest.cumulative_price, initial_price * 60);
+        assert_eq!(latest.cumulative_price, u256::from((*initial_price * 60) as u128));
 
         // twap over the 60s window should equal initial_price
         let twap = setup.client.twap(base, quote, &60);

@@ -14,15 +14,17 @@
 //! * Timestamps may not be in the future relative to the ledger clock.
 //! * `cumulative_price` is derived inside the contract from the previous
 //!   observation; callers can never supply it.
-//! * Prices must be positive and at or below [`MAX_PRICE`], and every
-//!   cumulative arithmetic step is checked, so an out-of-range price cannot
-//!   overflow the accumulator into a bogus average.
+//! * Prices must be positive and at or below [`MAX_PRICE`]. Cumulative arithmetic
+//!   uses 256-bit unsigned integers (`u256`) with modular wrapping math, so
+//!   accumulators never panic on large price-elapsed products and TWAP differences
+//!   remain exact across 2^256 overflow boundaries.
 //! * History is capped at [`MAX_OBSERVATIONS`]; the oldest entry is pruned, so
 //!   storage cannot grow without bound.
 //! * The TWAP window is bounded by [`MAX_WINDOW_SECONDS`] and requires enough
 //!   retained history to cover it, so a caller cannot average over a single
 //!   freshly written observation.
 
+use ethnum::u256;
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
 
 /// Maximum number of observations retained. When the buffer is full the oldest
@@ -45,13 +47,13 @@ pub const MAX_PRICE: i128 = i128::MAX / 1_000_000_000;
 /// A single price observation.
 ///
 /// `cumulative_price` is the integral of price over time up to and including
-/// this observation, expressed in `price * seconds`.
+/// this observation, expressed in `price * seconds` modulo 2^256.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Observation {
     pub timestamp: u64,
     pub price: i128,
-    pub cumulative_price: i128,
+    pub cumulative_price: u256,
 }
 
 /// Storage keys for the oracle.
@@ -176,7 +178,7 @@ impl TwapOracle {
 
         let mut observations = read_observations(&env, &base, &quote);
 
-        let mut cumulative_price = 0i128;
+        let mut cumulative_price = u256::ZERO;
         if !observations.is_empty() {
             let previous = observations.get(observations.len() - 1).unwrap();
 
@@ -187,15 +189,9 @@ impl TwapOracle {
                 return Err(Error::ObservationTooSoon);
             }
 
-            let elapsed = i128::from(timestamp - previous.timestamp);
-            let increment = previous
-                .price
-                .checked_mul(elapsed)
-                .ok_or(Error::PriceOverflow)?;
-            cumulative_price = previous
-                .cumulative_price
-                .checked_add(increment)
-                .ok_or(Error::PriceOverflow)?;
+            let elapsed = u256::from(timestamp - previous.timestamp);
+            let increment = u256::from(previous.price as u128).wrapping_mul(elapsed);
+            cumulative_price = previous.cumulative_price.wrapping_add(increment);
         }
 
         observations.push_back(Observation {
@@ -287,22 +283,16 @@ impl TwapOracle {
             base_obs.cumulative_price
         } else {
             // Interpolate to the exact window start inside the base segment.
-            let elapsed = i128::from(target - base_obs.timestamp);
-            let increment = base_obs
-                .price
-                .checked_mul(elapsed)
-                .ok_or(Error::PriceOverflow)?;
-            base_obs.cumulative_price
-                .checked_add(increment)
-                .ok_or(Error::PriceOverflow)?
+            let elapsed = u256::from(target - base_obs.timestamp);
+            let increment = u256::from(base_obs.price as u128).wrapping_mul(elapsed);
+            base_obs.cumulative_price.wrapping_add(increment)
         };
 
-        let accumulated = latest
-            .cumulative_price
-            .checked_sub(cumulative_at_target)
-            .ok_or(Error::PriceOverflow)?;
+        // Modular arithmetic (uint256 wrapping difference) remains exact across overflows.
+        let accumulated = latest.cumulative_price.wrapping_sub(cumulative_at_target);
 
-        Ok(accumulated / i128::from(window_seconds))
+        let avg = accumulated / u256::from(window_seconds);
+        i128::try_from(avg).map_err(|_| Error::PriceOverflow)
     }
 
     /// Consult the TWAP price for a token pair over `window_seconds`, enforcing
