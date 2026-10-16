@@ -4465,3 +4465,297 @@ fn test_version_is_non_empty() {
     // A Soroban String's byte length is accessible via .len()
     assert!(v.len() > 0, "version must not be empty");
 }
+
+// ── Split Swap Routing Tests ─────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+enum CurveDexKey {
+    ReserveIn,
+    ReserveOut,
+}
+
+#[contract]
+struct MockCurveDex;
+
+#[contractimpl]
+impl MockCurveDex {
+    pub fn set_reserves(env: Env, reserve_in: i128, reserve_out: i128) {
+        env.storage().instance().set(&CurveDexKey::ReserveIn, &reserve_in);
+        env.storage().instance().set(&CurveDexKey::ReserveOut, &reserve_out);
+    }
+
+    pub fn quote(env: Env, _sell_token: Address, _buy_token: Address, amount_in: i128) -> i128 {
+        let rin: i128 = env.storage().instance().get(&CurveDexKey::ReserveIn).unwrap_or(1);
+        let rout: i128 = env.storage().instance().get(&CurveDexKey::ReserveOut).unwrap_or(1);
+        // Constant-product AMM formula: amount_out = (amount_in * rout) / (rin + amount_in)
+        (amount_in * rout) / (rin + amount_in)
+    }
+
+    pub fn swap(
+        env: Env,
+        _sell_token: Address,
+        buy_token: Address,
+        amount_in: i128,
+        _min_amount_out: i128,
+        recipient: Address,
+    ) -> Result<i128, MockDexError> {
+        let rin: i128 = env.storage().instance().get(&CurveDexKey::ReserveIn).unwrap_or(1);
+        let rout: i128 = env.storage().instance().get(&CurveDexKey::ReserveOut).unwrap_or(1);
+        let amount_out = (amount_in * rout) / (rin + amount_in);
+
+        // Update reserves
+        env.storage().instance().set(&CurveDexKey::ReserveIn, &(rin + amount_in));
+        env.storage().instance().set(&CurveDexKey::ReserveOut, &(rout - amount_out));
+
+        let buy_client = token::Client::new(&env, &buy_token);
+        buy_client.transfer(&env.current_contract_address(), &recipient, &amount_out);
+
+        Ok(amount_out)
+    }
+}
+
+#[test]
+fn test_route_split_payment_with_swap_verifies_total_weight_equals_10000_bps() {
+    let f = setup_swap_fixture(1, 1);
+
+    let second_dex = f.env.register_contract(None, MockDex);
+    let second_dex_client = MockDexClient::new(&f.env, &second_dex);
+    second_dex_client.set_rate(&1, &1);
+    f.client.register_dex(&second_dex);
+
+    // Sum is 9_000 bps (< 10_000 bps)
+    let invalid_under = vec![
+        &f.env,
+        SplitRoute {
+            dex_address: f.dex.clone(),
+            weight_bps: 6_000,
+            min_amount_out: 1,
+        },
+        SplitRoute {
+            dex_address: second_dex.clone(),
+            weight_bps: 3_000,
+            min_amount_out: 1,
+        },
+    ];
+    let res = f.client.try_route_split_payment_with_swap(
+        &f.sender,
+        &f.recipient,
+        &f.sell_token,
+        &f.buy_token,
+        &10_000,
+        &invalid_under,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidSwapParams);
+
+    // Sum is 11_000 bps (> 10_000 bps)
+    let invalid_over = vec![
+        &f.env,
+        SplitRoute {
+            dex_address: f.dex.clone(),
+            weight_bps: 6_000,
+            min_amount_out: 1,
+        },
+        SplitRoute {
+            dex_address: second_dex.clone(),
+            weight_bps: 5_000,
+            min_amount_out: 1,
+        },
+    ];
+    let res = f.client.try_route_split_payment_with_swap(
+        &f.sender,
+        &f.recipient,
+        &f.sell_token,
+        &f.buy_token,
+        &10_000,
+        &invalid_over,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidSwapParams);
+
+    // Empty splits
+    let empty_splits = vec![&f.env];
+    let res = f.client.try_route_split_payment_with_swap(
+        &f.sender,
+        &f.recipient,
+        &f.sell_token,
+        &f.buy_token,
+        &10_000,
+        &empty_splits,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidSwapParams);
+}
+
+#[test]
+fn test_route_split_payment_with_swap_aggregates_proportional_output() {
+    let f = setup_swap_fixture(1, 1);
+
+    // Setup second DEX with a 1:2 rate (50% output)
+    let second_dex = f.env.register_contract(None, MockDex);
+    let second_dex_client = MockDexClient::new(&f.env, &second_dex);
+    second_dex_client.set_rate(&1, &2);
+    let sac = token::StellarAssetClient::new(&f.env, &f.buy_token);
+    sac.mint(&second_dex, &10_000_000);
+    f.client.register_dex(&second_dex);
+
+    // 10 000 in:
+    // Split 1: 60% = 6 000 in -> 1:1 rate -> 6 000 out (min 5 000)
+    // Split 2: 40% = 4 000 in -> 1:2 rate -> 2 000 out (min 1 500)
+    // Total out = 8 000. 1% fee = 80. Delivered = 7 920.
+    let splits = vec![
+        &f.env,
+        SplitRoute {
+            dex_address: f.dex.clone(),
+            weight_bps: 6_000,
+            min_amount_out: 5_000,
+        },
+        SplitRoute {
+            dex_address: second_dex.clone(),
+            weight_bps: 4_000,
+            min_amount_out: 1_500,
+        },
+    ];
+
+    let delivered = f.client.route_split_payment_with_swap(
+        &f.sender,
+        &f.recipient,
+        &f.sell_token,
+        &f.buy_token,
+        &10_000,
+        &splits,
+    );
+    assert_eq!(delivered, 7_920);
+    assert_eq!(f.buy_client.balance(&f.recipient), 7_920);
+    assert_eq!(f.buy_client.balance(&f.treasury), 80);
+    assert_eq!(f.sell_client.balance(&f.dex), 6_000);
+    assert_eq!(f.sell_client.balance(&second_dex), 4_000);
+    assert_eq!(f.client.get_user_volume(&f.sender), 10_000);
+}
+
+#[test]
+fn test_route_split_payment_with_swap_reverts_atomically_if_any_min_amount_out_violated() {
+    let f = setup_swap_fixture(1, 1);
+
+    let second_dex = f.env.register_contract(None, MockDex);
+    let second_dex_client = MockDexClient::new(&f.env, &second_dex);
+    second_dex_client.set_rate(&1, &2);
+    let sac = token::StellarAssetClient::new(&f.env, &f.buy_token);
+    sac.mint(&second_dex, &10_000_000);
+    f.client.register_dex(&second_dex);
+
+    // Split 1: 60% = 6 000 in -> 6 000 out (min 5 000 ok)
+    // Split 2: 40% = 4 000 in -> 2 000 out (min 3 000 -> FAILS!)
+    let splits = vec![
+        &f.env,
+        SplitRoute {
+            dex_address: f.dex.clone(),
+            weight_bps: 6_000,
+            min_amount_out: 5_000,
+        },
+        SplitRoute {
+            dex_address: second_dex.clone(),
+            weight_bps: 4_000,
+            min_amount_out: 3_000,
+        },
+    ];
+
+    let res = f.client.try_route_split_payment_with_swap(
+        &f.sender,
+        &f.recipient,
+        &f.sell_token,
+        &f.buy_token,
+        &10_000,
+        &splits,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), Error::SlippageExceeded);
+
+    // Atomicity verification: entire transaction reverted
+    assert_eq!(f.buy_client.balance(&f.recipient), 0);
+    assert_eq!(f.buy_client.balance(&f.treasury), 0);
+    assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
+    assert_eq!(f.sell_client.balance(&f.dex), 0);
+    assert_eq!(f.sell_client.balance(&second_dex), 0);
+    assert_eq!(f.client.get_user_volume(&f.sender), 0);
+}
+
+#[test]
+fn test_route_split_payment_exceeds_single_pool_execution_under_simulated_liquidity_curves() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.initialize(&admin, &treasury, &0, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+
+    let (sell_token, sell_client, sell_admin_client) = setup_token(&env);
+    let (buy_token, buy_client, buy_admin_client) = setup_token(&env);
+
+    // Create two identical constant-product AMM pools:
+    // Pool A: Reserve In = 100_000, Reserve Out = 100_000
+    // Pool B: Reserve In = 100_000, Reserve Out = 100_000
+    let pool_a = env.register_contract(None, MockCurveDex);
+    let pool_a_client = MockCurveDexClient::new(&env, &pool_a);
+    pool_a_client.set_reserves(&100_000, &100_000);
+    buy_admin_client.mint(&pool_a, &100_000);
+
+    let pool_b = env.register_contract(None, MockCurveDex);
+    let pool_b_client = MockCurveDexClient::new(&env, &pool_b);
+    pool_b_client.set_reserves(&100_000, &100_000);
+    buy_admin_client.mint(&pool_b, &100_000);
+
+    client.register_dex(&pool_a);
+    client.register_dex(&pool_b);
+
+    // Large payment volume: 50,000 units
+    let large_volume: i128 = 50_000;
+    sell_admin_client.mint(&sender, &200_000);
+
+    // Execution 1: Single pool (100% through Pool A)
+    // Formula: dx = 50_000, Rin = 100_000, Rout = 100_000
+    // dy = (50_000 * 100_000) / (100_000 + 50_000) = 5_000_000_000 / 150_000 = 33_333
+    let single_pool_out = MockCurveDex::quote(env.clone(), sell_token.clone(), buy_token.clone(), large_volume);
+    assert_eq!(single_pool_out, 33_333);
+
+    // Execution 2: Split routing (50% Pool A = 25,000, 50% Pool B = 25,000)
+    // Formula for each pool: dx = 25_000, Rin = 100_000, Rout = 100_000
+    // dy_each = (25_000 * 100_000) / (100_000 + 25_000) = 2_500_000_000 / 125_000 = 20_000
+    // Total dy = 20_000 + 20_000 = 40_000!
+    // 40,000 > 33,333 -> Split routing saves massive slippage!
+    let splits = vec![
+        &env,
+        SplitRoute {
+            dex_address: pool_a.clone(),
+            weight_bps: 5_000,
+            min_amount_out: 19_000,
+        },
+        SplitRoute {
+            dex_address: pool_b.clone(),
+            weight_bps: 5_000,
+            min_amount_out: 19_000,
+        },
+    ];
+
+    let split_received = client.route_split_payment_with_swap(
+        &sender,
+        &recipient,
+        &sell_token,
+        &buy_token,
+        &large_volume,
+        &splits,
+    );
+
+    assert_eq!(split_received, 40_000);
+    assert!(
+        split_received > single_pool_out,
+        "Split routing (received: {}) must exceed single-pool execution (received: {})",
+        split_received,
+        single_pool_out
+    );
+    assert_eq!(buy_client.balance(&recipient), 40_000);
+}
