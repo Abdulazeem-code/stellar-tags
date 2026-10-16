@@ -58,7 +58,7 @@ fn repaid_loan_keeps_the_fee() {
     let (env, provider_id, provider, borrower, token, asset) = setup();
     let initiator = Address::generate(&env);
     asset.mint(&provider_id, &100_000);
-    asset.mint(&borrower, &5);
+    asset.mint(&borrower, &6);
 
     let fee = provider.flash_loan(
         &initiator,
@@ -68,8 +68,8 @@ fn repaid_loan_keeps_the_fee() {
         &Bytes::new(&env),
     );
 
-    assert_eq!(fee, 5);
-    assert_eq!(token.balance(&provider_id), 100_005);
+    assert_eq!(fee, 6);
+    assert_eq!(token.balance(&provider_id), 100_006);
     assert_eq!(token.balance(&borrower), 0);
 }
 
@@ -104,4 +104,32 @@ fn rejects_invalid_or_unfunded_loans() {
     assert!(provider
         .try_flash_loan(&initiator, &borrower, &asset.address, &1, &Bytes::new(&env),)
         .is_err());
+}
+
+#[test]
+fn dynamic_fee_scales_with_pool_utilization() {
+    let (_env, provider_id, provider, _borrower, _token, asset) = setup();
+    asset.mint(&provider_id, &100_000);
+
+    // The same reserve balance gives these fee quotes at 10%, 50%, 85%,
+    // and 99% utilization. Amounts and fees are in the token's base units.
+    assert_eq!(provider.get_flash_loan_fee(&10_000, &asset.address), 6);
+    assert_eq!(provider.get_flash_loan_fee(&50_000, &asset.address), 45);
+    assert_eq!(provider.get_flash_loan_fee(&85_000, &asset.address), 170);
+    assert_eq!(provider.get_flash_loan_fee(&99_000, &asset.address), 476);
+}
+
+#[test]
+fn dynamic_fee_rejects_zero_amount_and_amount_above_reserves() {
+    let (_env, provider_id, provider, _borrower, _token, asset) = setup();
+    asset.mint(&provider_id, &100_000);
+
+    assert_eq!(
+        provider.try_get_flash_loan_fee(&0, &asset.address),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        provider.try_get_flash_loan_fee(&100_001, &asset.address),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
 }
