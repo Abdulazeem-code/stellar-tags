@@ -876,6 +876,141 @@ fn test_nonce_increments() {
     assert_eq!(n3, 3);
 }
 
+#[test]
+fn test_execute_batch_actions_three_distinct_actions_success() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let dex = Address::generate(&env);
+
+    // Queue 3 distinct actions
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+    let n3 = client.queue_action(&ActionType::RegisterDex(dex.clone()));
+
+    // Verify initial state
+    assert_eq!(client.get_fee(), 100);
+    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert!(!client.is_dex_registered(&dex));
+
+    // Advance time past the 24h delay
+    advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+
+    let nonces = vec![&env, n1, n2, n3];
+    client.execute_batch_actions(&nonces);
+
+    // Verify all 3 distinct actions executed together
+    assert_eq!(client.get_fee(), 250);
+    assert_eq!(client.get_max_slippage_bps(), 300);
+    assert!(client.is_dex_registered(&dex));
+
+    // Verify all nonces are removed from queue
+    assert_eq!(client.try_get_queued_action(&n1).unwrap_err().unwrap(), Error::TimelockNotFound);
+    assert_eq!(client.try_get_queued_action(&n2).unwrap_err().unwrap(), Error::TimelockNotFound);
+    assert_eq!(client.try_get_queued_action(&n3).unwrap_err().unwrap(), Error::TimelockNotFound);
+
+    // Verify batch_actions_executed event was emitted with the list of nonces
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, data)| {
+        if topics.is_empty() {
+            return false;
+        }
+        let raw = topics.get(0).unwrap();
+        let sym: Result<Symbol, _> = raw.try_into_val(&env);
+        if sym == Ok(Symbol::new(&env, "batch_actions_executed")) {
+            let emitted_nonces: Result<Vec<u64>, _> = data.try_into_val(&env);
+            emitted_nonces == Ok(nonces.clone())
+        } else {
+            false
+        }
+    });
+    assert!(found, "batch_actions_executed event not found with list of nonces");
+}
+
+#[test]
+fn test_execute_batch_actions_reverts_if_one_not_ready() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let dex = Address::generate(&env);
+
+    // Queue actions 1 and 2 at T0
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+
+    // Advance 20 hours (less than 24h)
+    advance_time(&env, 20 * 3600);
+
+    // Queue action 3 at T0 + 20h
+    let n3 = client.queue_action(&ActionType::RegisterDex(dex.clone()));
+
+    // Advance 5 hours (T0 + 25h total).
+    // Actions 1 and 2 have been queued for 25h (ready).
+    // Action 3 has been queued for only 5h (NOT ready).
+    advance_time(&env, 5 * 3600);
+
+    let nonces = vec![&env, n1, n2, n3];
+    let res = client.try_execute_batch_actions(&nonces);
+    assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
+
+    // Verify atomic rollback: none of the actions took effect
+    assert_eq!(client.get_fee(), 100);
+    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert!(!client.is_dex_registered(&dex));
+
+    // Verify all actions remain pending in the queue
+    assert!(client.try_get_queued_action(&n1).is_ok());
+    assert!(client.try_get_queued_action(&n2).is_ok());
+    assert!(client.try_get_queued_action(&n3).is_ok());
+}
+
+#[test]
+fn test_execute_batch_actions_reverts_if_one_not_found() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+
+    advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+
+    // Batch contains an invalid nonce 9999
+    let nonces = vec![&env, n1, 9999u64, n2];
+    let res = client.try_execute_batch_actions(&nonces);
+    assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+
+    // Verify neither action executed
+    assert_eq!(client.get_fee(), 100);
+    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert!(client.try_get_queued_action(&n1).is_ok());
+    assert!(client.try_get_queued_action(&n2).is_ok());
+}
+
+#[test]
+fn test_execute_batch_actions_blocks_when_frozen() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+
+    advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+
+    client.emergency_freeze();
+
+    let nonces = vec![&env, n1, n2];
+    let res = client.try_execute_batch_actions(&nonces);
+    assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
+}
+
 // ── Freeze tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -3935,6 +4070,64 @@ impl MockDex {
     }
 }
 
+#[contracttype]
+#[derive(Clone)]
+enum MockPathDexKey {
+    UnusedInput,
+}
+
+/// Small adapter used by multi-hop routing tests. It executes exactly one
+/// token pair per call, returns any unspent input to the router, and settles
+/// output to the requested recipient just like the production adapter API.
+#[contract]
+pub struct MockPathDex;
+
+#[contractimpl]
+impl MockPathDex {
+    pub fn set_unused_input(env: Env, amount: i128) {
+        env.storage()
+            .instance()
+            .set(&MockPathDexKey::UnusedInput, &amount);
+    }
+
+    pub fn swap_exact_tokens_for_tokens(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        path: Vec<Address>,
+        recipient: Address,
+    ) -> Vec<i128> {
+        assert_eq!(path.len(), 2);
+        assert_eq!(path.first(), Some(token_in.clone()));
+        assert_eq!(path.last(), Some(token_out.clone()));
+        let unused: i128 = env
+            .storage()
+            .instance()
+            .get(&MockPathDexKey::UnusedInput)
+            .unwrap_or(0);
+        assert!(unused >= 0 && unused <= amount_in);
+        let amount_out = amount_in - unused;
+        // Deliberately ignore the requested floor. The router must enforce it
+        // from the actual token balance delta, even with a non-compliant DEX.
+        let _ = min_amount_out;
+        if unused > 0 {
+            token::Client::new(&env, &token_in).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &unused,
+            );
+        }
+        token::Client::new(&env, &token_out).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount_out,
+        );
+        vec![&env, amount_out, unused]
+    }
+}
+
 /// Moves the test ledger to `timestamp`.
 fn set_timestamp(env: &Env, timestamp: u64) {
     env.ledger().set(LedgerInfo {
@@ -4044,6 +4237,109 @@ fn setup_swap_fixture(rate_num: i128, rate_den: i128) -> SwapFixture {
         buy_client,
         dex_client,
     }
+}
+
+struct MultiHopFixture {
+    env: Env,
+    client: PaymentRouterClient<'static>,
+    sender: Address,
+    recipient: Address,
+    treasury: Address,
+    dex: Address,
+    path: Vec<Address>,
+    token_clients: [token::Client<'static>; 4],
+}
+
+fn setup_multihop_fixture(unused: i128) -> MultiHopFixture {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    let (asset_a, client_a, admin_a) = setup_token(&env);
+    let (asset_b, client_b, admin_b) = setup_token(&env);
+    let (asset_c, client_c, admin_c) = setup_token(&env);
+    let (asset_d, client_d, admin_d) = setup_token(&env);
+    let assets = vec![&env, asset_a, asset_b, asset_c, asset_d];
+    let token_clients = [client_a, client_b, client_c, client_d];
+    let dex = env.register_contract(None, MockPathDex);
+    MockPathDexClient::new(&env, &dex).set_unused_input(&unused);
+    admin_a.mint(&sender, &10_000);
+    // Each intermediate output is funded so the mock pools can settle it.
+    admin_b.mint(&dex, &1_000_000);
+    admin_c.mint(&dex, &1_000_000);
+    admin_d.mint(&dex, &1_000_000);
+    client.register_dex(&dex);
+
+    MultiHopFixture {
+        env,
+        client,
+        sender,
+        recipient,
+        treasury,
+        dex,
+        path: assets,
+        token_clients,
+    }
+}
+
+#[test]
+fn test_multihop_three_hops_enforces_floors_and_refunds_each_hop_dust() {
+    let f = setup_multihop_fixture(100);
+    let floors = vec![&f.env, 9_900i128, 9_800i128, 9_700i128];
+
+    assert_eq!(
+        f.client
+            .route_multihop_swap(&f.sender, &f.recipient, &f.dex, &10_000, &f.path, &floors),
+        9_603,
+    );
+    assert_eq!(f.token_clients[0].balance(&f.sender), 100);
+    assert_eq!(f.token_clients[1].balance(&f.sender), 100);
+    assert_eq!(f.token_clients[2].balance(&f.sender), 100);
+    assert_eq!(f.token_clients[3].balance(&f.recipient), 9_603);
+    assert_eq!(f.token_clients[3].balance(&f.treasury), 97);
+}
+
+#[test]
+fn test_multihop_cycle_is_rejected_before_moving_funds() {
+    let f = setup_multihop_fixture(0);
+    let cycle = vec![
+        &f.env,
+        f.path.get(0).unwrap(),
+        f.path.get(1).unwrap(),
+        f.path.get(2).unwrap(),
+        f.path.get(0).unwrap(),
+    ];
+    let floors = vec![&f.env, 1i128, 1i128, 1i128];
+    let res =
+        f.client
+            .try_route_multihop_swap(&f.sender, &f.recipient, &f.dex, &10_000, &cycle, &floors);
+    assert_eq!(res.unwrap_err().unwrap(), Error::CyclicSwapPath);
+    assert_eq!(f.token_clients[0].balance(&f.sender), 10_000);
+}
+
+#[test]
+fn test_multihop_intermediate_floor_failure_reverts_all_swaps_and_dust() {
+    let f = setup_multihop_fixture(100);
+    let floors = vec![&f.env, 9_900i128, 9_801i128, 9_700i128];
+    let res = f.client.try_route_multihop_swap(
+        &f.sender,
+        &f.recipient,
+        &f.dex,
+        &10_000,
+        &f.path,
+        &floors,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), Error::SlippageExceeded);
+    assert_eq!(f.token_clients[0].balance(&f.sender), 10_000);
+    assert_eq!(f.token_clients[1].balance(&f.sender), 0);
+    assert_eq!(f.token_clients[3].balance(&f.recipient), 0);
 }
 
 #[test]

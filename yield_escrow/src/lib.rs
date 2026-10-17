@@ -9,6 +9,10 @@
 //! per escrow, and on settlement the interest accrued while the funds were
 //! locked is split between the beneficiary and the payer according to a
 //! per-escrow basis-point share.
+//!
+//! Adapters also expose a live annual yield rate in basis points. The escrow
+//! checkpoints that rate against ledger timestamps in a cumulative per-token
+//! index, so changes in protocol revenue or utilization apply prospectively.
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
@@ -30,6 +34,9 @@ const ESCROW_BUMP: u32 = 30 * DAY_IN_LEDGERS;
 const ESCROW_THRESHOLD: u32 = ESCROW_BUMP - DAY_IN_LEDGERS;
 /// 100% expressed in basis points.
 const BPS_DENOMINATOR: i128 = 10_000;
+/// Fixed-point precision for the cumulative per-token yield index.
+const INDEX_SCALE: i128 = 1_000_000_000_000;
+const SECONDS_PER_YEAR: i128 = 31_536_000;
 /// Value reported by `version()`.
 const VERSION: u32 = 1;
 
@@ -49,6 +56,17 @@ pub enum DataKey {
     ActiveEscrows,
     /// A single escrow position, keyed by the caller-supplied id.
     Escrow(u64),
+    /// Cumulative time-weighted yield index and active principal for a token.
+    YieldState(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldState {
+    pub index: i128,
+    pub updated_at: u64,
+    pub rate_bps: u32,
+    pub total_principal: i128,
 }
 
 /// A single locked escrow position.
@@ -68,6 +86,8 @@ pub struct Escrow {
     /// Share of the accrued interest, in basis points, paid to `beneficiary`.
     /// The remainder goes to `payer`. At most 10_000 (100%).
     pub beneficiary_interest_bps: u32,
+    /// Cumulative yield index at which this position began accruing.
+    pub reward_debt: i128,
     /// True once the position has been settled in favour of the beneficiary.
     pub released: bool,
     /// True once the position has been refunded to the payer.
@@ -130,6 +150,9 @@ pub enum Error {
     InvalidInterest = 12,
     /// An arithmetic operation overflowed.
     MathOverflow = 13,
+    InvalidYieldRate = 14,
+    InsufficientAccruedYield = 15,
+    TimestampRegression = 16,
 }
 
 // ── Lending protocol adapter ─────────────────────────────────────────────────
@@ -145,6 +168,9 @@ pub trait LendingProtocol {
     fn deposit(env: Env, from: Address, token: Address, amount: i128);
     fn withdraw(env: Env, to: Address, token: Address, amount: i128);
     fn harvest(env: Env, to: Address, token: Address) -> i128;
+    /// Dynamic annualized rate derived by the adapter from protocol revenue
+    /// and utilization, expressed in basis points.
+    fn yield_rate_bps(env: Env, token: Address) -> u32;
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -172,7 +198,9 @@ impl YieldEscrow {
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Adapter, &adapter);
-        env.storage().instance().set(&DataKey::ActiveEscrows, &0_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveEscrows, &0_u32);
         Self::bump_instance(&env);
 
         env.events()
@@ -246,12 +274,32 @@ impl YieldEscrow {
 
         let contract = env.current_contract_address();
         let adapter = Self::adapter(&env)?;
+        let mut yield_state = Self::update_yield_state(&env, &token)?;
 
         // Move the principal into this contract, then let the adapter pull it
         // into the lending pool. Both calls happen inside the payer's
         // authorization tree, so the payer signs a single transaction.
         token::Client::new(&env, &token).transfer(&payer, &contract, &amount);
         LendingProtocolClient::new(&env, &adapter).deposit(&contract, &token, &amount);
+
+        yield_state.total_principal = yield_state
+            .total_principal
+            .checked_add(amount)
+            .ok_or(Error::MathOverflow)?;
+        // Refresh after depositing so the next interval uses utilization that
+        // includes this position.
+        yield_state.rate_bps = LendingProtocolClient::new(&env, &adapter).yield_rate_bps(&token);
+        if yield_state.rate_bps > 100_000 {
+            return Err(Error::InvalidYieldRate);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldState(token.clone()), &yield_state);
+        env.storage().persistent().extend_ttl(
+            &DataKey::YieldState(token.clone()),
+            ESCROW_THRESHOLD,
+            ESCROW_BUMP,
+        );
 
         Self::add_active(&env)?;
         let record = Escrow {
@@ -261,6 +309,7 @@ impl YieldEscrow {
             principal: amount,
             release_ledger,
             beneficiary_interest_bps,
+            reward_debt: yield_state.index,
             released: false,
             cancelled: false,
         };
@@ -314,7 +363,12 @@ impl YieldEscrow {
             return Err(Error::NotYetReleasable);
         }
 
-        let (principal, interest) = Self::redeem_position(&env, &record)?;
+        let yield_state = Self::update_yield_state(&env, &record.token)?;
+        let (principal, harvested) = Self::redeem_position(&env, &record)?;
+        let interest = Self::position_yield(&record, &yield_state)?;
+        if harvested < interest {
+            return Err(Error::InsufficientAccruedYield);
+        }
         let (to_beneficiary, to_payer) =
             Self::split_interest(principal, interest, record.beneficiary_interest_bps)?;
 
@@ -328,6 +382,7 @@ impl YieldEscrow {
         }
 
         record.released = true;
+        Self::remove_active_principal(&env, &record.token, principal)?;
         env.storage().persistent().set(&key, &record);
         env.storage()
             .persistent()
@@ -371,7 +426,12 @@ impl YieldEscrow {
         }
         record.payer.require_auth();
 
-        let (principal, interest) = Self::redeem_position(&env, &record)?;
+        let yield_state = Self::update_yield_state(&env, &record.token)?;
+        let (principal, harvested) = Self::redeem_position(&env, &record)?;
+        let interest = Self::position_yield(&record, &yield_state)?;
+        if harvested < interest {
+            return Err(Error::InsufficientAccruedYield);
+        }
         let refund = principal + interest;
         if refund > 0 {
             token::Client::new(&env, &record.token).transfer(
@@ -382,6 +442,7 @@ impl YieldEscrow {
         }
 
         record.cancelled = true;
+        Self::remove_active_principal(&env, &record.token, principal)?;
         env.storage().persistent().set(&key, &record);
         env.storage()
             .persistent()
@@ -428,6 +489,13 @@ impl YieldEscrow {
         Self::active_escrows(&env)
     }
 
+    /// Returns the current cumulative yield index and active principal for a
+    /// token, first accruing the adapter's previous rate through now.
+    pub fn get_yield_state(env: Env, token: Address) -> Result<YieldState, Error> {
+        Self::require_initialized(&env)?;
+        Self::update_yield_state(&env, &token)
+    }
+
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         VERSION
@@ -448,6 +516,76 @@ impl YieldEscrow {
             return Err(Error::InvalidInterest);
         }
         Ok((record.principal, interest))
+    }
+
+    fn update_yield_state(env: &Env, token: &Address) -> Result<YieldState, Error> {
+        let now = env.ledger().timestamp();
+        let key = DataKey::YieldState(token.clone());
+        let mut state: YieldState = env.storage().persistent().get(&key).unwrap_or(YieldState {
+            index: 0,
+            updated_at: now,
+            rate_bps: 0,
+            total_principal: 0,
+        });
+        if now < state.updated_at {
+            return Err(Error::TimestampRegression);
+        }
+        let elapsed = (now - state.updated_at) as i128;
+        let growth = INDEX_SCALE
+            .checked_mul(state.rate_bps as i128)
+            .and_then(|value| value.checked_mul(elapsed))
+            .ok_or(Error::MathOverflow)?
+            / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
+        state.index = state.index.checked_add(growth).ok_or(Error::MathOverflow)?;
+        state.updated_at = now;
+
+        let adapter = Self::adapter(env)?;
+        state.rate_bps = LendingProtocolClient::new(env, &adapter).yield_rate_bps(token);
+        if state.rate_bps > 100_000 {
+            return Err(Error::InvalidYieldRate);
+        }
+        env.storage().persistent().set(&key, &state);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_THRESHOLD, ESCROW_BUMP);
+        Ok(state)
+    }
+
+    fn position_yield(record: &Escrow, state: &YieldState) -> Result<i128, Error> {
+        let index_delta = state
+            .index
+            .checked_sub(record.reward_debt)
+            .ok_or(Error::MathOverflow)?;
+        record
+            .principal
+            .checked_mul(index_delta)
+            .map(|value| value / INDEX_SCALE)
+            .ok_or(Error::MathOverflow)
+    }
+
+    fn remove_active_principal(env: &Env, token: &Address, principal: i128) -> Result<(), Error> {
+        let key = DataKey::YieldState(token.clone());
+        let mut state: YieldState = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotInitialized)?;
+        state.total_principal = state
+            .total_principal
+            .checked_sub(principal)
+            .ok_or(Error::MathOverflow)?;
+        // A settled position changes pool utilization; apply the new adapter
+        // rate only to future elapsed time.
+        let adapter = Self::adapter(env)?;
+        state.rate_bps = LendingProtocolClient::new(env, &adapter).yield_rate_bps(token);
+        if state.rate_bps > 100_000 {
+            return Err(Error::InvalidYieldRate);
+        }
+        env.storage().persistent().set(&key, &state);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_THRESHOLD, ESCROW_BUMP);
+        Ok(())
     }
 
     /// Splits `interest` between the beneficiary and the payer.

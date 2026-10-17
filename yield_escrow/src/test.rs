@@ -66,6 +66,10 @@ impl Fixture {
         self.token_admin.mint(&self.pool_id, &yield_amount);
         self.pool.accrue_yield(&self.token, &yield_amount);
     }
+
+    fn set_rate(&self, rate_bps: u32) {
+        self.pool.set_yield_rate_bps(&self.token, &rate_bps);
+    }
 }
 
 /// Moves the ledger sequence forward, preserving the rest of the ledger info.
@@ -74,6 +78,19 @@ fn set_sequence(env: &Env, sequence_number: u32) {
         timestamp: env.ledger().timestamp(),
         protocol_version: env.ledger().protocol_version(),
         sequence_number,
+        network_id: env.ledger().network_id().into(),
+        base_reserve: 100,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl: 6_312_000,
+    });
+}
+
+fn set_timestamp(env: &Env, timestamp: u64) {
+    env.ledger().set(LedgerInfo {
+        timestamp,
+        protocol_version: env.ledger().protocol_version(),
+        sequence_number: env.ledger().sequence(),
         network_id: env.ledger().network_id().into(),
         base_reserve: 100,
         min_temp_entry_ttl: 16,
@@ -93,6 +110,7 @@ fn set_sequence(env: &Env, sequence_number: u32) {
 enum MockLendingKey {
     Principal(Address),
     Yield(Address),
+    Rate(Address),
 }
 
 #[contract]
@@ -102,11 +120,7 @@ struct MockLendingPool;
 impl MockLendingPool {
     pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
         from.require_auth();
-        token::Client::new(&env, &token).transfer(
-            &from,
-            &env.current_contract_address(),
-            &amount,
-        );
+        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
         let key = MockLendingKey::Principal(token);
         let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
         env.storage().instance().set(&key, &(current + amount));
@@ -116,11 +130,7 @@ impl MockLendingPool {
         let key = MockLendingKey::Principal(token.clone());
         let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
         assert!(current >= amount);
-        token::Client::new(&env, &token).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
         env.storage().instance().set(&key, &(current - amount));
     }
 
@@ -144,6 +154,19 @@ impl MockLendingPool {
         let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
         env.storage().instance().set(&key, &(current + amount));
     }
+
+    pub fn yield_rate_bps(env: Env, token: Address) -> u32 {
+        env.storage()
+            .instance()
+            .get(&MockLendingKey::Rate(token))
+            .unwrap_or(0)
+    }
+
+    pub fn set_yield_rate_bps(env: Env, token: Address, rate_bps: u32) {
+        env.storage()
+            .instance()
+            .set(&MockLendingKey::Rate(token), &rate_bps);
+    }
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -159,7 +182,10 @@ fn initialize_is_guarded_and_required() {
 
     // Before initialisation the contract refuses to operate.
     assert_eq!(client.try_get_adapter(), Err(Ok(Error::NotInitialized)));
-    assert_eq!(client.try_set_adapter(&adapter), Err(Ok(Error::NotInitialized)));
+    assert_eq!(
+        client.try_set_adapter(&adapter),
+        Err(Ok(Error::NotInitialized))
+    );
 
     client.initialize(&admin, &adapter);
     assert_eq!(client.get_admin(), admin);
@@ -181,35 +207,72 @@ fn create_escrow_validates_its_arguments() {
 
     assert_eq!(
         f.client.try_create_escrow(
-            &1_u64, &f.payer, &f.beneficiary, &f.token, &0_i128, &150_u32, &100_u32
+            &1_u64,
+            &f.payer,
+            &f.beneficiary,
+            &f.token,
+            &0_i128,
+            &150_u32,
+            &100_u32
         ),
         Err(Ok(Error::InvalidAmount))
     );
     // The ledger sequence is still 0, so a deadline of 0 is not in the future.
     assert_eq!(
         f.client.try_create_escrow(
-            &2_u64, &f.payer, &f.beneficiary, &f.token, &100_i128, &0_u32, &100_u32
+            &2_u64,
+            &f.payer,
+            &f.beneficiary,
+            &f.token,
+            &100_i128,
+            &0_u32,
+            &100_u32
         ),
         Err(Ok(Error::InvalidReleaseLedger))
     );
     assert_eq!(
         f.client.try_create_escrow(
-            &3_u64, &f.payer, &f.beneficiary, &f.token, &100_i128, &150_u32, &10_001_u32
+            &3_u64,
+            &f.payer,
+            &f.beneficiary,
+            &f.token,
+            &100_i128,
+            &150_u32,
+            &10_001_u32
         ),
         Err(Ok(Error::InvalidInterestSplit))
     );
 
-    f.client
-        .create_escrow(&4_u64, &f.payer, &f.beneficiary, &f.token, &100_i128, &150_u32, &100_u32);
+    f.client.create_escrow(
+        &4_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &100_i128,
+        &150_u32,
+        &100_u32,
+    );
     assert_eq!(
         f.client.try_create_escrow(
-            &4_u64, &f.payer, &f.beneficiary, &f.token, &100_i128, &150_u32, &100_u32
+            &4_u64,
+            &f.payer,
+            &f.beneficiary,
+            &f.token,
+            &100_i128,
+            &150_u32,
+            &100_u32
         ),
         Err(Ok(Error::EscrowExists))
     );
 
-    assert_eq!(f.client.try_get_escrow(&99_u64), Err(Ok(Error::EscrowNotFound)));
-    assert_eq!(f.client.try_release(&99_u64), Err(Ok(Error::EscrowNotFound)));
+    assert_eq!(
+        f.client.try_get_escrow(&99_u64),
+        Err(Ok(Error::EscrowNotFound))
+    );
+    assert_eq!(
+        f.client.try_release(&99_u64),
+        Err(Ok(Error::EscrowNotFound))
+    );
     assert_eq!(f.client.try_cancel(&99_u64), Err(Ok(Error::EscrowNotFound)));
 }
 
@@ -218,6 +281,7 @@ fn create_escrow_validates_its_arguments() {
 #[test]
 fn release_splits_principal_and_accrued_interest() {
     let f = Fixture::new();
+    f.set_rate(1_000);
     f.token_admin.mint(&f.payer, &1_000);
     f.client.create_escrow(
         &1_u64,
@@ -235,6 +299,7 @@ fn release_splits_principal_and_accrued_interest() {
     assert_eq!(f.token_client.balance(&f.pool_id), 1_000);
 
     f.accrue(100);
+    set_timestamp(&f.env, SECONDS_PER_YEAR as u64);
     set_sequence(&f.env, 150);
 
     let outcome = f.client.release(&1_u64);
@@ -256,7 +321,10 @@ fn release_splits_principal_and_accrued_interest() {
     assert_eq!(f.client.get_active_escrows(), 0);
 
     // The matured position cannot be settled twice.
-    assert_eq!(f.client.try_release(&1_u64), Err(Ok(Error::EscrowNotActive)));
+    assert_eq!(
+        f.client.try_release(&1_u64),
+        Err(Ok(Error::EscrowNotActive))
+    );
 }
 
 #[test]
@@ -295,7 +363,10 @@ fn release_before_the_deadline_is_rejected() {
         &1_000_u32,
     );
 
-    assert_eq!(f.client.try_release(&3_u64), Err(Ok(Error::NotYetReleasable)));
+    assert_eq!(
+        f.client.try_release(&3_u64),
+        Err(Ok(Error::NotYetReleasable))
+    );
 
     // The deadline is inclusive: sequence 150 unlocks the escrow.
     set_sequence(&f.env, 150);
@@ -330,6 +401,7 @@ fn release_without_interest_pays_the_principal_to_the_beneficiary() {
 #[test]
 fn interest_split_stays_exact_when_the_share_does_not_divide_evenly() {
     let f = Fixture::new();
+    f.set_rate(70);
     f.token_admin.mint(&f.payer, &1_000);
     // 3_333 bps of the interest goes to the beneficiary.
     f.client.create_escrow(
@@ -342,6 +414,7 @@ fn interest_split_stays_exact_when_the_share_does_not_divide_evenly() {
         &3_333_u32,
     );
     f.accrue(7);
+    set_timestamp(&f.env, SECONDS_PER_YEAR as u64);
     set_sequence(&f.env, 150);
 
     let outcome = f.client.release(&31_u64);
@@ -357,6 +430,7 @@ fn interest_split_stays_exact_when_the_share_does_not_divide_evenly() {
 #[test]
 fn the_beneficiary_can_be_assigned_the_whole_interest() {
     let f = Fixture::new();
+    f.set_rate(1_000);
     f.token_admin.mint(&f.payer, &200);
     f.client.create_escrow(
         &41_u64,
@@ -368,6 +442,7 @@ fn the_beneficiary_can_be_assigned_the_whole_interest() {
         &10_000_u32,
     );
     f.accrue(20);
+    set_timestamp(&f.env, SECONDS_PER_YEAR as u64);
     set_sequence(&f.env, 150);
 
     let outcome = f.client.release(&41_u64);
@@ -382,6 +457,7 @@ fn the_beneficiary_can_be_assigned_the_whole_interest() {
 #[test]
 fn cancel_refunds_the_payer_with_interest_and_is_blocked_after_the_deadline() {
     let f = Fixture::new();
+    f.set_rate(1_000);
     f.token_admin.mint(&f.payer, &400);
     f.client.create_escrow(
         &11_u64,
@@ -393,6 +469,7 @@ fn cancel_refunds_the_payer_with_interest_and_is_blocked_after_the_deadline() {
         &3_000_u32,
     );
     f.accrue(40);
+    set_timestamp(&f.env, SECONDS_PER_YEAR as u64);
     set_sequence(&f.env, 100);
 
     let outcome = f.client.cancel(&11_u64);
@@ -406,7 +483,10 @@ fn cancel_refunds_the_payer_with_interest_and_is_blocked_after_the_deadline() {
 
     // The payer is the only address that may cancel, and a cancelled position
     // stays cancelled.
-    assert_eq!(f.client.try_cancel(&11_u64), Err(Ok(Error::EscrowNotActive)));
+    assert_eq!(
+        f.client.try_cancel(&11_u64),
+        Err(Ok(Error::EscrowNotActive))
+    );
 
     // Past the deadline the payer can no longer pull the funds back.
     f.token_admin.mint(&f.payer, &100);
@@ -428,6 +508,91 @@ fn cancel_refunds_the_payer_with_interest_and_is_blocked_after_the_deadline() {
 }
 
 // ── Adapter management ───────────────────────────────────────────────────────
+
+#[test]
+fn streamed_interest_scales_with_lock_duration() {
+    let amount = 1_000_000_000_000_i128;
+    let one_block = Fixture::new();
+    one_block.set_rate(1_200);
+    one_block.token_admin.mint(&one_block.payer, &amount);
+    one_block.client.create_escrow(
+        &51_u64,
+        &one_block.payer,
+        &one_block.beneficiary,
+        &one_block.token,
+        &amount,
+        &150_u32,
+        &10_000_u32,
+    );
+    set_timestamp(&one_block.env, 5);
+    let short_index = one_block.client.get_yield_state(&one_block.token).index;
+    let short_interest = amount * short_index / INDEX_SCALE;
+    let expected_short_index = INDEX_SCALE * 1_200 * 5 / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
+    assert_eq!(short_index, expected_short_index);
+    assert!(short_interest > 0);
+    assert!(short_interest < 20_000_000);
+    one_block.accrue(short_interest);
+    set_sequence(&one_block.env, 150);
+    assert_eq!(one_block.client.release(&51_u64).interest, short_interest);
+
+    let month = Fixture::new();
+    month.set_rate(1_200);
+    month.token_admin.mint(&month.payer, &amount);
+    month.client.create_escrow(
+        &52_u64,
+        &month.payer,
+        &month.beneficiary,
+        &month.token,
+        &amount,
+        &150_u32,
+        &10_000_u32,
+    );
+    let thirty_days = 30 * 24 * 60 * 60;
+    set_timestamp(&month.env, thirty_days);
+    let long_index = month.client.get_yield_state(&month.token).index;
+    let long_interest = amount * long_index / INDEX_SCALE;
+    let expected_long_index =
+        INDEX_SCALE * 1_200 * thirty_days as i128 / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
+    assert_eq!(long_index, expected_long_index);
+    assert!(long_interest > short_interest * 1_000);
+    assert_eq!(
+        long_interest,
+        amount * 1_200 * thirty_days as i128 / (10_000 * SECONDS_PER_YEAR)
+    );
+    month.accrue(long_interest);
+    set_sequence(&month.env, 150);
+    assert_eq!(month.client.release(&52_u64).interest, long_interest);
+}
+
+#[test]
+fn rate_changes_apply_only_to_elapsed_time_after_the_update() {
+    let f = Fixture::new();
+    f.set_rate(1_000);
+    f.token_admin.mint(&f.payer, &1_000);
+    f.client.create_escrow(
+        &53_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &1_000_i128,
+        &150_u32,
+        &10_000_u32,
+    );
+
+    set_timestamp(&f.env, SECONDS_PER_YEAR as u64);
+    f.set_rate(2_000);
+    let first_year = f.client.get_yield_state(&f.token);
+    assert_eq!(first_year.index, INDEX_SCALE * 1_000 / BPS_DENOMINATOR);
+
+    set_timestamp(&f.env, (SECONDS_PER_YEAR + SECONDS_PER_YEAR / 2) as u64);
+    let half_year_later = f.client.get_yield_state(&f.token);
+    let expected_index = INDEX_SCALE * 2_000 / BPS_DENOMINATOR;
+    assert_eq!(half_year_later.index, expected_index);
+    let expected_interest = 1_000 * expected_index / INDEX_SCALE;
+    f.accrue(expected_interest);
+    set_sequence(&f.env, 150);
+    assert_eq!(f.client.release(&53_u64).interest, expected_interest);
+}
 
 #[test]
 fn adapter_can_only_be_replaced_while_no_escrow_is_active() {

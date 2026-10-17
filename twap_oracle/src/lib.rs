@@ -23,7 +23,10 @@
 //!   retained history to cover it, so a caller cannot average over a single
 //!   freshly written observation.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
+    Env, Vec,
+};
 
 /// Maximum number of observations retained. When the buffer is full the oldest
 /// observation is dropped before the new one is appended.
@@ -38,6 +41,15 @@ pub const MAX_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Upper bound for a single observation price. Keeps `price * elapsed` well
 /// inside `i128` for any realistic ledger gap.
 pub const MAX_PRICE: i128 = i128::MAX / 1_000_000_000;
+
+/// Default maximum divergence between primary and secondary price feeds (500 bps = 5%).
+pub const DEFAULT_MAX_DIVERGENCE_BPS: u32 = 500;
+
+/// Default staleness threshold for observations (1 hour = 3600 seconds).
+pub const DEFAULT_STALENESS_THRESHOLD: u64 = 3_600;
+
+/// Basis points divisor (10,000 bps = 100%).
+pub const BPS_DIVISOR: i128 = 10_000;
 
 /// A single price observation.
 ///
@@ -57,6 +69,11 @@ pub struct Observation {
 pub enum DataKey {
     Admin,
     Observations,
+    SecondaryOracle,
+    MaxDivergenceBps,
+    StalenessThreshold,
+    Weights,
+    CircuitBreakerTripped,
 }
 
 /// Oracle errors surfaced to callers.
@@ -74,6 +91,18 @@ pub enum Error {
     InvalidWindow = 8,
     InsufficientHistory = 9,
     NoObservations = 10,
+    CircuitBreakerTripped = 11,
+    PrimaryStale = 12,
+    SecondaryStale = 13,
+    OracleUnavailable = 14,
+    InvalidConfig = 15,
+}
+
+/// Interface implemented by secondary price feed contracts.
+#[contractclient(name = "SecondaryOracleClient")]
+pub trait SecondaryOracle {
+    fn latest_observation(env: Env) -> Option<Observation>;
+    fn twap(env: Env, window_seconds: u64) -> i128;
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -267,6 +296,313 @@ impl TwapOracle {
             .ok_or(Error::PriceOverflow)?;
 
         Ok(accumulated / i128::from(window_seconds))
+    }
+
+    // ── Consensus & Fallback Configuration ───────────────────────────────────
+
+    /// Registers the secondary oracle contract address in persistent storage.
+    ///
+    /// Requires authorization from the configured admin.
+    pub fn set_secondary_oracle(env: Env, secondary_oracle: Address) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SecondaryOracle, &secondary_oracle);
+
+        env.events().publish(
+            (symbol_short!("oracle"), symbol_short!("set_sec")),
+            secondary_oracle,
+        );
+
+        Ok(())
+    }
+
+    /// Alias for [`Self::set_secondary_oracle`] to register a secondary oracle.
+    pub fn register_secondary_oracle(env: Env, secondary_oracle: Address) -> Result<(), Error> {
+        Self::set_secondary_oracle(env, secondary_oracle)
+    }
+
+    /// Returns the registered secondary oracle contract address, if set.
+    pub fn secondary_oracle(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::SecondaryOracle)
+    }
+
+    /// Configures the maximum allowed price divergence in basis points between
+    /// primary and secondary oracles (e.g. 500 bps = 5%).
+    ///
+    /// Requires authorization from the configured admin.
+    pub fn set_max_divergence_bps(env: Env, max_divergence_bps: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        if max_divergence_bps > 10_000 {
+            return Err(Error::InvalidConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxDivergenceBps, &max_divergence_bps);
+
+        Ok(())
+    }
+
+    /// Returns the maximum divergence threshold in basis points (defaults to 500 bps).
+    pub fn max_divergence_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxDivergenceBps)
+            .unwrap_or(DEFAULT_MAX_DIVERGENCE_BPS)
+    }
+
+    /// Configures the maximum age in seconds for observations before they are considered stale.
+    ///
+    /// Requires authorization from the configured admin.
+    pub fn set_staleness_threshold(env: Env, threshold_seconds: u64) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        if threshold_seconds == 0 {
+            return Err(Error::InvalidConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StalenessThreshold, &threshold_seconds);
+
+        Ok(())
+    }
+
+    /// Returns the staleness threshold in seconds (defaults to 3600 seconds).
+    pub fn staleness_threshold(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StalenessThreshold)
+            .unwrap_or(DEFAULT_STALENESS_THRESHOLD)
+    }
+
+    /// Configures consensus weights for primary and secondary feeds.
+    ///
+    /// Requires authorization from the configured admin.
+    pub fn set_consensus_weights(
+        env: Env,
+        primary_weight: u32,
+        secondary_weight: u32,
+    ) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        if primary_weight == 0 || secondary_weight == 0 {
+            return Err(Error::InvalidConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Weights, &(primary_weight, secondary_weight));
+
+        Ok(())
+    }
+
+    /// Returns consensus weights (primary_weight, secondary_weight), defaulting to (5000, 5000).
+    pub fn consensus_weights(env: Env) -> (u32, u32) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Weights)
+            .unwrap_or((5_000, 5_000))
+    }
+
+    /// Returns whether the dynamic discrepancy circuit breaker is currently tripped.
+    pub fn is_circuit_breaker_tripped(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CircuitBreakerTripped)
+            .unwrap_or(false)
+    }
+
+    /// Resets the circuit breaker, allowing normal oracle operations to resume.
+    ///
+    /// Requires authorization from the configured admin.
+    pub fn reset_circuit_breaker(env: Env) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CircuitBreakerTripped, &false);
+
+        env.events().publish(
+            (symbol_short!("breaker"), symbol_short!("reset")),
+            (),
+        );
+
+        Ok(())
+    }
+
+    /// Manually trips the circuit breaker to freeze oracle pricing in emergencies.
+    ///
+    /// Requires authorization from the configured admin.
+    pub fn trip_circuit_breaker(env: Env) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CircuitBreakerTripped, &true);
+
+        env.events().publish(
+            (symbol_short!("breaker"), symbol_short!("tripped")),
+            (0i128, 0i128, 0i128),
+        );
+
+        Ok(())
+    }
+
+    // ── Consensus Oracle Query ───────────────────────────────────────────────
+
+    /// Consults the oracle consensus engine over the given `window_seconds`.
+    ///
+    /// - If the circuit breaker is tripped, reverts immediately with [`Error::CircuitBreakerTripped`].
+    /// - Checks primary and secondary price feeds against the staleness limit.
+    /// - If both feeds are fresh:
+    ///   - Validates that discrepancy between feeds does not exceed `max_divergence_bps` (500 bps).
+    ///   - If divergence exceeds threshold, trips the circuit breaker and reverts with [`Error::CircuitBreakerTripped`].
+    ///   - If within threshold, returns the weighted consensus average.
+    /// - If primary is stale and secondary is fresh, falls back to secondary with a warning event emission.
+    /// - If primary is fresh and secondary is stale or absent, returns the primary price.
+    /// - If both feeds are stale, returns [`Error::PrimaryStale`].
+    pub fn consult(env: Env, window_seconds: u64) -> Result<i128, Error> {
+        if Self::is_circuit_breaker_tripped(env.clone()) {
+            return Err(Error::CircuitBreakerTripped);
+        }
+
+        if window_seconds > MAX_WINDOW_SECONDS {
+            return Err(Error::InvalidWindow);
+        }
+
+        let staleness_limit = Self::staleness_threshold(env.clone());
+        let current_time = env.ledger().timestamp();
+
+        // 1. Evaluate primary feed
+        let observations = read_observations(&env);
+        let mut primary_fresh = false;
+        let mut primary_price = 0i128;
+        let mut primary_timestamp = 0u64;
+
+        if !observations.is_empty() {
+            let latest = observations.get(observations.len() - 1).unwrap();
+            primary_timestamp = latest.timestamp;
+            let elapsed = current_time.saturating_sub(latest.timestamp);
+            let is_stale = staleness_limit > 0 && elapsed > staleness_limit;
+
+            if !is_stale {
+                if window_seconds == 0 {
+                    primary_price = latest.price;
+                    primary_fresh = true;
+                } else if let Ok(twap_p) = Self::twap(env.clone(), window_seconds) {
+                    primary_price = twap_p;
+                    primary_fresh = true;
+                }
+            }
+        }
+
+        // 2. Evaluate secondary feed
+        let secondary_opt = Self::secondary_oracle(env.clone());
+        let mut secondary_fresh = false;
+        let mut secondary_price = 0i128;
+
+        if let Some(sec_addr) = &secondary_opt {
+            let sec_client = SecondaryOracleClient::new(&env, sec_addr);
+            if let Ok(Ok(Some(sec_obs))) = sec_client.try_latest_observation() {
+                if sec_obs.price > 0 && sec_obs.price <= MAX_PRICE {
+                    let sec_elapsed = current_time.saturating_sub(sec_obs.timestamp);
+                    let sec_is_stale = staleness_limit > 0 && sec_elapsed > staleness_limit;
+
+                    if !sec_is_stale {
+                        secondary_fresh = true;
+                        if window_seconds > 0 {
+                            if let Ok(Ok(p)) = sec_client.try_twap(&window_seconds) {
+                                if p > 0 && p <= MAX_PRICE {
+                                    secondary_price = p;
+                                } else {
+                                    secondary_price = sec_obs.price;
+                                }
+                            } else {
+                                secondary_price = sec_obs.price;
+                            }
+                        } else {
+                            secondary_price = sec_obs.price;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Handle consensus, fallback, or failure
+        if primary_fresh && secondary_fresh {
+            let diff = (primary_price - secondary_price).abs();
+            let max_bps = Self::max_divergence_bps(env.clone());
+            let divergence_bps = diff
+                .checked_mul(BPS_DIVISOR)
+                .ok_or(Error::PriceOverflow)?
+                / primary_price;
+
+            if divergence_bps > i128::from(max_bps) {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::CircuitBreakerTripped, &true);
+
+                env.events().publish(
+                    (symbol_short!("breaker"), symbol_short!("tripped")),
+                    (primary_price, secondary_price, divergence_bps),
+                );
+
+                return Err(Error::CircuitBreakerTripped);
+            }
+
+            let (w1, w2) = Self::consensus_weights(env.clone());
+            let total_w = i128::from(w1 + w2);
+            if total_w == 0 {
+                return Err(Error::InvalidConfig);
+            }
+
+            let p_part = primary_price
+                .checked_mul(i128::from(w1))
+                .ok_or(Error::PriceOverflow)?;
+            let s_part = secondary_price
+                .checked_mul(i128::from(w2))
+                .ok_or(Error::PriceOverflow)?;
+            let avg = p_part
+                .checked_add(s_part)
+                .ok_or(Error::PriceOverflow)?
+                / total_w;
+
+            env.events().publish(
+                (symbol_short!("oracle"), symbol_short!("consensus")),
+                avg,
+            );
+
+            Ok(avg)
+        } else if !primary_fresh {
+            if secondary_fresh {
+                env.events().publish(
+                    (symbol_short!("oracle"), symbol_short!("fallback")),
+                    (primary_timestamp, secondary_price),
+                );
+                Ok(secondary_price)
+            } else {
+                Err(Error::PrimaryStale)
+            }
+        } else {
+            // primary_fresh is true, but secondary is stale or absent
+            if secondary_opt.is_some() {
+                env.events().publish(
+                    (symbol_short!("oracle"), symbol_short!("sec_stale")),
+                    primary_price,
+                );
+            }
+            Ok(primary_price)
+        }
     }
 }
 
