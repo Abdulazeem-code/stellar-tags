@@ -1545,59 +1545,57 @@ impl PaymentRouter {
     /// - `user`: The sender whose legacy entries should be migrated.
     ///
     /// # Returns
-    /// `true` if legacy state was found and migrated, `false` if `user` has
-    /// no legacy entries to migrate.
-    ///
-    /// # Panics
-    /// Does not panic.
-    pub fn migrate_user_record(env: Env, user: Address) -> bool {
+    /// `Ok(())` when migrated, `Err(UserRecordAlreadyMigrated)` when a packed
+    /// record already exists, or `Err(LegacyUserRecordNotFound)` when there is
+    /// no legacy state to migrate.
+    pub fn migrate_user_record(env: Env, user: Address) -> Result<(), Error> {
         let record_key = DataKey::UserRecord(user.clone());
-        let has_packed = env.storage().persistent().has(&record_key);
+        if env.storage().persistent().has(&record_key) {
+            return Err(Error::UserRecordAlreadyMigrated);
+        }
 
+        let spending_key = DataKey::UserSpending(user.clone());
+        let volume_key = DataKey::UserVolume(user.clone());
+        let has_legacy_spending = env.storage().persistent().has(&spending_key);
+        let has_legacy_volume = env.storage().persistent().has(&volume_key);
+        if !has_legacy_spending && !has_legacy_volume {
+            return Err(Error::LegacyUserRecordNotFound);
+        }
         let legacy_spending: Option<(u64, i128)> = env
             .storage()
             .persistent()
-            .get(&DataKey::UserSpending(user.clone()))
+            .get(&spending_key)
             .map(|packed: BytesN<24>| unpack_legacy_spending(&packed));
         let legacy_volume: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::UserVolume(user.clone()))
+            .get(&volume_key)
             .unwrap_or(0);
 
-        if legacy_spending.is_none() && legacy_volume == 0 {
-            return false;
-        }
+        let (last_reset_time, accumulated_amount) =
+            legacy_spending.unwrap_or((env.ledger().timestamp(), 0));
 
-        if !has_packed {
-            let (last_reset_time, accumulated_amount) =
-                legacy_spending.unwrap_or((env.ledger().timestamp(), 0));
+        // The legacy `UserVolume` already counts every amount in the current
+        // window, so do not add the spending amount to it during migration.
+        env.storage().persistent().set(
+            &record_key,
+            &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
+        );
+        env.storage().persistent().extend_ttl(
+            &record_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
 
-            // The legacy `UserVolume` already counts every amount in the
-            // current window (each payment incremented both counters), so the
-            // window balance must not be added again here.
-            env.storage().persistent().set(
-                &record_key,
-                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
-            );
-            env.storage().persistent().extend_ttl(
-                &record_key,
-                Self::PERSISTENT_LIFETIME_THRESHOLD,
-                Self::PERSISTENT_BUMP_AMOUNT,
-            );
-        }
+        env.storage().persistent().remove(&spending_key);
+        env.storage().persistent().remove(&volume_key);
 
-        env.storage()
-            .persistent()
-            .remove(&DataKey::UserSpending(user.clone()));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::UserVolume(user.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "user_record_migrated"), user),
+            legacy_volume,
+        );
 
-        env.events()
-            .publish((symbol_short!("migrated"), user), legacy_volume);
-
-        true
+        Ok(())
     }
 
     /// Adds an address to the blacklist. ComplianceOfficer-protected.

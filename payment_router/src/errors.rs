@@ -113,4 +113,8 @@ pub enum Error {
     AlreadyApproved = 41,
     /// A reentrant call was detected.
     ReentrantCall = 42,
+    /// A user record migration was attempted after the user was already migrated.
+    UserRecordAlreadyMigrated = 48,
+    /// No legacy user record entries were found to migrate.
+    LegacyUserRecordNotFound = 49,
 }
