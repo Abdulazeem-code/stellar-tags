@@ -50,6 +50,10 @@ impl PaymentRouter {
     pub const USER_LIFETIME_THRESHOLD: u32 = storage::USER_LIFETIME_THRESHOLD;
     pub const PERSISTENT_BUMP_AMOUNT: u32 = storage::PERSISTENT_BUMP_AMOUNT;
     pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = storage::PERSISTENT_LIFETIME_THRESHOLD;
+    pub const TEMPORARY_BUMP_AMOUNT: u32 = storage::TEMPORARY_BUMP_AMOUNT;
+    pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = storage::TEMPORARY_LIFETIME_THRESHOLD;
+    pub const DEFAULT_TELEMETRY_CAPACITY: u32 = storage::DEFAULT_TELEMETRY_CAPACITY;
+    pub const MAX_TELEMETRY_CAPACITY: u32 = storage::MAX_TELEMETRY_CAPACITY;
 
     // ── Delegated Domain Helpers ─────────────────────────────────────────────
 
@@ -1453,6 +1457,22 @@ impl PaymentRouter {
             volume,
             last_reset_time,
         }
+    }
+
+    /// Returns the rolling average volume computed across the temporary storage telemetry ring buffer.
+    pub fn get_telemetry_average(env: Env) -> u64 {
+        storage::get_telemetry_average(&env)
+    }
+
+    /// Computes the statistical percentile (0..=100) of payment volume in the circular telemetry buffer.
+    pub fn get_telemetry_percentile(env: Env, p: u32) -> u32 {
+        storage::get_telemetry_percentile(&env, p)
+    }
+
+    /// Appends a new payment telemetry observation to the temporary storage ring buffer.
+    pub fn record_telemetry(env: Env, volume: u32, status: u8) -> PackedTelemetryRecord {
+        let timestamp = env.ledger().timestamp() as u32;
+        storage::append_telemetry(&env, timestamp, volume, status)
     }
 
     /// Permissionless migration of a sender's legacy pre-#663 split entries
