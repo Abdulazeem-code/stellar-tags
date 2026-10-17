@@ -33,12 +33,14 @@ fn test_fuzz_crash() {
         recipient: senders[1].clone(), // Changed from recipients[3]
         token_address: token_address.clone(),
         amount: 1099528363175,
+        memo: Memo::None,
     });
     payments.push_back(Payment {
         sender: senders[0].clone(),
         recipient: recipients[0].clone(), // 0 % 4 = 0
         token_address: token_address.clone(),
         amount: 0,
+        memo: Memo::None,
     });
 
     println!("5: calling try_route_payments");
