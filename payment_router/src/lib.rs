@@ -23,6 +23,273 @@ use soroban_sdk::{
     Error as SdkError, IntoVal, InvokeError, String, Symbol, Vec,
 };
 
+/// Two-phase commit protocol for cross-contract, timelocked upgrades
+/// (issue #887).  The protocol logic lives here; `PaymentRouter` exposes it
+/// through the `prepare_cross_contract_upgrade` / `commit_cross_contract_upgrade`
+/// entry points below.
+pub mod timelock;
+
+use timelock::TwoPhaseCommit;
+
+// ── Packed UserSpending helpers ──────────────────────────────────────────────
+//
+// Issue #519: Replace the two-field UserSpending contracttype with a single
+// BytesN<24> value packed with bitwise operations.
+//
+// Layout (big-endian):
+//   bytes  0..8  — last_reset_time  : u64   (8 bytes)
+//   bytes  8..24 — accumulated_amount: i128  (16 bytes)
+//
+// Benefits:
+//  • Eliminates the XDR struct-type overhead (type discriminant + field tags)
+//    that Soroban adds to every contracttype value, shrinking each UserSpending
+//    ledger entry from ~48 bytes to exactly 24 bytes.
+//  • Smaller entries → lower state-rent fee per ledger entry per TTL period.
+
+/// Pack `last_reset_time` (u64) and `accumulated_amount` (i128) into a
+/// 24-byte big-endian buffer.
+fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> BytesN<24> {
+    let mut buf = [0u8; 24];
+
+    // Bytes 0..8 — last_reset_time (u64 big-endian)
+    let t_bytes = last_reset_time.to_be_bytes();
+    buf[0] = t_bytes[0];
+    buf[1] = t_bytes[1];
+    buf[2] = t_bytes[2];
+    buf[3] = t_bytes[3];
+    buf[4] = t_bytes[4];
+    buf[5] = t_bytes[5];
+    buf[6] = t_bytes[6];
+    buf[7] = t_bytes[7];
+
+    // Bytes 8..24 — accumulated_amount (i128 big-endian)
+    let a_bytes = accumulated_amount.to_be_bytes();
+    buf[8] = a_bytes[0];
+    buf[9] = a_bytes[1];
+    buf[10] = a_bytes[2];
+    buf[11] = a_bytes[3];
+    buf[12] = a_bytes[4];
+    buf[13] = a_bytes[5];
+    buf[14] = a_bytes[6];
+    buf[15] = a_bytes[7];
+    buf[16] = a_bytes[8];
+    buf[17] = a_bytes[9];
+    buf[18] = a_bytes[10];
+    buf[19] = a_bytes[11];
+    buf[20] = a_bytes[12];
+    buf[21] = a_bytes[13];
+    buf[22] = a_bytes[14];
+    buf[23] = a_bytes[15];
+
+    BytesN::from_array(env, &buf)
+}
+
+/// Unpack a 24-byte buffer into `(last_reset_time, accumulated_amount)`.
+fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
+    // BytesN::to_array() is available in soroban-sdk v20.
+    let buf: [u8; 24] = packed.to_array();
+
+    // last_reset_time — bytes 0..8
+    let last_reset_time = u64::from_be_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+
+    // accumulated_amount — bytes 8..24
+    let accumulated_amount = i128::from_be_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    ]);
+
+    (last_reset_time, accumulated_amount)
+}
+
+// ── Legacy struct kept for test snapshot compatibility ───────────────────────
+//
+// The UserSpending contracttype is retained so existing tests that reference
+// it directly continue to compile.  All runtime code now uses the packed
+// BytesN<24> representation stored under DataKey::UserSpending.
+
+/// A user's rolling 24-hour spending record.
+///
+/// Retained purely so existing test snapshots that reference this type by
+/// name keep compiling. Live contract state is stored as a packed
+/// `BytesN<24>` (see `pack_spending` / `unpack_spending`); this struct is not
+/// read from or written to storage at runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSpending {
+    /// Unix timestamp (seconds) at which the 24-hour window last reset.
+    pub last_reset_time: u64,
+    /// Total amount routed by the user since `last_reset_time`.
+    pub accumulated_amount: i128,
+}
+
+/// A single transfer instruction for use with [`PaymentRouter::route_payments`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payment {
+    /// Address the funds are debited from. Must authorize the call.
+    pub sender: Address,
+    /// Address the funds (minus the platform fee) are credited to.
+    pub recipient: Address,
+    /// Contract ID of the token (or Stellar Asset Contract) being transferred.
+    pub token_address: Address,
+    /// Amount to route, denominated in the token's smallest unit. Must be
+    /// positive and within the contract's configured min/max bounds.
+    pub amount: i128,
+}
+
+// ── Timelock data structures ─────────────────────────────────────────────────
+//
+// Admin actions that change sensitive contract parameters (treasury, fees,
+// governance, admin transfer) are not applied instantly.  Instead the admin
+// queues an ActionType intent that gets a nonce ID and a ledger timestamp.
+// Only after SECONDS_IN_24H (86 400 s) has elapsed can execute_action be
+// called to apply the change.  This gives observers a 24-hour window to
+// detect and respond to a compromised-admin scenario.
+//
+// The freeze mechanism is the complementary emergency tool: calling
+// emergency_freeze instantly blocks all payments and all timelock executions.
+// A freeze does NOT require going through the timelock itself so it is always
+// available to the admin as an immediate last resort.  Unfreezing likewise
+// takes effect immediately so the admin can restore service once the threat is
+// resolved.
+
+/// Describes which administrative parameter change a timelock entry represents.
+/// Each variant carries all the arguments needed to apply that change when the
+/// delay period is over.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionType {
+    /// Change the platform treasury address.
+    SetPlatformTreasury(Address),
+    /// Update fee basis-points and fee cap together (legacy / combined setter).
+    SetFeeConfig(i128, i128),
+    /// Update fee basis-points only.
+    SetFeeBps(i128),
+    /// Set the governance contract address.
+    SetGovernance(Address),
+    /// Change the minimum routing limit.
+    SetMinLimit(i128),
+    /// Transfer admin rights to a new address.
+    TransferAdmin(Address),
+    /// Upgrade the contract WASM.
+    Upgrade(BytesN<32>),
+}
+
+/// A pending timelock entry stored in persistent ledger storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockEntry {
+    /// Ledger timestamp (seconds since epoch) when this action was queued.
+    pub queued_at: u64,
+    /// The action payload to apply once the delay has elapsed.
+    pub action: ActionType,
+}
+
+/// Storage keys for all contract instance and persistent data.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    /// The current admin address.
+    Admin,
+    /// Governance contract address; if set, it takes over fee-authority from the admin.
+    Governance,
+    /// Address that receives collected platform fees.
+    PlatformTreasury,
+    /// Platform fee rate, in basis points (1/100th of a percent).
+    FeeBps,
+    /// Upper bound on the fee taken from a single payment.
+    FeeCap,
+    /// Minimum amount accepted by `route_payment` / `route_payments`, if set.
+    MinLimit,
+    /// Whether routing is currently paused.
+    Paused,
+    /// Maximum amount accepted by a single payment.
+    MaxAmount,
+    /// Cumulative lifetime amount routed by a given sender.
+    UserVolume(Address),
+    /// Packed 24-hour spending window for a given sender.
+    UserSpending(Address),
+    /// Whether a given recipient address is blacklisted.
+    Blacklist(Address),
+    /// Internal refund balance for a (user, token) pair, credited when a
+    /// direct transfer to the recipient fails.
+    RefundBalance(Address, Address),
+    /// Monotonically-increasing nonce counter used to generate unique IDs for
+    /// timelock entries.  Stored as `u64` in instance storage.
+    TimelockNonce,
+    /// A pending timelock entry keyed by its nonce ID.
+    /// Stored in persistent storage so it survives instance eviction.
+    TimelockEntry(u64),
+    /// When `true` the contract is frozen: payments and timelock executions
+    /// are blocked.  Stored as `bool` in instance storage.
+    Frozen,
+    /// A prepared two-phase cross-contract upgrade manifest, keyed by its
+    /// upgrade ID. Stored in persistent storage so it survives instance
+    /// eviction while the timelock runs.
+    TwoPhaseCommit(BytesN<32>),
+}
+
+/// Contract-level errors returned instead of panicking, so callers get a
+/// specific, stable error code to branch on rather than an opaque trap.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// Caller is not authorized to perform this action (e.g. not the admin).
+    Unauthorized = 1,
+    /// Sender's token balance is lower than the requested payment amount.
+    InsufficientBalance = 2,
+    /// Requested amount is outside allowed bounds, or a spending limit was exceeded.
+    LimitExceeded = 3,
+    /// `initialize` was called on a contract that already has an admin set.
+    AlreadyInitialized = 4,
+    /// An admin-configured value (treasury, fee, admin) was read before `initialize`.
+    NotInitialized = 5,
+    /// The contract is currently paused; routing calls are rejected until unpaused.
+    Paused = 6,
+    /// A fee configuration value (basis points or cap) is out of the allowed range.
+    InvalidFeeRate = 7,
+    /// Sender and recipient addresses are the same (self-routing not allowed).
+    InvalidRecipient = 8,
+    /// Recipient address is blacklisted.
+    Blacklisted = 9,
+    /// Requested refund withdrawal amount is zero or exceeds available refund balance.
+    NoRefundAvailable = 10,
+    /// An action is already pending in the timelock queue; it must be executed
+    /// or cancelled before a duplicate can be queued (not currently enforced,
+    /// but reserved for future deduplication logic).
+    TimelockPending = 11,
+    /// The 24-hour delay for the given timelock entry has not elapsed yet.
+    TimelockNotReady = 12,
+    /// No timelock entry exists for the supplied nonce ID.
+    TimelockNotFound = 13,
+    /// The contract is frozen; all payments and timelock executions are blocked.
+    ContractFrozen = 14,
+    /// No prepared cross-contract upgrade manifest exists for the supplied
+    /// upgrade ID (it was never prepared, or it was already committed).
+    UpgradeManifestNotFound = 15,
+    /// The upgrade manifest is malformed: no target contracts, a different
+    /// number of code hashes than addresses, or a duplicated target.
+    InvalidUpgradeManifest = 16,
+    /// A manifest for this upgrade ID is already prepared; commit or wait for
+    /// its execution window to lapse before preparing it again.
+    UpgradeAlreadyPrepared = 17,
+    /// The 48-hour cross-contract timelock delay has not elapsed yet.
+    UpgradeNotReady = 18,
+    /// The execution deadline of the prepared upgrade has passed; the upgrade
+    /// must be prepared again.
+    UpgradeManifestExpired = 19,
+    /// A participating contract rejected the manifest during the atomic
+    /// commit. The entire invocation was rolled back, so no contract was
+    /// upgraded: the protocol is still fully on its previous version.
+    UpgradeCommitFailed = 20,
+    /// A participating contract rejected the manifest during preparation. The
+    /// entire invocation was rolled back, so no contract was registered.
+    UpgradePrepareFailed = 21,
+}
+
 /// Soroban contract that routes token payments between addresses while
 /// collecting a configurable platform fee, enforcing per-user daily spending
 /// limits, and supporting an admin-managed blacklist and pause switch.
@@ -887,6 +1154,65 @@ impl PaymentRouter {
 
         log!(&env, "Timelock action cancelled for nonce {}", nonce);
         Ok(())
+    }
+
+    // ── Two-phase commit: cross-contract timelocked upgrades ────────────────
+
+    /// Phase 1 of a cross-contract upgrade: validate the upgrade manifest and
+    /// register it on every participating contract under one synchronized
+    /// 48-hour timelock.
+    ///
+    /// See [`timelock`] for the protocol description.  Both entry points
+    /// require admin authorization and a non-frozen contract, and both are
+    /// atomic: if any participating contract rejects its manifest, the whole
+    /// invocation reverts and no contract keeps a registration.
+    ///
+    /// # Parameters
+    /// - `upgrade_id`: unique identifier of the upgrade attempt.
+    /// - `contract_addresses`: every contract taking part in the upgrade.
+    /// - `code_hashes`: code hash for the contract at the matching index;
+    ///   must contain exactly one entry per address.
+    ///
+    /// # Returns
+    /// The stored [`TwoPhaseCommit`] manifest, including `execution_deadline`.
+    pub fn prepare_cross_contract_upgrade(
+        env: Env,
+        upgrade_id: BytesN<32>,
+        contract_addresses: Vec<Address>,
+        code_hashes: Vec<BytesN<32>>,
+    ) -> Result<TwoPhaseCommit, Error> {
+        timelock::prepare_cross_contract_upgrade(&env, upgrade_id, contract_addresses, code_hashes)
+    }
+
+    /// Phase 2 of a cross-contract upgrade: after the 48-hour delay has
+    /// elapsed, upgrade every participating contract in one atomic step.
+    ///
+    /// Every manifest entry is validated before the first cross-contract call
+    /// is made.  If any participating contract rejects its own manifest
+    /// validation, the error unwinds the entire invocation, so contracts
+    /// upgraded earlier in the same call roll back with it — the protocol
+    /// ends up either fully upgraded or not upgraded at all.
+    ///
+    /// # Parameters
+    /// - `upgrade_id`: the upgrade prepared by `prepare_cross_contract_upgrade`.
+    ///
+    /// # Errors
+    /// - [`Error::UpgradeManifestNotFound`]: unknown or already committed ID.
+    /// - [`Error::UpgradeNotReady`]: the 48-hour delay has not elapsed.
+    /// - [`Error::UpgradeManifestExpired`]: past `execution_deadline`.
+    /// - [`Error::UpgradeCommitFailed`]: a participating contract rejected its
+    ///   manifest; the whole commit was rolled back.
+    pub fn commit_cross_contract_upgrade(env: Env, upgrade_id: BytesN<32>) -> Result<(), Error> {
+        timelock::commit_cross_contract_upgrade(&env, upgrade_id)
+    }
+
+    /// Returns the prepared [`TwoPhaseCommit`] manifest for `upgrade_id`, or
+    /// [`Error::UpgradeManifestNotFound`] if there is none.
+    pub fn get_cross_contract_upgrade(
+        env: Env,
+        upgrade_id: BytesN<32>,
+    ) -> Result<TwoPhaseCommit, Error> {
+        timelock::get_cross_contract_upgrade(&env, upgrade_id)
     }
 
     // ── Freeze / unfreeze ────────────────────────────────────────────────────
