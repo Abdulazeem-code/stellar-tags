@@ -42,9 +42,45 @@
 //! | `forward`            | Anyone       | Delegates an arbitrary call to logic contract |
 //! | `get_logic_contract` | Anyone       | Returns current logic address (view)          |
 //! | `get_admin`          | Anyone       | Returns current admin address (view)          |
+//! | `consume_nonce`      | User (auth)  | Marks one nonce bit consumed in a channel     |
+//! | `is_nonce_consumed`  | Anyone       | Reads a single nonce bit (view)               |
+//! | `get_nonce_bitmap`   | Anyone       | Returns the raw 256-bit word (view)           |
+//!
+//! ## Bitmapped nonce management (issue #918)
+//!
+//! Meta-transactions guarded by a strictly sequential nonce suffer
+//! head-of-line blocking: if transaction `#1` stalls in the relayer pool,
+//! every later transaction from the same sender (`#2`, `#3`, ...) is blocked
+//! behind it indefinitely.
+//!
+//! The proxy therefore tracks consumed nonces in a two-dimensional bitmap:
+//!
+//! ```text
+//! nonce = (channel_id: u32, word_index: u32, bit_index: u32 in 0..=255)
+//!
+//! (`bit_index` is carried as a `u32` because the Soroban host has no `u8`
+//! type; values above 255 are rejected with `ProxyError::InvalidBitIndex`.)
+//!
+//!                  channel 0             channel 1
+//!   word 0     [ 256-bit word ]     [ 256-bit word ]
+//!   word 1     [ 256-bit word ]     [ 256-bit word ]
+//!    ...              ...                  ...
+//! ```
+//!
+//! Each word covers 256 consecutive nonces and is stored (as four big-endian
+//! `u64` limbs) at `ProxyDataKey::NonceBitmap(user, channel_id, word_index)`
+//! in persistent storage. Consuming a nonce validates that its bit is still
+//! clear and flips it in the same invocation — a consumed bit can never be
+//! set again, so a replayed nonce always reverts with
+//! `ProxyError::NonceAlreadyUsed`.
+//!
+//! Because every `(channel_id, word_index, bit_index)` triple is independent,
+//! execution order is unconstrained: `#5` may execute before `#2`, and
+//! separate channels stream completely in parallel, so a stalled nonce no
+//! longer blocks any other payment.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Val, Vec,
 };
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -57,6 +93,10 @@ pub enum ProxyDataKey {
     Admin,
     /// Current logic contract that this proxy delegates calls to.
     LogicContract,
+    /// 256-bit bitmap of consumed nonces for `(user, channel_id, word_index)`.
+    /// Stored as `BytesN<32>` — four big-endian `u64` limbs ([u64; 4]) — in
+    /// persistent storage (issue #918).
+    NonceBitmap(Address, u32, u32),
 }
 
 // ── Error codes ───────────────────────────────────────────────────────────────
@@ -74,6 +114,10 @@ pub enum ProxyError {
     Unauthorized = 3,
     /// The supplied logic address equals the one already stored.
     SameLogicAddress = 4,
+    /// The requested nonce bit was already consumed — replay attempt.
+    NonceAlreadyUsed = 5,
+    /// `bit_index` exceeded 255; a word holds exactly 256 nonce bits.
+    InvalidBitIndex = 6,
 }
 
 // ── TTL helpers ───────────────────────────────────────────────────────────────
@@ -81,6 +125,8 @@ pub enum ProxyError {
 const DAY_IN_LEDGERS: u32 = 17_280; // ≈5 s per ledger
 const INSTANCE_BUMP: u32 = 7 * DAY_IN_LEDGERS;
 const INSTANCE_THRESHOLD: u32 = INSTANCE_BUMP - DAY_IN_LEDGERS;
+const PERSISTENT_BUMP: u32 = 30 * DAY_IN_LEDGERS;
+const PERSISTENT_THRESHOLD: u32 = PERSISTENT_BUMP - DAY_IN_LEDGERS;
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -251,6 +297,94 @@ impl PaymentProxy {
             .ok_or(ProxyError::NotInitialized)
     }
 
+    // ── Bitmapped nonce management (issue #918) ───────────────────────
+
+    /// Consumes the nonce `(channel_id, word_index, bit_index)` for `user`.
+    ///
+    /// The 256-bit word holding the bit is loaded, validated, flipped, and
+    /// written back in this one invocation, so check-and-set is atomic. An
+    /// already-set bit — a nonce consumed before — is rejected with
+    /// [`ProxyError::NonceAlreadyUsed`], making replay impossible.
+    ///
+    /// Nonces are independent per bit (and per channel), so execution order
+    /// is unconstrained: `#5` may execute before `#2` — no head-of-line
+    /// blocking.
+    ///
+    /// # Parameters
+    /// - `user` — Nonce owner; must authorize this call.
+    /// - `channel_id` — Independent nonce channel (parallel stream).
+    /// - `word_index` — Index of the 256-bit word inside the channel.
+    /// - `bit_index` — Bit inside the word (`0..=255`, carried as `u32`).
+    ///
+    /// # Errors
+    /// - [`ProxyError::NonceAlreadyUsed`] if the bit was already consumed.
+    /// - [`ProxyError::InvalidBitIndex`] if `bit_index` exceeds 255.
+    pub fn consume_nonce(
+        env: Env,
+        user: Address,
+        channel_id: u32,
+        word_index: u32,
+        bit_index: u32,
+    ) -> Result<(), ProxyError> {
+        if bit_index > 255 {
+            return Err(ProxyError::InvalidBitIndex);
+        }
+
+        // Only the nonce owner may burn their own nonces; otherwise anyone
+        // could grief a sender by consuming future nonces out from under them.
+        user.require_auth();
+
+        let mut word = Self::load_nonce_word(&env, &user, channel_id, word_index);
+        let limb = (bit_index / 64) as usize;
+        let mask = 1u64 << (bit_index % 64);
+
+        // Revert on reuse: the bit must still be unconsumed.
+        if word[limb] & mask != 0 {
+            return Err(ProxyError::NonceAlreadyUsed);
+        }
+
+        word[limb] |= mask;
+        Self::store_nonce_word(&env, &user, channel_id, word_index, &word);
+
+        env.events().publish(
+            (symbol_short!("nonce"), user, channel_id),
+            (word_index, bit_index),
+        );
+
+        Ok(())
+    }
+
+    /// Returns `true` when `user` has already consumed
+    /// `(channel_id, word_index, bit_index)`. An out-of-range `bit_index`
+    /// (`> 255`) always reads as `false`.
+    pub fn is_nonce_consumed(
+        env: Env,
+        user: Address,
+        channel_id: u32,
+        word_index: u32,
+        bit_index: u32,
+    ) -> bool {
+        if bit_index > 255 {
+            return false;
+        }
+        let word = Self::load_nonce_word(&env, &user, channel_id, word_index);
+        let limb = (bit_index / 64) as usize;
+        word[limb] & (1u64 << (bit_index % 64)) != 0
+    }
+
+    /// Returns the raw 256-bit bitmap word for `(user, channel_id,
+    /// word_index)` as 32 bytes (four big-endian `u64` limbs). A word that
+    /// was never written reads as all zeroes.
+    pub fn get_nonce_bitmap(
+        env: Env,
+        user: Address,
+        channel_id: u32,
+        word_index: u32,
+    ) -> BytesN<32> {
+        let word = Self::load_nonce_word(&env, &user, channel_id, word_index);
+        BytesN::from_array(&env, &Self::nonce_word_to_bytes(&word))
+    }
+
     // ── Internal helpers ───────────────────────────────────────────────────────
 
     /// Reads the stored admin, checks it equals `caller`, and calls
@@ -275,6 +409,59 @@ impl PaymentProxy {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_THRESHOLD, INSTANCE_BUMP);
+    }
+
+    /// Loads the 256-bit nonce bitmap word ([u64; 4]) for
+    /// `(user, channel_id, word_index)`, defaulting to an all-zero word.
+    fn load_nonce_word(env: &Env, user: &Address, channel_id: u32, word_index: u32) -> [u64; 4] {
+        let key = ProxyDataKey::NonceBitmap(user.clone(), channel_id, word_index);
+        match env
+            .storage()
+            .persistent()
+            .get::<ProxyDataKey, BytesN<32>>(&key)
+        {
+            Some(packed) => Self::nonce_word_from_bytes(&packed.to_array()),
+            None => [0u64; 4],
+        }
+    }
+
+    /// Writes a 256-bit nonce bitmap word back to persistent storage and
+    /// extends its TTL so an idle channel cannot expire mid-stream.
+    fn store_nonce_word(
+        env: &Env,
+        user: &Address,
+        channel_id: u32,
+        word_index: u32,
+        word: &[u64; 4],
+    ) {
+        let key = ProxyDataKey::NonceBitmap(user.clone(), channel_id, word_index);
+        env.storage().persistent().set(
+            &key,
+            &BytesN::from_array(env, &Self::nonce_word_to_bytes(word)),
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP);
+    }
+
+    /// Unpacks a 32-byte bitmap word into its four big-endian `u64` limbs.
+    fn nonce_word_from_bytes(bytes: &[u8; 32]) -> [u64; 4] {
+        let mut word = [0u64; 4];
+        for (i, limb) in word.iter_mut().enumerate() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
+            *limb = u64::from_be_bytes(chunk);
+        }
+        word
+    }
+
+    /// Packs four big-endian `u64` limbs back into a 32-byte bitmap word.
+    fn nonce_word_to_bytes(word: &[u64; 4]) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for (i, limb) in word.iter().enumerate() {
+            bytes[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_be_bytes());
+        }
+        bytes
     }
 }
 
@@ -536,5 +723,223 @@ mod tests {
             client.try_get_logic_contract(),
             Err(Ok(ProxyError::NotInitialized))
         );
+    }
+
+    // ── Bitmapped nonce management (issue #918) ───────────────────────
+
+    /// Convenience: nonce management is self-contained, so a fresh
+    /// uninitialized proxy client is enough (auth is mocked for the user
+    /// require_auth inside consume_nonce).
+    fn make_nonce_client() -> (Env, PaymentProxyClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let proxy_id = env.register_contract(None, PaymentProxy);
+        let client = PaymentProxyClient::new(&env, &proxy_id);
+        (env, client)
+    }
+
+    /// A word that was never written reads back as all zeroes.
+    #[test]
+    fn untouched_nonce_word_reads_all_zeroes() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        assert_eq!(
+            client.get_nonce_bitmap(&user, &0, &0),
+            BytesN::from_array(&env, &[0u8; 32])
+        );
+    }
+
+    /// Consuming a nonce flips exactly its bit in the 256-bit word, which is
+    /// persisted under NonceBitmap(user, channel_id, word_index).
+    #[test]
+    fn consume_nonce_flips_bit_in_256_bit_word() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &7));
+
+        client.consume_nonce(&user, &0, &0, &7);
+
+        assert!(client.is_nonce_consumed(&user, &0, &0, &7));
+        // Neighbouring bits stay unconsumed.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &6));
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &8));
+
+        // Bit 7 lives in the first big-endian u64 limb, whose byte 7 holds
+        // the low mask 0x80.
+        let mut expected = [0u8; 32];
+        expected[7] = 0x80;
+        assert_eq!(
+            client.get_nonce_bitmap(&user, &0, &0),
+            BytesN::from_array(&env, &expected)
+        );
+    }
+
+    /// Out-of-order execution: nonce #5 lands and executes before nonce #2
+    /// — the core fix for head-of-line blocking.
+    #[test]
+    fn out_of_order_execution_succeeds() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        // #5 arrives first while #2 is still stalled in the relayer pool.
+        client.consume_nonce(&user, &0, &0, &5);
+        // #2 finally lands; it must not be blocked by #5 having gone first.
+        client.consume_nonce(&user, &0, &0, &2);
+
+        assert!(client.is_nonce_consumed(&user, &0, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &2));
+        // Nothing between or around them was implicitly consumed.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &3));
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &4));
+    }
+
+    /// Replaying a consumed nonce reverts with NonceAlreadyUsed and leaves
+    /// the bitmap intact — no replay vulnerability.
+    #[test]
+    fn replay_of_consumed_nonce_reverts() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        client.consume_nonce(&user, &0, &0, &5);
+        client.consume_nonce(&user, &0, &0, &2);
+
+        assert_eq!(
+            client.try_consume_nonce(&user, &0, &0, &5),
+            Err(Ok(ProxyError::NonceAlreadyUsed))
+        );
+        assert_eq!(
+            client.try_consume_nonce(&user, &0, &0, &2),
+            Err(Ok(ProxyError::NonceAlreadyUsed))
+        );
+
+        // The failed replays changed nothing: a fresh nonce in the same
+        // word is still usable, and the replayed bits are still consumed.
+        client.consume_nonce(&user, &0, &0, &3);
+        assert!(client.is_nonce_consumed(&user, &0, &0, &3));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &2));
+    }
+
+    /// Channels are independent: the same (word, bit) position can be
+    /// consumed in each channel without touching the others.
+    #[test]
+    fn channels_are_independent() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        client.consume_nonce(&user, &0, &0, &5);
+        client.consume_nonce(&user, &1, &0, &5);
+        client.consume_nonce(&user, &2, &0, &2);
+
+        assert!(client.is_nonce_consumed(&user, &0, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &1, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &2, &0, &2));
+        // Channels 0 and 1 did not consume bit 2; channels 0 and 2 did not
+        // share state for bit 5.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &2));
+        assert!(!client.is_nonce_consumed(&user, &1, &0, &2));
+
+        // #5 is still consumable on a brand-new channel...
+        client.consume_nonce(&user, &3, &0, &5);
+        // ...but replaying it inside a used channel still reverts.
+        assert_eq!(
+            client.try_consume_nonce(&user, &1, &0, &5),
+            Err(Ok(ProxyError::NonceAlreadyUsed))
+        );
+    }
+
+    /// Bits on limb boundaries live in different u64 limbs of the same
+    /// 256-bit word and never collide with each other.
+    #[test]
+    fn limb_boundaries_do_not_collide() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        let boundary_bits = [0u32, 63, 64, 127, 128, 191, 192, 255];
+
+        for bit in boundary_bits {
+            client.consume_nonce(&user, &0, &0, &bit);
+        }
+        for bit in boundary_bits {
+            assert!(client.is_nonce_consumed(&user, &0, &0, &bit));
+            assert_eq!(
+                client.try_consume_nonce(&user, &0, &0, &bit),
+                Err(Ok(ProxyError::NonceAlreadyUsed))
+            );
+        }
+
+        // Each of the four limbs holds exactly bits 0 and 63 set:
+        // 0x8000000000000001, big-endian, repeated four times.
+        let limb_value: u64 = (1u64 << 63) | 1;
+        let mut expected = [0u8; 32];
+        for chunk in expected.chunks_mut(8) {
+            chunk.copy_from_slice(&limb_value.to_be_bytes());
+        }
+        assert_eq!(
+            client.get_nonce_bitmap(&user, &0, &0),
+            BytesN::from_array(&env, &expected)
+        );
+    }
+
+    /// A fully consumed 256-bit word rejects replays of every nonce in it,
+    /// while the next word in the same channel remains a fresh 256-nonce
+    /// space — the stream continues without head-of-line blocking.
+    #[test]
+    fn full_word_rejects_replays_and_next_word_is_fresh() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        for bit in 0..=255u32 {
+            client.consume_nonce(&user, &0, &0, &bit);
+        }
+        for bit in [0u32, 42, 128, 255] {
+            assert_eq!(
+                client.try_consume_nonce(&user, &0, &0, &bit),
+                Err(Ok(ProxyError::NonceAlreadyUsed))
+            );
+        }
+
+        // Word 1 in the same channel is untouched by word 0's exhaustion.
+        client.consume_nonce(&user, &0, &1, &0);
+        assert!(client.is_nonce_consumed(&user, &0, &1, &0));
+        assert!(!client.is_nonce_consumed(&user, &0, &1, &1));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &0));
+    }
+
+    /// Nonce bitmaps are scoped per user: one user's consumption never
+    /// affects another user's stream.
+    #[test]
+    fn nonces_are_scoped_per_user() {
+        let (env, client) = make_nonce_client();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.consume_nonce(&alice, &0, &0, &5);
+
+        assert!(client.is_nonce_consumed(&alice, &0, &0, &5));
+        assert!(!client.is_nonce_consumed(&bob, &0, &0, &5));
+
+        client.consume_nonce(&bob, &0, &0, &5);
+        assert!(client.is_nonce_consumed(&bob, &0, &0, &5));
+    }
+
+    /// An out-of-range bit_index reverts instead of silently aliasing
+    /// another bit (256 would wrap into bit 0 of the same limb if unchecked).
+    #[test]
+    fn out_of_range_bit_index_reverts() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        assert_eq!(
+            client.try_consume_nonce(&user, &0, &0, &256),
+            Err(Ok(ProxyError::InvalidBitIndex))
+        );
+
+        // The rejected call consumed nothing, and the view reports
+        // out-of-range bits as never consumed.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &0));
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &256));
     }
 }
