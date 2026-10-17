@@ -3142,7 +3142,10 @@ fn test_migrate_user_record_combines_legacy_entries() {
 
     // Migrate: reports success, writes the packed record, drops the
     // legacy keys.
-    assert!(client.migrate_user_record(&user));
+    client.migrate_user_record(&user);
+    let (_, topics, _) = env.events().all().last().unwrap();
+    let event_name: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(event_name, Symbol::new(&env, "user_record_migrated"));
 
     env.as_contract(&contract_id, || {
         let record_key = DataKey::UserRecord(user.clone());
@@ -3157,8 +3160,14 @@ fn test_migrate_user_record_combines_legacy_entries() {
     assert_eq!(post.last_reset_time, legacy_window_start);
     assert_eq!(client.get_user_volume(&user), 7_500);
 
-    // Migrating again is a no-op.
-    assert!(!client.migrate_user_record(&user));
+    // Migrating an existing packed record is rejected explicitly.
+    assert_eq!(
+        client
+            .try_migrate_user_record(&user)
+            .unwrap_err()
+            .unwrap(),
+        Error::UserRecordAlreadyMigrated
+    );
 
     // And a fresh payment continues from the migrated record.
     let (token_address, _token_client, sac) = setup_token(&env);
@@ -3221,8 +3230,8 @@ fn test_route_payment_upgrades_legacy_entries_in_place() {
     assert_eq!(client.get_user_volume(&sender), 21_000);
 }
 
-/// `migrate_user_record` is a safe no-op for unknown senders and for
-/// senders that already have a packed record (issue #663).
+/// `migrate_user_record` rejects unknown senders and senders that already
+/// have a packed record (issue #663).
 #[test]
 fn test_migrate_user_record_no_op_cases() {
     let (env, client, _) = setup_env();
@@ -3236,13 +3245,25 @@ fn test_migrate_user_record_no_op_cases() {
     client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
     // Unknown sender: nothing to migrate.
-    assert!(!client.migrate_user_record(&unknown));
+    assert_eq!(
+        client
+            .try_migrate_user_record(&unknown)
+            .unwrap_err()
+            .unwrap(),
+        Error::LegacyUserRecordNotFound
+    );
 
     // Sender with a packed record already: nothing to migrate.
     let (token_address, _token_client, sac) = setup_token(&env);
     sac.mint(&sender, &10_000);
     client.route_payment(&sender, &recipient, &token_address, &1_000);
-    assert!(!client.migrate_user_record(&sender));
+    assert_eq!(
+        client
+            .try_migrate_user_record(&sender)
+            .unwrap_err()
+            .unwrap(),
+        Error::UserRecordAlreadyMigrated
+    );
 
     // State is untouched.
     let record = client.get_user_record(&sender);

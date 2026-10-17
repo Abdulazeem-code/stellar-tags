@@ -248,6 +248,51 @@
             "key": {
               "vec": [
                 {
+                  "symbol": "RateLimitCounter"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "RateLimitCounter"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "bytes": "0000000000000001"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
                   "symbol": "UserRecord"
                 },
                 {
@@ -494,6 +539,57 @@
         {
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "UserRole"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "u32": 5
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "UserRole"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                    },
+                    {
+                      "u32": 5
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "bool": true
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "key": "ledger_key_contract_instance",
             "durability": "persistent"
           }
@@ -686,6 +782,21 @@
                             },
                             {
                               "u32": 4
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Role"
+                            },
+                            {
+                              "u32": 5
                             }
                           ]
                         },
@@ -1283,7 +1394,73 @@
               }
             ],
             "data": {
-              "bool": false
+              "error": {
+                "contract": 49
+              }
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 49
+                }
+              }
+            ],
+            "data": {
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 49
+                }
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "contract try_call failed"
+                },
+                {
+                  "symbol": "migrate_user_record"
+                },
+                {
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  ]
+                }
+              ]
             }
           }
         }
@@ -1935,7 +2112,73 @@
               }
             ],
             "data": {
-              "bool": false
+              "error": {
+                "contract": 48
+              }
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 48
+                }
+              }
+            ],
+            "data": {
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 48
+                }
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "contract try_call failed"
+                },
+                {
+                  "symbol": "migrate_user_record"
+                },
+                {
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  ]
+                }
+              ]
             }
           }
         }
