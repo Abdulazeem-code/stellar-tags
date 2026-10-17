@@ -115,4 +115,6 @@ pub enum Error {
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
     CyclicSwapPath = 48,
+    /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
+    InvalidSlippageConfig = 49,
 }

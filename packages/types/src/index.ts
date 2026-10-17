@@ -114,7 +114,7 @@ min_amount_out: i128;
  * Each variant carries all the arguments needed to apply that change when the
  * delay period is over.
  */
-export type ActionType = {tag: "SetPlatformTreasury", values: readonly [string]} | {tag: "SetFeeConfig", values: readonly [i128, i128]} | {tag: "SetFeeBps", values: readonly [i128]} | {tag: "SetGovernance", values: readonly [string]} | {tag: "SetMinLimit", values: readonly [i128]} | {tag: "TransferAdmin", values: readonly [string]} | {tag: "Upgrade", values: readonly [Buffer]} | {tag: "SetBackupAdmin", values: readonly [string, u64]} | {tag: "RegisterDex", values: readonly [string]} | {tag: "DeregisterDex", values: readonly [string]} | {tag: "SetMaxSlippageBps", values: readonly [i128]} | {tag: "SetMultisigConfig", values: readonly [Array<string>, u32]};
+export type ActionType = {tag: "SetPlatformTreasury", values: readonly [string]} | {tag: "SetFeeConfig", values: readonly [i128, i128]} | {tag: "SetFeeBps", values: readonly [i128]} | {tag: "SetGovernance", values: readonly [string]} | {tag: "SetMinLimit", values: readonly [i128]} | {tag: "TransferAdmin", values: readonly [string]} | {tag: "Upgrade", values: readonly [Buffer]} | {tag: "SetBackupAdmin", values: readonly [string, u64]} | {tag: "RegisterDex", values: readonly [string]} | {tag: "DeregisterDex", values: readonly [string]} | {tag: "SetMaxSlippageBps", values: readonly [i128]} | {tag: "SetPairMaxSlippageBps", values: readonly [string, string, i128]} | {tag: "SetMultisigConfig", values: readonly [Array<string>, u32]};
 
 
 /**
@@ -472,7 +472,9 @@ export const Errors = {
   /**
    * A reentrant call was detected.
    */
-  42: {message:"ReentrantCall"}
+  42: {message:"ReentrantCall"},
+  /** A pair-specific slippage cap is negative or exceeds 500 bps. */
+  49: {message:"InvalidSlippageConfig"}
 }
 
 /**
@@ -493,7 +495,7 @@ export enum Role {
 /**
  * Storage keys for all contract instance and persistent data.
  */
-export type DataKey = {tag: "Admin", values: void} | {tag: "Governance", values: void} | {tag: "PlatformTreasury", values: void} | {tag: "FeeBps", values: void} | {tag: "FeeCap", values: void} | {tag: "MinLimit", values: void} | {tag: "Paused", values: void} | {tag: "MaxAmount", values: void} | {tag: "UserRecord", values: readonly [string]} | {tag: "UserSpending", values: readonly [string]} | {tag: "UserVolume", values: readonly [string]} | {tag: "Blacklist", values: readonly [string]} | {tag: "RefundBalance", values: readonly [string, string]} | {tag: "TimelockNonce", values: void} | {tag: "TimelockEntry", values: readonly [u64]} | {tag: "Frozen", values: void} | {tag: "UserRole", values: readonly [string, Role]} | {tag: "Role", values: readonly [Role]} | {tag: "MetaNonce", values: readonly [string]} | {tag: "KycOracle", values: void} | {tag: "KycThreshold", values: void} | {tag: "BackupAdmin", values: void} | {tag: "LastHeartbeat", values: void} | {tag: "DmsTimeout", values: void} | {tag: "RateLimitConfig", values: void} | {tag: "RateLimitCounter", values: readonly [string]} | {tag: "RateLimitWhitelist", values: readonly [string]} | {tag: "OracleAddress", values: void} | {tag: "StalenessThreshold", values: void} | {tag: "FallbackPrice", values: readonly [string, string]} | {tag: "GovernanceToken", values: void} | {tag: "GovernanceQuorum", values: void} | {tag: "GovernanceNonce", values: void} | {tag: "GovernanceProposal", values: readonly [u64]} | {tag: "GovernanceVote", values: readonly [u64, string]} | {tag: "ArchiveEpoch", values: void} | {tag: "ArchiveRoot", values: readonly [u64]} | {tag: "ArchiveMeta", values: readonly [u64]} | {tag: "YieldProtocol", values: void} | {tag: "YieldPrincipal", values: readonly [string]} | {tag: "RegisteredDex", values: readonly [string]} | {tag: "MaxSlippageBps", values: void} | {tag: "MultisigSigners", values: void} | {tag: "MultisigThreshold", values: void} | {tag: "UpgradeApproval", values: readonly [Buffer]} | {tag: "ReentrancyGuard", values: void};
+export type DataKey = {tag: "Admin", values: void} | {tag: "Governance", values: void} | {tag: "PlatformTreasury", values: void} | {tag: "FeeBps", values: void} | {tag: "FeeCap", values: void} | {tag: "MinLimit", values: void} | {tag: "Paused", values: void} | {tag: "MaxAmount", values: void} | {tag: "UserRecord", values: readonly [string]} | {tag: "UserSpending", values: readonly [string]} | {tag: "UserVolume", values: readonly [string]} | {tag: "Blacklist", values: readonly [string]} | {tag: "RefundBalance", values: readonly [string, string]} | {tag: "TimelockNonce", values: void} | {tag: "TimelockEntry", values: readonly [u64]} | {tag: "Frozen", values: void} | {tag: "UserRole", values: readonly [string, Role]} | {tag: "Role", values: readonly [Role]} | {tag: "MetaNonce", values: readonly [string]} | {tag: "KycOracle", values: void} | {tag: "KycThreshold", values: void} | {tag: "BackupAdmin", values: void} | {tag: "LastHeartbeat", values: void} | {tag: "DmsTimeout", values: void} | {tag: "RateLimitConfig", values: void} | {tag: "RateLimitCounter", values: readonly [string]} | {tag: "RateLimitWhitelist", values: readonly [string]} | {tag: "OracleAddress", values: void} | {tag: "StalenessThreshold", values: void} | {tag: "FallbackPrice", values: readonly [string, string]} | {tag: "GovernanceToken", values: void} | {tag: "GovernanceQuorum", values: void} | {tag: "GovernanceNonce", values: void} | {tag: "GovernanceProposal", values: readonly [u64]} | {tag: "GovernanceVote", values: readonly [u64, string]} | {tag: "ArchiveEpoch", values: void} | {tag: "ArchiveRoot", values: readonly [u64]} | {tag: "ArchiveMeta", values: readonly [u64]} | {tag: "YieldProtocol", values: void} | {tag: "YieldPrincipal", values: readonly [string]} | {tag: "RegisteredDex", values: readonly [string]} | {tag: "MaxSlippageBps", values: void} | {tag: "PairSlippage", values: readonly [string, string]} | {tag: "MultisigSigners", values: void} | {tag: "MultisigThreshold", values: void} | {tag: "UpgradeApproval", values: readonly [Buffer]} | {tag: "ReentrancyGuard", values: void};
 
 
 /**
@@ -1710,6 +1712,9 @@ export interface Client {
    */
   get_max_slippage_bps: (options?: MethodOptions) => Promise<AssembledTransaction<i128>>
 
+  /** Construct and simulate a get_pair_max_slippage_bps transaction. */
+  get_pair_max_slippage_bps: ({token_in, token_out}: {token_in: string, token_out: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
+
   /**
    * Construct and simulate a set_max_slippage_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Sets the maximum tolerated swap slippage. Admin-only.
@@ -1733,6 +1738,9 @@ export interface Client {
    * and execute after 24 hours.
    */
   set_max_slippage_bps: ({max_slippage_bps}: {max_slippage_bps: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /** Sets a pair-specific swap slippage ceiling (0 through 500 bps). */
+  set_pair_max_slippage_bps: ({token_in, token_out, max_slippage_bps}: {token_in: string, token_out: string, max_slippage_bps: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a get_effective_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -2247,7 +2255,9 @@ export class Client extends ContractClient {
         configure_governance: this.txFromJSON<Result<void>>,
         get_dead_mans_switch: this.txFromJSON<readonly [Option<string>, u64, u64, u64]>,
         get_max_slippage_bps: this.txFromJSON<i128>,
+        get_pair_max_slippage_bps: this.txFromJSON<Result<i128>>,
         set_max_slippage_bps: this.txFromJSON<Result<void>>,
+        set_pair_max_slippage_bps: this.txFromJSON<Result<void>>,
         get_effective_fee_bps: this.txFromJSON<i128>,
         get_upgrade_approvals: this.txFromJSON<Array<string>>,
         is_upgrade_authorized: this.txFromJSON<Result<boolean>>,
