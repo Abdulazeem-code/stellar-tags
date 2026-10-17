@@ -1,6 +1,7 @@
 #![no_std]
 pub mod access;
 mod archival;
+pub mod batch;
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
@@ -10,6 +11,7 @@ pub mod types;
 
 pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
+pub use batch::*;
 pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
