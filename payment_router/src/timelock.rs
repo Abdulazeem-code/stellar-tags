@@ -43,7 +43,7 @@ pub fn apply_action(env: &Env, action: ActionType) -> Result<(), Error> {
             apply_upgrade(env, &new_wasm_hash);
         }
         ActionType::SetMultisigConfig(signers, threshold) => {
-            store_multisig_config(env, signers, threshold);
+            store_multisig_config(env, signers, threshold)?;
         }
         ActionType::RegisterDex(dex) => {
             let key = DataKey::RegisteredDex(dex.clone());

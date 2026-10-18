@@ -93,14 +93,11 @@ pub enum Error {
     InvalidSwapPath = 35,
     /// The DEX returned less than the caller's minimum acceptable output.
     SlippageExceededSwap = 36,
-    /// The multi-signature configuration is unusable: the signer set is empty,
-    /// contains a duplicate address, the threshold is zero, or the threshold
-    /// exceeds the number of signers (so the upgrade could never be authorized).
+    /// Legacy multisig-configuration error retained for compatibility.
     InvalidMultisigConfig = 37,
     /// The calling address is not a member of the multi-signature admin group.
     NotMultisigSigner = 38,
-    /// The number of collected upgrade approvals is below the configured
-    /// threshold, so the upgrade is not authorized yet.
+    /// The number of collected approvals is below the configured threshold.
     InsufficientApprovals = 39,
     /// No multi-signature admin group has been configured yet.  Upgrades fail
     /// closed until `set_multisig_config` has been called, so a freshly
@@ -115,4 +112,8 @@ pub enum Error {
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
     CyclicSwapPath = 48,
+    /// A multi-signature threshold is outside the allowed quorum bounds.
+    InvalidThreshold = 49,
+    /// A multi-signature signer set contains a duplicate address.
+    DuplicateSigner = 50,
 }

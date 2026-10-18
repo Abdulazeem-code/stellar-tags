@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::Env;
+use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
+use soroban_sdk::{Env, Symbol, TryIntoVal};
 
 struct Setup {
     env: Env,
@@ -544,3 +544,133 @@ fn consult_with_zero_window_returns_latest_spot_consensus() {
     assert_eq!(setup.client.consult(&0), 305);
 }
 
+#[test]
+fn geometric_twap_resists_oscillating_price_bias() {
+    let setup = setup();
+    set_time(&setup.env, 1_000);
+    setup.client.observe(&100, &1_000);
+    setup.env.budget().reset_default();
+    set_time(&setup.env, 1_060);
+    setup.client.observe(&400, &1_060);
+    assert!(
+        setup.env.budget().cpu_instruction_cost() < 50_000,
+        "geometric accumulator update exceeded the CPU instruction budget"
+    );
+    set_time(&setup.env, 1_120);
+    setup.client.observe(&100, &1_120);
+
+    assert_eq!(setup.client.twap(&120), 250);
+    assert_eq!(setup.client.geometric_twap(&120), 200);
+}
+
+fn signed_submission(
+    setup: &Setup,
+    key: &ed25519_dalek::SigningKey,
+    base: &Symbol,
+    quote: &Symbol,
+    price: i128,
+    timestamp: u64,
+) -> SignedPricePayload {
+    use ed25519_dalek::Signer;
+    let signer = BytesN::from_array(&setup.env, &key.verifying_key().to_bytes());
+    let digest = setup
+        .client
+        .oracle_price_digest(base, quote, &price, &timestamp, &signer);
+    let signature = key.sign(&digest.to_array());
+    SignedPricePayload {
+        base: base.clone(),
+        quote: quote.clone(),
+        price,
+        timestamp,
+        signer,
+        signature: BytesN::from_array(&setup.env, &signature.to_bytes()),
+    }
+}
+
+#[test]
+fn signed_oracle_aggregates_a_quorum_median_and_rejects_untrusted_keys() {
+    use ed25519_dalek::SigningKey;
+
+    let setup = setup();
+    let keys = [
+        SigningKey::from_bytes(&[1; 32]),
+        SigningKey::from_bytes(&[2; 32]),
+        SigningKey::from_bytes(&[3; 32]),
+    ];
+    let signers = soroban_sdk::vec![
+        &setup.env,
+        BytesN::from_array(&setup.env, &keys[0].verifying_key().to_bytes()),
+        BytesN::from_array(&setup.env, &keys[1].verifying_key().to_bytes()),
+        BytesN::from_array(&setup.env, &keys[2].verifying_key().to_bytes()),
+    ];
+    setup.client.set_oracle_signers(&signers, &2);
+
+    let base = Symbol::new(&setup.env, "XLM");
+    let quote = Symbol::new(&setup.env, "USD");
+    let timestamp = setup.env.ledger().timestamp();
+    let submissions = soroban_sdk::vec![
+        &setup.env,
+        signed_submission(&setup, &keys[0], &base, &quote, 100, timestamp),
+        signed_submission(&setup, &keys[1], &base, &quote, 110, timestamp),
+        signed_submission(&setup, &keys[2], &base, &quote, 1_000, timestamp),
+    ];
+    let aggregate = setup.client.push_oracle_prices(&submissions);
+    assert_eq!(aggregate.price, 110);
+    assert_eq!(aggregate.valid_signatures, 3);
+    assert_eq!(
+        setup.client.signed_oracle_price(&base, &quote),
+        Some(aggregate)
+    );
+
+    let untrusted = SigningKey::from_bytes(&[4; 32]);
+    let invalid = soroban_sdk::vec![
+        &setup.env,
+        signed_submission(&setup, &keys[0], &base, &quote, 100, timestamp),
+        signed_submission(&setup, &untrusted, &base, &quote, 110, timestamp),
+    ];
+    assert_eq!(
+        setup.client.try_push_oracle_prices(&invalid),
+        Err(Ok(Error::InvalidSigner))
+    );
+}
+
+#[test]
+fn outlier_pool_is_rejected_emits_event_and_uses_secondary_median() {
+    let setup = setup();
+    let base = Symbol::new(&setup.env, "XLM");
+    let quote = Symbol::new(&setup.env, "USD");
+    let primary = Address::generate(&setup.env);
+    let secondary_a = Address::generate(&setup.env);
+    let secondary_b = Address::generate(&setup.env);
+
+    setup.client.set_primary_pool(&base, &quote, &primary);
+    set_time(&setup.env, 1_000);
+    assert!(setup
+        .client
+        .observe_pool(&base, &quote, &primary, &100, &10, &1_000));
+    assert!(setup
+        .client
+        .observe_pool(&base, &quote, &secondary_a, &102, &10, &1_000));
+    assert!(setup
+        .client
+        .observe_pool(&base, &quote, &secondary_b, &98, &10, &1_000));
+    assert_eq!(setup.client.pool_consensus_price(&base, &quote), 100);
+
+    set_time(&setup.env, 1_060);
+    assert!(!setup
+        .client
+        .observe_pool(&base, &quote, &primary, &500, &10, &1_060));
+    assert_eq!(setup.client.consult_pair(&base, &quote), 100);
+
+    let mut saw_anomaly = false;
+    for event in setup.env.events().all().iter() {
+        let (_, topics, _) = event;
+        if topics.len() > 0 {
+            let topic: Symbol = topics.get(0).unwrap().try_into_val(&setup.env).unwrap();
+            if topic == Symbol::new(&setup.env, "oracle_anomaly_detected") {
+                saw_anomaly = true;
+            }
+        }
+    }
+    assert!(saw_anomaly);
+}

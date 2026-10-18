@@ -4761,3 +4761,71 @@ fn test_version_is_non_empty() {
     // A Soroban String's byte length is accessible via .len()
     assert!(v.len() > 0, "version must not be empty");
 }
+
+#[test]
+fn multisig_configuration_enforces_quorum_and_unique_signers() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+    let signers = soroban_sdk::vec![
+        &env,
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+
+    assert_eq!(
+        client.try_set_multisig_config(&signers, &0),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    assert_eq!(
+        client.try_set_multisig_config(&signers, &1),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    assert_eq!(
+        client.try_set_multisig_config(&signers, &6),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    let duplicate = soroban_sdk::vec![&env, signers.get(0).unwrap(), signers.get(0).unwrap(),];
+    assert_eq!(
+        client.try_set_multisig_config(&duplicate, &2),
+        Err(Ok(Error::DuplicateSigner))
+    );
+}
+
+#[test]
+fn multisig_rotation_requires_current_group_quorum() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+    let current_signers = soroban_sdk::vec![
+        &env,
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    client.set_multisig_config(&current_signers, &2);
+    let replacement = soroban_sdk::vec![&env, Address::generate(&env), Address::generate(&env),];
+
+    assert_eq!(
+        client.try_set_multisig_config(&replacement, &2),
+        Err(Ok(Error::InsufficientApprovals))
+    );
+    client.approve_multisig_config(&replacement, &2, &current_signers.get(0).unwrap());
+    client.approve_multisig_config(&replacement, &2, &current_signers.get(1).unwrap());
+    client.set_multisig_config(&replacement, &2);
+
+    let stored = client.get_multisig_config();
+    assert_eq!(stored.threshold, 2);
+    assert_eq!(stored.signers.len(), 2);
+    assert!(stored.signers.contains(&replacement.get(0).unwrap()));
+    assert!(stored.signers.contains(&replacement.get(1).unwrap()));
+    assert_eq!(
+        stored.signers,
+        access::sorted_multisig_signers(&env, &stored.signers)
+    );
+}

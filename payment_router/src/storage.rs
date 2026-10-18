@@ -139,6 +139,8 @@ pub enum DataKey {
     UpgradeApproval(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
+    /// Signer approvals collected for a specific multisig configuration.
+    MultisigConfigApproval(BytesN<32>),
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
