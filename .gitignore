@@ -1,4 +1,6 @@
 node_modules/
+target/
+pausable_token/target/
 
 # Logs
 logs
