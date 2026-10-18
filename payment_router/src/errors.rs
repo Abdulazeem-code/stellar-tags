@@ -115,4 +115,8 @@ pub enum Error {
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
     CyclicSwapPath = 48,
+    /// The multi-signature proposal or approval has passed its deadline ledger sequence.
+    ApprovalExpired = 49,
+    /// The multi-signature proposal has already been executed and cannot be replayed.
+    ProposalAlreadyExecuted = 50,
 }

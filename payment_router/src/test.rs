@@ -892,7 +892,10 @@ fn test_execute_batch_actions_three_distinct_actions_success() {
 
     // Verify initial state
     assert_eq!(client.get_fee(), 100);
-    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
     assert!(!client.is_dex_registered(&dex));
 
     // Advance time past the 24h delay
@@ -907,9 +910,18 @@ fn test_execute_batch_actions_three_distinct_actions_success() {
     assert!(client.is_dex_registered(&dex));
 
     // Verify all nonces are removed from queue
-    assert_eq!(client.try_get_queued_action(&n1).unwrap_err().unwrap(), Error::TimelockNotFound);
-    assert_eq!(client.try_get_queued_action(&n2).unwrap_err().unwrap(), Error::TimelockNotFound);
-    assert_eq!(client.try_get_queued_action(&n3).unwrap_err().unwrap(), Error::TimelockNotFound);
+    assert_eq!(
+        client.try_get_queued_action(&n1).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
+    assert_eq!(
+        client.try_get_queued_action(&n2).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
+    assert_eq!(
+        client.try_get_queued_action(&n3).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
 
     // Verify batch_actions_executed event was emitted with the list of nonces
     let events = env.events().all();
@@ -926,7 +938,10 @@ fn test_execute_batch_actions_three_distinct_actions_success() {
             false
         }
     });
-    assert!(found, "batch_actions_executed event not found with list of nonces");
+    assert!(
+        found,
+        "batch_actions_executed event not found with list of nonces"
+    );
 }
 
 #[test]
@@ -959,7 +974,10 @@ fn test_execute_batch_actions_reverts_if_one_not_ready() {
 
     // Verify atomic rollback: none of the actions took effect
     assert_eq!(client.get_fee(), 100);
-    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
     assert!(!client.is_dex_registered(&dex));
 
     // Verify all actions remain pending in the queue
@@ -987,7 +1005,10 @@ fn test_execute_batch_actions_reverts_if_one_not_found() {
 
     // Verify neither action executed
     assert_eq!(client.get_fee(), 100);
-    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
     assert!(client.try_get_queued_action(&n1).is_ok());
     assert!(client.try_get_queued_action(&n2).is_ok());
 }
@@ -4760,4 +4781,167 @@ fn test_version_is_non_empty() {
 
     // A Soroban String's byte length is accessible via .len()
     assert!(v.len() > 0, "version must not be empty");
+}
+
+#[test]
+fn test_multisig_proposal_struct_and_approval_rejected_after_deadline_ledger() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signers = vec![&env, signer1.clone(), signer2.clone()];
+    client.set_multisig_config(&signers, &2);
+
+    // Initial sequence is set to 100
+    advance_ledger(&env, 100);
+
+    let proposal = MultisigProposal {
+        action: ActionType::Upgrade(BytesN::from_array(&env, &[1u8; 32])),
+        deadline_ledger: 100,
+        nonce: 1,
+    };
+
+    // Advancing past deadline_ledger sequence
+    advance_ledger(&env, 101);
+
+    let res = client.try_approve_proposal(&signer1, &proposal);
+    assert_eq!(res.unwrap_err().unwrap(), Error::ApprovalExpired);
+}
+
+#[test]
+fn test_multisig_proposal_approved_before_deadline_and_executed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signers = vec![&env, signer1.clone(), signer2.clone()];
+    client.set_multisig_config(&signers, &2);
+
+    advance_ledger(&env, 50);
+
+    let new_treasury = Address::generate(&env);
+    let proposal = MultisigProposal {
+        action: ActionType::SetPlatformTreasury(new_treasury.clone()),
+        deadline_ledger: 100,
+        nonce: 42,
+    };
+
+    // First approval
+    let digest = client.approve_proposal(&signer1, &proposal);
+    assert!(!client.is_proposal_authorized(&proposal));
+
+    // Second approval reaches 2-of-2 threshold
+    client.approve_proposal(&signer2, &proposal);
+    assert!(client.is_proposal_authorized(&proposal));
+
+    let approvals = client.get_proposal_approvals(&proposal);
+    assert_eq!(approvals.len(), 2);
+
+    // Execution marks digest as executed in storage
+    assert!(!client.is_proposal_executed(&digest));
+    client.execute_proposal(&proposal);
+    assert!(client.is_proposal_executed(&digest));
+
+    let stored_treasury: Address = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformTreasury)
+            .unwrap()
+    });
+    assert_eq!(stored_treasury, new_treasury);
+
+    // Replay attack prevention: cannot execute again
+    let replay_exec = client.try_execute_proposal(&proposal);
+    assert_eq!(
+        replay_exec.unwrap_err().unwrap(),
+        Error::ProposalAlreadyExecuted
+    );
+
+    // Replay attack prevention: cannot approve again
+    let replay_approve = client.try_approve_proposal(&signer1, &proposal);
+    assert_eq!(
+        replay_approve.unwrap_err().unwrap(),
+        Error::ProposalAlreadyExecuted
+    );
+}
+
+#[test]
+fn test_multisig_proposal_nonce_provides_domain_separation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let signer1 = Address::generate(&env);
+    let signers = vec![&env, signer1.clone()];
+    client.set_multisig_config(&signers, &1);
+
+    advance_ledger(&env, 50);
+
+    let new_treasury = Address::generate(&env);
+    let proposal1 = MultisigProposal {
+        action: ActionType::SetPlatformTreasury(new_treasury.clone()),
+        deadline_ledger: 100,
+        nonce: 1,
+    };
+    let proposal2 = MultisigProposal {
+        action: ActionType::SetPlatformTreasury(new_treasury.clone()),
+        deadline_ledger: 100,
+        nonce: 2,
+    };
+
+    let digest1 = client.approve_proposal(&signer1, &proposal1);
+    let digest2 = access::compute_proposal_hash(&env, &proposal2);
+
+    assert_ne!(digest1, digest2);
+    assert!(client.is_proposal_authorized(&proposal1));
+    assert!(!client.is_proposal_authorized(&proposal2));
+}
+
+#[test]
+fn test_multisig_proposal_revoke_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let signer1 = Address::generate(&env);
+    let signers = vec![&env, signer1.clone()];
+    client.set_multisig_config(&signers, &1);
+
+    advance_ledger(&env, 50);
+
+    let proposal = MultisigProposal {
+        action: ActionType::SetMinLimit(500),
+        deadline_ledger: 100,
+        nonce: 10,
+    };
+
+    client.approve_proposal(&signer1, &proposal);
+    assert!(client.is_proposal_authorized(&proposal));
+
+    client.revoke_proposal_approval(&signer1, &proposal);
+    assert!(!client.is_proposal_authorized(&proposal));
 }

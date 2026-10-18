@@ -182,6 +182,18 @@ pub struct MultisigConfig {
     pub threshold: u32,
 }
 
+/// Multi-signature proposal with expiration and replay protection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigProposal {
+    /// The administrative parameter change or action being proposed.
+    pub action: ActionType,
+    /// Ledger sequence after which this proposal's approvals are expired and rejected.
+    pub deadline_ledger: u32,
+    /// Proposal nonce ensuring unique approval digest even for identical actions and deadlines.
+    pub nonce: u64,
+}
+
 /// Adapter interface implemented by the DEX used for an arbitrary token swap.
 #[contractclient(name = "DexRouterClient")]
 pub trait DexRouter {
