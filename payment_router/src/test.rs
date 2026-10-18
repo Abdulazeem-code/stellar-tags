@@ -2105,6 +2105,172 @@ fn sign_meta_payload(
     BytesN::from_array(env, &sig.to_bytes())
 }
 
+fn sign_quote_payload(
+    env: &Env,
+    contract_id: &Address,
+    sender: &Address,
+    recipient: &Address,
+    quote: &Quote,
+    maker_pubkey: &BytesN<32>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> BytesN<64> {
+    use ed25519_dalek::Signer;
+    use soroban_sdk::xdr::ToXdr;
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&contract_id.to_xdr(env));
+    payload.append(&sender.to_xdr(env));
+    payload.append(&recipient.to_xdr(env));
+    payload.append(&quote.to_xdr(env));
+    payload.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &maker_pubkey.to_array(),
+    ));
+    let hash = env.crypto().sha256(&payload);
+    let mut message = [0u8; 32];
+    soroban_sdk::Bytes::from(&hash).copy_into_slice(&mut message);
+    BytesN::from_array(env, &signing_key.sign(&message).to_bytes())
+}
+
+#[test]
+fn test_signed_quote_settles_input_and_output() {
+    let (env, client, contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let maker = Address::generate(&env);
+    let (token_in, input_client, input_admin) = setup_token(&env);
+    let (token_out, output_client, output_admin) = setup_token(&env);
+    input_admin.mint(&sender, &8_000);
+    output_admin.mint(&maker, &12_000);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
+    let maker_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    let quote = Quote {
+        quote_id: soroban_sdk::String::from_str(&env, "quote-1"),
+        maker: maker.clone(),
+        token_in,
+        token_out,
+        amount_in: 8_000,
+        amount_out: 12_000,
+        expires_at: env.ledger().timestamp() + 100,
+    };
+    let signature = sign_quote_payload(
+        &env,
+        &contract_id,
+        &sender,
+        &recipient,
+        &quote,
+        &maker_pubkey,
+        &signing_key,
+    );
+
+    assert_eq!(
+        client.route_payment_with_quote(
+            &sender,
+            &recipient,
+            &quote,
+            &maker_pubkey,
+            &signature,
+        ),
+        12_000
+    );
+    assert_eq!(input_client.balance(&sender), 0);
+    assert_eq!(input_client.balance(&maker), 8_000);
+    assert_eq!(output_client.balance(&maker), 0);
+    assert_eq!(output_client.balance(&recipient), 12_000);
+}
+
+#[test]
+fn test_expired_signed_quote_is_rejected() {
+    let (env, client, contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let maker = Address::generate(&env);
+    let (token_in, _, _) = setup_token(&env);
+    let (token_out, _, _) = setup_token(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+    set_timestamp(&env, 200);
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+    let maker_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    let quote = Quote {
+        quote_id: soroban_sdk::String::from_str(&env, "expired-quote"),
+        maker,
+        token_in,
+        token_out,
+        amount_in: 100,
+        amount_out: 100,
+        expires_at: 100,
+    };
+    let signature = sign_quote_payload(
+        &env,
+        &contract_id,
+        &sender,
+        &recipient,
+        &quote,
+        &maker_pubkey,
+        &signing_key,
+    );
+
+    let result = client.try_route_payment_with_quote(
+        &sender,
+        &recipient,
+        &quote,
+        &maker_pubkey,
+        &signature,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), Error::QuoteExpired);
+}
+
+#[test]
+fn test_tampered_signed_quote_fails_verification() {
+    let (env, client, contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let maker = Address::generate(&env);
+    let (token_in, _, _) = setup_token(&env);
+    let (token_out, _, _) = setup_token(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+    let maker_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    let signed_quote = Quote {
+        quote_id: soroban_sdk::String::from_str(&env, "tampered-quote"),
+        maker,
+        token_in,
+        token_out,
+        amount_in: 100,
+        amount_out: 100,
+        expires_at: env.ledger().timestamp() + 100,
+    };
+    let signature = sign_quote_payload(
+        &env,
+        &contract_id,
+        &sender,
+        &recipient,
+        &signed_quote,
+        &maker_pubkey,
+        &signing_key,
+    );
+    let mut tampered_quote = signed_quote;
+    tampered_quote.amount_out += 1;
+
+    let result = client.try_route_payment_with_quote(
+        &sender,
+        &recipient,
+        &tampered_quote,
+        &maker_pubkey,
+        &signature,
+    );
+    assert!(result.is_err());
+}
+
 #[test]
 fn test_meta_payment_success_and_nonce_increments() {
     let (env, client, contract_id) = setup_env();

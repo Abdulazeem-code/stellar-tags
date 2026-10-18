@@ -87,7 +87,7 @@ fn swap(
     amount_in: i128,
     min_amount_out: i128,
     recipient: Address,
-) -> i128;
+) -> (Address, i128); // actual output token, amount_out
 
 // Prices the same swap without moving funds.
 fn quote(sell_token: Address, buy_token: Address, amount_in: i128) -> i128;
@@ -126,8 +126,17 @@ setters in this contract work.
 | `route_payment_with_swap(SwapPayment) -> i128` | Route one swap-routed payment; returns the `buy_token` delivered. |
 | `route_payments_with_swap(Vec<SwapPayment>) -> i128` | Route a batch atomically; returns the total delivered. |
 | `quote_swap(dex, sell_token, buy_token, amount_in) -> SwapQuote` | Price a swap and derive a slippage-adjusted floor. |
+| `route_payment_with_quote(sender, recipient, quote, maker_pubkey, signature) -> i128` | Settle a signed RFQ quote once; the sender and maker authorize their token transfers. |
 | `register_dex(dex)` / `deregister_dex(dex)` / `is_dex_registered(dex)` | Manage the DEX allowlist. |
 | `set_max_slippage_bps(bps)` / `get_max_slippage_bps()` | Manage the slippage ceiling. |
+
+For quote settlement, the signed message is the SHA-256 hash of the XDR
+serialization of the router address, sender, recipient, `Quote`, and maker
+Ed25519 public key, concatenated in that order. The quote's `maker` is the
+Soroban address that must authorize the transfer of `token_out`; the separate
+public key verifies the quote signature. Quote IDs are single-use per maker.
+The maker transfers the full `amount_out` to the recipient; this route does
+not deduct the platform fee.
 
 New errors, all stable codes a client can branch on:
 
@@ -138,6 +147,8 @@ New errors, all stable codes a client can branch on:
 | `SlippageExceeded` (17) | The output breached `min_amount_out` or `max_slippage_bps`. |
 | `SwapDeadlineExpired` (18) | The payment arrived after its `deadline`. |
 | `InvalidSwapParams` (19) | Unusable parameters, e.g. `sell_token == buy_token`. |
+| `QuoteExpired` (50) | The quote's `expires_at` is earlier than the current ledger timestamp. |
+| `QuoteAlreadyUsed` (51) | The maker has already settled this quote ID. |
 
 A successful swap emits `swap_executed` with the DEX and both tokens as topics
 and `(amount_in, amount_out, min_amount_out)` as data, alongside the usual

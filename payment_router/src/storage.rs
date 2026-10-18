@@ -81,6 +81,8 @@ pub enum DataKey {
     Role(Role),
     /// Monotonic nonce for meta-transaction replay protection.
     MetaNonce(Address),
+    /// Whether a maker quote identified by its quote ID has been settled.
+    UsedQuote(Address, soroban_sdk::String),
     /// Trusted issuer/oracle queried for high-value payment senders.
     KycOracle,
     /// Payments strictly above this amount require a valid KYC claim.

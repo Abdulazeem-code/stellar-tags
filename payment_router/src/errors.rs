@@ -117,4 +117,8 @@ pub enum Error {
     CyclicSwapPath = 48,
     /// The DEX settled or reported an output asset other than the requested asset.
     AssetMismatch = 49,
+    /// A signed maker quote was submitted after its expiration timestamp.
+    QuoteExpired = 50,
+    /// A signed maker quote has already been settled.
+    QuoteAlreadyUsed = 51,
 }

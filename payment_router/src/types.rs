@@ -102,6 +102,26 @@ pub struct SwapQuote {
     pub max_slippage_bps: i128,
 }
 
+/// A signed maker quote for a direct cross-currency settlement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Quote {
+    /// Unique identifier used to prevent replaying a settled quote.
+    pub quote_id: String,
+    /// Maker that authorizes the settlement and supplies the output tokens.
+    pub maker: Address,
+    /// Token the sender pays to the maker.
+    pub token_in: Address,
+    /// Token the maker pays to the recipient.
+    pub token_out: Address,
+    /// Input amount paid by the sender.
+    pub amount_in: i128,
+    /// Output amount paid by the maker.
+    pub amount_out: i128,
+    /// Unix timestamp after which the quote cannot be settled.
+    pub expires_at: u64,
+}
+
 /// Describes which administrative parameter change a timelock entry represents.
 /// Each variant carries all the arguments needed to apply that change when the
 /// delay period is over.
