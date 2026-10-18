@@ -3464,6 +3464,7 @@ pub enum MockDexKey {
     RateNum,
     RateDen,
     ShouldRevert,
+    OutputToken,
 }
 
 /// Errors the mock DEX can return.
@@ -3981,7 +3982,7 @@ fn test_rate_limit_admin_config_and_disable() {
 
 /// Minimal stand-in for a Soroban DEX, exposing the adapter interface the
 /// payment router expects:
-/// `swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> i128`
+/// `swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> (output_token, amount_out)`
 /// and `quote(sell_token, buy_token, amount_in) -> i128`.
 ///
 /// It trades at a configurable rate.  The router funds it with the sell
@@ -4005,6 +4006,13 @@ impl MockDex {
             .set(&MockDexKey::ShouldRevert, &should_revert);
     }
 
+    /// Makes the DEX settle and report an output asset other than the one requested.
+    pub fn set_output_token(env: Env, token: Address) {
+        env.storage()
+            .instance()
+            .set(&MockDexKey::OutputToken, &token);
+    }
+
     /// Prices a swap without moving any funds.
     pub fn quote(env: Env, _sell_token: Address, _buy_token: Address, amount_in: i128) -> i128 {
         Self::rate(&env, amount_in)
@@ -4019,7 +4027,7 @@ impl MockDex {
         amount_in: i128,
         _min_amount_out: i128,
         recipient: Address,
-    ) -> Result<i128, MockDexError> {
+    ) -> Result<(Address, i128), MockDexError> {
         if env
             .storage()
             .instance()
@@ -4033,10 +4041,15 @@ impl MockDex {
         // the buy token to `recipient`.
         let _ = sell_token;
         let amount_out = Self::rate(&env, amount_in);
-        let buy_client = token::Client::new(&env, &buy_token);
+        let output_token: Address = env
+            .storage()
+            .instance()
+            .get(&MockDexKey::OutputToken)
+            .unwrap_or(buy_token);
+        let buy_client = token::Client::new(&env, &output_token);
         buy_client.transfer(&env.current_contract_address(), &recipient, &amount_out);
 
-        Ok(amount_out)
+        Ok((output_token, amount_out))
     }
 
     /// PROBE: pull into self.
@@ -4357,6 +4370,24 @@ fn test_route_payment_with_swap_delivers_buy_token_after_fee() {
     assert_eq!(f.sell_client.balance(&f.dex), 10_000);
     assert_eq!(f.sell_client.balance(&f.contract_id), 0);
     assert_eq!(f.client.get_user_volume(&f.sender), 10_000);
+}
+
+#[test]
+fn test_swap_with_wrong_output_asset_reverts_with_asset_mismatch() {
+    let f = setup_swap_fixture(1, 1);
+    let (unexpected_token, unexpected_client, unexpected_admin) = setup_token(&f.env);
+    unexpected_admin.mint(&f.dex, &10_000);
+    f.dex_client.set_output_token(&unexpected_token);
+
+    let res = f
+        .client
+        .try_route_payment_with_swap(&f.payment(10_000, 1));
+    assert_eq!(res.unwrap_err().unwrap(), Error::AssetMismatch);
+
+    assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
+    assert_eq!(f.buy_client.balance(&f.recipient), 0);
+    assert_eq!(unexpected_client.balance(&f.recipient), 0);
+    assert_eq!(f.client.get_user_volume(&f.sender), 0);
 }
 
 #[test]

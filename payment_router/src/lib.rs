@@ -254,8 +254,8 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
-    /// Invokes the DEX adapter and returns the amount it claims to have
-    /// delivered.
+    /// Invokes the DEX adapter and returns the output asset and amount it
+    /// claims to have delivered.
     ///
     /// A reverting, missing, or mistyped DEX call is reported as
     /// [`Error::SwapFailed`] instead of trapping, so the caller can abort with
@@ -270,7 +270,7 @@ impl PaymentRouter {
         buy_token: &Address,
         amount_in: i128,
         min_amount_out: i128,
-    ) -> Result<i128, Error> {
+    ) -> Result<(Address, i128), Error> {
         let fn_name = Symbol::new(env, "swap");
         let args = vec![
             env,
@@ -281,11 +281,11 @@ impl PaymentRouter {
             env.current_contract_address().into_val(env),
         ];
 
-        let res: Result<Result<i128, SdkError>, Result<InvokeError, InvokeError>> =
+        let res: Result<Result<(Address, i128), SdkError>, Result<InvokeError, InvokeError>> =
             env.try_invoke_contract(dex, &fn_name, args);
 
         match res {
-            Ok(Ok(amount_out)) => Ok(amount_out),
+            Ok(Ok(output)) => Ok(output),
             Ok(Err(_)) | Err(_) => Err(Error::SwapFailed),
         }
     }
@@ -2874,7 +2874,8 @@ impl PaymentRouter {
     // The swap itself is a cross-contract call into a registered DEX adapter,
     // which must expose:
     //
-    //   swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> i128
+    //   swap(sell_token, buy_token, amount_in, min_amount_out, recipient)
+    //       -> (output_token, amount_out)
     //   quote(sell_token, buy_token, amount_in) -> i128
     //
     // By the time `swap` runs, the router has already transferred `amount_in`
@@ -2982,7 +2983,7 @@ impl PaymentRouter {
         // router's balance.
         sell_token_client.transfer(&contract_address, &swap.dex, &swap.amount_in);
 
-        Self::invoke_dex_swap(
+        let (output_token, _) = Self::invoke_dex_swap(
             env,
             &swap.dex,
             &swap.sell_token,
@@ -2990,6 +2991,9 @@ impl PaymentRouter {
             swap.amount_in,
             swap.min_amount_out,
         )?;
+        if output_token != swap.buy_token {
+            return Err(Error::AssetMismatch);
+        }
 
         // --- Verify the output against both slippage guards -------------------
         // The balance delta is authoritative: a DEX cannot claim an output it
