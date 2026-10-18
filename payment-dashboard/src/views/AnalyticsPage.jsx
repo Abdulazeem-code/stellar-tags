@@ -281,6 +281,7 @@ function AnalyticsPage({
         <div className="brand">
           <div className="brand-mark">S</div>
           <h1>Stellar Pay</h1>
+          <span className="brand-badge">Testnet</span>
         </div>
         <div className="nav">
           <button type="button" onClick={() => handleNav(onDashboardClick)}>

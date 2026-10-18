@@ -1,21 +1,21 @@
-// ---------------------------------------------------------------------------
-// #52 — SSE Horizon Listener for Real-Time Payment Detection
-// ---------------------------------------------------------------------------
-// This background service connects to the Stellar Horizon network using
-// Server-Sent Events (SSE) to monitor incoming payments for all public keys
-// registered in the local federation database.
-//
-// Usage:
-//   npm run listener                  (testnet, default)
-//   HORIZON_NETWORK=public npm run listener  (mainnet)
-// ---------------------------------------------------------------------------
+// SSE Horizon Listener for Real-Time Payment Detection
 
-const { Horizon } = require('@stellar/stellar-sdk');
 const { prisma } = require('./prismaClient');
+const { logger } = require('./src/logger');
+const { createRedisConnection } = require('./src/config/redis');
+const { PAYMENT_STREAM } = require('./src/fraudDetection');
+const {
+  dispatchPaymentWebhooks,
+  scheduleWebhookRetryJob,
+  closeWebhookQueue,
+} = require('./src/webhookWorker');
+const {
+  horizon,
+  createBreaker,
+} = require('./src/services/stellarService');
+const { publishPaymentUpdate } = require('./src/sse');
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
 
 const HORIZON_URLS = {
@@ -24,19 +24,36 @@ const HORIZON_URLS = {
 };
 
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000; // Re-check for new accounts every 60s
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
-// ---------------------------------------------------------------------------
-// Horizon Server Instance
-// ---------------------------------------------------------------------------
-const horizon = new Horizon.Server(HORIZON_URL);
+// Dedicated ioredis publisher for cross-process SSE payment events.
+// When REDIS_URL is absent real-time updates are silently disabled.
+const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
+if (redisPublisher) {
+  redisPublisher.on('error', (err) =>
+    logger.error({ err }, '[listener] Redis publisher error'),
+  );
+} else {
+  logger.warn(
+    '[listener] REDIS_URL not set — real-time SSE payment updates are disabled.',
+  );
+}
 
-// Track active streams so we can clean up on shutdown
+const healthCheckBreaker = createBreaker(
+  () => horizon.ledgers().latest().call(),
+  { timeout: 5000, volumeThreshold: 3 },
+);
+
+
 const activeStreams = new Map();
+const fraudStream = process.env.REDIS_URL ? createRedisConnection() : null;
+// Handle for the periodic account-sync timer, kept so shutdown can clear it.
+let syncInterval = null;
+// Guards against overlapping syncs opening duplicate streams when one cycle
+// takes longer than the poll interval.
+let isSyncing = false;
 
-// ---------------------------------------------------------------------------
-// Formatting Helpers
-// ---------------------------------------------------------------------------
+
 const timestamp = () => new Date().toISOString();
 
 const formatPayment = (payment, trackedAccount) => {
@@ -58,117 +75,233 @@ const formatPayment = (payment, trackedAccount) => {
   ].join('\n');
 };
 
+
+
 // ---------------------------------------------------------------------------
 // Stream Management
 // ---------------------------------------------------------------------------
 
-/**
- * Open a payment SSE stream for a single Stellar account.
- * Returns the stream close function.
- */
+// Open a payment SSE stream for a single Stellar account.
 const watchAccount = (accountId) => {
   if (activeStreams.has(accountId)) {
     return; // Already watching
   }
 
-  console.log(`[${timestamp()}] 👁️  Watching payments for ${accountId}`);
+  logger.info(`[${timestamp()}] 👁️  Watching payments for ${accountId}`);
 
-  const closeStream = horizon
+  let closeStream = null;
+  let closed = false;
+
+
+  const stopStream = () => {
+    if (closed) return;
+    closed = true;
+    activeStreams.delete(accountId);
+    if (typeof closeStream === 'function') {
+      try {
+        closeStream();
+      } catch (err) {
+        logger.error(
+          `[${timestamp()}] Failed to close stream for ${accountId}:`,
+          err?.message || err,
+        );
+      }
+    }
+  };
+
+  closeStream = horizon
     .payments()
     .forAccount(accountId)
     .cursor('now')
     .stream({
       onmessage: (payment) => {
-        // Only log payment operations (ignore account_merge, etc.)
         if (payment.type === 'payment' || payment.type_i === 1) {
-          console.log(formatPayment(payment, accountId));
+          logger.info(formatPayment(payment, accountId));
+          prisma.payment.create({
+            data: {
+              transactionHash: payment.transaction_hash,
+              fromAddress: payment.from,
+              toAddress: payment.to,
+              amount: parseFloat(payment.amount),
+              assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
+              status: 'completed'
+            }
+          }).then((created) =>
+            // Fan the new payment out to connected SSE clients via Redis, so
+            // every API process can stream the status update (#730).
+            publishPaymentUpdate(redisPublisher, created.id, {
+              status: created.status,
+              transactionHash: created.transactionHash,
+              fromAddress: created.fromAddress,
+              toAddress: created.toAddress,
+              amount: created.amount,
+              assetCode: created.assetCode,
+              detectedAt: created.createdAt,
+            }).catch((publishErr) =>
+              logger.error({ err: publishErr }, 'Failed to publish payment status update'),
+            ),
+          ).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
         }
       },
       onerror: (error) => {
-        console.error(
+        logger.error(
           `[${timestamp()}] ⚠️  Stream error for ${accountId}:`,
           error?.message || error,
         );
-        // The SDK handles automatic reconnection for SSE streams
+        // Release dead stream before removing map entry
+        stopStream();
+        logger.info(
+          `[${timestamp()}] 🔄 Removed dead stream for ${accountId}; will reconnect on next sync`,
+        );
       },
     });
 
-  activeStreams.set(accountId, closeStream);
+  if (closed) {
+    // Close synchronously-errored stream
+    if (typeof closeStream === 'function') {
+      try {
+        closeStream();
+      } catch (err) {
+        logger.error(
+          `[${timestamp()}] Failed to close stream for ${accountId}:`,
+          err?.message || err,
+        );
+      }
+    }
+    return;
+  }
+
+  activeStreams.set(accountId, stopStream);
 };
 
-/**
- * Query the local database for all registered public keys and open
- * streams for any that aren't already being watched.
- */
+// Query the local database for all registered public keys and open streams for any that aren't already being watched.
 const syncWatchedAccounts = async () => {
+  if (isSyncing) return;
+  isSyncing = true;
+
   try {
-    const rows = await prisma.user.findMany({
-      distinct: ['address'],
-      select: { address: true },
-    });
 
-    const currentAddresses = new Set(rows.map((r) => r.address));
-
-    // Start watching new accounts
-    for (const { address } of rows) {
-      if (!activeStreams.has(address)) {
-        watchAccount(address);
-      }
+    try {
+      await healthCheckBreaker.fire();
+    } catch {
+      logger.warn(
+        `[${timestamp()}] ⏸️  Horizon health check failed; skipping stream sync`,
+      );
+      return;
     }
 
-    // Stop watching removed accounts
-    for (const [address, closeFn] of activeStreams) {
-      if (!currentAddresses.has(address)) {
-        console.log(`[${timestamp()}] 🛑 Stopped watching removed account ${address}`);
-        if (typeof closeFn === 'function') closeFn();
-        activeStreams.delete(address);
-      }
-    }
+    try {
+      const rows = await prisma.user.findMany({
+        distinct: ['address'],
+        select: { address: true },
+      });
 
-    console.log(
-      `[${timestamp()}] 📡 Actively monitoring ${activeStreams.size} account(s)`,
-    );
-  } catch (err) {
-    console.error(`[${timestamp()}] ❌ Failed to sync watched accounts:`, err.message);
+      const currentAddresses = new Set(rows.map((r) => r.address));
+
+      // Start watching new accounts
+      for (const { address } of rows) {
+        if (!activeStreams.has(address)) {
+          watchAccount(address);
+        }
+      }
+
+      // Stop watching removed accounts
+      for (const [address, stopFn] of activeStreams) {
+        if (!currentAddresses.has(address)) {
+          logger.info(`[${timestamp()}] 🛑 Stopped watching removed account ${address}`);
+          if (typeof stopFn === 'function') {
+            stopFn();
+          } else {
+            activeStreams.delete(address);
+          }
+        }
+      }
+
+      logger.info(
+        `[${timestamp()}] 📡 Actively monitoring ${activeStreams.size} account(s)`,
+      );
+    } catch (err) {
+      logger.error(`[${timestamp()}] ❌ Failed to sync watched accounts:`, err.message);
+    }
+  } finally {
+    isSyncing = false;
   }
 };
 
-// ---------------------------------------------------------------------------
-// Graceful Shutdown
-// ---------------------------------------------------------------------------
+
 const shutdown = async () => {
-  console.log(`\n[${timestamp()}] Shutting down Horizon listener...`);
-  for (const [address, closeFn] of activeStreams) {
-    if (typeof closeFn === 'function') closeFn();
-    console.log(`  Closed stream for ${address}`);
+  logger.info(`\n[${timestamp()}] Shutting down Horizon listener...`);
+
+  if (syncInterval) {
+    clearInterval(syncInterval);
+    syncInterval = null;
+  }
+
+  for (const [address, stopFn] of activeStreams) {
+    if (typeof stopFn === 'function') {
+      stopFn();
+    } else {
+      activeStreams.delete(address);
+    }
+    logger.info(`  Closed stream for ${address}`);
   }
   activeStreams.clear();
+  await closeWebhookQueue();
+  if (redisPublisher) {
+    try {
+      await redisPublisher.quit();
+    } catch (err) {
+      logger.error({ err }, '[listener] Error closing Redis publisher during shutdown');
+    }
+  }
+  if (fraudStream) await fraudStream.quit();
   await prisma.$disconnect();
   process.exit(0);
 };
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 const main = async () => {
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('  Stellar Horizon Payment Listener');
-  console.log(`  Network:  ${NETWORK.toUpperCase()}`);
-  console.log(`  Horizon:  ${HORIZON_URL}`);
-  console.log(`  Poll:     every ${POLL_INTERVAL_MS / 1000}s for new accounts`);
-  console.log('═══════════════════════════════════════════════════════');
+  logger.info('═══════════════════════════════════════════════════════');
+  logger.info('  Stellar Horizon Payment Listener');
+  logger.info(`  Network:  ${NETWORK.toUpperCase()}`);
+  logger.info(`  Horizon:  ${HORIZON_URL}`);
+  logger.info(`  Poll:     every ${POLL_INTERVAL_MS / 1000}s for new accounts`);
+  logger.info('═══════════════════════════════════════════════════════');
 
   // Initial sync
   await syncWatchedAccounts();
 
-  // Periodically check for newly registered accounts
-  setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
+  // Schedule webhook retry / liveness pings
+  try {
+    scheduleWebhookRetryJob({ prisma });
+  } catch (err) {
+    logger.error('Failed to schedule webhook retry job:', err.message);
+  }
+
+  // Periodically check for newly registered accounts.
+  syncInterval = setInterval(syncWatchedAccounts, POLL_INTERVAL_MS);
+  if (syncInterval && typeof syncInterval.unref === 'function') {
+    syncInterval.unref();
+  }
+
+  return { syncInterval };
 };
 
-main().catch((err) => {
-  console.error('Fatal error starting Horizon listener:', err);
-  process.exit(1);
-});
+
+if (require.main === module) {
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  main().catch((err) => {
+    logger.error('Fatal error starting Horizon listener:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  watchAccount,
+  syncWatchedAccounts,
+  shutdown,
+  main,
+  activeStreams,
+};

@@ -1,8 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
-import freighterApi from '@stellar/freighter-api';
-import { Toaster } from 'react-hot-toast';
+import { toast, Toaster } from "react-hot-toast";
+import logger from "./logger";
 import LoadingSpinner from './components/LoadingSpinner';
-import { HORIZON_BASE } from './views/shared';
+import { HORIZON_BASE, API_BASE, walletKit } from './views/shared';
 
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
 const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
@@ -13,19 +13,31 @@ const RegistrationPage = lazy(() => import('./views/RegistrationPage.jsx'));
 function ViewFallback({ label = 'Loading view...' }) {
   return (
     <div className="route-fallback" role="status" aria-live="polite">
-      <LoadingSpinner color="text-blue" />
+      <LoadingSpinner size="w-6 h-6" color="text-cyan" />
       <span>{label}</span>
     </div>
   );
 }
 
+function OfflineBanner() {
+  return (
+    <div className="offline-banner" role="alert">
+      <span className="offline-dot" />
+      <span>Offline Mode — Network transactions will pause until connection is restored.</span>
+    </div>
+  );
+}
+
 function App() {
-const [activeView, setActiveView] = useState('dashboard')
+  const [activeView, setActiveView] = useState('dashboard');
   const [userPublicKey, setUserPublicKey] = useState(() => {
-    return localStorage.getItem('walletPublicKey') || ''
-  })
+    return localStorage.getItem('walletPublicKey') || '';
+  });
   const [registrationState, setRegistrationState] = useState("unknown");
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const [balance, setBalance] = useState(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [balanceError, setBalanceError] = useState("");
 
   useEffect(() => {
     const handleOnline = () => setIsOffline(false);
@@ -41,34 +53,53 @@ const [activeView, setActiveView] = useState('dashboard')
   }, []);
 
   const handleConnectWallet = async () => {
-    const status = await freighterApi.isConnected();
-    const isInstalled =
-      status.isConnected !== undefined ? status.isConnected : status;
+    try {
+      await walletKit.openModal({
+        onWalletSelected: async (option) => {
+          try {
+            walletKit.setWallet(option.id);
+            const addressResponse = await walletKit.getAddress();
+            
+            const publicKey = typeof addressResponse === 'string' 
+              ? addressResponse 
+              : addressResponse.address;
+            
+            const dbResponse = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(publicKey)}`);
+            
+            if (dbResponse.ok) {
+              setRegistrationState("existing");
+            } else if (dbResponse.status === 404) {
+              setRegistrationState("new");
+              handleNavigate("register");
+            }
 
-    if (!isInstalled) {
-      return { ok: false, error: "Freighter is not installed or locked." };
+            localStorage.setItem("walletPublicKey", publicKey);
+            setUserPublicKey(publicKey);
+            toast.success("Wallet connected successfully!");
+          } catch (err) {
+            logger.error("Wallet connection failed:", err);
+            toast.error("Failed to connect wallet.");
+          }
+        },
+      });
+
+      return { ok: true };
+    } catch (error) {
+      toast.error("Connection cancelled.");
+      logger.error("User closed modal or an error occurred:", error);
+      return { ok: false, error: "Wallet connection process cancelled." };
     }
-
-    const response = await freighterApi.requestAccess();
-    if (response.error) {
-      return { ok: false, error: "Wallet connection failed." };
-    }
-
-    localStorage.setItem("walletPublicKey", response.address);
-    setUserPublicKey(response.address);
-    return { ok: true, address: response.address };
   };
 
   const handleDisconnectWallet = () => {
-    localStorage.removeItem('walletPublicKey')
-    setUserPublicKey('')
-  }
-
-  const [balance, setBalance] = useState(null);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [balanceError, setBalanceError] = useState("");
+    localStorage.removeItem('walletPublicKey');
+    setUserPublicKey('');
+    setBalance(null);
+    toast.success("Wallet disconnected.");
+  };
 
   const loadBalance = useCallback(async () => {
+    if (!userPublicKey) return;
     setIsRefreshing(true);
     setBalanceError("");
     try {
@@ -108,22 +139,18 @@ const [activeView, setActiveView] = useState('dashboard')
         setActiveView("register");
         return;
       }
-
       if (hash === "#help") {
         setActiveView("help");
         return;
       }
-
       if (hash === "#analytics") {
         setActiveView("analytics");
         return;
       }
-
       if (hash === "#history") {
         setActiveView("history");
         return;
       }
-
       setActiveView("dashboard");
     };
 
@@ -136,25 +163,15 @@ const [activeView, setActiveView] = useState('dashboard')
     setActiveView(view);
     if (view === "register") {
       window.location.hash = "register";
-      return;
-    }
-
-    if (view === "help") {
+    } else if (view === "help") {
       window.location.hash = "help";
-      return;
-    }
-
-    if (view === "analytics") {
+    } else if (view === "analytics") {
       window.location.hash = "analytics";
-      return;
-    }
-
-    if (view === "history") {
+    } else if (view === "history") {
       window.location.hash = "history";
-      return;
+    } else {
+      window.location.hash = "";
     }
-
-    window.location.hash = "";
   }, []);
 
   const handleRegistrationStateChange = useCallback(
@@ -164,7 +181,6 @@ const [activeView, setActiveView] = useState('dashboard')
       if (nextState === "new") {
         handleNavigate("register");
       }
-
       if (nextState === "existing" && activeView === "register") {
         handleNavigate("dashboard");
       }
@@ -172,196 +188,111 @@ const [activeView, setActiveView] = useState('dashboard')
     [activeView, handleNavigate],
   );
 
-  if (activeView === "register" && registrationState === "new") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading registration..." />}>
-
-        <RegistrationPage
-          userPublicKey={userPublicKey}
-          setUserPublicKey={setUserPublicKey}
-          onBack={() => handleNavigate("dashboard")}
-          onRegistered={() => handleRegistrationStateChange("existing")}
-        />
-        </Suspense>
-      </>
-    );
-  }
-
-  if (activeView === "help") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading help center..." />}>
-
-        <HelpPage
-          userPublicKey={userPublicKey}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onDashboardClick={() => handleNavigate("dashboard")}
-          onAnalyticsClick={() => handleNavigate("analytics")}
-          onHistoryClick={() => handleNavigate("history")}
-          onRegisterClick={() => handleNavigate("register")}
-          canRegister={registrationState === "new"}
-        />
-        </Suspense>
-      </>
-    );
-  }
-
-  if (activeView === "analytics") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading analytics..." />}>
-
-        <AnalyticsPage
-          userPublicKey={userPublicKey}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onDashboardClick={() => handleNavigate("dashboard")}
-          onHistoryClick={() => handleNavigate("history")}
-          onHelpClick={() => handleNavigate("help")}
-          onRegisterClick={() => handleNavigate("register")}
-          canRegister={registrationState === "new"}
-        />
-        </Suspense>
-      </>
-    );
-  }
-
-  if (activeView === "history") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading history..." />}>
-
-        <HistoryPage
-          userPublicKey={userPublicKey}
-          setUserPublicKey={setUserPublicKey}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onRefreshBalance={loadBalance}
-          onDashboardClick={() => handleNavigate("dashboard")}
-          onAnalyticsClick={() => handleNavigate("analytics")}
-          onHelpClick={() => handleNavigate("help")}
-          onRegisterClick={() => handleNavigate("register")}
-          canRegister={registrationState === "new"}
-        />
-        </Suspense>
-      </>
-    );
-  }
-
   return (
     <>
       <Toaster
         position="top-right"
         toastOptions={{
           duration: 5000,
-          style: { borderRadius: '12px', padding: '14px 18px', fontSize: '14px', fontWeight: 500 },
+          style: {
+            background: 'rgba(14, 20, 34, 0.94)',
+            color: '#F8FAFC',
+            border: '1px solid rgba(255, 255, 255, 0.12)',
+            backdropFilter: 'blur(20px)',
+            boxShadow: '0 16px 40px rgba(0, 0, 0, 0.5)',
+            borderRadius: '16px',
+            padding: '14px 18px',
+            fontSize: '14px',
+            fontWeight: 600,
+          },
+          success: {
+            iconTheme: {
+              primary: '#10B981',
+              secondary: '#050811',
+            },
+          },
+          error: {
+            iconTheme: {
+              primary: '#F43F5E',
+              secondary: '#050811',
+            },
+          },
         }}
       />
-      {isOffline && (
-        <div
-          style={{
-            backgroundColor: "#DC2626",
-            color: "#FFFFFF",
-            padding: "12px 16px",
-            textAlign: "center",
-            fontWeight: "500",
-            fontSize: "14px",
-            position: "sticky",
-            top: 0,
-            zIndex: 1000,
-          }}
-        >
-          ⚠️ You are currently offline. Transactions will fail.
-        </div>
-      )}
-        <Suspense fallback={<ViewFallback label="Loading dashboard..." />}>
+      {isOffline && <OfflineBanner />}
 
-      <Dashboard
-        userPublicKey={userPublicKey}
-        onConnectWallet={handleConnectWallet}
-        onDisconnectWallet={handleDisconnectWallet}
-        balance={balance}
-        isRefreshing={isRefreshing}
-        balanceError={balanceError}
-        onRefreshBalance={loadBalance}
-        onRegisterClick={() => handleNavigate("register")}
-        onAnalyticsClick={() => handleNavigate("analytics")}
-        onHistoryClick={() => handleNavigate("history")}
-        onHelpClick={() => handleNavigate("help")}
-        onRegistrationStateChange={handleRegistrationStateChange}
-        canRegister={registrationState === "new"}
-      />
+      {activeView === "register" && (registrationState === "new" || registrationState === "skipped") ? (
+        <Suspense fallback={<ViewFallback label="Loading registration..." />}>
+          <RegistrationPage
+            userPublicKey={userPublicKey}
+            setUserPublicKey={setUserPublicKey}
+            onBack={() => {
+              setRegistrationState("skipped");
+              handleNavigate("dashboard");
+            }}
+            onRegistered={() => handleRegistrationStateChange("existing")}
+          />
         </Suspense>
+      ) : activeView === "help" ? (
+        <Suspense fallback={<ViewFallback label="Loading help center..." />}>
+          <HelpPage
+            userPublicKey={userPublicKey}
+            onConnectWallet={handleConnectWallet}
+            onDisconnectWallet={handleDisconnectWallet}
+            onDashboardClick={() => handleNavigate("dashboard")}
+            onAnalyticsClick={() => handleNavigate("analytics")}
+            onHistoryClick={() => handleNavigate("history")}
+            onRegisterClick={() => handleNavigate("register")}
+            canRegister={registrationState !== "existing"}
+          />
+        </Suspense>
+      ) : activeView === "analytics" ? (
+        <Suspense fallback={<ViewFallback label="Loading analytics..." />}>
+          <AnalyticsPage
+            userPublicKey={userPublicKey}
+            onConnectWallet={handleConnectWallet}
+            onDisconnectWallet={handleDisconnectWallet}
+            onDashboardClick={() => handleNavigate("dashboard")}
+            onHistoryClick={() => handleNavigate("history")}
+            onHelpClick={() => handleNavigate("help")}
+            onRegisterClick={() => handleNavigate("register")}
+            canRegister={registrationState === "new"}
+          />
+        </Suspense>
+      ) : activeView === "history" ? (
+        <Suspense fallback={<ViewFallback label="Loading history..." />}>
+          <HistoryPage
+            userPublicKey={userPublicKey}
+            setUserPublicKey={setUserPublicKey}
+            onConnectWallet={handleConnectWallet}
+            onDisconnectWallet={handleDisconnectWallet}
+            onRefreshBalance={loadBalance}
+            onDashboardClick={() => handleNavigate("dashboard")}
+            onAnalyticsClick={() => handleNavigate("analytics")}
+            onHelpClick={() => handleNavigate("help")}
+            onRegisterClick={() => handleNavigate("register")}
+            canRegister={registrationState === "new"}
+          />
+        </Suspense>
+      ) : (
+        <Suspense fallback={<ViewFallback label="Loading dashboard..." />}>
+          <Dashboard
+            userPublicKey={userPublicKey}
+            onConnectWallet={handleConnectWallet}
+            onDisconnectWallet={handleDisconnectWallet}
+            balance={balance}
+            isRefreshing={isRefreshing}
+            balanceError={balanceError}
+            onRefreshBalance={loadBalance}
+            onRegisterClick={() => handleNavigate("register")}
+            onAnalyticsClick={() => handleNavigate("analytics")}
+            onHistoryClick={() => handleNavigate("history")}
+            onHelpClick={() => handleNavigate("help")}
+            onRegistrationStateChange={handleRegistrationStateChange}
+            canRegister={registrationState === "new"}
+          />
+        </Suspense>
+      )}
     </>
   );
 }

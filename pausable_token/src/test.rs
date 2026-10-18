@@ -1,0 +1,546 @@
+#![cfg(test)]
+
+use super::*;
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+use soroban_sdk::{Address, Bytes, Env, String, Symbol, TryFromVal, Vec};
+use ed25519_dalek::{Signer, SigningKey};
+
+struct Fixture {
+    env: Env,
+    admin: Address,
+    alice: Address,
+    bob: Address,
+    id: Address,
+    token: PausableTokenClient<'static>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let id = env.register_contract(None, PausableToken);
+        let token = PausableTokenClient::new(&env, &id);
+
+        token.initialize(
+            &admin,
+            &String::from_str(&env, "Pausable USD"),
+            &String::from_str(&env, "PUSD"),
+            &7,
+        );
+
+        token.mint(&alice, &1_000_000);
+        token.mint(&bob, &1_000_000);
+
+        Fixture {
+            env,
+            admin,
+            alice,
+            bob,
+            id,
+            token,
+        }
+    }
+
+    fn ledger(&self) -> u32 {
+        self.env.ledger().sequence()
+    }
+}
+
+#[test]
+fn reports_token_metadata() {
+    let f = Fixture::new();
+    assert_eq!(f.token.name(), String::from_str(&f.env, "Pausable USD"));
+    assert_eq!(f.token.symbol(), String::from_str(&f.env, "PUSD"));
+    assert_eq!(f.token.decimals(), 7);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
+}
+
+#[test]
+fn transfers_between_accounts() {
+    let f = Fixture::new();
+    f.token.transfer(&f.alice, &f.bob, &250_000);
+    assert_eq!(f.token.balance(&f.alice), 750_000);
+    assert_eq!(f.token.balance(&f.bob), 1_250_000);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn spenders_move_funds_under_an_allowance() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+
+    f.token
+        .approve(&f.alice, &spender, &300_000, &(f.ledger() + 1_000));
+    assert_eq!(f.token.allowance(&f.alice, &spender), 300_000);
+
+    f.token.transfer_from(&spender, &f.alice, &f.bob, &120_000);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 180_000);
+    assert_eq!(f.token.balance(&f.alice), 880_000);
+    assert_eq!(f.token.balance(&f.bob), 1_120_000);
+}
+
+fn account_for_signing_key(env: &Env, signing_key: &SigningKey) -> Address {
+    let public_key = signing_key.verifying_key().to_bytes();
+    let address = soroban_sdk::xdr::ScAddress::Account(soroban_sdk::xdr::AccountId(
+        soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(soroban_sdk::xdr::Uint256(public_key)),
+    ));
+    Address::try_from_val(env, &address).unwrap()
+}
+
+fn sign_permit(
+    f: &Fixture,
+    signing_key: &SigningKey,
+    owner: &Address,
+    spender: &Address,
+    value: i128,
+    nonce: u64,
+    deadline: u64,
+) -> Bytes {
+    let digest = f
+        .token
+        .permit_digest(owner, spender, &value, &nonce, &deadline);
+    let signature = signing_key.sign(&digest.to_array()).to_bytes();
+    Bytes::from_slice(&f.env, &signature)
+}
+
+#[test]
+fn valid_permit_sets_allowance_and_allows_transfer_from() {
+    let f = Fixture::new();
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let owner = account_for_signing_key(&f.env, &signing_key);
+    let spender = Address::generate(&f.env);
+    f.token.mint(&owner, &500_000);
+
+    let deadline = f.env.ledger().timestamp() + 3_600;
+    let signature = sign_permit(&f, &signing_key, &owner, &spender, 250_000, 0, deadline);
+    f.token
+        .permit(&owner, &spender, &250_000, &deadline, &signature);
+
+    assert_eq!(f.token.permit_nonce(&owner), 1);
+    assert_eq!(f.token.allowance(&owner, &spender), 250_000);
+
+    f.token.transfer_from(&spender, &owner, &f.bob, &100_000);
+    assert_eq!(f.token.allowance(&owner, &spender), 150_000);
+    assert_eq!(f.token.balance(&owner), 400_000);
+    assert_eq!(f.token.balance(&f.bob), 1_100_000);
+
+    assert!(f
+        .token
+        .try_permit(&owner, &spender, &250_000, &deadline, &signature)
+        .is_err());
+    assert_eq!(f.token.permit_nonce(&owner), 1);
+    assert_eq!(f.token.allowance(&owner, &spender), 150_000);
+}
+
+#[test]
+fn permit_rejects_expired_deadline_without_mutating_state() {
+    let f = Fixture::new();
+    let signing_key = SigningKey::from_bytes(&[8u8; 32]);
+    let owner = account_for_signing_key(&f.env, &signing_key);
+    let spender = Address::generate(&f.env);
+    let deadline = f.env.ledger().timestamp();
+    let signature = sign_permit(&f, &signing_key, &owner, &spender, 50, 0, deadline);
+    f.env.ledger().with_mut(|info| info.timestamp = deadline + 1);
+
+    let result = f
+        .token
+        .try_permit(&owner, &spender, &50, &deadline, &signature);
+    assert_eq!(result.unwrap_err().unwrap(), Error::PermitExpired);
+    assert_eq!(f.token.permit_nonce(&owner), 0);
+    assert_eq!(f.token.allowance(&owner, &spender), 0);
+}
+
+#[test]
+fn invalid_signature_does_not_consume_nonce_or_set_allowance() {
+    let f = Fixture::new();
+    let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+    let other_key = SigningKey::from_bytes(&[10u8; 32]);
+    let owner = account_for_signing_key(&f.env, &signing_key);
+    let spender = Address::generate(&f.env);
+    let deadline = f.env.ledger().timestamp() + 3_600;
+    let signature = sign_permit(&f, &other_key, &owner, &spender, 75, 0, deadline);
+
+    assert!(f
+        .token
+        .try_permit(&owner, &spender, &75, &deadline, &signature)
+        .is_err());
+    assert_eq!(f.token.permit_nonce(&owner), 0);
+    assert_eq!(f.token.allowance(&owner, &spender), 0);
+}
+
+// ── Issue #714: packed Allowance round trips ─────────────────────────────────
+
+/// The packed allowance must be exactly 20 bytes.
+///
+/// This is the assertion that encodes the optimization: if a future change
+/// widens the layout, the per-(owner, spender) entry stops shrinking and this
+/// fails.
+#[test]
+fn packed_allowance_is_twenty_bytes() {
+    let env = Env::default();
+    let packed = pack_allowance(&env, 1, 1);
+    assert_eq!(packed.to_array().len(), 20);
+}
+
+/// `pack_allowance` / `unpack_allowance` must be exactly inverse, including
+/// the i128 endpoints and the sign bit, which is where a naive unsigned copy
+/// would corrupt a negative value.
+#[test]
+fn packed_allowance_round_trips() {
+    let env = Env::default();
+    let cases: [(i128, u32); 8] = [
+        (0, 0),
+        (1, 1),
+        (i128::MAX, u32::MAX),
+        (i128::MAX, 0),
+        (0, u32::MAX),
+        (i128::MIN, 1),
+        (-1, u32::MAX),
+        (300_000, 1_000),
+    ];
+
+    for (amount, expiration) in cases {
+        let packed = pack_allowance(&env, amount, expiration);
+        assert_eq!(
+            unpack_allowance(&packed),
+            (amount, expiration),
+            "round trip failed for ({amount}, {expiration})"
+        );
+    }
+}
+
+/// The two halves must not bleed into each other: a large amount must not
+/// corrupt the expiry ledger, and vice versa.
+#[test]
+fn packed_allowance_fields_are_independent() {
+    let env = Env::default();
+
+    // All-ones amount with a small expiry: the amount's high bytes must not
+    // spill into the expiration field.
+    let packed = pack_allowance(&env, i128::MAX, 7);
+    assert_eq!(unpack_allowance(&packed), (i128::MAX, 7));
+
+    // Large expiry with a small amount: the expiry must not be truncated.
+    let packed = pack_allowance(&env, 42, u32::MAX);
+    assert_eq!(unpack_allowance(&packed), (42, u32::MAX));
+}
+
+/// Big-endian layout, asserted on the raw bytes so an endianness change (which
+/// would silently reinterpret every already-stored entry) is caught.
+#[test]
+fn packed_allowance_is_big_endian() {
+    let env = Env::default();
+    let buf =
+        pack_allowance(&env, 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10, 0x1112_1314).to_array();
+    assert_eq!(
+        &buf[0..16],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    );
+    assert_eq!(&buf[16..20], &[0x11, 0x12, 0x13, 0x14]);
+}
+
+/// The allowance actually stored on the ledger must be the packed 20-byte
+/// value, not a struct-encoded one. This ties the helper tests above to the
+/// real write path.
+#[test]
+fn allowance_is_persisted_in_packed_form() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+
+    f.token
+        .approve(&f.alice, &spender, &300_000, &(f.ledger() + 1_000));
+
+    let stored: BytesN<20> = f
+        .env
+        .as_contract(&f.id, || {
+            f.env
+                .storage()
+                .persistent()
+                .get(&DataKey::Allowance(f.alice.clone(), spender.clone()))
+        })
+        .expect("allowance entry should exist after approve");
+
+    assert_eq!(stored.to_array().len(), 20);
+    assert_eq!(unpack_allowance(&stored), (300_000, f.ledger() + 1_000));
+
+    // And the packed bytes agree with what the public getter reports.
+    assert_eq!(f.token.allowance(&f.alice, &spender), 300_000);
+}
+
+#[test]
+fn burn_reduces_balance_and_supply() {
+    let f = Fixture::new();
+
+    f.token.burn(&f.alice, &400_000);
+    assert_eq!(f.token.balance(&f.alice), 600_000);
+    assert_eq!(f.token.total_supply(), 1_600_000);
+}
+
+#[test]
+fn allowance_expires_and_reads_as_zero() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+
+    let issued_at = f.ledger();
+    f.token
+        .approve(&f.alice, &spender, &300_000, &(issued_at + 10));
+    assert_eq!(f.token.allowance(&f.alice, &spender), 300_000);
+
+    let expired_at = issued_at + 11;
+    f.env
+        .ledger()
+        .with_mut(|info| info.sequence_number = expired_at);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 0);
+}
+
+#[test]
+fn pause_blocks_every_movement_and_unpause_restores_it() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+    f.token
+        .approve(&f.alice, &spender, &10, &(f.ledger() + 1_000));
+
+    assert!(!f.token.is_paused());
+    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
+
+    f.token.pause();
+    assert!(f.token.is_paused());
+
+    // No holder may send or receive while paused, and the spender path is
+    // covered too because it moves someone else's balance.
+    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+    assert!(!f.token.transfer_allowed(&f.bob, &f.alice));
+    assert!(!f.token.transfer_allowed(&f.alice, &spender));
+
+    // Reads stay available so wallets can still render state.
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 10);
+
+    f.token.unpause();
+    assert!(!f.token.is_paused());
+    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
+    f.token.transfer(&f.alice, &f.bob, &1);
+    assert_eq!(f.token.balance(&f.bob), 1_000_001);
+}
+
+#[test]
+fn pause_is_reversible_through_set_paused() {
+    let f = Fixture::new();
+
+    f.token.set_paused(&true);
+    assert!(f.token.is_paused());
+    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+
+    f.token.set_paused(&false);
+    assert!(!f.token.is_paused());
+    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
+}
+
+#[test]
+fn freezing_blocks_an_account_in_both_directions_only() {
+    let f = Fixture::new();
+
+    f.token.freeze(&f.alice);
+    assert!(f.token.is_frozen(&f.alice));
+    assert!(!f.token.is_frozen(&f.bob));
+
+    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+    assert!(!f.token.transfer_allowed(&f.bob, &f.alice));
+
+    // Everyone else is untouched and can still move funds.
+    assert!(f.token.transfer_allowed(&f.bob, &f.admin));
+    f.token.transfer(&f.bob, &f.admin, &10);
+    assert_eq!(f.token.balance(&f.admin), 10);
+
+    // Freezing does not seize or burn the balance.
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+
+    f.token.unfreeze(&f.alice);
+    assert!(!f.token.is_frozen(&f.alice));
+    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
+    f.token.transfer(&f.alice, &f.bob, &1);
+    // bob started at 1_000_000, sent 10 above, and has just received 1.
+    assert_eq!(f.token.balance(&f.bob), 999_991);
+}
+
+#[test]
+fn freezing_is_reversible_through_set_frozen() {
+    let f = Fixture::new();
+
+    f.token.set_frozen(&f.bob, &true);
+    assert!(f.token.is_frozen(&f.bob));
+    assert!(!f.token.transfer_allowed(&f.bob, &f.alice));
+
+    f.token.set_frozen(&f.bob, &false);
+    assert!(!f.token.is_frozen(&f.bob));
+    assert!(f.token.transfer_allowed(&f.bob, &f.alice));
+}
+
+#[test]
+fn freeze_and_pause_lift_independently() {
+    let f = Fixture::new();
+
+    f.token.freeze(&f.alice);
+    f.token.pause();
+
+    // The global switch is reported first while it is still engaged.
+    f.token.unpause();
+    assert!(!f.token.is_paused());
+    // The per-account freeze is still in force and is the reason transfers
+    // remain blocked.
+    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+
+    f.token.unfreeze(&f.alice);
+    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
+    f.token.transfer(&f.alice, &f.bob, &1);
+    assert_eq!(f.token.balance(&f.bob), 1_000_001);
+}
+
+#[test]
+fn frozen_spender_cannot_be_used_to_move_someone_elses_funds() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+
+    f.token
+        .approve(&f.alice, &spender, &300_000, &(f.ledger() + 1_000));
+    f.token.freeze(&spender);
+
+    // The frozen spender is blocked, but the allowance holder is untouched.
+    assert!(!f.token.transfer_allowed(&f.alice, &spender));
+    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+
+    f.token.unfreeze(&spender);
+    f.token.transfer_from(&spender, &f.alice, &f.bob, &1_000);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 299_000);
+    assert_eq!(f.token.balance(&f.bob), 1_001_000);
+}
+
+#[test]
+fn initialize_cannot_be_repeated_to_seize_the_contract() {
+    let f = Fixture::new();
+    let attacker = Address::generate(&f.env);
+
+    let result = f.token.try_initialize(
+        &attacker,
+        &String::from_str(&f.env, "Hijacked"),
+        &String::from_str(&f.env, "HJK"),
+        &7,
+    );
+
+    assert_eq!(result.unwrap_err().unwrap(), Error::AlreadyInitialized);
+    assert_eq!(f.token.admin(), f.admin);
+    assert_eq!(f.token.symbol(), String::from_str(&f.env, "PUSD"));
+    assert_eq!(f.token.decimals(), 7);
+}
+
+#[test]
+fn admin_handover_moves_every_privilege() {
+    let f = Fixture::new();
+    let new_admin = Address::generate(&f.env);
+
+    f.token.set_admin(&new_admin);
+    assert_eq!(f.token.admin(), new_admin);
+
+    f.token.mint(&new_admin, &5);
+    assert_eq!(f.token.balance(&new_admin), 5);
+
+    f.token.pause();
+    assert!(f.token.is_paused());
+    f.token.unpause();
+    assert!(!f.token.is_paused());
+
+    f.token.freeze(&f.bob);
+    assert!(f.token.is_frozen(&f.bob));
+    f.token.unfreeze(&f.bob);
+    assert!(!f.token.is_frozen(&f.bob));
+}
+
+#[test]
+fn frozen_address_cannot_be_installed_as_admin() {
+    let f = Fixture::new();
+    let candidate = Address::generate(&f.env);
+
+    f.token.freeze(&candidate);
+    let result = f.token.try_set_admin(&candidate);
+
+    assert_eq!(result.unwrap_err().unwrap(), Error::AccountFrozen);
+    assert_eq!(f.token.admin(), f.admin);
+}
+
+#[test]
+fn admin_address_is_exposed_and_stable() {
+    let f = Fixture::new();
+    assert_eq!(f.token.admin(), f.admin);
+    assert_eq!(f.token.admin(), f.admin);
+}
+
+#[test]
+fn mint_increases_supply_only_for_the_recipient() {
+    let f = Fixture::new();
+    let carol = Address::generate(&f.env);
+
+    f.token.mint(&carol, &750);
+    assert_eq!(f.token.balance(&carol), 750);
+    assert_eq!(f.token.total_supply(), 2_000_750);
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+
+    let result = f.token.try_mint(&carol, &0);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidAmount);
+}
+
+#[test]
+fn mint_is_blocked_for_a_frozen_recipient() {
+    let f = Fixture::new();
+    let carol = Address::generate(&f.env);
+
+    f.token.freeze(&carol);
+    let result = f.token.try_mint(&carol, &10);
+
+    assert_eq!(result.unwrap_err().unwrap(), Error::AccountFrozen);
+    assert_eq!(f.token.balance(&carol), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn mint_is_blocked_while_paused() {
+    let f = Fixture::new();
+    let carol = Address::generate(&f.env);
+
+    f.token.pause();
+    let result = f.token.try_mint(&carol, &10);
+
+    assert_eq!(result.unwrap_err().unwrap(), Error::Paused);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn emits_standard_transfer_and_control_events() {
+    let f = Fixture::new();
+
+    f.token.transfer(&f.alice, &f.bob, &1_000);
+    f.token.pause();
+    f.token.freeze(&f.bob);
+
+    let mut names: Vec<Symbol> = Vec::new(&f.env);
+    for (_, topics, _) in f.env.events().all() {
+        if let Some(first) = topics.first() {
+            if let Ok(name) = Symbol::try_from_val(&f.env, &first) {
+                names.push_back(name);
+            }
+        }
+    }
+
+    assert!(names.contains(symbol_short!("transfer")));
+    assert!(names.contains(symbol_short!("paused")));
+    assert!(names.contains(symbol_short!("frozen")));
+    assert!(names.contains(symbol_short!("init")));
+}

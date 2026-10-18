@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Stellar Tags API",
-    "description": "API Blueprint Collection for Stellar Tags (/lookup, /register, and /health).",
+    "description": "API Blueprint Collection for Stellar Tags (/lookup, /register, and /health), following standardized JSON response and error envelopes according to JSend/API error specifications.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
