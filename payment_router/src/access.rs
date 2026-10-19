@@ -249,6 +249,11 @@ pub fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Erro
         ActionType::SetMultisigConfig(signers, threshold) => {
             validate_multisig_config(signers, *threshold)?;
         }
+        ActionType::SetPairMaxSlippageBps(_, _, bps)
+            if !(0..=crate::storage::MAX_PAIR_SLIPPAGE_BPS).contains(bps) =>
+        {
+            return Err(Error::InvalidSlippageConfig);
+        }
         _ => {}
     }
     Ok(())

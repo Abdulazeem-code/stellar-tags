@@ -43,6 +43,7 @@ impl PaymentRouter {
     pub const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
     pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = storage::DEFAULT_MAX_SLIPPAGE_BPS;
     pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = storage::MAX_SLIPPAGE_BPS_LIMIT;
+    pub const MAX_PAIR_SLIPPAGE_BPS: i128 = storage::MAX_PAIR_SLIPPAGE_BPS;
     pub const DAY_IN_LEDGERS: u32 = storage::DAY_IN_LEDGERS;
     pub const INSTANCE_BUMP_AMOUNT: u32 = storage::INSTANCE_BUMP_AMOUNT;
     pub const INSTANCE_LIFETIME_THRESHOLD: u32 = storage::INSTANCE_LIFETIME_THRESHOLD;
@@ -120,10 +121,6 @@ impl PaymentRouter {
     #[inline]
     fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
         access::store_multisig_config(env, signers, threshold);
-    }
-    #[inline]
-    fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
-        access::validate_queued_action(env, action)
     }
     #[inline]
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
@@ -244,6 +241,24 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::MaxSlippageBps)
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Resolve the token-pair override, falling back to the legacy global cap.
+    /// Corrupt or out-of-range persisted overrides fail closed.
+    fn pair_max_slippage_bps(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<i128, Error> {
+        let configured: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairSlippage(token_in.clone(), token_out.clone()));
+        match configured {
+            Some(bps) if (0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&bps) => Ok(bps),
+            Some(_) => Err(Error::InvalidSlippageConfig),
+            None => Ok(Self::max_slippage_bps(env)),
+        }
     }
 
     /// Returns whether a DEX router has been approved for swap routing.
@@ -3000,7 +3015,8 @@ impl PaymentRouter {
             return Err(Error::SlippageExceeded);
         }
         if swap.expected_amount_out > 0 {
-            let max_slippage_bps = Self::max_slippage_bps(env);
+            let max_slippage_bps =
+                Self::pair_max_slippage_bps(env, &swap.sell_token, &swap.buy_token)?;
             let slippage_floor = Self::slippage_floor(swap.expected_amount_out, max_slippage_bps);
             if amount_out < slippage_floor {
                 log!(
@@ -3175,7 +3191,7 @@ impl PaymentRouter {
             return Err(Error::InvalidSwapParams);
         }
 
-        let max_slippage_bps = Self::max_slippage_bps(&env);
+        let max_slippage_bps = Self::pair_max_slippage_bps(&env, &sell_token, &buy_token)?;
 
         Ok(SwapQuote {
             amount_out,
@@ -3312,6 +3328,39 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_max_slippage_bps(env: Env) -> i128 {
         Self::max_slippage_bps(&env)
+    }
+
+    /// Returns the configured cap for `(token_in, token_out)`, or the global
+    /// cap when no pair override exists. Invalid stored overrides fail closed.
+    pub fn get_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+    ) -> Result<i128, Error> {
+        Self::pair_max_slippage_bps(&env, &token_in, &token_out)
+    }
+
+    /// Sets a pair-specific slippage cap. Prefer the timelocked
+    /// `SetPairMaxSlippageBps` action for production configuration.
+    pub fn set_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        max_slippage_bps: i128,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        if !(0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&max_slippage_bps) {
+            return Err(Error::InvalidSlippageConfig);
+        }
+        let key = DataKey::PairSlippage(token_in, token_out);
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
     }
 
     /// Returns the available internal refund balance for a user and token.

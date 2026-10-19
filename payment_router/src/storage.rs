@@ -131,6 +131,8 @@ pub enum DataKey {
     RegisteredDex(Address),
     /// Maximum tolerated swap slippage in basis points.
     MaxSlippageBps,
+    /// Maximum tolerated swap slippage for a specific input/output token pair.
+    PairSlippage(Address, Address),
     /// The N addresses of the multi-signature admin group for upgrades.
     MultisigSigners,
     /// The M signers threshold of the multi-signature admin group.
@@ -154,6 +156,8 @@ pub const DEFAULT_RATE_LIMIT: u32 = 10;
 pub const MAX_RATE_LIMIT: u32 = 1_000_000;
 pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
 pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = 10_000;
+/// Pair overrides are deliberately stricter than the legacy global ceiling.
+pub const MAX_PAIR_SLIPPAGE_BPS: i128 = 500;
 pub const DAY_IN_LEDGERS: u32 = 17280;
 pub const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
 pub const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;

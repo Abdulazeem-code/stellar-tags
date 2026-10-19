@@ -64,6 +64,15 @@ pub fn apply_action(env: &Env, action: ActionType) -> Result<(), Error> {
                 .instance()
                 .set(&DataKey::MaxSlippageBps, &max_slippage_bps);
         }
+        ActionType::SetPairMaxSlippageBps(token_in, token_out, bps) => {
+            let key = DataKey::PairSlippage(token_in, token_out);
+            env.storage().persistent().set(&key, &bps);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
     }
 
     env.storage().instance().extend_ttl(

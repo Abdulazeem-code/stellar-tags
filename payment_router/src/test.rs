@@ -4647,6 +4647,87 @@ fn test_max_slippage_bps_is_bounded_and_tightens_the_quote() {
 }
 
 #[test]
+fn pair_slippage_overrides_global_cap_for_stable_and_volatile_pairs() {
+    let f = setup_swap_fixture(1, 1);
+    let other_token = Address::generate(&f.env);
+
+    // Stablecoin pairs can use a strict cap; volatile pairs can use a higher one.
+    f.client
+        .set_pair_max_slippage_bps(&f.sell_token, &f.buy_token, &10);
+    assert_eq!(
+        f.client.get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
+        10
+    );
+    let stable_quote = f
+        .client
+        .quote_swap(&f.dex, &f.sell_token, &f.buy_token, &10_000);
+    assert_eq!(stable_quote.max_slippage_bps, 10);
+    assert_eq!(stable_quote.min_amount_out, 9_990);
+
+    f.client
+        .set_pair_max_slippage_bps(&f.sell_token, &other_token, &400);
+    assert_eq!(
+        f.client.get_pair_max_slippage_bps(&f.sell_token, &other_token),
+        400
+    );
+    let volatile_quote = f
+        .client
+        .quote_swap(&f.dex, &f.sell_token, &other_token, &10_000);
+    assert_eq!(volatile_quote.max_slippage_bps, 400);
+    assert_eq!(volatile_quote.min_amount_out, 9_600);
+    assert_eq!(
+        f.client.get_pair_max_slippage_bps(&other_token, &f.buy_token),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
+}
+
+#[test]
+fn pair_slippage_rejects_values_above_ceiling_and_invalid_stored_values() {
+    let f = setup_swap_fixture(1, 1);
+    let token_in = Address::generate(&f.env);
+    let token_out = Address::generate(&f.env);
+
+    assert_eq!(
+        f.client
+            .try_set_pair_max_slippage_bps(&token_in, &token_out, &501)
+            .unwrap_err()
+            .unwrap(),
+        Error::InvalidSlippageConfig
+    );
+    f.env.as_contract(&f.contract_id, || {
+        f.env.storage().persistent().set(
+            &DataKey::PairSlippage(token_in.clone(), token_out.clone()),
+            &501i128,
+        );
+    });
+    assert_eq!(
+        f.client
+            .try_get_pair_max_slippage_bps(&token_in, &token_out)
+            .unwrap_err()
+            .unwrap(),
+        Error::InvalidSlippageConfig
+    );
+}
+
+#[test]
+fn pair_slippage_timelock_action_applies_override() {
+    let f = setup_swap_fixture(1, 1);
+    let action = ActionType::SetPairMaxSlippageBps(
+        f.sell_token.clone(),
+        f.buy_token.clone(),
+        250,
+    );
+    let nonce = f.client.queue_action(&action);
+    advance_time(&f.env, PaymentRouter::SECONDS_IN_24H + 1);
+    f.client.execute_action(&nonce);
+
+    assert_eq!(
+        f.client.get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
+        250
+    );
+}
+
+#[test]
 fn test_dex_registration_goes_through_the_timelock() {
     let f = setup_swap_fixture(1, 1);
 
