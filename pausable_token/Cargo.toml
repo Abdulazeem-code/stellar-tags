@@ -7,10 +7,13 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "29.0.1"
+soroban-sdk = "20.0.0"
 
 [dev-dependencies]
-soroban-sdk = { version = "29.0.1", features = ["testutils"] }
+soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+
+[patch.crates-io]
+ethnum = { version = "1.5.3" }
 
 [profile.release]
 opt-level = "z"
