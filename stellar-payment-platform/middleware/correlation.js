@@ -1,4 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
+const { logger } = require('../src/logger');
+const { currentTraceId } = require('../src/utils/traceContext');
 
 const CORRELATION_HEADER = 'X-Correlation-ID';
 
@@ -12,11 +14,19 @@ const correlationId = (req, res, next) => {
 
   req.correlationId = id;
   res.set(CORRELATION_HEADER, id);
+  const traceId = currentTraceId();
+  if (traceId) res.set('X-Trace-ID', traceId);
 
-  // Prefix request logs with the correlation ID so a single API call can be
-  // traced end-to-end across the backend's log output.
+  // Tag request logs with the correlation ID so a single API call can be traced
+  // end-to-end across the backend's log output (console and rotating files).
   res.on('finish', () => {
-    console.log(`[Correlation ID: ${id}] ${req.method} ${req.originalUrl} ${res.statusCode}`);
+    logger.info(`${req.method} ${req.originalUrl} ${res.statusCode}`, {
+      correlationId: id,
+      traceId,
+      method: req.method,
+      url: req.originalUrl,
+      statusCode: res.statusCode,
+    });
   });
 
   next();
