@@ -1,6 +1,30 @@
 use crate::errors::Error;
 use soroban_sdk::{contracttype, Address, BytesN, Env};
 
+// ── Tiered Circuit Breaker ───────────────────────────────────────────────────
+
+/// Tiered pause levels for the emergency circuit breaker (issue #890).
+///
+/// - `None` (0): Contract is fully operational — both direct payments and
+///   swap-routed payments are accepted.
+/// - `SwapsOnly` (1): Only DEX swap operations (`route_payment_with_swap` and
+///   `route_payments_with_swap`) are halted.  Direct `route_payments` calls
+///   continue to function normally, so core merchant payment flows remain
+///   unaffected during an isolated DEX exploit.
+/// - `FullHalt` (2): All routing operations are halted.  Equivalent to the
+///   legacy `Paused = true` behaviour.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PauseLevel {
+    /// Contract fully operational.
+    None = 0,
+    /// DEX swaps halted; direct payments continue.
+    SwapsOnly = 1,
+    /// All routing halted.
+    FullHalt = 2,
+}
+
 /// Role definitions for the Role-Based Access Control (RBAC) system.
 ///
 /// Segregates operational privileges across dedicated role boundaries:
@@ -131,6 +155,8 @@ pub enum DataKey {
     RegisteredDex(Address),
     /// Maximum tolerated swap slippage in basis points.
     MaxSlippageBps,
+    /// Maximum tolerated swap slippage for a specific input/output token pair.
+    PairSlippage(Address, Address),
     /// The N addresses of the multi-signature admin group for upgrades.
     MultisigSigners,
     /// The M signers threshold of the multi-signature admin group.
@@ -139,6 +165,15 @@ pub enum DataKey {
     UpgradeApproval(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
+    /// Tiered pause level for the emergency circuit breaker (issue #890).
+    /// Stored as `PauseLevel` in instance storage. Supersedes the legacy
+    /// `DataKey::Paused` boolean; both keys are honoured during migration so
+    /// existing paused state is preserved.
+    PauseLevel,
+    /// The operator address authorized to renew the dead man's switch heartbeat
+    /// without possessing full admin privileges (issue #889).
+    /// Stored as `Address` in instance storage.
+    HeartbeatOperator,
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -154,6 +189,8 @@ pub const DEFAULT_RATE_LIMIT: u32 = 10;
 pub const MAX_RATE_LIMIT: u32 = 1_000_000;
 pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
 pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = 10_000;
+/// Pair overrides are deliberately stricter than the legacy global ceiling.
+pub const MAX_PAIR_SLIPPAGE_BPS: i128 = 500;
 pub const DAY_IN_LEDGERS: u32 = 17280;
 pub const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
 pub const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;

@@ -131,6 +131,8 @@ pub enum ActionType {
     DeregisterDex(Address),
     /// Update the maximum tolerated swap slippage.
     SetMaxSlippageBps(i128),
+    /// Update the maximum tolerated slippage for one token pair.
+    SetPairMaxSlippageBps(Address, Address, i128),
     /// Configure the multi-signature admin group for contract upgrades.
     SetMultisigConfig(Vec<Address>, u32),
 }

@@ -1,38 +1,39 @@
 #![no_std]
-//! # PaymentProxy — upgradeable proxy for PaymentRouter
+//! # PaymentProxy — upgradeable proxy for PaymentRouter with EIP-712 Typed Structured Data Meta-Transactions
 //!
 //! This contract provides a **stable on-chain address** so clients never need
 //! to change the contract ID they interact with, even when the underlying
 //! `PaymentRouter` logic contract is upgraded to a new WASM binary.
 //!
+//! In addition to upgrade delegation, `PaymentProxy` implements **EIP-712 style
+//! typed structured data hashing and signature verification for meta-transactions**.
+//!
 //! ## Architecture
 //!
 //! ```text
-//!   Client
-//!     │  calls PaymentProxy at a stable, permanent address
+//!   Client / Relayer
+//!     │  signs typed PaymentIntent with human-readable parameters (EIP-712)
+//!     │  submits signed intent to PaymentProxy
 //!     ▼
 //!   PaymentProxy  (this contract — address is immutable)
-//!     │  reads LogicContract storage key
+//!     │  validates domain separator (contract_id, network_id, version)
+//!     │  verifies cryptographic Ed25519 signature over deterministic typed hash
+//!     │  burns nonce to prevent replay attacks
 //!     │  forwards calls via env.invoke_contract
 //!     ▼
 //!   PaymentRouter  (upgradeable logic — address may change across major upgrades)
 //! ```
 //!
-//! ## Upgrade scenarios
+//! ## EIP-712 Typed Structured Data Hashing
 //!
-//! ### Scenario A — in-place WASM upgrade (no address change)
-//! Use the existing `PaymentRouter` timelock: `queue_action(Upgrade(hash))` then
-//! `execute_action(nonce)` after 24 h. The proxy's stored address remains valid;
-//! state is fully preserved because the contract instance does not change.
+//! Blind signing of raw byte hashes exposes users to phishing attacks and signature
+//! reuse across different contracts or networks.
 //!
-//! ### Scenario B — logic contract replacement (new deployment)
-//! 1. Deploy a fresh `PaymentRouter` instance and initialize it.
-//! 2. Call `PaymentProxy::upgrade_logic(admin, new_logic_address)`.
-//! 3. All subsequent forwarded calls reach the new contract.
-//!    State migration, if required, must be handled in the new contract's
-//!    initializer or via a separate migration transaction.
-//!
-//! ## Admin controls
+//! To prevent these vulnerabilities, `PaymentProxy` enforces typed data hashing:
+//! 1. **Domain Separator**: Binds `contract_id`, `network_id` (from the active ledger or network passphrase),
+//!    and the contract `version` string.
+//! 2. **Payment Intent**: Binds readable transaction parameters (`from`, `to`, `amount`, `nonce`, `fee`, `deadline`).
+//! 3. **Canonical Digest**: `SHA256("\x19\x01" || domain_separator_hash || intent_hash)`.
 //!
 //! | Function             | Who can call | What it does                                  |
 //! |----------------------|--------------|-----------------------------------------------|
@@ -79,9 +80,61 @@
 //! separate channels stream completely in parallel, so a stalled nonce no
 //! longer blocks any other payment.
 
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Val, Vec,
 };
+
+// ── Constants & Version ───────────────────────────────────────────────────────
+
+/// Semantic contract version string embedded in the EIP-712 domain separator.
+pub const CONTRACT_VERSION: &str = "0.1.0";
+
+// ── Data structures: EIP-712 Domain Separator & Payment Intent ────────────────
+
+/// EIP-712 style domain separator for meta-transactions in PaymentProxy.
+/// Protects against signature replay attacks across contracts, networks, and versions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomainSeparator {
+    /// Contract address where the meta-transaction is intended to execute.
+    pub contract_id: Address,
+    /// 32-byte network identifier (SHA-256 hash of the Stellar network passphrase).
+    pub network_id: BytesN<32>,
+    /// Contract version string (e.g., "0.1.0").
+    pub version: String,
+}
+
+/// Typed structured data for payment intents (EIP-712 style).
+/// Enables human-readable transaction inspection on hardware and browser wallets.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentIntent {
+    /// Address of the payment sender whose funds are transferred and whose nonce is incremented.
+    pub from: Address,
+    /// Address of the payment recipient.
+    pub to: Address,
+    /// Amount of tokens to transfer in the smallest unit.
+    pub amount: i128,
+    /// Replay prevention nonce (must match next expected nonce for `from`).
+    pub nonce: u64,
+    /// Relayer or platform fee in smallest unit.
+    pub fee: i128,
+    /// Ledger timestamp deadline after which the transaction is rejected.
+    pub deadline: u64,
+}
+
+/// Single meta-transaction invocation parameters for batch execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaTxCall {
+    /// 32-byte Ed25519 signer public key.
+    pub signer_pubkey: BytesN<32>,
+    /// EIP-712 structured payment intent.
+    pub intent: PaymentIntent,
+    /// 64-byte Ed25519 signature over the typed intent hash.
+    pub signature: BytesN<64>,
+}
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -102,7 +155,7 @@ pub enum ProxyDataKey {
 // ── Error codes ───────────────────────────────────────────────────────────────
 
 /// Errors specific to the proxy contract.
-#[soroban_sdk::contracterror]
+#[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ProxyError {
@@ -120,6 +173,9 @@ pub enum ProxyError {
     InvalidBitIndex = 6,
 }
 
+pub type MetaPaymentPayload = MetaPayment;
+pub type MetaTransaction = MetaPayment;
+
 // ── TTL helpers ───────────────────────────────────────────────────────────────
 
 const DAY_IN_LEDGERS: u32 = 17_280; // ≈5 s per ledger
@@ -128,10 +184,14 @@ const INSTANCE_THRESHOLD: u32 = INSTANCE_BUMP - DAY_IN_LEDGERS;
 const PERSISTENT_BUMP: u32 = 30 * DAY_IN_LEDGERS;
 const PERSISTENT_THRESHOLD: u32 = PERSISTENT_BUMP - DAY_IN_LEDGERS;
 
+const USER_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 /// Stable-address proxy that delegates all routing calls to an upgradeable
-/// `PaymentRouter` logic contract.
+/// `PaymentRouter` logic contract, with EIP-712 typed structured data hashing
+/// for secure meta-transactions.
 #[contract]
 pub struct PaymentProxy;
 
@@ -249,10 +309,6 @@ impl PaymentProxy {
     /// The caller supplies the function name (`func`) and the full argument
     /// vector (`args`) to pass to the logic contract. The return value is the
     /// raw `Val` returned by the logic contract.
-    ///
-    /// This keeps the proxy interface stable: as the logic contract's function
-    /// signatures evolve, callers continue to use `forward` with the updated
-    /// function name and argument shapes.
     ///
     /// # Parameters
     /// - `func` — `Symbol` name of the function to invoke on the logic contract.
@@ -387,6 +443,71 @@ impl PaymentProxy {
 
     // ── Internal helpers ───────────────────────────────────────────────────────
 
+    /// Internal logic for computing the EIP-712 typed structured data hash.
+    fn compute_typed_data_hash_internal(
+        env: &Env,
+        domain: &DomainSeparator,
+        intent: &PaymentIntent,
+    ) -> BytesN<32> {
+        let domain_hash = env.crypto().sha256(&domain.clone().to_xdr(env));
+        let intent_hash = env.crypto().sha256(&intent.clone().to_xdr(env));
+
+        let mut msg = Bytes::new(env);
+        // EIP-712 \x19\x01 prefix ensuring separation from plain transactions and arbitrary byte messages
+        msg.append(&Bytes::from_slice(env, b"\x19\x01"));
+        msg.append(&Bytes::from_slice(env, &domain_hash.to_array()));
+        msg.append(&Bytes::from_slice(env, &intent_hash.to_array()));
+
+        env.crypto().sha256(&msg)
+    }
+
+    /// Internal verification helper for typed payment intents.
+    fn verify_payment_intent_internal(
+        env: &Env,
+        signer_pubkey: &BytesN<32>,
+        intent: &PaymentIntent,
+        signature: &BytesN<64>,
+    ) -> Result<(), ProxyError> {
+        if env.ledger().timestamp() > intent.deadline {
+            return Err(ProxyError::DeadlineExpired);
+        }
+
+        let current_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&ProxyDataKey::Nonce(intent.from.clone()))
+            .unwrap_or(0);
+
+        if intent.nonce != current_nonce {
+            return Err(ProxyError::InvalidNonce);
+        }
+
+        let domain = Self::get_domain_separator(env.clone());
+        let digest = Self::compute_typed_data_hash_internal(env, &domain, intent);
+
+        #[cfg(any(test, feature = "testutils"))]
+        {
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let pubkey_bytes: [u8; 32] = signer_pubkey.to_array();
+            let sig_bytes: [u8; 64] = signature.to_array();
+            let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
+                .map_err(|_| ProxyError::InvalidSignature)?;
+            let dalek_sig = Signature::from_bytes(&sig_bytes);
+            verifying_key
+                .verify(&digest.to_array(), &dalek_sig)
+                .map_err(|_| ProxyError::InvalidSignature)?;
+        }
+
+        #[cfg(not(any(test, feature = "testutils")))]
+        {
+            let digest_bytes = Bytes::from_slice(env, &digest.to_array());
+            env.crypto()
+                .ed25519_verify(signer_pubkey, &digest_bytes, signature);
+        }
+
+        Ok(())
+    }
+
     /// Reads the stored admin, checks it equals `caller`, and calls
     /// `caller.require_auth()`.
     fn assert_admin(env: &Env, caller: &Address) -> Result<(), ProxyError> {
@@ -467,10 +588,13 @@ impl PaymentProxy {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(all(test, feature = "testutils"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, vec, Env, TryIntoVal};
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger},
+        token, vec, Env, TryIntoVal,
+    };
 
     // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -627,8 +751,6 @@ mod tests {
         let client = PaymentProxyClient::new(&env, &proxy_id);
 
         let result = client.try_forward(&Symbol::new(&env, "get_admin"), &vec![&env]);
-        // Val does not implement PartialEq, so we cannot use assert_eq! on the
-        // full return type.  Match on only the error branch instead.
         assert!(
             matches!(result, Err(Ok(ProxyError::NotInitialized))),
             "expected NotInitialized error",
@@ -643,21 +765,17 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        // Deploy a second proxy instance that will act as the "logic contract"
-        // so we can call one of its functions (get_admin) through the forwarder.
         let logic_id = env.register_contract(None, PaymentProxy);
         let logic_client = PaymentProxyClient::new(&env, &logic_id);
         let logic_admin = Address::generate(&env);
         let dummy_logic = Address::generate(&env);
         logic_client.initialize(&logic_admin, &dummy_logic);
 
-        // Deployer proxy: will forward calls to logic_id.
         let proxy_id = env.register_contract(None, PaymentProxy);
         let proxy_client = PaymentProxyClient::new(&env, &proxy_id);
         let proxy_admin = Address::generate(&env);
         proxy_client.initialize(&proxy_admin, &logic_id);
 
-        // forward get_admin to the logic contract — expects logic_admin back.
         let result: Address = proxy_client
             .forward(&Symbol::new(&env, "get_admin"), &vec![&env])
             .try_into_val(&env)
@@ -673,34 +791,28 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        // v1 logic
         let logic_v1_id = env.register_contract(None, PaymentProxy);
         let v1_admin = Address::generate(&env);
         let dummy = Address::generate(&env);
         PaymentProxyClient::new(&env, &logic_v1_id).initialize(&v1_admin, &dummy);
 
-        // v2 logic
         let logic_v2_id = env.register_contract(None, PaymentProxy);
         let v2_admin = Address::generate(&env);
         PaymentProxyClient::new(&env, &logic_v2_id).initialize(&v2_admin, &dummy);
 
-        // Proxy starts pointing at v1.
         let proxy_id = env.register_contract(None, PaymentProxy);
         let proxy_admin = Address::generate(&env);
         let proxy = PaymentProxyClient::new(&env, &proxy_id);
         proxy.initialize(&proxy_admin, &logic_v1_id);
 
-        // Before upgrade: forward resolves v1_admin.
         let before: Address = proxy
             .forward(&Symbol::new(&env, "get_admin"), &vec![&env])
             .try_into_val(&env)
             .unwrap();
         assert_eq!(before, v1_admin);
 
-        // Upgrade logic pointer to v2.
         proxy.upgrade_logic(&proxy_admin, &logic_v2_id);
 
-        // After upgrade: forward resolves v2_admin.
         let after: Address = proxy
             .forward(&Symbol::new(&env, "get_admin"), &vec![&env])
             .try_into_val(&env)
