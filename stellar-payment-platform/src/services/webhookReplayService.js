@@ -9,7 +9,7 @@
  * and idempotency replay headers.
  */
 
-const { prisma } = require('../prismaClient');
+const { prisma } = require('../../prismaClient');
 const crypto = require('crypto');
 const { logger } = require('../logger');
 const { internalFetch } = require('../utils/internalClient');

@@ -432,3 +432,42 @@ model WebAuthnChallenge {
   @@index([userId, type])
   @@map("webauthn_challenges")
 }
+
+// PaymentReceipt: stores cryptographic Merkle inclusion proofs for completed payments
+model PaymentReceipt {
+  id              String   @id @default(uuid())
+  paymentId       String   @unique @map("payment_id")
+  merkleRoot      String   @map("merkle_root")
+  leafIndex       Int      @map("leaf_index")
+  proof           Json     // Array of { position: 'left'|'right', hash: string }
+  anchorTxHash    String?  @map("anchor_tx_hash") // Stellar transaction hash anchoring the Merkle root
+  anchorStatus    String   @default("pending") @map("anchor_status") // pending | confirmed | failed
+  batchId         String   @map("batch_id")
+  batchTimestamp  BigInt   @map("batch_timestamp") // Unix milliseconds
+  createdAt       DateTime @default(now()) @map("created_at")
+  confirmedAt     DateTime? @map("confirmed_at")
+
+  @@index([anchorTxHash])
+  @@index([batchId])
+  @@index([createdAt])
+  @@map("payment_receipts")
+}
+
+// ReceiptAnchor: records each hourly Merkle root anchoring to Stellar ledger
+model ReceiptAnchor {
+  id              String   @id @default(uuid())
+  merkleRoot      String   @unique @map("merkle_root")
+  anchorTxHash    String   @unique @map("anchor_tx_hash")
+  batchId         String   @unique @map("batch_id")
+  batchTimestamp  BigInt   @map("batch_timestamp")
+  leafCount       Int      @map("leaf_count")
+  status          String   @default("pending") // pending | confirmed | failed
+  attempts        Int      @default(0)
+  lastError       String?  @map("last_error")
+  createdAt       DateTime @default(now()) @map("created_at")
+  confirmedAt     DateTime? @map("confirmed_at")
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("receipt_anchors")
+}

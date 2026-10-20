@@ -6,7 +6,7 @@ const { shouldFallbackToLocalRegistry } = require('./utils');
 const { context, propagation, trace } = require('@opentelemetry/api');
 const { internalFetch } = require('./utils/internalClient');
 const { routeToDlq, isDlqAvailable, DLQ_QUEUE_NAME } = require('./dlq');
-const { prisma } = require('./prismaClient');
+const { prisma } = require('../prismaClient');
 
 /** Reads a positive integer env var, falling back when unset or malformed. */
 const parseEnvInt = (value, fallback) => {
