@@ -33,6 +33,7 @@ const {
   setDlqDepthSource,
 } = require("./src/metrics");
 const { closeDlqQueue, getDlqDepth, hasOpenDlqQueues } = require("./src/dlq");
+const { startDlqWorker, closeDlqWorker } = require("./src/dlqWorker");
 const {
   buildErrorHandler,
   notFoundHandler,
@@ -314,6 +315,8 @@ scheduleReconciliationJob(prisma);
 scheduleReceiptNotarizationJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
+startDlqWorker();
+
 // RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
 
 
@@ -504,6 +507,11 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
         } catch (err) {
           logger.error(err, "Error closing the DLQ queues during shutdown:");
         }
+      }
+      try {
+        await closeDlqWorker();
+      } catch (err) {
+        logger.error(err, "Error closing the DLQ worker during shutdown:");
       }
       process.exit(0);
     });
