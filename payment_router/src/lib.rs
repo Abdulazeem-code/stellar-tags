@@ -1,6 +1,7 @@
 #![no_std]
 pub mod access;
 mod archival;
+pub mod dead_mans_switch;
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
@@ -10,6 +11,7 @@ pub mod types;
 
 pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
+pub use dead_mans_switch::*;
 pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
@@ -43,6 +45,7 @@ impl PaymentRouter {
     pub const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
     pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = storage::DEFAULT_MAX_SLIPPAGE_BPS;
     pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = storage::MAX_SLIPPAGE_BPS_LIMIT;
+    pub const MAX_PAIR_SLIPPAGE_BPS: i128 = storage::MAX_PAIR_SLIPPAGE_BPS;
     pub const DAY_IN_LEDGERS: u32 = storage::DAY_IN_LEDGERS;
     pub const INSTANCE_BUMP_AMOUNT: u32 = storage::INSTANCE_BUMP_AMOUNT;
     pub const INSTANCE_LIFETIME_THRESHOLD: u32 = storage::INSTANCE_LIFETIME_THRESHOLD;
@@ -170,6 +173,22 @@ impl PaymentRouter {
         access::require_circuit_closed(env)
     }
     #[inline]
+    fn get_pause_level_internal(env: &Env) -> PauseLevel {
+        access::get_pause_level(env)
+    }
+    #[inline]
+    fn set_pause_level_internal(env: &Env, level: PauseLevel) {
+        access::set_pause_level(env, level);
+    }
+    #[inline]
+    fn require_not_fully_halted(env: &Env) -> Result<(), Error> {
+        access::require_not_fully_halted(env)
+    }
+    #[inline]
+    fn require_swaps_not_paused(env: &Env) -> Result<(), Error> {
+        access::require_swaps_not_paused(env)
+    }
+    #[inline]
     fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
         fees::calculate_fee(amount, effective_fee_bps, fee_cap)
     }
@@ -240,6 +259,24 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::MaxSlippageBps)
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Resolve the token-pair override, falling back to the legacy global cap.
+    /// Corrupt or out-of-range persisted overrides fail closed.
+    fn pair_max_slippage_bps(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<i128, Error> {
+        let configured: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairSlippage(token_in.clone(), token_out.clone()));
+        match configured {
+            Some(bps) if (0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&bps) => Ok(bps),
+            Some(_) => Err(Error::InvalidSlippageConfig),
+            None => Ok(Self::max_slippage_bps(env)),
+        }
     }
 
     /// Returns whether a DEX router has been approved for swap routing.
@@ -1395,11 +1432,14 @@ impl PaymentRouter {
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         Self::require_role(&env, Role::Pauser)?;
 
-        env.storage().instance().set(&DataKey::Paused, &paused);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
+        // Convert the boolean to a tiered level for backward compatibility.
+        // `true` → `FullHalt`, `false` → `None`.
+        let level = if paused {
+            PauseLevel::FullHalt
+        } else {
+            PauseLevel::None
+        };
+        Self::set_pause_level_internal(&env, level);
 
         env.events().publish((symbol_short!("pause"),), (paused,));
 
@@ -1420,10 +1460,52 @@ impl PaymentRouter {
         Self::set_pause(env, paused)
     }
 
-    /// Returns whether the contract is currently paused.
+    /// Sets the tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `PauseLevel::None` (0) — all routing enabled.
+    /// - `PauseLevel::SwapsOnly` (1) — DEX swap calls blocked; direct payments continue.
+    /// - `PauseLevel::FullHalt` (2) — all routing blocked (equivalent to `set_pause(true)`).
+    ///
+    /// Pauser role is required. This call is NOT timelocked so the Pauser can
+    /// react immediately to an exploit.
+    ///
+    /// # Panics
+    /// Panics if the current Pauser does not authorize the call.
+    pub fn set_pause_level(env: Env, level: PauseLevel) -> Result<(), Error> {
+        Self::require_role(&env, Role::Pauser)?;
+
+        Self::set_pause_level_internal(&env, level);
+
+        env.events()
+            .publish((Symbol::new(&env, "pause_level"),), (level as u32,));
+
+        Ok(())
+    }
+
+    /// Returns the current tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `0` = None (fully operational)
+    /// - `1` = SwapsOnly (swaps halted, direct payments active)
+    /// - `2` = FullHalt (all routing halted)
     ///
     /// # Returns
-    /// `true` if paused, `false` if unpaused or not yet initialized.
+    /// The active [`PauseLevel`].
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_pause_level(env: Env) -> PauseLevel {
+        Self::get_pause_level_internal(&env)
+    }
+
+    /// Returns whether the contract is currently paused.
+    ///
+    /// Returns `true` only when the pause level is `FullHalt`.  Under
+    /// `SwapsOnly`, direct payments still work so this returns `false` to
+    /// preserve backward compatibility for callers that only need to know
+    /// whether core transfers are allowed.
+    ///
+    /// # Returns
+    /// `true` if fully halted, `false` otherwise.
     ///
     /// # Panics
     /// Does not panic.
@@ -2320,6 +2402,110 @@ impl PaymentRouter {
         env.ledger().timestamp().saturating_sub(last) >= timeout
     }
 
+    // ── Dead Man's Switch — Operator Heartbeat (issue #889) ──────────────────
+
+    /// Appoints `operator` as the designated heartbeat renewal address.
+    ///
+    /// The operator can call `renew_heartbeat` to reset the DMS clock without
+    /// holding any other admin privileges.  This avoids exposing cold-storage
+    /// admin keys for routine monthly renewals.
+    ///
+    /// Only one operator may be designated at a time; calling this again
+    /// overwrites the previous designation.
+    ///
+    /// # Parameters
+    /// - `operator`: Address to designate as the heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    /// - `Error::Unauthorized` — caller is not the admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn set_heartbeat_operator(env: Env, operator: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::set_heartbeat_operator_internal(&env, &operator);
+
+        env.events().publish(
+            (Symbol::new(&env, "hb_operator_set"), admin),
+            operator,
+        );
+
+        log!(&env, "Heartbeat operator set");
+        Ok(())
+    }
+
+    /// Removes the designated heartbeat operator.
+    ///
+    /// After removal, only the primary admin (`ping`) or a routed payment can
+    /// reset the DMS clock.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn remove_heartbeat_operator(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::remove_heartbeat_operator_internal(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "hb_operator_rm"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Heartbeat operator removed");
+        Ok(())
+    }
+
+    /// Returns the currently designated heartbeat operator, if any.
+    ///
+    /// # Returns
+    /// `Some(operator)` if one is configured, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_heartbeat_operator(env: Env) -> Option<Address> {
+        dead_mans_switch::get_heartbeat_operator_internal(&env)
+    }
+
+    /// Renews the dead man's switch heartbeat on behalf of the configured
+    /// heartbeat operator (issue #889).
+    ///
+    /// The `operator` address must match the stored `DataKey::HeartbeatOperator`
+    /// and must authorize this call.  The operator may **only** reset the
+    /// heartbeat timestamp — it cannot modify the backup admin address, the
+    /// DMS timeout, or any other contract parameter.
+    ///
+    /// # Parameters
+    /// - `operator`: The address claiming operator privileges.  Must match the
+    ///   configured heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::Unauthorized` — `operator` does not match the stored operator
+    ///   or no operator has been configured.
+    /// - `Error::InvalidDmsConfig` — the dead man's switch is not currently
+    ///   armed (no heartbeat timestamp exists).
+    ///
+    /// # Panics
+    /// Panics if `operator` does not authorize the call.
+    pub fn renew_heartbeat(env: Env, operator: Address) -> Result<(), Error> {
+        dead_mans_switch::renew_heartbeat(&env, &operator)
+    }
+
     /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
     ///
     /// # Parameters
@@ -2707,9 +2893,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): direct payments are only
+        // blocked at FullHalt.  SwapsOnly leaves them unaffected.
+        Self::require_not_fully_halted(&env)?;
 
         // Pre-validate the whole batch before authorizing or moving any
         // funds, so a rejected payment never triggers an auth rollback.
@@ -3024,7 +3210,8 @@ impl PaymentRouter {
             return Err(Error::SlippageExceeded);
         }
         if swap.expected_amount_out > 0 {
-            let max_slippage_bps = Self::max_slippage_bps(env);
+            let max_slippage_bps =
+                Self::pair_max_slippage_bps(env, &swap.sell_token, &swap.buy_token)?;
             let slippage_floor = Self::slippage_floor(swap.expected_amount_out, max_slippage_bps);
             if amount_out < slippage_floor {
                 log!(
@@ -3110,9 +3297,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3140,9 +3327,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3199,7 +3386,7 @@ impl PaymentRouter {
             return Err(Error::InvalidSwapParams);
         }
 
-        let max_slippage_bps = Self::max_slippage_bps(&env);
+        let max_slippage_bps = Self::pair_max_slippage_bps(&env, &sell_token, &buy_token)?;
 
         Ok(SwapQuote {
             amount_out,
@@ -3336,6 +3523,39 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_max_slippage_bps(env: Env) -> i128 {
         Self::max_slippage_bps(&env)
+    }
+
+    /// Returns the configured cap for `(token_in, token_out)`, or the global
+    /// cap when no pair override exists. Invalid stored overrides fail closed.
+    pub fn get_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+    ) -> Result<i128, Error> {
+        Self::pair_max_slippage_bps(&env, &token_in, &token_out)
+    }
+
+    /// Sets a pair-specific slippage cap. Prefer the timelocked
+    /// `SetPairMaxSlippageBps` action for production configuration.
+    pub fn set_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        max_slippage_bps: i128,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        if !(0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&max_slippage_bps) {
+            return Err(Error::InvalidSlippageConfig);
+        }
+        let key = DataKey::PairSlippage(token_in, token_out);
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
     }
 
     /// Returns the available internal refund balance for a user and token.

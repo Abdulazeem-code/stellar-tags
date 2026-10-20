@@ -431,10 +431,8 @@ impl TwapOracle {
             .persistent()
             .set(&DataKey::CircuitBreakerTripped, &false);
 
-        env.events().publish(
-            (symbol_short!("breaker"), symbol_short!("reset")),
-            (),
-        );
+        env.events()
+            .publish((symbol_short!("breaker"), symbol_short!("reset")), ());
 
         Ok(())
     }
@@ -489,8 +487,7 @@ impl TwapOracle {
         let mut primary_price = 0i128;
         let mut primary_timestamp = 0u64;
 
-        if !observations.is_empty() {
-            let latest = observations.get(observations.len() - 1).unwrap();
+        if let Some(latest) = observations.get(observations.len().saturating_sub(1)) {
             primary_timestamp = latest.timestamp;
             let elapsed = current_time.saturating_sub(latest.timestamp);
             let is_stale = staleness_limit > 0 && elapsed > staleness_limit;
@@ -542,10 +539,8 @@ impl TwapOracle {
         if primary_fresh && secondary_fresh {
             let diff = (primary_price - secondary_price).abs();
             let max_bps = Self::max_divergence_bps(env.clone());
-            let divergence_bps = diff
-                .checked_mul(BPS_DIVISOR)
-                .ok_or(Error::PriceOverflow)?
-                / primary_price;
+            let divergence_bps =
+                diff.checked_mul(BPS_DIVISOR).ok_or(Error::PriceOverflow)? / primary_price;
 
             if divergence_bps > i128::from(max_bps) {
                 env.storage()
@@ -572,15 +567,10 @@ impl TwapOracle {
             let s_part = secondary_price
                 .checked_mul(i128::from(w2))
                 .ok_or(Error::PriceOverflow)?;
-            let avg = p_part
-                .checked_add(s_part)
-                .ok_or(Error::PriceOverflow)?
-                / total_w;
+            let avg = p_part.checked_add(s_part).ok_or(Error::PriceOverflow)? / total_w;
 
-            env.events().publish(
-                (symbol_short!("oracle"), symbol_short!("consensus")),
-                avg,
-            );
+            env.events()
+                .publish((symbol_short!("oracle"), symbol_short!("consensus")), avg);
 
             Ok(avg)
         } else if !primary_fresh {

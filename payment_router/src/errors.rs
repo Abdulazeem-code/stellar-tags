@@ -116,5 +116,7 @@ pub enum Error {
     /// A multi-hop swap path contains the same asset more than once.
     CyclicSwapPath = 48,
     /// A payment memo is malformed or exceeds Stellar's text memo limit.
-    InvalidMemo = 49,
+    InvalidMemo = 50,
+    /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
+    InvalidSlippageConfig = 49,
 }
