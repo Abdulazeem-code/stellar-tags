@@ -10,7 +10,14 @@ export default [
     // declared in `payment-dashboard/package.json`, not the root), aborting the
     // whole root run with ERR_MODULE_NOT_FOUND. They are linted separately
     // via `npm --prefix payment-dashboard run lint`, so exclude them here.
-    ignores: ["payment-dashboard/**", "packages/**"],
+    ignores: [
+      "payment-dashboard/**",
+      "packages/**",
+      // Jest's cache for the container-backed integration phase. It holds no
+      // sources, but ESLint still walks it, and a run that rewrites it while
+      // the lint job is walking the tree fails with a transient ENOENT.
+      "**/.jest-cache-integration/**",
+    ],
   },
   js.configs.recommended,
   {
