@@ -37,6 +37,7 @@ const { app } = require('../../server');
 const { createSlidingWindowRateLimiter } = require('../../src/middleware/slidingWindowRateLimit');
 const {
   closeRedis,
+  idempotencyKey,
   makeAddress,
   prisma,
   redis,
@@ -87,31 +88,36 @@ describe('Redis-backed middleware (real Redis)', () => {
         // eslint-disable-next-line no-await-in-loop
         const res = await request(app)
           .post(ROOT_REGISTER_URL)
+          .set('Idempotency-Key', idempotencyKey('rl'))
           .send({ username: `ratelimit${index}`, address: makeAddress(`RL${index}`) });
         statuses.push(res.status);
-        expect(res.headers['ratelimit-limit']).toBe('3');
+        // The signature limiter is a token bucket, which advertises its budget
+        // through the X-RateLimit-* headers.
+        expect(res.headers['x-ratelimit-limit']).toBe('3');
       }
       expect(statuses).toEqual([201, 201, 201]);
 
       const blocked = await request(app)
         .post(ROOT_REGISTER_URL)
+        .set('Idempotency-Key', idempotencyKey('rl'))
         .send({ username: 'ratelimit3', address: makeAddress('RL3') });
 
       expect(blocked.status).toBe(429);
       expect(blocked.body).toMatchObject({ success: false, error: { code: 'RATE_LIMITED' } });
       expect(blocked.headers['retry-after']).toMatch(/^\d+$/);
-      expect(blocked.headers['ratelimit-remaining']).toBe('0');
+      expect(blocked.headers['x-ratelimit-remaining']).toBe('0');
 
       // The limiter runs ahead of the handler, so the rejected request never
       // reached the database.
       expect(await prisma().user.count()).toBe(3);
     });
 
-    it('keeps the sliding window in a sorted set in Redis', async () => {
+    it('keeps the token bucket in a Redis hash', async () => {
       for (let index = 0; index < 2; index += 1) {
         // eslint-disable-next-line no-await-in-loop
         await request(app)
           .post(ROOT_REGISTER_URL)
+          .set('Idempotency-Key', idempotencyKey('rl'))
           .send({ username: `zset${index}`, address: makeAddress(`ZS${index}`) });
       }
 
@@ -119,12 +125,18 @@ describe('Redis-backed middleware (real Redis)', () => {
       const keys = await keysWithPrefix('sig-rl:');
       expect(keys).toHaveLength(1);
 
-      const entries = await client.zRange(keys[0], 0, -1, { WITHSCORES: true });
-      expect(entries).toHaveLength(2);
-      // The window is 60s, so PEXPIRE must have been set by the Lua script.
+      // The bucket lives in a hash holding the remaining tokens and the last
+      // refill timestamp — never in an in-process counter.
+      expect(await client.type(keys[0])).toBe('hash');
+      const bucket = await client.hGetAll(keys[0]);
+      expect(Object.keys(bucket).sort()).toEqual(['lastRefill', 'tokens']);
+      expect(Number(bucket.tokens)).toBe(1);
+
+      // The bucket expires once it would have refilled completely, plus a
+      // small grace period: ceil(capacity / refillRate) + 10 seconds.
       const ttl = await client.pTTL(keys[0]);
       expect(ttl).toBeGreaterThan(0);
-      expect(ttl).toBeLessThanOrEqual(60_000);
+      expect(ttl).toBeLessThanOrEqual(70_000);
     });
   });
 
@@ -275,14 +287,18 @@ describe('Redis-backed middleware (real Redis)', () => {
       expect((await probe('b')).status).toBe(200);
 
       // The key is a sorted set holding one member per allowed request, scored
-      // with the injected clock — never an in-process array.
+      // with the injected clock — never an in-process array. Identity 'b' has
+      // its own window, so it has its own key.
       const client = await redis();
       const keys = await keysWithPrefix('probe-rl:');
-      expect(keys).toEqual(['probe-rl:a']);
+      expect(keys).toEqual(['probe-rl:a', 'probe-rl:b']);
       expect(await client.zCard('probe-rl:a')).toBe(MAX);
-      const scores = (await client.zRange('probe-rl:a', 0, -1, { WITHSCORES: true })).filter((_, i) => i % 2 === 1);
-      for (const score of scores) {
-        expect(Number(score)).toBe(clock);
+      // node-redis v4 exposes the scores through zRangeWithScores; the
+      // WITHSCORES option on zRange is silently ignored.
+      const scores = await client.zRangeWithScores('probe-rl:a', 0, -1);
+      expect(scores).toHaveLength(MAX);
+      for (const entry of scores) {
+        expect(Number(entry.score)).toBe(clock);
       }
 
       // Slide past the window: the two old entries fall out of it.

@@ -36,6 +36,7 @@ const request = require('supertest');
 const { app } = require('../../server');
 const {
   closeRedis,
+  idempotencyKey,
   makeAddress,
   prisma,
   resetTestState,
@@ -44,7 +45,13 @@ const {
 
 const REGISTER_URL = '/api/v1/register';
 
-const register = (body) => request(app).post(REGISTER_URL).send(body);
+// Every mutating /api/v1 request must carry an Idempotency-Key: paymentRoutes
+// mounts idempotencyMiddleware(redisClient, { enforce: true }) at the v1 root.
+const register = (body) =>
+  request(app)
+    .post(REGISTER_URL)
+    .set('Idempotency-Key', idempotencyKey('register'))
+    .send(body);
 
 describe('registration (real PostgreSQL)', () => {
   beforeAll(async () => {
@@ -193,7 +200,8 @@ describe('registration (real PostgreSQL)', () => {
       const address = makeAddress('GONE');
       expect((await register({ username: 'goner', address })).status).toBe(201);
 
-      const del = await request(app).delete(`${REGISTER_URL}/goner`);
+      const del = await request(app).delete(`${REGISTER_URL}/goner`)
+        .set('Idempotency-Key', idempotencyKey('register'));
 
       expect(del.status).toBe(200);
       expect(del.body).toMatchObject({ ok: true, username: 'goner*localhost', deleted: true });
@@ -214,7 +222,8 @@ describe('registration (real PostgreSQL)', () => {
     it('still occupies the primary key, so the username cannot be re-registered', async () => {
       const address = makeAddress('RETAKE');
       expect((await register({ username: 'retaken', address })).status).toBe(201);
-      expect((await request(app).delete(`${REGISTER_URL}/retaken`)).status).toBe(200);
+      expect((await request(app).delete(`${REGISTER_URL}/retaken`)
+        .set('Idempotency-Key', idempotencyKey('register'))).status).toBe(200);
 
       const res = await register({ username: 'retaken', address: makeAddress('OTHER') });
 
@@ -223,7 +232,8 @@ describe('registration (real PostgreSQL)', () => {
     });
 
     it('answers 404 when the username does not exist', async () => {
-      const res = await request(app).delete(`${REGISTER_URL}/neverregistered`);
+      const res = await request(app).delete(`${REGISTER_URL}/neverregistered`)
+        .set('Idempotency-Key', idempotencyKey('register'));
 
       expect(res.status).toBe(404);
       expect(res.body).toMatchObject({ error: { code: 'NOT_FOUND' } });

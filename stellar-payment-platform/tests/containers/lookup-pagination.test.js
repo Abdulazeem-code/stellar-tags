@@ -158,7 +158,9 @@ describe('lookup (real PostgreSQL)', () => {
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({ totalCount: 7, totalPages: 3, currentPage: 2 });
       expect(res.body.data).toHaveLength(3);
-      expect(namesOn(res)).toEqual(['paged4*localhost', 'paged3*localhost', 'paged2*localhost']);
+      // Newest first, so the seven rows are paged as
+      // [paged6, paged5, paged4] / [paged3, paged2, paged1] / [paged0].
+      expect(namesOn(res)).toEqual(['paged3*localhost', 'paged2*localhost', 'paged1*localhost']);
     });
 
     it('returns a short final page', async () => {

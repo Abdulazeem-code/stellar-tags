@@ -38,6 +38,13 @@ const idempotencyMiddleware = (redisClient, options = {}) => {
   return async (req, res, next) => {
     if (!MUTATING_METHODS.has(req.method)) return next();
 
+    // A request can reach more than one instance of this middleware: the v1
+    // router is mounted at /api/v1, /api and /, and the admin router installs
+    // its own instance on top of the v1-wide one. The key must be claimed once
+    // per request — a second instance would find the pending claim the first
+    // one left behind and answer 409 instead of letting the request through.
+    if (req.idempotencyClaimed) return next();
+
     const rawKey = req.get(IDEMPOTENCY_HEADER);
     if (!rawKey) {
       if (options.enforce) {
@@ -107,6 +114,10 @@ const idempotencyMiddleware = (redisClient, options = {}) => {
       }
       return next(new ApiError('SERVICE_UNAVAILABLE', 'Invalid idempotency record'));
     }
+
+    // This request now owns the claim; a later instance of the middleware on
+    // the same request must not claim it again.
+    req.idempotencyClaimed = true;
 
     const release = async () => {
       if (usesRedis) {

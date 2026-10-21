@@ -58,6 +58,10 @@ function tenantContextMiddleware(options = {}) {
  * Sets the current tenant context for a PostgreSQL connection/transaction.
  * Uses parameterized queries to prevent SQL injection.
  *
+ * `SET LOCAL` only accepts literals, so the value is bound through
+ * `set_config(..., true)` — the transactional equivalent of `SET LOCAL` — which
+ * keeps the tenant id out of the SQL text.
+ *
  * @param {import('pg').PoolClient} client
  * @param {string} tenantId
  */
@@ -65,7 +69,7 @@ async function setTenantContext(client, tenantId) {
   if (!isValidTenantId(tenantId)) {
     throw new Error(`Invalid tenantId provided: ${tenantId}`);
   }
-  await client.query('SET LOCAL app.current_tenant_id = $1', [tenantId]);
+  await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
 }
 
 /**
@@ -74,7 +78,7 @@ async function setTenantContext(client, tenantId) {
  * @param {import('pg').PoolClient} client
  */
 async function clearTenantContext(client) {
-  await client.query("SET LOCAL app.current_tenant_id = ''");
+  await client.query("SELECT set_config('app.current_tenant_id', '', true)");
 }
 
 /**

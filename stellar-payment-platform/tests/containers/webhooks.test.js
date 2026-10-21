@@ -28,6 +28,7 @@ const request = require('supertest');
 const { app } = require('../../server');
 const {
   closeRedis,
+  idempotencyKey,
   insertUser,
   makeAddress,
   nameTag,
@@ -44,13 +45,27 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Credentials the auth layer accepts: a signature-shaped value, no signer. */
 const credentialsFor = (username) => ({ username, signature: makeAddress('SIG') });
 
+// Every mutating /api/v1 request must carry an Idempotency-Key: paymentRoutes
+// mounts idempotencyMiddleware(redisClient, { enforce: true }) at the v1 root,
+// so the requirement covers the webhook routes too.
 const createWebhook = (username, url) =>
-  request(app).post(WEBHOOKS_URL).send({ ...credentialsFor(username), url });
+  request(app)
+    .post(WEBHOOKS_URL)
+    .set('Idempotency-Key', idempotencyKey('webhook'))
+    .send({ ...credentialsFor(username), url });
 
 const listWebhooks = (username) => request(app).get(WEBHOOKS_URL).send(credentialsFor(username));
 
 const deleteWebhook = (username, id) =>
-  request(app).delete(`${WEBHOOKS_URL}/${id}`).send(credentialsFor(username));
+  request(app)
+    .delete(`${WEBHOOKS_URL}/${id}`)
+    .set('Idempotency-Key', idempotencyKey('webhook'))
+    .send(credentialsFor(username));
+
+// Every mutating /api/v1 request must carry an Idempotency-Key, including the
+// verify-test endpoint.
+const verifyTest = () =>
+  request(app).post(VERIFY_URL).set('Idempotency-Key', idempotencyKey('verify'));
 
 describe('webhooks (real PostgreSQL)', () => {
   let owner;
@@ -246,7 +261,10 @@ describe('webhooks (real PostgreSQL)', () => {
     });
 
     it('answers 405 for a method the router does not implement', async () => {
-      const res = await request(app).put(WEBHOOKS_URL).send(credentialsFor('hookowner'));
+      const res = await request(app)
+        .put(WEBHOOKS_URL)
+        .set('Idempotency-Key', idempotencyKey('webhook'))
+        .send(credentialsFor('hookowner'));
 
       expect(res.status).toBe(405);
     });
@@ -255,14 +273,17 @@ describe('webhooks (real PostgreSQL)', () => {
   describe('POST /webhooks/verify-test', () => {
     const secret = 'a'.repeat(64);
     const payload = { event: 'payment.completed', amount: 12.5 };
+    // The endpoint signs the exact bytes a merchant would send, so the payload
+    // travels as a JSON string. Sending it as a nested object is rejected by
+    // the app-wide `rejectNestedObjects` guard.
+    const payloadString = JSON.stringify(payload);
 
     const legacySignature = (body) =>
       crypto.createHmac('sha256', secret).update(JSON.stringify(body)).digest('hex');
 
     it('accepts a signature computed over the payload', async () => {
-      const res = await request(app)
-        .post(VERIFY_URL)
-        .send({ secret, payload })
+      const res = await verifyTest()
+        .send({ secret, payload: payloadString })
         .set('X-Webhook-Signature', legacySignature(payload));
 
       expect(res.status).toBe(200);
@@ -272,9 +293,8 @@ describe('webhooks (real PostgreSQL)', () => {
     it('rejects a signature computed with the wrong secret', async () => {
       const wrong = crypto.createHmac('sha256', 'b'.repeat(64)).update(JSON.stringify(payload)).digest('hex');
 
-      const res = await request(app)
-        .post(VERIFY_URL)
-        .send({ secret, payload })
+      const res = await verifyTest()
+        .send({ secret, payload: payloadString })
         .set('X-Webhook-Signature', wrong);
 
       expect(res.status).toBe(401);
@@ -284,23 +304,21 @@ describe('webhooks (real PostgreSQL)', () => {
     it('rejects a payload mutated after signing', async () => {
       const signature = legacySignature(payload);
 
-      const res = await request(app)
-        .post(VERIFY_URL)
-        .send({ secret, payload: { ...payload, amount: 1000000 } })
+      const res = await verifyTest()
+        .send({ secret, payload: JSON.stringify({ ...payload, amount: 1000000 }) })
         .set('X-Webhook-Signature', signature);
 
       expect(res.status).toBe(401);
     });
 
     it('answers 400 when the secret or the signature is missing', async () => {
-      const noSecret = await request(app)
-        .post(VERIFY_URL)
-        .send({ payload })
+      const noSecret = await verifyTest()
+        .send({ payload: payloadString })
         .set('X-Webhook-Signature', legacySignature(payload));
       expect(noSecret.status).toBe(400);
       expect(noSecret.body.error.code).toBe('MISSING_WEBHOOK_SECRET');
 
-      const noSignature = await request(app).post(VERIFY_URL).send({ secret, payload });
+      const noSignature = await verifyTest().send({ secret, payload: payloadString });
       expect(noSignature.status).toBe(400);
       expect(noSignature.body.error.code).toBe('MISSING_SIGNATURE');
     });
@@ -315,9 +333,8 @@ describe('webhooks (real PostgreSQL)', () => {
       it('accepts a fresh timestamp', async () => {
         const timestamp = new Date().toISOString();
 
-        const res = await request(app)
-          .post(VERIFY_URL)
-          .send({ secret, payload })
+        const res = await verifyTest()
+          .send({ secret, payload: payloadString })
           .set('Stellar-Timestamp', timestamp)
           .set('Stellar-Signature', boundSignature(timestamp, payload));
 
@@ -328,9 +345,8 @@ describe('webhooks (real PostgreSQL)', () => {
       it('rejects a replayed dispatch older than the tolerance window', async () => {
         const timestamp = new Date(Date.now() - 10 * 60 * 1000).toISOString();
 
-        const res = await request(app)
-          .post(VERIFY_URL)
-          .send({ secret, payload })
+        const res = await verifyTest()
+          .send({ secret, payload: payloadString })
           .set('Stellar-Timestamp', timestamp)
           .set('Stellar-Signature', boundSignature(timestamp, payload));
 
@@ -341,9 +357,8 @@ describe('webhooks (real PostgreSQL)', () => {
       it('rejects a timestamp more than a minute in the future', async () => {
         const timestamp = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-        const res = await request(app)
-          .post(VERIFY_URL)
-          .send({ secret, payload })
+        const res = await verifyTest()
+          .send({ secret, payload: payloadString })
           .set('Stellar-Timestamp', timestamp)
           .set('Stellar-Signature', boundSignature(timestamp, payload));
 
@@ -352,9 +367,8 @@ describe('webhooks (real PostgreSQL)', () => {
       });
 
       it('requires the timestamp when the signature is bound to it', async () => {
-        const res = await request(app)
-          .post(VERIFY_URL)
-          .send({ secret, payload })
+        const res = await verifyTest()
+          .send({ secret, payload: payloadString })
           .set('Stellar-Signature', boundSignature('2026-01-01T00:00:00.000Z', payload));
 
         expect(res.status).toBe(400);
