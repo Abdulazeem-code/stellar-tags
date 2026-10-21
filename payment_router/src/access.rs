@@ -160,19 +160,16 @@ pub fn get_pause_level(env: &Env) -> PauseLevel {
 /// Also keeps the legacy `DataKey::Paused` in sync so contracts that still
 /// read the old key see a consistent value.
 pub fn set_pause_level(env: &Env, level: PauseLevel) {
-    env.storage()
-        .instance()
-        .set(&DataKey::PauseLevel, &level);
+    env.storage().instance().set(&DataKey::PauseLevel, &level);
     // Keep legacy key consistent so any external tooling that reads
     // DataKey::Paused still gets a sensible answer.
     let legacy_paused = level != PauseLevel::None;
     env.storage()
         .instance()
         .set(&DataKey::Paused, &legacy_paused);
-    env.storage().instance().extend_ttl(
-        INSTANCE_LIFETIME_THRESHOLD,
-        INSTANCE_BUMP_AMOUNT,
-    );
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
 /// Returns `true` when the contract is at `PauseLevel::FullHalt` **or** the
