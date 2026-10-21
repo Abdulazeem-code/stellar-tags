@@ -215,6 +215,55 @@ pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = USER_LIFETIME_THRESHOLD;
 /// Number of bits packed into each `u64` word of a Merkle claimed bitset.
 pub const MERKLE_BITS_PER_WORD: u32 = 64;
 
+/// Remaining-TTL threshold below which automatic extension is triggered.
+/// At ~17,280 ledgers/day this equals roughly 14 hours of runway.
+pub const EXTEND_THRESHOLD: u32 = 10_000;
+
+/// Target TTL applied when the remaining TTL has fallen below [`EXTEND_THRESHOLD`].
+/// At ~17,280 ledgers/day this gives ~2.9 days of runway after extension.
+pub const EXTEND_AMOUNT: u32 = 50_000;
+
+// ── TTL Extension Helpers ────────────────────────────────────────────────────
+
+/// Extends instance storage TTL if the remaining ledgers have fallen below
+/// [`EXTEND_THRESHOLD`].
+///
+/// This is a **read-then-conditionally-write** guard: when the TTL is healthy
+/// (≥ `EXTEND_THRESHOLD`) the only cost is one `get_ttl` host call, so the
+/// gas overhead on the happy path is minimal.
+///
+/// Call this at the start of every high-frequency entry-point
+/// (`route_payment`, `route_payments`) so the instance can never be
+/// inadvertently archived mid-operation.
+pub fn extend_instance_ttl(env: &Env) {
+    let current_ttl = env.storage().instance().get_ttl();
+    if current_ttl < EXTEND_THRESHOLD {
+        env.storage()
+            .instance()
+            .extend_ttl(EXTEND_THRESHOLD, EXTEND_AMOUNT);
+    }
+}
+
+/// Extends the TTL of a single **persistent** storage key if the remaining
+/// ledgers have fallen below [`EXTEND_THRESHOLD`].
+///
+/// Like [`extend_instance_ttl`], the hot path (TTL healthy) incurs only one
+/// host read, keeping gas overhead negligible for keys that are touched
+/// frequently.
+///
+/// `key` must be a `DataKey` that is already present in persistent storage;
+/// calling this for a non-existent key is a no-op (the SDK's `get_ttl` will
+/// panic on a missing entry, so callers should only invoke this after
+/// confirming or writing the entry).
+pub fn extend_persistent_ttl(env: &Env, key: &DataKey) {
+    let current_ttl = env.storage().persistent().get_ttl(key);
+    if current_ttl < EXTEND_THRESHOLD {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, EXTEND_THRESHOLD, EXTEND_AMOUNT);
+    }
+}
+
 // ── Reentrancy Guard ─────────────────────────────────────────────────────────
 
 pub struct ReentrancyGuard<'a> {
