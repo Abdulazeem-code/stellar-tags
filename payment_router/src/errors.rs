@@ -129,4 +129,7 @@ pub enum Error {
     /// The claimed amount does not match the amount committed in the Merkle
     /// leaf for this recipient.
     MerkleAmountMismatch = 54,
+    /// The pool cannot provide even the `min_fill_bps` fraction of the swap;
+    /// the whole transaction reverts.
+    MinFillNotMet = 55,
 }
