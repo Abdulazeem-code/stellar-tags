@@ -158,6 +158,17 @@ function wrapPageWithBreaker(page) {
   });
 }
 
+/**
+ * Submit a signed transaction to Horizon with circuit breaker protection.
+ */
+const submitTransactionBreaker = createBreaker(
+  (tx) => horizon.submitTransaction(tx),
+);
+
+async function submitTransaction(tx) {
+  return submitTransactionBreaker.fire(tx);
+}
+
 // ---------------------------------------------------------------------------
 // Transaction submission retry
 // ---------------------------------------------------------------------------
@@ -249,6 +260,7 @@ module.exports = {
   fetchPaymentsForTransaction,
   fetchPaymentsForAccount,
   fetchFirstPaymentsPage,
+  submitTransaction,
 
   // Transaction submission with retry/backoff
   submitTransactionWithRetry,
