@@ -129,7 +129,11 @@ impl PaymentRouter {
         fees::load_fee_config(env)
     }
     #[inline]
-    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+    fn load_user_record(
+        env: &Env,
+        sender: &Address,
+        current_time: u64,
+    ) -> (u64, i128, i128, BytesN<32>, bool) {
         storage::load_user_record(env, sender, current_time)
     }
     #[inline]
@@ -1462,13 +1466,14 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_user_record(env: Env, user: Address) -> UserRecord {
         let current_time = env.ledger().timestamp();
-        let (last_reset_time, accumulated_amount, volume, _) =
+        let (last_reset_time, accumulated_amount, volume, flags, _) =
             Self::load_user_record(&env, &user, current_time);
 
         UserRecord {
             accumulated_amount,
             volume,
             last_reset_time,
+            flags,
         }
     }
 
@@ -1516,9 +1521,11 @@ impl PaymentRouter {
             // The legacy `UserVolume` already counts every amount in the
             // current window (each payment incremented both counters), so the
             // window balance must not be added again here.
+            // Legacy data carries no flags, so the bitmap starts zeroed.
+            let zero_flags = BytesN::from_array(&env, &[0u8; 32]);
             env.storage().persistent().set(
                 &record_key,
-                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
+                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume, &zero_flags),
             );
             env.storage().persistent().extend_ttl(
                 &record_key,

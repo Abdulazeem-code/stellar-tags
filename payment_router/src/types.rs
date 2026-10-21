@@ -14,11 +14,11 @@ pub struct UserSpending {
     pub accumulated_amount: i128,
 }
 
-/// A user's combined routing stats, unpacked from the packed `BytesN<40>`
-/// `UserRecord` ledger value (issue #663).
+/// A user's combined routing stats, unpacked from the packed `BytesN<72>`
+/// `UserRecord` ledger value (issues #663 and #894).
 ///
 /// Returned by [`PaymentRouter::get_user_record`] so a client can read both
-/// counters in a single view call instead of two.
+/// counters and the packed flag bitmap in a single view call.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserRecord {
@@ -28,6 +28,45 @@ pub struct UserRecord {
     pub volume: i128,
     /// Unix timestamp (seconds) at which the 24-hour window last reset.
     pub last_reset_time: u64,
+    /// Packed 256-bit boolean flag bitmap (issue #894). Bit `i` records the
+    /// state of user flag `i` (e.g. KYC verified, rate-limited, VIP tier,
+    /// active subscription). Stored alongside the counters in a single
+    /// persistent ledger entry to minimize storage rent.
+    pub flags: BytesN<32>,
+}
+
+impl UserRecord {
+    /// Returns `true` when the flag at `bit` (0..=255) is set in the packed
+    /// bitmap.
+    pub fn has_flag(&self, bit: u8) -> bool {
+        let byte = (bit / 8) as usize;
+        let offset = bit % 8;
+        self.flags
+            .to_array()
+            .get(byte)
+            .copied()
+            .unwrap_or(0)
+            >> offset
+            & 1
+            == 1
+    }
+
+    /// Sets the flag at `bit` (0..=255) to `val` on `self`.
+    ///
+    /// An `Env` is required to reconstruct the packed bitmap bytes.
+    pub fn set_flag(&mut self, env: &Env, bit: u8, val: bool) {
+        let byte = (bit / 8) as usize;
+        let offset = bit % 8;
+        let mut buf = self.flags.to_array();
+        if byte < buf.len() {
+            if val {
+                buf[byte] |= 1u8 << offset;
+            } else {
+                buf[byte] &= !(1u8 << offset);
+            }
+        }
+        self.flags = BytesN::from_array(env, &buf);
+    }
 }
 
 /// A single transfer instruction for use with [`PaymentRouter::route_payments`].
