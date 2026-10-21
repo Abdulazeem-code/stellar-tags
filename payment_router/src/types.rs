@@ -143,6 +143,8 @@ pub enum ActionType {
     DeregisterDex(Address),
     /// Update the maximum tolerated swap slippage.
     SetMaxSlippageBps(i128),
+    /// Update the maximum tolerated slippage for one token pair.
+    SetPairMaxSlippageBps(Address, Address, i128),
     /// Configure the multi-signature admin group for contract upgrades.
     SetMultisigConfig(Vec<Address>, u32),
 }
@@ -192,6 +194,32 @@ pub struct MultisigConfig {
     pub signers: Vec<Address>,
     /// The minimum number of signers required to approve an upgrade.
     pub threshold: u32,
+}
+
+/// A batch of payments committed by a 32-byte Merkle root.
+///
+/// The sender deposits `total_amount` of `token` and commits the Merkle root
+/// with the contract. Recipients then claim their individual payments by submitting
+/// the Merkle inclusion proof for their leaf. This keeps the on-chain work constant
+/// per claim and avoids iterating a linear recipient vector.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleBatch {
+    /// Address that funded the batch and may reclaim unclaimed funds.
+    pub sender: Address,
+    /// Contract ID of the token being distributed.
+    pub token: Address,
+    /// Total amount deposited for this batch, in the token's smallest unit.
+    pub total_amount: i128,
+    /// Amount already paid out to claiming recipients.
+    pub claimed_amount: i128,
+    /// SHA-256 Merkle root over the batch leaves.
+    pub merkle_root: BytesN<32>,
+    /// Unix timestamp (seconds) after which the sender may reclaim the
+    /// remaining balance.
+    pub expiration: u64,
+    /// Whether the batch has been closed and its remaining funds reclaimed.
+    pub reclaimed: bool,
 }
 
 /// Adapter interface implemented by the DEX used for an arbitrary token swap.

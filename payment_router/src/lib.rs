@@ -1,20 +1,22 @@
 #![no_std]
 pub mod access;
 mod archival;
+pub mod batch;
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
 pub mod storage;
-pub mod swaps;
+pub mod timelock;
 pub mod types;
 
 pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
+pub use batch::*;
 pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
 pub use storage::*;
-pub use swaps::*;
+pub use timelock::*;
 pub use types::*;
 
 use soroban_sdk::xdr::ToXdr;
@@ -43,6 +45,7 @@ impl PaymentRouter {
     pub const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
     pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = storage::DEFAULT_MAX_SLIPPAGE_BPS;
     pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = storage::MAX_SLIPPAGE_BPS_LIMIT;
+    pub const MAX_PAIR_SLIPPAGE_BPS: i128 = storage::MAX_PAIR_SLIPPAGE_BPS;
     pub const DAY_IN_LEDGERS: u32 = storage::DAY_IN_LEDGERS;
     pub const INSTANCE_BUMP_AMOUNT: u32 = storage::INSTANCE_BUMP_AMOUNT;
     pub const INSTANCE_LIFETIME_THRESHOLD: u32 = storage::INSTANCE_LIFETIME_THRESHOLD;
@@ -120,10 +123,6 @@ impl PaymentRouter {
     #[inline]
     fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
         access::store_multisig_config(env, signers, threshold);
-    }
-    #[inline]
-    fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
-        access::validate_queued_action(env, action)
     }
     #[inline]
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
@@ -244,6 +243,24 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::MaxSlippageBps)
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Resolve the token-pair override, falling back to the legacy global cap.
+    /// Corrupt or out-of-range persisted overrides fail closed.
+    fn pair_max_slippage_bps(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<i128, Error> {
+        let configured: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairSlippage(token_in.clone(), token_out.clone()));
+        match configured {
+            Some(bps) if (0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&bps) => Ok(bps),
+            Some(_) => Err(Error::InvalidSlippageConfig),
+            None => Ok(Self::max_slippage_bps(env)),
+        }
     }
 
     /// Returns whether a DEX router has been approved for swap routing.
@@ -846,101 +863,22 @@ impl PaymentRouter {
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
-        if Self::is_frozen_internal(&env) {
-            return Err(Error::ContractFrozen);
-        }
-        // Circuit breaker: applying a queued parameter change is a
-        // non-essential state change and is blocked while paused.
-        Self::require_circuit_closed(&env)?;
+        timelock::execute_action(&env, nonce)
+    }
 
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        let key = DataKey::TimelockEntry(nonce);
-        let entry: TimelockEntry = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::TimelockNotFound)?;
-
-        let now = env.ledger().timestamp();
-        if now < entry.queued_at + Self::SECONDS_IN_24H {
-            return Err(Error::TimelockNotReady);
-        }
-
-        // Validate the action before touching storage so that a rejected entry
-        // stays in the queue for the admin to retry or cancel.  Upgrades are
-        // gated on the M-of-N threshold here as well as in `upgrade`, so
-        // routing an upgrade through the timelock is not a way around it.
-        Self::validate_queued_action(&env, &entry.action)?;
-
-        // Remove the entry before applying the action (checks-effects-interactions).
-        env.storage().persistent().remove(&key);
-
-        // Apply the action.
-        match entry.action {
-            ActionType::SetPlatformTreasury(new_treasury) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::PlatformTreasury, &new_treasury);
-            }
-            ActionType::SetFeeConfig(fee_bps, fee_cap) => {
-                env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-                env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
-            }
-            ActionType::SetFeeBps(new_fee_bps) => {
-                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
-            }
-            ActionType::SetGovernance(gov) => {
-                env.storage().instance().set(&DataKey::Governance, &gov);
-            }
-            ActionType::SetMinLimit(min_limit) => {
-                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
-            }
-            ActionType::TransferAdmin(new_admin) => {
-                env.storage().instance().set(&DataKey::Admin, &new_admin);
-                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
-            }
-            ActionType::SetBackupAdmin(backup, timeout_seconds) => {
-                Self::apply_set_backup_admin(&env, backup, timeout_seconds)?;
-            }
-            ActionType::Upgrade(new_wasm_hash) => {
-                Self::apply_upgrade(&env, &new_wasm_hash);
-            }
-            ActionType::SetMultisigConfig(signers, threshold) => {
-                Self::store_multisig_config(&env, signers, threshold);
-            }
-            ActionType::RegisterDex(dex) => {
-                let key = DataKey::RegisteredDex(dex.clone());
-                env.storage().persistent().set(&key, &true);
-                env.storage().persistent().extend_ttl(
-                    &key,
-                    Self::PERSISTENT_LIFETIME_THRESHOLD,
-                    Self::PERSISTENT_BUMP_AMOUNT,
-                );
-            }
-            ActionType::DeregisterDex(dex) => {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::RegisteredDex(dex.clone()));
-            }
-            ActionType::SetMaxSlippageBps(max_slippage_bps) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::MaxSlippageBps, &max_slippage_bps);
-            }
-        }
-
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        env.events()
-            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
-
-        log!(&env, "Timelock action executed for nonce {}", nonce);
-        Ok(())
+    /// Executes a batch of previously queued timelock actions sequentially within
+    /// a single atomic invocation.
+    ///
+    /// Requirements:
+    /// - The contract must not be frozen.
+    /// - Circuit breaker must be closed.
+    /// - The admin must authorize.
+    /// - All nonces in the batch must be verified ready and valid BEFORE any action is executed.
+    /// - All actions execute sequentially. If any action fails execution,
+    ///   the entire invocation reverts atomically.
+    /// - Emits `batch_actions_executed` event with the list of nonces.
+    pub fn execute_batch_actions(env: Env, nonces: Vec<u64>) -> Result<(), Error> {
+        timelock::execute_batch_actions(&env, nonces)
     }
 
     /// Cancels a pending timelock entry before it can be executed.
@@ -1766,7 +1704,7 @@ impl PaymentRouter {
     /// configuration, stores the backup admin and timeout, and starts the
     /// claim clock. Performs NO authorization; callers must do that first
     /// (direct admin call or timelock execution).
-    fn apply_set_backup_admin(
+    pub(crate) fn apply_set_backup_admin(
         env: &Env,
         backup: Address,
         timeout_seconds: u64,
@@ -2585,6 +2523,164 @@ impl PaymentRouter {
         )
     }
 
+    /// Routes a payment through two to four consecutive DEX swaps. `path`
+    /// contains the input asset followed by every intermediate asset and the
+    /// output asset. `min_amounts_out[i]` is the required output for hop `i`.
+    /// Any input dust returned by a hop is refunded to `sender` in that hop's
+    /// input asset. All swaps and settlement are atomic.
+    pub fn route_multihop_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex_router: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        min_amounts_out: Vec<i128>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+
+        let hop_count = path.len().saturating_sub(1);
+        if !(2..=4).contains(&hop_count) || min_amounts_out.len() != hop_count {
+            return Err(Error::InvalidSwapPath);
+        }
+        // Paths are intentionally short (at most five assets), so checking
+        // every pair keeps the cycle guard simple and bounded.
+        for i in 0..path.len() {
+            let asset = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            for j in (i + 1)..path.len() {
+                if path.get(j).as_ref() == Some(&asset) {
+                    return Err(Error::CyclicSwapPath);
+                }
+            }
+        }
+        for floor in min_amounts_out.iter() {
+            if floor <= 0 {
+                return Err(Error::InvalidSwapParams);
+            }
+        }
+        if !Self::is_dex_registered_internal(&env, &dex_router) {
+            return Err(Error::DexNotRegistered);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+        Self::check_rate_limit(&env, &sender)?;
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let user_volume = Self::accrue_user_record(&env, &sender, amount_in)?;
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+        let contract_address = env.current_contract_address();
+        let first_token = path.get(0).ok_or(Error::InvalidSwapPath)?;
+        let input_client = token::Client::new(&env, &first_token);
+        if input_client.balance(&sender) < amount_in {
+            return Err(Error::InsufficientBalance);
+        }
+        input_client.transfer(&sender, &contract_address, &amount_in);
+
+        let mut current_amount = amount_in;
+        for i in 0..hop_count {
+            let token_in = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_out = path.get(i + 1).ok_or(Error::InvalidSwapPath)?;
+            let floor = min_amounts_out.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_in_client = token::Client::new(&env, &token_in);
+            let token_out_client = token::Client::new(&env, &token_out);
+            let input_before = token_in_client.balance(&contract_address);
+            let output_before = token_out_client.balance(&contract_address);
+            token_in_client.transfer(&contract_address, &dex_router, &current_amount);
+            let hop_path = vec![&env, token_in.clone(), token_out.clone()];
+            let result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
+                &token_in,
+                &token_out,
+                &current_amount,
+                &floor,
+                &hop_path,
+                &contract_address,
+            );
+            if result.len() != 2 {
+                return Err(Error::InvalidSwapPath);
+            }
+            let reported_out: i128 = result.get(0).ok_or(Error::SwapFailed)?;
+            let reported_unused: i128 = result.get(1).ok_or(Error::SwapFailed)?;
+            let input_after = token_in_client.balance(&contract_address);
+            let output_after = token_out_client.balance(&contract_address);
+            let actual_unused = input_after - (input_before - current_amount);
+            let actual_out = output_after - output_before;
+            if reported_unused < 0
+                || reported_unused > current_amount
+                || actual_unused != reported_unused
+                || reported_out != actual_out
+                || actual_out < floor
+                || actual_out <= 0
+            {
+                return Err(Error::SlippageExceeded);
+            }
+            if actual_unused > 0 {
+                // The path cannot revisit an asset, so this hop's unused input
+                // is no longer needed by a later hop.
+                token_in_client.transfer(&contract_address, &sender, &actual_unused);
+            }
+            env.events().publish(
+                (
+                    Symbol::new(&env, "swap_hop"),
+                    dex_router.clone(),
+                    token_in,
+                    token_out,
+                ),
+                (current_amount, actual_out, actual_unused, floor),
+            );
+            current_amount = actual_out;
+        }
+
+        let final_token = path.get(path.len() - 1).ok_or(Error::InvalidSwapPath)?;
+        let output_client = token::Client::new(&env, &final_token);
+        let (fee_amount, remainder) =
+            Self::calculate_fee(current_amount, effective_fee_bps, fee_cap);
+        if fee_amount > 0 {
+            output_client.transfer(&contract_address, &platform_treasury, &fee_amount);
+        }
+        if remainder > 0 {
+            match output_client.try_transfer(&contract_address, &recipient, &remainder) {
+                Ok(Ok(())) => {}
+                _ => Self::credit_refund_balance(&env, &sender, &final_token, remainder),
+            }
+        }
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            remainder,
+        );
+        Self::bump_heartbeat(&env);
+        Ok(remainder)
+    }
+
     /// Routes multiple payments in a single transaction. If any payment fails,
     /// the entire batch is reverted atomically.
     ///
@@ -2921,7 +3017,8 @@ impl PaymentRouter {
             return Err(Error::SlippageExceeded);
         }
         if swap.expected_amount_out > 0 {
-            let max_slippage_bps = Self::max_slippage_bps(env);
+            let max_slippage_bps =
+                Self::pair_max_slippage_bps(env, &swap.sell_token, &swap.buy_token)?;
             let slippage_floor = Self::slippage_floor(swap.expected_amount_out, max_slippage_bps);
             if amount_out < slippage_floor {
                 log!(
@@ -3145,7 +3242,7 @@ impl PaymentRouter {
             return Err(Error::InvalidSwapParams);
         }
 
-        let max_slippage_bps = Self::max_slippage_bps(&env);
+        let max_slippage_bps = Self::pair_max_slippage_bps(&env, &sell_token, &buy_token)?;
 
         Ok(SwapQuote {
             amount_out,
@@ -3282,6 +3379,39 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_max_slippage_bps(env: Env) -> i128 {
         Self::max_slippage_bps(&env)
+    }
+
+    /// Returns the configured cap for `(token_in, token_out)`, or the global
+    /// cap when no pair override exists. Invalid stored overrides fail closed.
+    pub fn get_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+    ) -> Result<i128, Error> {
+        Self::pair_max_slippage_bps(&env, &token_in, &token_out)
+    }
+
+    /// Sets a pair-specific slippage cap. Prefer the timelocked
+    /// `SetPairMaxSlippageBps` action for production configuration.
+    pub fn set_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        max_slippage_bps: i128,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        if !(0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&max_slippage_bps) {
+            return Err(Error::InvalidSlippageConfig);
+        }
+        let key = DataKey::PairSlippage(token_in, token_out);
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
     }
 
     /// Returns the available internal refund balance for a user and token.

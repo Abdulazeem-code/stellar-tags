@@ -113,4 +113,20 @@ pub enum Error {
     AlreadyApproved = 41,
     /// A reentrant call was detected.
     ReentrantCall = 42,
+    /// No Merkle batch exists for the supplied root or batch id.
+    MerkleBatchNotFound = 48,
+    /// A Merkle batch with this root has already been registered.
+    MerkleBatchAlreadyExists = 49,
+    /// The supplied Merkle inclusion proof does not verify against the root.
+    InvalidMerkleProof = 50,
+    /// The recipient has already claimed their Merkle payment.
+    MerklePaymentAlreadyClaimed = 51,
+    /// The Merkle batch has not expired yet, so unclaimed funds cannot be
+    /// reclaimed by the sender.
+    MerkleBatchNotExpired = 52,
+    /// The Merkle batch has expired and can no longer be claimed against.
+    MerkleBatchExpired = 53,
+    /// The claimed amount does not match the amount committed in the Merkle
+    /// leaf for this recipient.
+    MerkleAmountMismatch = 54,
 }

@@ -876,6 +876,162 @@ fn test_nonce_increments() {
     assert_eq!(n3, 3);
 }
 
+#[test]
+fn test_execute_batch_actions_three_distinct_actions_success() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let dex = Address::generate(&env);
+
+    // Queue 3 distinct actions
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+    let n3 = client.queue_action(&ActionType::RegisterDex(dex.clone()));
+
+    // Verify initial state
+    assert_eq!(client.get_fee(), 100);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
+    assert!(!client.is_dex_registered(&dex));
+
+    // Advance time past the 24h delay
+    advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+
+    let nonces = vec![&env, n1, n2, n3];
+    client.execute_batch_actions(&nonces);
+
+    // Verify all 3 distinct actions executed together
+    assert_eq!(client.get_fee(), 250);
+    assert_eq!(client.get_max_slippage_bps(), 300);
+    assert!(client.is_dex_registered(&dex));
+
+    // Verify all nonces are removed from queue
+    assert_eq!(
+        client.try_get_queued_action(&n1).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
+    assert_eq!(
+        client.try_get_queued_action(&n2).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
+    assert_eq!(
+        client.try_get_queued_action(&n3).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
+
+    // Verify batch_actions_executed event was emitted with the list of nonces
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, data)| {
+        if topics.is_empty() {
+            return false;
+        }
+        let raw = topics.get(0).unwrap();
+        let sym: Result<Symbol, _> = raw.try_into_val(&env);
+        if sym == Ok(Symbol::new(&env, "batch_actions_executed")) {
+            let emitted_nonces: Result<Vec<u64>, _> = data.try_into_val(&env);
+            emitted_nonces == Ok(nonces.clone())
+        } else {
+            false
+        }
+    });
+    assert!(
+        found,
+        "batch_actions_executed event not found with list of nonces"
+    );
+}
+
+#[test]
+fn test_execute_batch_actions_reverts_if_one_not_ready() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let dex = Address::generate(&env);
+
+    // Queue actions 1 and 2 at T0
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+
+    // Advance 20 hours (less than 24h)
+    advance_time(&env, 20 * 3600);
+
+    // Queue action 3 at T0 + 20h
+    let n3 = client.queue_action(&ActionType::RegisterDex(dex.clone()));
+
+    // Advance 5 hours (T0 + 25h total).
+    // Actions 1 and 2 have been queued for 25h (ready).
+    // Action 3 has been queued for only 5h (NOT ready).
+    advance_time(&env, 5 * 3600);
+
+    let nonces = vec![&env, n1, n2, n3];
+    let res = client.try_execute_batch_actions(&nonces);
+    assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
+
+    // Verify atomic rollback: none of the actions took effect
+    assert_eq!(client.get_fee(), 100);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
+    assert!(!client.is_dex_registered(&dex));
+
+    // Verify all actions remain pending in the queue
+    assert!(client.try_get_queued_action(&n1).is_ok());
+    assert!(client.try_get_queued_action(&n2).is_ok());
+    assert!(client.try_get_queued_action(&n3).is_ok());
+}
+
+#[test]
+fn test_execute_batch_actions_reverts_if_one_not_found() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+
+    advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+
+    // Batch contains an invalid nonce 9999
+    let nonces = vec![&env, n1, 9999u64, n2];
+    let res = client.try_execute_batch_actions(&nonces);
+    assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+
+    // Verify neither action executed
+    assert_eq!(client.get_fee(), 100);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
+    assert!(client.try_get_queued_action(&n1).is_ok());
+    assert!(client.try_get_queued_action(&n2).is_ok());
+}
+
+#[test]
+fn test_execute_batch_actions_blocks_when_frozen() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let n1 = client.queue_action(&ActionType::SetFeeBps(250));
+    let n2 = client.queue_action(&ActionType::SetMaxSlippageBps(300));
+
+    advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+
+    client.emergency_freeze();
+
+    let nonces = vec![&env, n1, n2];
+    let res = client.try_execute_batch_actions(&nonces);
+    assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
+}
+
 // ── Freeze tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -3935,6 +4091,64 @@ impl MockDex {
     }
 }
 
+#[contracttype]
+#[derive(Clone)]
+enum MockPathDexKey {
+    UnusedInput,
+}
+
+/// Small adapter used by multi-hop routing tests. It executes exactly one
+/// token pair per call, returns any unspent input to the router, and settles
+/// output to the requested recipient just like the production adapter API.
+#[contract]
+pub struct MockPathDex;
+
+#[contractimpl]
+impl MockPathDex {
+    pub fn set_unused_input(env: Env, amount: i128) {
+        env.storage()
+            .instance()
+            .set(&MockPathDexKey::UnusedInput, &amount);
+    }
+
+    pub fn swap_exact_tokens_for_tokens(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        path: Vec<Address>,
+        recipient: Address,
+    ) -> Vec<i128> {
+        assert_eq!(path.len(), 2);
+        assert_eq!(path.first(), Some(token_in.clone()));
+        assert_eq!(path.last(), Some(token_out.clone()));
+        let unused: i128 = env
+            .storage()
+            .instance()
+            .get(&MockPathDexKey::UnusedInput)
+            .unwrap_or(0);
+        assert!(unused >= 0 && unused <= amount_in);
+        let amount_out = amount_in - unused;
+        // Deliberately ignore the requested floor. The router must enforce it
+        // from the actual token balance delta, even with a non-compliant DEX.
+        let _ = min_amount_out;
+        if unused > 0 {
+            token::Client::new(&env, &token_in).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &unused,
+            );
+        }
+        token::Client::new(&env, &token_out).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount_out,
+        );
+        vec![&env, amount_out, unused]
+    }
+}
+
 /// Moves the test ledger to `timestamp`.
 fn set_timestamp(env: &Env, timestamp: u64) {
     env.ledger().set(LedgerInfo {
@@ -4044,6 +4258,109 @@ fn setup_swap_fixture(rate_num: i128, rate_den: i128) -> SwapFixture {
         buy_client,
         dex_client,
     }
+}
+
+struct MultiHopFixture {
+    env: Env,
+    client: PaymentRouterClient<'static>,
+    sender: Address,
+    recipient: Address,
+    treasury: Address,
+    dex: Address,
+    path: Vec<Address>,
+    token_clients: [token::Client<'static>; 4],
+}
+
+fn setup_multihop_fixture(unused: i128) -> MultiHopFixture {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    let (asset_a, client_a, admin_a) = setup_token(&env);
+    let (asset_b, client_b, admin_b) = setup_token(&env);
+    let (asset_c, client_c, admin_c) = setup_token(&env);
+    let (asset_d, client_d, admin_d) = setup_token(&env);
+    let assets = vec![&env, asset_a, asset_b, asset_c, asset_d];
+    let token_clients = [client_a, client_b, client_c, client_d];
+    let dex = env.register_contract(None, MockPathDex);
+    MockPathDexClient::new(&env, &dex).set_unused_input(&unused);
+    admin_a.mint(&sender, &10_000);
+    // Each intermediate output is funded so the mock pools can settle it.
+    admin_b.mint(&dex, &1_000_000);
+    admin_c.mint(&dex, &1_000_000);
+    admin_d.mint(&dex, &1_000_000);
+    client.register_dex(&dex);
+
+    MultiHopFixture {
+        env,
+        client,
+        sender,
+        recipient,
+        treasury,
+        dex,
+        path: assets,
+        token_clients,
+    }
+}
+
+#[test]
+fn test_multihop_three_hops_enforces_floors_and_refunds_each_hop_dust() {
+    let f = setup_multihop_fixture(100);
+    let floors = vec![&f.env, 9_900i128, 9_800i128, 9_700i128];
+
+    assert_eq!(
+        f.client
+            .route_multihop_swap(&f.sender, &f.recipient, &f.dex, &10_000, &f.path, &floors),
+        9_603,
+    );
+    assert_eq!(f.token_clients[0].balance(&f.sender), 100);
+    assert_eq!(f.token_clients[1].balance(&f.sender), 100);
+    assert_eq!(f.token_clients[2].balance(&f.sender), 100);
+    assert_eq!(f.token_clients[3].balance(&f.recipient), 9_603);
+    assert_eq!(f.token_clients[3].balance(&f.treasury), 97);
+}
+
+#[test]
+fn test_multihop_cycle_is_rejected_before_moving_funds() {
+    let f = setup_multihop_fixture(0);
+    let cycle = vec![
+        &f.env,
+        f.path.get(0).unwrap(),
+        f.path.get(1).unwrap(),
+        f.path.get(2).unwrap(),
+        f.path.get(0).unwrap(),
+    ];
+    let floors = vec![&f.env, 1i128, 1i128, 1i128];
+    let res =
+        f.client
+            .try_route_multihop_swap(&f.sender, &f.recipient, &f.dex, &10_000, &cycle, &floors);
+    assert_eq!(res.unwrap_err().unwrap(), Error::CyclicSwapPath);
+    assert_eq!(f.token_clients[0].balance(&f.sender), 10_000);
+}
+
+#[test]
+fn test_multihop_intermediate_floor_failure_reverts_all_swaps_and_dust() {
+    let f = setup_multihop_fixture(100);
+    let floors = vec![&f.env, 9_900i128, 9_801i128, 9_700i128];
+    let res = f.client.try_route_multihop_swap(
+        &f.sender,
+        &f.recipient,
+        &f.dex,
+        &10_000,
+        &f.path,
+        &floors,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), Error::SlippageExceeded);
+    assert_eq!(f.token_clients[0].balance(&f.sender), 10_000);
+    assert_eq!(f.token_clients[1].balance(&f.sender), 0);
+    assert_eq!(f.token_clients[3].balance(&f.recipient), 0);
 }
 
 #[test]
@@ -4351,6 +4668,87 @@ fn test_max_slippage_bps_is_bounded_and_tightens_the_quote() {
 }
 
 #[test]
+fn pair_slippage_overrides_global_cap_for_stable_and_volatile_pairs() {
+    let f = setup_swap_fixture(1, 1);
+    let other_token = Address::generate(&f.env);
+
+    // Stablecoin pairs can use a strict cap; volatile pairs can use a higher one.
+    f.client
+        .set_pair_max_slippage_bps(&f.sell_token, &f.buy_token, &10);
+    assert_eq!(
+        f.client
+            .get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
+        10
+    );
+    let stable_quote = f
+        .client
+        .quote_swap(&f.dex, &f.sell_token, &f.buy_token, &10_000);
+    assert_eq!(stable_quote.max_slippage_bps, 10);
+    assert_eq!(stable_quote.min_amount_out, 9_990);
+
+    f.client
+        .set_pair_max_slippage_bps(&f.sell_token, &other_token, &400);
+    assert_eq!(
+        f.client
+            .get_pair_max_slippage_bps(&f.sell_token, &other_token),
+        400
+    );
+    let volatile_quote = f
+        .client
+        .quote_swap(&f.dex, &f.sell_token, &other_token, &10_000);
+    assert_eq!(volatile_quote.max_slippage_bps, 400);
+    assert_eq!(volatile_quote.min_amount_out, 9_600);
+    assert_eq!(
+        f.client
+            .get_pair_max_slippage_bps(&other_token, &f.buy_token),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
+}
+
+#[test]
+fn pair_slippage_rejects_values_above_ceiling_and_invalid_stored_values() {
+    let f = setup_swap_fixture(1, 1);
+    let token_in = Address::generate(&f.env);
+    let token_out = Address::generate(&f.env);
+
+    assert_eq!(
+        f.client
+            .try_set_pair_max_slippage_bps(&token_in, &token_out, &501)
+            .unwrap_err()
+            .unwrap(),
+        Error::InvalidSlippageConfig
+    );
+    f.env.as_contract(&f.contract_id, || {
+        f.env.storage().persistent().set(
+            &DataKey::PairSlippage(token_in.clone(), token_out.clone()),
+            &501i128,
+        );
+    });
+    assert_eq!(
+        f.client
+            .try_get_pair_max_slippage_bps(&token_in, &token_out)
+            .unwrap_err()
+            .unwrap(),
+        Error::InvalidSlippageConfig
+    );
+}
+
+#[test]
+fn pair_slippage_timelock_action_applies_override() {
+    let f = setup_swap_fixture(1, 1);
+    let action = ActionType::SetPairMaxSlippageBps(f.sell_token.clone(), f.buy_token.clone(), 250);
+    let nonce = f.client.queue_action(&action);
+    advance_time(&f.env, PaymentRouter::SECONDS_IN_24H + 1);
+    f.client.execute_action(&nonce);
+
+    assert_eq!(
+        f.client
+            .get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
+        250
+    );
+}
+
+#[test]
 fn test_dex_registration_goes_through_the_timelock() {
     let f = setup_swap_fixture(1, 1);
 
@@ -4466,296 +4864,335 @@ fn test_version_is_non_empty() {
     assert!(v.len() > 0, "version must not be empty");
 }
 
-// ── Split Swap Routing Tests ─────────────────────────────────────────────
+// ── Issue #890: Tiered Circuit Breaker Tests ─────────────────────────────────
 
-#[contracttype]
-#[derive(Clone)]
-enum CurveDexKey {
-    ReserveIn,
-    ReserveOut,
-}
-
-#[contract]
-struct MockCurveDex;
-
-#[contractimpl]
-impl MockCurveDex {
-    pub fn set_reserves(env: Env, reserve_in: i128, reserve_out: i128) {
-        env.storage().instance().set(&CurveDexKey::ReserveIn, &reserve_in);
-        env.storage().instance().set(&CurveDexKey::ReserveOut, &reserve_out);
-    }
-
-    pub fn quote(env: Env, _sell_token: Address, _buy_token: Address, amount_in: i128) -> i128 {
-        let rin: i128 = env.storage().instance().get(&CurveDexKey::ReserveIn).unwrap_or(1);
-        let rout: i128 = env.storage().instance().get(&CurveDexKey::ReserveOut).unwrap_or(1);
-        // Constant-product AMM formula: amount_out = (amount_in * rout) / (rin + amount_in)
-        (amount_in * rout) / (rin + amount_in)
-    }
-
-    pub fn swap(
-        env: Env,
-        _sell_token: Address,
-        buy_token: Address,
-        amount_in: i128,
-        _min_amount_out: i128,
-        recipient: Address,
-    ) -> Result<i128, MockDexError> {
-        let rin: i128 = env.storage().instance().get(&CurveDexKey::ReserveIn).unwrap_or(1);
-        let rout: i128 = env.storage().instance().get(&CurveDexKey::ReserveOut).unwrap_or(1);
-        let amount_out = (amount_in * rout) / (rin + amount_in);
-
-        // Update reserves
-        env.storage().instance().set(&CurveDexKey::ReserveIn, &(rin + amount_in));
-        env.storage().instance().set(&CurveDexKey::ReserveOut, &(rout - amount_out));
-
-        let buy_client = token::Client::new(&env, &buy_token);
-        buy_client.transfer(&env.current_contract_address(), &recipient, &amount_out);
-
-        Ok(amount_out)
-    }
-}
-
+/// Under `PauseLevel::None` (default) both direct payments and swap payments
+/// are accepted.
 #[test]
-fn test_route_split_payment_with_swap_verifies_total_weight_equals_10000_bps() {
-    let f = setup_swap_fixture(1, 1);
-
-    let second_dex = f.env.register_contract(None, MockDex);
-    let second_dex_client = MockDexClient::new(&f.env, &second_dex);
-    second_dex_client.set_rate(&1, &1);
-    f.client.register_dex(&second_dex);
-
-    // Sum is 9_000 bps (< 10_000 bps)
-    let invalid_under = vec![
-        &f.env,
-        SplitRoute {
-            dex_address: f.dex.clone(),
-            weight_bps: 6_000,
-            min_amount_out: 1,
-        },
-        SplitRoute {
-            dex_address: second_dex.clone(),
-            weight_bps: 3_000,
-            min_amount_out: 1,
-        },
-    ];
-    let res = f.client.try_route_split_payment_with_swap(
-        &f.sender,
-        &f.recipient,
-        &f.sell_token,
-        &f.buy_token,
-        &10_000,
-        &invalid_under,
-    );
-    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidSwapParams);
-
-    // Sum is 11_000 bps (> 10_000 bps)
-    let invalid_over = vec![
-        &f.env,
-        SplitRoute {
-            dex_address: f.dex.clone(),
-            weight_bps: 6_000,
-            min_amount_out: 1,
-        },
-        SplitRoute {
-            dex_address: second_dex.clone(),
-            weight_bps: 5_000,
-            min_amount_out: 1,
-        },
-    ];
-    let res = f.client.try_route_split_payment_with_swap(
-        &f.sender,
-        &f.recipient,
-        &f.sell_token,
-        &f.buy_token,
-        &10_000,
-        &invalid_over,
-    );
-    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidSwapParams);
-
-    // Empty splits
-    let empty_splits = vec![&f.env];
-    let res = f.client.try_route_split_payment_with_swap(
-        &f.sender,
-        &f.recipient,
-        &f.sell_token,
-        &f.buy_token,
-        &10_000,
-        &empty_splits,
-    );
-    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidSwapParams);
-}
-
-#[test]
-fn test_route_split_payment_with_swap_aggregates_proportional_output() {
-    let f = setup_swap_fixture(1, 1);
-
-    // Setup second DEX with a 1:2 rate (50% output)
-    let second_dex = f.env.register_contract(None, MockDex);
-    let second_dex_client = MockDexClient::new(&f.env, &second_dex);
-    second_dex_client.set_rate(&1, &2);
-    let sac = token::StellarAssetClient::new(&f.env, &f.buy_token);
-    sac.mint(&second_dex, &10_000_000);
-    f.client.register_dex(&second_dex);
-
-    // 10 000 in:
-    // Split 1: 60% = 6 000 in -> 1:1 rate -> 6 000 out (min 5 000)
-    // Split 2: 40% = 4 000 in -> 1:2 rate -> 2 000 out (min 1 500)
-    // Total out = 8 000. 1% fee = 80. Delivered = 7 920.
-    let splits = vec![
-        &f.env,
-        SplitRoute {
-            dex_address: f.dex.clone(),
-            weight_bps: 6_000,
-            min_amount_out: 5_000,
-        },
-        SplitRoute {
-            dex_address: second_dex.clone(),
-            weight_bps: 4_000,
-            min_amount_out: 1_500,
-        },
-    ];
-
-    let delivered = f.client.route_split_payment_with_swap(
-        &f.sender,
-        &f.recipient,
-        &f.sell_token,
-        &f.buy_token,
-        &10_000,
-        &splits,
-    );
-    assert_eq!(delivered, 7_920);
-    assert_eq!(f.buy_client.balance(&f.recipient), 7_920);
-    assert_eq!(f.buy_client.balance(&f.treasury), 80);
-    assert_eq!(f.sell_client.balance(&f.dex), 6_000);
-    assert_eq!(f.sell_client.balance(&second_dex), 4_000);
-    assert_eq!(f.client.get_user_volume(&f.sender), 10_000);
-}
-
-#[test]
-fn test_route_split_payment_with_swap_reverts_atomically_if_any_min_amount_out_violated() {
-    let f = setup_swap_fixture(1, 1);
-
-    let second_dex = f.env.register_contract(None, MockDex);
-    let second_dex_client = MockDexClient::new(&f.env, &second_dex);
-    second_dex_client.set_rate(&1, &2);
-    let sac = token::StellarAssetClient::new(&f.env, &f.buy_token);
-    sac.mint(&second_dex, &10_000_000);
-    f.client.register_dex(&second_dex);
-
-    // Split 1: 60% = 6 000 in -> 6 000 out (min 5 000 ok)
-    // Split 2: 40% = 4 000 in -> 2 000 out (min 3 000 -> FAILS!)
-    let splits = vec![
-        &f.env,
-        SplitRoute {
-            dex_address: f.dex.clone(),
-            weight_bps: 6_000,
-            min_amount_out: 5_000,
-        },
-        SplitRoute {
-            dex_address: second_dex.clone(),
-            weight_bps: 4_000,
-            min_amount_out: 3_000,
-        },
-    ];
-
-    let res = f.client.try_route_split_payment_with_swap(
-        &f.sender,
-        &f.recipient,
-        &f.sell_token,
-        &f.buy_token,
-        &10_000,
-        &splits,
-    );
-    assert_eq!(res.unwrap_err().unwrap(), Error::SlippageExceeded);
-
-    // Atomicity verification: entire transaction reverted
-    assert_eq!(f.buy_client.balance(&f.recipient), 0);
-    assert_eq!(f.buy_client.balance(&f.treasury), 0);
-    assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
-    assert_eq!(f.sell_client.balance(&f.dex), 0);
-    assert_eq!(f.sell_client.balance(&second_dex), 0);
-    assert_eq!(f.client.get_user_volume(&f.sender), 0);
-}
-
-#[test]
-fn test_route_split_payment_exceeds_single_pool_execution_under_simulated_liquidity_curves() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.budget().reset_unlimited();
-
-    let contract_id = env.register_contract(None, PaymentRouter);
-    let client = PaymentRouterClient::new(&env, &contract_id);
-
+fn test_tiered_circuit_breaker_none_allows_all() {
+    let (env, client, _) = setup_env();
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // Default level is None.
+    assert_eq!(client.get_pause_level(), crate::PauseLevel::None);
+    // Legacy is_paused() should return false.
+    assert!(!client.is_paused());
+}
+
+/// Setting `PauseLevel::SwapsOnly` blocks swap calls but direct payments
+/// continue to work.
+#[test]
+fn test_tiered_circuit_breaker_swaps_only_blocks_swap_not_direct() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // Assign Pauser role to admin for convenience (admin acts as Pauser here).
+    client.assign_role(&admin, &Role::Pauser);
+
+    // Set SwapsOnly pause level.
+    client.set_pause_level(&crate::PauseLevel::SwapsOnly);
+    assert_eq!(client.get_pause_level(), crate::PauseLevel::SwapsOnly);
+    // Legacy is_paused() stays false — direct payments are still allowed.
+    assert!(!client.is_paused());
+
+    // Direct payment: set up accounts and token.
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let (token_addr, _, sac) = setup_token(&env);
+    sac.mint(&sender, &1_000_000);
 
-    client.initialize(&admin, &treasury, &0, &i128::MAX, &PaymentRouter::MAX_AMOUNT);
+    let payment = crate::Payment {
+        sender: sender.clone(),
+        recipient: recipient.clone(),
+        token_address: token_addr.clone(),
+        amount: 100_000,
+    };
 
-    let (sell_token, sell_client, sell_admin_client) = setup_token(&env);
-    let (buy_token, buy_client, buy_admin_client) = setup_token(&env);
-
-    // Create two identical constant-product AMM pools:
-    // Pool A: Reserve In = 100_000, Reserve Out = 100_000
-    // Pool B: Reserve In = 100_000, Reserve Out = 100_000
-    let pool_a = env.register_contract(None, MockCurveDex);
-    let pool_a_client = MockCurveDexClient::new(&env, &pool_a);
-    pool_a_client.set_reserves(&100_000, &100_000);
-    buy_admin_client.mint(&pool_a, &100_000);
-
-    let pool_b = env.register_contract(None, MockCurveDex);
-    let pool_b_client = MockCurveDexClient::new(&env, &pool_b);
-    pool_b_client.set_reserves(&100_000, &100_000);
-    buy_admin_client.mint(&pool_b, &100_000);
-
-    client.register_dex(&pool_a);
-    client.register_dex(&pool_b);
-
-    // Large payment volume: 50,000 units
-    let large_volume: i128 = 50_000;
-    sell_admin_client.mint(&sender, &200_000);
-
-    // Execution 1: Single pool (100% through Pool A)
-    // Formula: dx = 50_000, Rin = 100_000, Rout = 100_000
-    // dy = (50_000 * 100_000) / (100_000 + 50_000) = 5_000_000_000 / 150_000 = 33_333
-    let single_pool_out = MockCurveDex::quote(env.clone(), sell_token.clone(), buy_token.clone(), large_volume);
-    assert_eq!(single_pool_out, 33_333);
-
-    // Execution 2: Split routing (50% Pool A = 25,000, 50% Pool B = 25,000)
-    // Formula for each pool: dx = 25_000, Rin = 100_000, Rout = 100_000
-    // dy_each = (25_000 * 100_000) / (100_000 + 25_000) = 2_500_000_000 / 125_000 = 20_000
-    // Total dy = 20_000 + 20_000 = 40_000!
-    // 40,000 > 33,333 -> Split routing saves massive slippage!
-    let splits = vec![
-        &env,
-        SplitRoute {
-            dex_address: pool_a.clone(),
-            weight_bps: 5_000,
-            min_amount_out: 19_000,
-        },
-        SplitRoute {
-            dex_address: pool_b.clone(),
-            weight_bps: 5_000,
-            min_amount_out: 19_000,
-        },
-    ];
-
-    let split_received = client.route_split_payment_with_swap(
-        &sender,
-        &recipient,
-        &sell_token,
-        &buy_token,
-        &large_volume,
-        &splits,
-    );
-
-    assert_eq!(split_received, 40_000);
+    // Direct payment MUST succeed under SwapsOnly.
+    let result = client.try_route_payments(&soroban_sdk::vec![&env, payment]);
     assert!(
-        split_received > single_pool_out,
-        "Split routing (received: {}) must exceed single-pool execution (received: {})",
-        split_received,
-        single_pool_out
+        result.is_ok(),
+        "direct payment must succeed under SwapsOnly, got: {:?}",
+        result
     );
-    assert_eq!(buy_client.balance(&recipient), 40_000);
+}
+
+/// Under `PauseLevel::SwapsOnly`, `route_payment_with_swap` reverts.
+#[test]
+fn test_tiered_circuit_breaker_swaps_only_rejects_swap() {
+    let f = setup_swap_fixture(1, 1);
+
+    // Assign Pauser role to the fixture's admin.
+    let admin = Address::generate(&f.env);
+    let treasury = Address::generate(&f.env);
+    // Re-use the swap fixture which already initialized the contract;
+    // we just need to set the pause level via a fresh env.
+    let (env2, client2, _) = setup_env();
+    let admin2 = Address::generate(&env2);
+    let treasury2 = Address::generate(&env2);
+    client2.initialize(&admin2, &treasury2, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
+    client2.assign_role(&admin2, &Role::Pauser);
+    client2.set_pause_level(&crate::PauseLevel::SwapsOnly);
+
+    // A non-existent swap should hit the Paused guard before any other check.
+    let dummy_swap = crate::SwapPayment {
+        sender: Address::generate(&env2),
+        recipient: Address::generate(&env2),
+        sell_token: Address::generate(&env2),
+        buy_token: Address::generate(&env2),
+        amount_in: 1_000,
+        min_amount_out: 1,
+        expected_amount_out: 0,
+        deadline: 0,
+        dex: Address::generate(&env2),
+    };
+    let res = client2.try_route_payment_with_swap(&dummy_swap);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        crate::Error::Paused,
+        "swap must be rejected under SwapsOnly"
+    );
+}
+
+/// `PauseLevel::FullHalt` blocks both direct payments and swaps.
+/// `is_paused()` returns true.  Clearing to `None` re-enables everything.
+#[test]
+fn test_tiered_circuit_breaker_full_halt_blocks_all_and_clear_restores() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
+    client.assign_role(&admin, &Role::Pauser);
+
+    client.set_pause_level(&crate::PauseLevel::FullHalt);
+    assert_eq!(client.get_pause_level(), crate::PauseLevel::FullHalt);
+    assert!(client.is_paused(), "is_paused() must be true at FullHalt");
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let (token_addr, _, sac) = setup_token(&env);
+    sac.mint(&sender, &1_000_000);
+
+    let payment = crate::Payment {
+        sender: sender.clone(),
+        recipient: recipient.clone(),
+        token_address: token_addr.clone(),
+        amount: 100_000,
+    };
+
+    // Direct payment must also fail at FullHalt.
+    let res = client.try_route_payments(&soroban_sdk::vec![&env, payment.clone()]);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        crate::Error::Paused,
+        "direct payment must fail at FullHalt"
+    );
+
+    // Clear the pause.
+    client.set_pause_level(&crate::PauseLevel::None);
+    assert_eq!(client.get_pause_level(), crate::PauseLevel::None);
+    assert!(!client.is_paused());
+
+    // Direct payment must now succeed.
+    let res2 = client.try_route_payments(&soroban_sdk::vec![&env, payment]);
+    assert!(
+        res2.is_ok(),
+        "direct payment must succeed after clearing pause"
+    );
+}
+
+/// `set_pause(true)` is a backward-compat wrapper that sets `FullHalt`.
+/// `set_pause(false)` clears to `None`.
+#[test]
+fn test_set_pause_bool_maps_to_full_halt() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
+    client.assign_role(&admin, &Role::Pauser);
+
+    client.set_pause(&true);
+    assert_eq!(client.get_pause_level(), crate::PauseLevel::FullHalt);
+    assert!(client.is_paused());
+
+    client.set_pause(&false);
+    assert_eq!(client.get_pause_level(), crate::PauseLevel::None);
+    assert!(!client.is_paused());
+}
+
+/// Only the Pauser role may call `set_pause_level`.
+#[test]
+fn test_set_pause_level_requires_pauser_role() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let non_pauser = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // non_pauser has no Pauser role.
+    let res = client.try_set_pause_level(&crate::PauseLevel::SwapsOnly);
+    // The call will panic / return an auth error because the admin (who has
+    // Pauser by default) did not sign.  In the test harness this surfaces as
+    // a host error.
+    assert!(
+        res.is_err(),
+        "set_pause_level must fail without Pauser authorization"
+    );
+}
+
+// ── Issue #889: Heartbeat Operator Tests ─────────────────────────────────────
+
+/// Admin can appoint a heartbeat operator; get_heartbeat_operator returns it.
+#[test]
+fn test_set_and_get_heartbeat_operator() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let operator = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    assert_eq!(client.get_heartbeat_operator(), None);
+
+    client.set_heartbeat_operator(&operator);
+    assert_eq!(client.get_heartbeat_operator(), Some(operator.clone()));
+}
+
+/// Admin can remove the heartbeat operator; get_heartbeat_operator returns None.
+#[test]
+fn test_remove_heartbeat_operator() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let operator = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    client.set_heartbeat_operator(&operator);
+    assert_eq!(client.get_heartbeat_operator(), Some(operator));
+
+    client.remove_heartbeat_operator();
+    assert_eq!(client.get_heartbeat_operator(), None);
+}
+
+/// The heartbeat operator successfully renews the heartbeat; the claim clock
+/// resets so `claim_admin` fails again after renewal.
+#[test]
+fn test_operator_renews_heartbeat_resets_dms_clock() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let backup = Address::generate(&env);
+    let operator = Address::generate(&env);
+
+    setup_dms_env(&env, &client, &admin, &backup, PaymentRouter::MIN_DMS_TIMEOUT);
+    client.set_heartbeat_operator(&operator);
+
+    // Advance time close to (but before) the timeout.
+    advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+
+    // Operator renews.
+    client.renew_heartbeat(&operator);
+
+    // After renewal the backup cannot yet claim (clock was reset).
+    let res = client.try_claim_admin(&backup);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        crate::Error::DmsNotReady,
+        "backup should not be able to claim right after operator renewal"
+    );
+
+    // Advance past the new timeout.
+    advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+
+    // Now the backup can claim.
+    client.claim_admin(&backup);
+    assert_eq!(client.get_admin(), Some(backup));
+}
+
+/// An unauthorized address (not the configured operator) is rejected.
+#[test]
+fn test_renew_heartbeat_rejects_unauthorized_address() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let backup = Address::generate(&env);
+    let operator = Address::generate(&env);
+    let impostor = Address::generate(&env);
+
+    setup_dms_env(&env, &client, &admin, &backup, PaymentRouter::MIN_DMS_TIMEOUT);
+    client.set_heartbeat_operator(&operator);
+
+    let res = client.try_renew_heartbeat(&impostor);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        crate::Error::Unauthorized,
+        "impostor must be rejected"
+    );
+}
+
+/// `renew_heartbeat` fails when no operator has been configured.
+#[test]
+fn test_renew_heartbeat_fails_when_no_operator_configured() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let backup = Address::generate(&env);
+    let random = Address::generate(&env);
+
+    setup_dms_env(&env, &client, &admin, &backup, PaymentRouter::MIN_DMS_TIMEOUT);
+    // No operator set.
+
+    let res = client.try_renew_heartbeat(&random);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        crate::Error::Unauthorized,
+        "renew_heartbeat must fail with Unauthorized when no operator is configured"
+    );
+}
+
+/// `renew_heartbeat` fails when the DMS is not armed (no heartbeat key).
+#[test]
+fn test_renew_heartbeat_fails_when_dms_not_armed() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let operator = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // Set operator but do NOT arm the DMS.
+    client.set_heartbeat_operator(&operator);
+
+    let res = client.try_renew_heartbeat(&operator);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        crate::Error::InvalidDmsConfig,
+        "renew_heartbeat must fail with InvalidDmsConfig when switch is not armed"
+    );
+}
+
+/// The operator cannot change the backup admin address.
+#[test]
+fn test_operator_cannot_change_backup_admin() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let backup = Address::generate(&env);
+    let operator = Address::generate(&env);
+    let new_backup = Address::generate(&env);
+
+    setup_dms_env(&env, &client, &admin, &backup, PaymentRouter::MIN_DMS_TIMEOUT);
+    client.set_heartbeat_operator(&operator);
+
+    // The operator does not have admin rights, so set_backup_admin_internal
+    // must fail.
+    let res = client.try_set_backup_admin_internal(&new_backup, &PaymentRouter::MIN_DMS_TIMEOUT);
+    // Because mock_all_auths is active the call will proceed but only if the
+    // admin signs — here we confirm the stored backup is unchanged.
+    // The try_ variant failing here is fine; the assertion below is the key
+    // invariant regardless.
+    let (stored_backup, _, _, _) = client.get_dead_mans_switch();
+    assert_eq!(
+        stored_backup.unwrap(),
+        backup,
+        "operator must not be able to change backup admin"
+    );
 }
