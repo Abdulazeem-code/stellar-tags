@@ -169,6 +169,7 @@ const horizonPollFailures = new client.Gauge({
 const horizonLastSuccessTimestamp = new client.Gauge({
   name: 'stellar_tags_horizon_poll_last_success_timestamp_seconds',
   help: 'Unix timestamp of the last successful Horizon poll cycle',
+});
 
 // Gauge: payment retry jobs currently parked in the dead letter queue. Read on
 // every scrape so the value is never stale, and 0 when Redis is unconfigured.

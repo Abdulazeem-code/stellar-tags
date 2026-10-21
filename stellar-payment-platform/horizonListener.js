@@ -26,7 +26,7 @@ const { createRedisConnection } = require('./src/config/redis');
 const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
-  scheduleWebhookRetryJob,
+  startWebhookWorker,
   closeWebhookQueue,
 } = require('./src/webhookWorker');
 const {
@@ -87,6 +87,16 @@ if (redisPublisher) {
 } else {
   logger.warn(
     '[listener] REDIS_URL not set — real-time SSE payment updates are disabled.',
+  );
+}
+
+// Dedicated ioredis connection used by the fraud-detection stream.  It is a
+// separate connection from `redisPublisher` so that a blocked fraud consumer
+// cannot stall the payment publisher (and vice versa).
+const fraudStream = process.env.REDIS_URL ? createRedisConnection() : null;
+if (fraudStream) {
+  fraudStream.on('error', (err) =>
+    logger.error({ err }, '[listener] Redis fraud stream error'),
   );
 }
 
@@ -350,6 +360,14 @@ const watchAccount = (accountId) => {
 
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
+
+          // Hand the payment to the webhook dispatcher so any endpoint the
+          // recipient registered actually gets notified. A failing dispatch
+          // must never tear the stream down with it.
+          dispatchPaymentWebhooks({ prisma, payment }).catch((err) =>
+            logger.error('Webhook dispatch failed for %s', accountId, { err }),
+          );
+
           prisma.payment.create({
             data: {
               transactionHash: payment.transaction_hash,
@@ -584,11 +602,13 @@ const main = async () => {
   // Initial sync
   await syncWatchedAccounts();
 
-  // Schedule webhook retry / liveness pings
+  // Start the webhook delivery worker. This process is the one that detects
+  // payments and enqueues their deliveries, so it is also the one that has to
+  // consume the queue — otherwise the deliveries would pile up undelivered.
   try {
-    scheduleWebhookRetryJob({ prisma });
+    startWebhookWorker({ prisma });
   } catch (err) {
-    logger.error('Failed to schedule webhook retry job:', err.message);
+    logger.error('Failed to start webhook worker:', err.message);
   }
 
   // First cycle runs immediately, then reschedules itself on a backoff timer.

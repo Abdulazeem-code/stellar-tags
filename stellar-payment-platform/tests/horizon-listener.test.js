@@ -2,74 +2,45 @@
 // Tests for the Horizon listener's polling loop (#675)
 //
 // Verifies that the loop applies exponential backoff with jitter, honours
-// Retry-After on 429s, and backs off on empty responses — the behaviour the
-// issue asks for — instead of hammering Horizon on a fixed interval.
+// Retry-After on 429s, and backs off on empty responses - the behaviour the
+// issue asks for - instead of hammering Horizon on a fixed interval.
+//
+// Every mocked dependency is a stable module-scope object on purpose: the
+// listener is re-required for each test (so it picks up the environment that
+// test configures), and a fresh copy of a mocked module would otherwise hand
+// the test a different set of jest.fn()s than the listener under test.
 // ---------------------------------------------------------------------------
 
+const mockLogger = {
+  warn: jest.fn(),
+  info: jest.fn(),
+  error: jest.fn(),
+  debug: jest.fn(),
+};
 jest.mock('../src/logger', () => ({
-  logger: {
-    warn: jest.fn(),
-    info: jest.fn(),
-    error: jest.fn(),
-    debug: jest.fn(),
-  },
+  logger: mockLogger,
   httpLogger: (req, res, next) => next(),
 }));
 
-const mockPrisma = {
-  user: { findMany: jest.fn() },
-  $disconnect: jest.fn().mockResolvedValue(undefined),
-};
-jest.mock('../prismaClient', () => ({
-  prisma: {
-    user: { findMany: jest.fn() },
-    payment: { create: jest.fn() },
-    $disconnect: jest.fn(),
-  },
+jest.mock('../src/config/redis', () => ({
+  createRedisConnection: jest.fn(() => ({ on: jest.fn(), quit: jest.fn() })),
 }));
 
-jest.mock('../prismaClient', () => ({ prisma: mockPrisma }));
+jest.mock('../src/fraudDetection', () => ({ PAYMENT_STREAM: 'payments' }));
 
 jest.mock('../src/db', () => ({
   poolGet: jest.fn(),
   poolRun: jest.fn(),
 }));
 
-jest.mock('../src/webhookWorker', () => ({
+const mockWebhookWorker = {
   dispatchPaymentWebhooks: jest.fn().mockResolvedValue(undefined),
   startWebhookWorker: jest.fn(),
   closeWebhookQueue: jest.fn().mockResolvedValue(undefined),
-}));
-
-// A breaker that never trips on its own, so each cycle is driven explicitly.
-const mockBreaker = { fire: jest.fn() };
-
-jest.mock('../src/services/stellarService', () => ({
-  horizon: {
-    payments: () => ({
-      forAccount: () => ({
-        cursor: () => ({ stream: (options) => mockStream(options) }),
-      }),
-    }),
-  },
-  createBreaker: jest.fn(() => mockBreaker),
-  HORIZON_BASE: 'https://horizon-testnet.stellar.org',
-  HORIZON_NETWORK: 'testnet',
-}));
-
-/** Records every stream opened and lets a test drive its callbacks. */
-let mockStream = () => () => {};
-
-const ACCOUNTS = {
-  alice: { address: 'G_ALICE' },
-  bob: { address: 'G_BOB' },
 };
+jest.mock('../src/webhookWorker', () => mockWebhookWorker);
 
-describe('horizonListener poll loop', () => {
-  let listener;
-  let env;
-
-jest.mock('../src/sse', () => ({
+const mockSse = {
   publishPaymentUpdate: jest.fn().mockResolvedValue(undefined),
   initSse: jest.fn(),
   closeSse: jest.fn().mockResolvedValue(undefined),
@@ -78,25 +49,60 @@ jest.mock('../src/sse', () => ({
   sendClientEvent: jest.fn(),
   getSseClientCount: jest.fn().mockReturnValue(0),
   isSseStreamPath: jest.fn().mockReturnValue(false),
-}));
+};
+jest.mock('../src/sse', () => mockSse);
 
-const { horizon } = require('../src/services/stellarService');
-const { prisma } = require('../prismaClient');
-const { publishPaymentUpdate } = require('../src/sse');
-const {
-  watchAccount,
-  syncWatchedAccounts,
-  shutdown,
-  activeStreams,
-} = require('../horizonListener');
+// The Prisma client is shared by every copy of the listener, so a test can
+// drive the database regardless of which instance is under test.
+const mockPrisma = {
+  user: { findMany: jest.fn() },
+  payment: { create: jest.fn() },
+  $disconnect: jest.fn().mockResolvedValue(undefined),
+};
+jest.mock('../prismaClient', () => ({ prisma: mockPrisma }));
 
+// A breaker that never trips on its own, so each cycle is driven explicitly.
+const mockBreaker = { fire: jest.fn() };
+
+// The Horizon SDK is replaced by a small stub. `mockHorizonPayments` is a
+// mutable holder so a suite can change the shape the SDK hands back without
+// re-registering the mock.
 const mockCloseStream = jest.fn();
 const mockStream = jest.fn(() => mockCloseStream);
 const mockCursor = jest.fn(() => ({ stream: mockStream }));
 const mockForAccount = jest.fn(() => ({ cursor: mockCursor }));
+let mockHorizonPayments = () => ({
+  forAccount: () => ({
+    cursor: () => ({ stream: (options) => mockStream(options) }),
+  }),
+});
 
-describe('Horizon listener stream cleanup (#683)', () => {
+jest.mock('../src/services/stellarService', () => ({
+  horizon: {
+    payments: (...args) => mockHorizonPayments(...args),
+  },
+  createBreaker: jest.fn(() => mockBreaker),
+  HORIZON_BASE: 'https://horizon-testnet.stellar.org',
+  HORIZON_NETWORK: 'testnet',
+}));
+
+const { prisma } = require('../prismaClient');
+const { publishPaymentUpdate } = require('../src/sse');
+const { watchAccount, activeStreams } = require('../horizonListener');
+
+const ACCOUNTS = {
+  alice: { address: 'G_ALICE' },
+  bob: { address: 'G_BOB' },
+};
+
+describe('horizonListener poll loop (#675)', () => {
+  let listener;
+  let env;
+
   beforeEach(() => {
+    // Start from a clean module registry so the listener under test is loaded
+    // with the environment configured below.
+    jest.resetModules();
     // Small intervals keep the fake-timer advances readable.
     env = { ...process.env };
     process.env.POLL_INTERVAL_MS = '1000';
@@ -107,8 +113,27 @@ describe('Horizon listener stream cleanup (#683)', () => {
     process.env.HORIZON_POLL_JITTER = 'none';
 
     mockPrisma.user.findMany.mockReset().mockResolvedValue([ACCOUNTS.alice]);
+    mockPrisma.payment.create.mockReset().mockResolvedValue({
+      id: 'PAY-1',
+      status: 'completed',
+      transactionHash: 'tx-hash',
+      fromAddress: 'GFROM',
+      toAddress: 'GTO',
+      amount: 1,
+      assetCode: 'XLM',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    });
     mockBreaker.fire.mockReset().mockResolvedValue(true);
-    mockStream = jest.fn(() => jest.fn());
+    mockWebhookWorker.dispatchPaymentWebhooks
+      .mockReset()
+      .mockResolvedValue(undefined);
+    mockWebhookWorker.startWebhookWorker.mockClear();
+    mockStream.mockReset().mockImplementation(() => jest.fn());
+    mockHorizonPayments = () => ({
+      forAccount: () => ({
+        cursor: () => ({ stream: (options) => mockStream(options) }),
+      }),
+    });
     listener = require('../horizonListener');
   });
 
@@ -721,7 +746,7 @@ describe('Horizon listener publishes status updates to SSE (#730)', () => {
     jest.clearAllMocks();
     activeStreams.clear();
     mockStream.mockImplementation(() => mockCloseStream);
-    horizon.payments.mockReturnValue({ forAccount: mockForAccount });
+    mockHorizonPayments = () => ({ forAccount: mockForAccount });
     prisma.payment.create.mockResolvedValue({
       id: 'PAY-123',
       status: 'completed',
