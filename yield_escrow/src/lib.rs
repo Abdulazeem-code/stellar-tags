@@ -1,4 +1,9 @@
 #![no_std]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::missing_panics_doc,
+    clippy::cast_lossless
+)]
 
 //! Yield-bearing escrow.
 //!
@@ -16,7 +21,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env,
+    Address, Env, Vec,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -52,12 +57,26 @@ pub enum DataKey {
     Admin,
     /// Lending protocol new positions are supplied to.
     Adapter,
+    /// Configured multi-strategy portfolio allocations.
+    Strategies,
+    /// Minimum deviation in bps before automated rebalance is indicated.
+    RebalanceThreshold,
+    /// Ledger sequence of the last rebalance operation for a token.
+    LastRebalance(Address),
     /// Number of escrows that are still locked (not released or cancelled).
     ActiveEscrows,
     /// A single escrow position, keyed by the caller-supplied id.
     Escrow(u64),
     /// Cumulative time-weighted yield index and active principal for a token.
     YieldState(Address),
+}
+
+/// Strategy allocation entry defining a verified lending protocol and target weight in bps.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrategyAllocation {
+    pub address: Address,
+    pub weight_bps: u32,
 }
 
 #[contracttype]
@@ -153,6 +172,12 @@ pub enum Error {
     InvalidYieldRate = 14,
     InsufficientAccruedYield = 15,
     TimestampRegression = 16,
+    InvalidStrategyCount = 17,
+    InvalidWeights = 18,
+    DuplicateStrategy = 19,
+    StrategyNotFound = 20,
+    MaxStrategiesExceeded = 21,
+    InvalidThreshold = 22,
 }
 
 // ── Lending protocol adapter ─────────────────────────────────────────────────
@@ -171,6 +196,8 @@ pub trait LendingProtocol {
     /// Dynamic annualized rate derived by the adapter from protocol revenue
     /// and utilization, expressed in basis points.
     fn yield_rate_bps(env: Env, token: Address) -> u32;
+    /// Current pool balance (principal plus accrued interest).
+    fn get_balance(env: Env, token: Address) -> i128;
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -198,6 +225,12 @@ impl YieldEscrow {
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Adapter, &adapter);
+        let mut strats = Vec::new(&env);
+        strats.push_back(StrategyAllocation {
+            address: adapter.clone(),
+            weight_bps: BPS_DENOMINATOR as u32,
+        });
+        env.storage().instance().set(&DataKey::Strategies, &strats);
         env.storage()
             .instance()
             .set(&DataKey::ActiveEscrows, &0_u32);
@@ -223,6 +256,12 @@ impl YieldEscrow {
         }
 
         env.storage().instance().set(&DataKey::Adapter, &adapter);
+        let mut strats = Vec::new(&env);
+        strats.push_back(StrategyAllocation {
+            address: adapter.clone(),
+            weight_bps: BPS_DENOMINATOR as u32,
+        });
+        env.storage().instance().set(&DataKey::Strategies, &strats);
         Self::bump_instance(&env);
 
         env.events()
@@ -230,9 +269,284 @@ impl YieldEscrow {
         Ok(())
     }
 
+    // ── Strategy Management ──────────────────────────────────────────────
+
+    /// Sets the multi-strategy portfolio allocation. Admin only.
+    ///
+    /// Supports registration of up to 4 verified strategy contracts.
+    /// Validates that weights sum to exactly 10,000 basis points.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` before initialization,
+    /// `Error::InvalidStrategyCount` if empty,
+    /// `Error::MaxStrategiesExceeded` if > 4 strategies,
+    /// `Error::DuplicateStrategy` if duplicate addresses exist,
+    /// `Error::InvalidWeights` if weights are 0 or sum != 10_000,
+    /// and `Error::ActiveEscrowsRemain` if changing strategy addresses while escrows are open.
+    pub fn set_strategies(env: Env, strategies: Vec<StrategyAllocation>) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        if Self::active_escrows(&env) != 0 {
+            let current = Self::get_strategies(env.clone());
+            if !Self::same_strategy_addresses(&current, &strategies) {
+                return Err(Error::ActiveEscrowsRemain);
+            }
+        }
+        Self::validate_strategies(&strategies)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Strategies, &strategies);
+        if let Some(first) = strategies.get(0) {
+            env.storage()
+                .instance()
+                .set(&DataKey::Adapter, &first.address);
+        }
+        Self::bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("strats"), admin), strategies.len());
+        Ok(())
+    }
+
+    /// Registers or updates a strategy in the portfolio with a target weight. Admin only.
+    pub fn register_strategy(env: Env, strategy: Address, weight_bps: u32) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        if weight_bps == 0 || weight_bps > (BPS_DENOMINATOR as u32) {
+            return Err(Error::InvalidWeights);
+        }
+        let current = Self::get_strategies(env.clone());
+        let mut new_strats = Vec::new(&env);
+        let mut found = false;
+
+        for s in current.iter() {
+            if s.address == strategy {
+                found = true;
+                new_strats.push_back(StrategyAllocation {
+                    address: strategy.clone(),
+                    weight_bps,
+                });
+            } else {
+                new_strats.push_back(s);
+            }
+        }
+
+        if !found {
+            if Self::active_escrows(&env) != 0 {
+                return Err(Error::ActiveEscrowsRemain);
+            }
+            if new_strats.len() >= 4 {
+                return Err(Error::MaxStrategiesExceeded);
+            }
+            new_strats.push_back(StrategyAllocation {
+                address: strategy.clone(),
+                weight_bps,
+            });
+        }
+
+        Self::validate_strategies(&new_strats)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Strategies, &new_strats);
+        if let Some(first) = new_strats.get(0) {
+            env.storage()
+                .instance()
+                .set(&DataKey::Adapter, &first.address);
+        }
+        Self::bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("reg_strat"), admin), strategy);
+        Ok(())
+    }
+
+    /// Returns the currently configured multi-strategy portfolio.
+    pub fn get_strategies(env: Env) -> Vec<StrategyAllocation> {
+        if let Some(strategies) = env.storage().instance().get(&DataKey::Strategies) {
+            strategies
+        } else if let Ok(adapter) = Self::adapter(&env) {
+            let mut s = Vec::new(&env);
+            s.push_back(StrategyAllocation {
+                address: adapter,
+                weight_bps: BPS_DENOMINATOR as u32,
+            });
+            s
+        } else {
+            Vec::new(&env)
+        }
+    }
+
+    /// Returns the count of registered strategies.
+    pub fn get_strategy_count(env: Env) -> u32 {
+        Self::get_strategies(env).len()
+    }
+
+    /// Sets the rebalance threshold in basis points. Admin only.
+    pub fn set_rebalance_threshold(env: Env, threshold_bps: u32) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        if threshold_bps > (BPS_DENOMINATOR as u32) {
+            return Err(Error::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RebalanceThreshold, &threshold_bps);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("thresh"), admin), threshold_bps);
+        Ok(())
+    }
+
+    /// Returns the configured rebalance threshold in basis points (default: 100 bps / 1%).
+    pub fn get_rebalance_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RebalanceThreshold)
+            .unwrap_or(100)
+    }
+
+    /// Checks if any strategy's current weight has drifted from target weight
+    /// by more than the configured rebalance threshold.
+    pub fn check_rebalance_needed(env: Env, token: Address) -> Result<bool, Error> {
+        Self::require_initialized(&env)?;
+        let strategies = Self::get_strategies(env.clone());
+        if strategies.len() <= 1 {
+            return Ok(false);
+        }
+        let threshold_bps = Self::get_rebalance_threshold(env.clone()) as i128;
+        let mut total_balance: i128 = 0;
+        let mut balances = Vec::new(&env);
+        for strat in strategies.iter() {
+            let bal = LendingProtocolClient::new(&env, &strat.address).get_balance(&token);
+            balances.push_back(bal);
+            total_balance = total_balance.checked_add(bal).ok_or(Error::MathOverflow)?;
+        }
+        if total_balance <= 0 {
+            return Ok(false);
+        }
+        for i in 0..strategies.len() {
+            let strat = strategies.get(i).unwrap();
+            let bal = balances.get(i).unwrap();
+            let current_weight_bps = bal
+                .checked_mul(BPS_DENOMINATOR)
+                .ok_or(Error::MathOverflow)?
+                / total_balance;
+            let target_weight_bps = strat.weight_bps as i128;
+            let drift = if current_weight_bps >= target_weight_bps {
+                current_weight_bps - target_weight_bps
+            } else {
+                target_weight_bps - current_weight_bps
+            };
+            if drift >= threshold_bps {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Rebalances capital across all configured strategies to match target allocation weights.
+    ///
+    /// Checks current balances in each strategy, calculates target balances, and executes
+    /// withdrawals from excess strategies followed by deposits into deficit strategies.
+    pub fn rebalance(env: Env, token: Address) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+        let strategies = Self::get_strategies(env.clone());
+        let num_strats = strategies.len();
+        if num_strats <= 1 {
+            return Ok(());
+        }
+
+        let contract = env.current_contract_address();
+
+        // 1. Query current balances of all strategies
+        let mut total_balance: i128 = 0;
+        let mut balances = Vec::new(&env);
+        for strat in strategies.iter() {
+            let bal = LendingProtocolClient::new(&env, &strat.address).get_balance(&token);
+            balances.push_back(bal);
+            total_balance = total_balance.checked_add(bal).ok_or(Error::MathOverflow)?;
+        }
+
+        if total_balance <= 0 {
+            return Ok(());
+        }
+
+        // 2. Compute target balances based on weights
+        let mut target_balances = Vec::new(&env);
+        let mut allocated_target: i128 = 0;
+        for strat in strategies.iter() {
+            let target = total_balance
+                .checked_mul(strat.weight_bps as i128)
+                .ok_or(Error::MathOverflow)?
+                / BPS_DENOMINATOR;
+            target_balances.push_back(target);
+            allocated_target = allocated_target
+                .checked_add(target)
+                .ok_or(Error::MathOverflow)?;
+        }
+
+        let remainder = total_balance - allocated_target;
+        let mut final_targets = Vec::new(&env);
+        for i in 0..num_strats {
+            let mut target = target_balances.get(i).unwrap();
+            if (i as i128) < remainder {
+                target += 1;
+            }
+            final_targets.push_back(target);
+        }
+
+        // 3. Step 1: Withdraw from strategies with surplus
+        for i in 0..num_strats {
+            let strat = strategies.get(i).unwrap();
+            let current = balances.get(i).unwrap();
+            let target = final_targets.get(i).unwrap();
+            if current > target {
+                let excess = current - target;
+                LendingProtocolClient::new(&env, &strat.address)
+                    .withdraw(&contract, &token, &excess);
+            }
+        }
+
+        // 4. Step 2: Deposit into strategies with deficit
+        for i in 0..num_strats {
+            let strat = strategies.get(i).unwrap();
+            let current = balances.get(i).unwrap();
+            let target = final_targets.get(i).unwrap();
+            if current < target {
+                let deficit = target - current;
+                LendingProtocolClient::new(&env, &strat.address)
+                    .deposit(&contract, &token, &deficit);
+            }
+        }
+
+        env.storage().persistent().set(
+            &DataKey::LastRebalance(token.clone()),
+            &env.ledger().sequence(),
+        );
+
+        env.events()
+            .publish((symbol_short!("rebal"), token), (total_balance, num_strats));
+        Ok(())
+    }
+
+    /// Returns the current balance of a specific strategy for the given token.
+    pub fn get_strategy_balance(env: Env, strategy: Address, token: Address) -> i128 {
+        LendingProtocolClient::new(&env, &strategy).get_balance(&token)
+    }
+
+    /// Returns the aggregate balance across all configured strategies for the given token.
+    pub fn get_total_strategy_balance(env: Env, token: Address) -> Result<i128, Error> {
+        let strategies = Self::get_strategies(env.clone());
+        let mut total: i128 = 0;
+        for strat in strategies.iter() {
+            let bal = LendingProtocolClient::new(&env, &strat.address).get_balance(&token);
+            total = total.checked_add(bal).ok_or(Error::MathOverflow)?;
+        }
+        Ok(total)
+    }
+
     // ── Escrow lifecycle ─────────────────────────────────────────────────
 
-    /// Locks `amount` of `token` from `payer` and supplies it to the adapter.
+    /// Locks `amount` of `token` from `payer` and supplies it across strategies.
     ///
     /// `payer` must authorize the call. `beneficiary_interest_bps` is the share
     /// of the interest accrued while the funds are locked that the beneficiary
@@ -273,14 +587,40 @@ impl YieldEscrow {
         }
 
         let contract = env.current_contract_address();
-        let adapter = Self::adapter(&env)?;
+        let strategies = Self::get_strategies(env.clone());
         let mut yield_state = Self::update_yield_state(&env, &token)?;
 
-        // Move the principal into this contract, then let the adapter pull it
-        // into the lending pool. Both calls happen inside the payer's
-        // authorization tree, so the payer signs a single transaction.
+        // Move the principal into this contract, then supply across strategies
         token::Client::new(&env, &token).transfer(&payer, &contract, &amount);
-        LendingProtocolClient::new(&env, &adapter).deposit(&contract, &token, &amount);
+
+        let num_strats = strategies.len();
+        let mut allocated: i128 = 0;
+        let mut amounts = Vec::new(&env);
+        for strat in strategies.iter() {
+            let strat_amount = amount
+                .checked_mul(strat.weight_bps as i128)
+                .ok_or(Error::MathOverflow)?
+                / BPS_DENOMINATOR;
+            amounts.push_back(strat_amount);
+            allocated = allocated
+                .checked_add(strat_amount)
+                .ok_or(Error::MathOverflow)?;
+        }
+        let remainder = amount - allocated;
+        for i in 0..num_strats {
+            let strat = strategies.get(i).unwrap();
+            let mut strat_amount = amounts.get(i).unwrap();
+            if (i as i128) < remainder {
+                strat_amount += 1;
+            }
+            if strat_amount > 0 {
+                LendingProtocolClient::new(&env, &strat.address).deposit(
+                    &contract,
+                    &token,
+                    &strat_amount,
+                );
+            }
+        }
 
         yield_state.total_principal = yield_state
             .total_principal
@@ -288,7 +628,7 @@ impl YieldEscrow {
             .ok_or(Error::MathOverflow)?;
         // Refresh after depositing so the next interval uses utilization that
         // includes this position.
-        yield_state.rate_bps = LendingProtocolClient::new(&env, &adapter).yield_rate_bps(&token);
+        yield_state.rate_bps = Self::get_weighted_yield_rate(&env, &token)?;
         if yield_state.rate_bps > 100_000 {
             return Err(Error::InvalidYieldRate);
         }
@@ -503,19 +843,156 @@ impl YieldEscrow {
 
     // ── Internal helpers ─────────────────────────────────────────────────
 
-    /// Withdraws the escrowed principal and harvests the interest into this
-    /// contract, returning `(principal, interest)`.
-    fn redeem_position(env: &Env, record: &Escrow) -> Result<(i128, i128), Error> {
-        let adapter = Self::adapter(env)?;
-        let contract = env.current_contract_address();
-        let protocol = LendingProtocolClient::new(env, &adapter);
-
-        protocol.withdraw(&contract, &record.token, &record.principal);
-        let interest = protocol.harvest(&contract, &record.token);
-        if interest < 0 {
-            return Err(Error::InvalidInterest);
+    /// Validates strategy allocations: between 1 and 4 entries, no duplicates,
+    /// each weight > 0, and weights sum to exactly 10,000 basis points.
+    fn validate_strategies(strategies: &Vec<StrategyAllocation>) -> Result<(), Error> {
+        let len = strategies.len();
+        if len == 0 {
+            return Err(Error::InvalidStrategyCount);
         }
-        Ok((record.principal, interest))
+        if len > 4 {
+            return Err(Error::MaxStrategiesExceeded);
+        }
+
+        let mut total_weight: u32 = 0;
+        for i in 0..len {
+            let strat_i = strategies.get(i).unwrap();
+            if strat_i.weight_bps == 0 {
+                return Err(Error::InvalidWeights);
+            }
+            total_weight = total_weight
+                .checked_add(strat_i.weight_bps)
+                .ok_or(Error::MathOverflow)?;
+
+            // Check for duplicate strategy addresses
+            for j in (i + 1)..len {
+                let strat_j = strategies.get(j).unwrap();
+                if strat_i.address == strat_j.address {
+                    return Err(Error::DuplicateStrategy);
+                }
+            }
+        }
+
+        if total_weight != (BPS_DENOMINATOR as u32) {
+            return Err(Error::InvalidWeights);
+        }
+
+        Ok(())
+    }
+
+    /// Returns true if both collections share the exact same strategy addresses.
+    fn same_strategy_addresses(
+        current: &Vec<StrategyAllocation>,
+        new_strats: &Vec<StrategyAllocation>,
+    ) -> bool {
+        if current.len() != new_strats.len() {
+            return false;
+        }
+        for i in 0..current.len() {
+            let curr_addr = current.get(i).unwrap().address;
+            let mut found = false;
+            for j in 0..new_strats.len() {
+                if new_strats.get(j).unwrap().address == curr_addr {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Computes the weighted average yield rate across all registered strategies in basis points.
+    fn get_weighted_yield_rate(env: &Env, token: &Address) -> Result<u32, Error> {
+        let strategies = Self::get_strategies(env.clone());
+        if strategies.is_empty() {
+            let adapter = Self::adapter(env)?;
+            return Ok(LendingProtocolClient::new(env, &adapter).yield_rate_bps(token));
+        }
+        let mut total_weighted_rate: u128 = 0;
+        for strat in strategies.iter() {
+            let rate = LendingProtocolClient::new(env, &strat.address).yield_rate_bps(token);
+            if rate > 100_000 {
+                return Err(Error::InvalidYieldRate);
+            }
+            total_weighted_rate = total_weighted_rate
+                .checked_add((rate as u128) * (strat.weight_bps as u128))
+                .ok_or(Error::MathOverflow)?;
+        }
+        let avg_rate = (total_weighted_rate / (BPS_DENOMINATOR as u128)) as u32;
+        Ok(avg_rate)
+    }
+
+    /// Withdraws the escrowed principal and harvests the interest across all strategies,
+    /// returning `(principal, interest)`.
+    fn redeem_position(env: &Env, record: &Escrow) -> Result<(i128, i128), Error> {
+        let strategies = Self::get_strategies(env.clone());
+        let contract = env.current_contract_address();
+        let num_strats = strategies.len();
+
+        let mut total_balance: i128 = 0;
+        let mut balances = Vec::new(env);
+        for strat in strategies.iter() {
+            let bal = LendingProtocolClient::new(env, &strat.address).get_balance(&record.token);
+            balances.push_back(bal);
+            total_balance = total_balance.checked_add(bal).ok_or(Error::MathOverflow)?;
+        }
+
+        let mut to_withdraw = Vec::new(env);
+        let mut allocated: i128 = 0;
+
+        if total_balance > 0 {
+            for i in 0..num_strats {
+                let bal = balances.get(i).unwrap();
+                let amt = record
+                    .principal
+                    .checked_mul(bal)
+                    .ok_or(Error::MathOverflow)?
+                    / total_balance;
+                to_withdraw.push_back(amt);
+                allocated = allocated.checked_add(amt).ok_or(Error::MathOverflow)?;
+            }
+        } else {
+            for strat in strategies.iter() {
+                let amt = record
+                    .principal
+                    .checked_mul(strat.weight_bps as i128)
+                    .ok_or(Error::MathOverflow)?
+                    / BPS_DENOMINATOR;
+                to_withdraw.push_back(amt);
+                allocated = allocated.checked_add(amt).ok_or(Error::MathOverflow)?;
+            }
+        }
+
+        let remainder = record.principal - allocated;
+        let mut total_interest: i128 = 0;
+
+        for i in 0..num_strats {
+            let strat = strategies.get(i).unwrap();
+            let mut amt = to_withdraw.get(i).unwrap();
+            if (i as i128) < remainder {
+                amt += 1;
+            }
+            if amt > 0 {
+                LendingProtocolClient::new(env, &strat.address).withdraw(
+                    &contract,
+                    &record.token,
+                    &amt,
+                );
+            }
+            let harvested =
+                LendingProtocolClient::new(env, &strat.address).harvest(&contract, &record.token);
+            if harvested < 0 {
+                return Err(Error::InvalidInterest);
+            }
+            total_interest = total_interest
+                .checked_add(harvested)
+                .ok_or(Error::MathOverflow)?;
+        }
+
+        Ok((record.principal, total_interest))
     }
 
     fn update_yield_state(env: &Env, token: &Address) -> Result<YieldState, Error> {
@@ -539,8 +1016,7 @@ impl YieldEscrow {
         state.index = state.index.checked_add(growth).ok_or(Error::MathOverflow)?;
         state.updated_at = now;
 
-        let adapter = Self::adapter(env)?;
-        state.rate_bps = LendingProtocolClient::new(env, &adapter).yield_rate_bps(token);
+        state.rate_bps = Self::get_weighted_yield_rate(env, token)?;
         if state.rate_bps > 100_000 {
             return Err(Error::InvalidYieldRate);
         }
@@ -574,10 +1050,7 @@ impl YieldEscrow {
             .total_principal
             .checked_sub(principal)
             .ok_or(Error::MathOverflow)?;
-        // A settled position changes pool utilization; apply the new adapter
-        // rate only to future elapsed time.
-        let adapter = Self::adapter(env)?;
-        state.rate_bps = LendingProtocolClient::new(env, &adapter).yield_rate_bps(token);
+        state.rate_bps = Self::get_weighted_yield_rate(env, token)?;
         if state.rate_bps > 100_000 {
             return Err(Error::InvalidYieldRate);
         }

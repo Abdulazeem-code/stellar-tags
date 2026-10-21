@@ -892,7 +892,10 @@ fn test_execute_batch_actions_three_distinct_actions_success() {
 
     // Verify initial state
     assert_eq!(client.get_fee(), 100);
-    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
     assert!(!client.is_dex_registered(&dex));
 
     // Advance time past the 24h delay
@@ -907,9 +910,18 @@ fn test_execute_batch_actions_three_distinct_actions_success() {
     assert!(client.is_dex_registered(&dex));
 
     // Verify all nonces are removed from queue
-    assert_eq!(client.try_get_queued_action(&n1).unwrap_err().unwrap(), Error::TimelockNotFound);
-    assert_eq!(client.try_get_queued_action(&n2).unwrap_err().unwrap(), Error::TimelockNotFound);
-    assert_eq!(client.try_get_queued_action(&n3).unwrap_err().unwrap(), Error::TimelockNotFound);
+    assert_eq!(
+        client.try_get_queued_action(&n1).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
+    assert_eq!(
+        client.try_get_queued_action(&n2).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
+    assert_eq!(
+        client.try_get_queued_action(&n3).unwrap_err().unwrap(),
+        Error::TimelockNotFound
+    );
 
     // Verify batch_actions_executed event was emitted with the list of nonces
     let events = env.events().all();
@@ -926,7 +938,10 @@ fn test_execute_batch_actions_three_distinct_actions_success() {
             false
         }
     });
-    assert!(found, "batch_actions_executed event not found with list of nonces");
+    assert!(
+        found,
+        "batch_actions_executed event not found with list of nonces"
+    );
 }
 
 #[test]
@@ -959,7 +974,10 @@ fn test_execute_batch_actions_reverts_if_one_not_ready() {
 
     // Verify atomic rollback: none of the actions took effect
     assert_eq!(client.get_fee(), 100);
-    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
     assert!(!client.is_dex_registered(&dex));
 
     // Verify all actions remain pending in the queue
@@ -987,7 +1005,10 @@ fn test_execute_batch_actions_reverts_if_one_not_found() {
 
     // Verify neither action executed
     assert_eq!(client.get_fee(), 100);
-    assert_eq!(client.get_max_slippage_bps(), PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS);
+    assert_eq!(
+        client.get_max_slippage_bps(),
+        PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
+    );
     assert!(client.try_get_queued_action(&n1).is_ok());
     assert!(client.try_get_queued_action(&n2).is_ok());
 }
@@ -4655,7 +4676,8 @@ fn pair_slippage_overrides_global_cap_for_stable_and_volatile_pairs() {
     f.client
         .set_pair_max_slippage_bps(&f.sell_token, &f.buy_token, &10);
     assert_eq!(
-        f.client.get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
+        f.client
+            .get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
         10
     );
     let stable_quote = f
@@ -4667,7 +4689,8 @@ fn pair_slippage_overrides_global_cap_for_stable_and_volatile_pairs() {
     f.client
         .set_pair_max_slippage_bps(&f.sell_token, &other_token, &400);
     assert_eq!(
-        f.client.get_pair_max_slippage_bps(&f.sell_token, &other_token),
+        f.client
+            .get_pair_max_slippage_bps(&f.sell_token, &other_token),
         400
     );
     let volatile_quote = f
@@ -4676,7 +4699,8 @@ fn pair_slippage_overrides_global_cap_for_stable_and_volatile_pairs() {
     assert_eq!(volatile_quote.max_slippage_bps, 400);
     assert_eq!(volatile_quote.min_amount_out, 9_600);
     assert_eq!(
-        f.client.get_pair_max_slippage_bps(&other_token, &f.buy_token),
+        f.client
+            .get_pair_max_slippage_bps(&other_token, &f.buy_token),
         PaymentRouter::DEFAULT_MAX_SLIPPAGE_BPS
     );
 }
@@ -4712,17 +4736,14 @@ fn pair_slippage_rejects_values_above_ceiling_and_invalid_stored_values() {
 #[test]
 fn pair_slippage_timelock_action_applies_override() {
     let f = setup_swap_fixture(1, 1);
-    let action = ActionType::SetPairMaxSlippageBps(
-        f.sell_token.clone(),
-        f.buy_token.clone(),
-        250,
-    );
+    let action = ActionType::SetPairMaxSlippageBps(f.sell_token.clone(), f.buy_token.clone(), 250);
     let nonce = f.client.queue_action(&action);
     advance_time(&f.env, PaymentRouter::SECONDS_IN_24H + 1);
     f.client.execute_action(&nonce);
 
     assert_eq!(
-        f.client.get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
+        f.client
+            .get_pair_max_slippage_bps(&f.sell_token, &f.buy_token),
         250
     );
 }
