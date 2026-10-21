@@ -5159,7 +5159,6 @@ fn test_renew_heartbeat_fails_when_dms_not_armed() {
     let operator = Address::generate(&env);
     client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
 
-    // Set operator but do NOT arm the DMS.
     client.set_heartbeat_operator(&operator);
 
     let res = client.try_renew_heartbeat(&operator);
@@ -5182,17 +5181,141 @@ fn test_operator_cannot_change_backup_admin() {
     setup_dms_env(&env, &client, &admin, &backup, PaymentRouter::MIN_DMS_TIMEOUT);
     client.set_heartbeat_operator(&operator);
 
-    // The operator does not have admin rights, so set_backup_admin_internal
-    // must fail.
     let res = client.try_set_backup_admin_internal(&new_backup, &PaymentRouter::MIN_DMS_TIMEOUT);
-    // Because mock_all_auths is active the call will proceed but only if the
-    // admin signs — here we confirm the stored backup is unchanged.
-    // The try_ variant failing here is fine; the assertion below is the key
-    // invariant regardless.
     let (stored_backup, _, _, _) = client.get_dead_mans_switch();
     assert_eq!(
         stored_backup.unwrap(),
         backup,
         "operator must not be able to change backup admin"
     );
+}
+
+// ─── Partial-fill swap tests ─────────────────────────────────────────────────
+struct PartialFillFixture {
+    env: Env,
+    client: PaymentRouterClient<'static>,
+    sender: Address,
+    recipient: Address,
+    treasury: Address,
+    dex: Address,
+    sell_token: Address,
+    buy_token: Address,
+    sell_client: token::Client<'static>,
+    buy_client: token::Client<'static>,
+    dex_client: MockPathDexClient<'static>,
+}
+
+impl PartialFillFixture {
+    fn payment(&self, amount_in: i128, min_amount_out: i128, min_fill_bps: i128) -> PartialSwapPayment {
+        PartialSwapPayment {
+            sender: self.sender.clone(),
+            recipient: self.recipient.clone(),
+            sell_token: self.sell_token.clone(),
+            buy_token: self.buy_token.clone(),
+            amount_in,
+            min_amount_out,
+            expected_amount_out: 0,
+            deadline: 0,
+            dex: self.dex.clone(),
+            min_fill_bps,
+        }
+    }
+}
+
+fn setup_partial_fill_fixture() -> PartialFillFixture {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    let (sell_token, sell_client, sell_admin) = setup_token(&env);
+    let (buy_token, buy_client, buy_admin) = setup_token(&env);
+
+    let dex = env.register_contract(None, MockPathDex);
+    let dex_client = MockPathDexClient::new(&env, &dex);
+    dex_client.set_unused_input(&0);
+
+    buy_admin.mint(&dex, &10_000_000);
+    sell_admin.mint(&sender, &1_000_000);
+
+    client.register_dex(&dex);
+
+    PartialFillFixture {
+        env,
+        client,
+        sender,
+        recipient,
+        treasury,
+        dex,
+        sell_token,
+        buy_token,
+        sell_client,
+        buy_client,
+        dex_client,
+    }
+}
+
+#[test]
+fn test_partial_fill_100_percent_delivers_full_output() {
+    let f = setup_partial_fill_fixture();
+    f.dex_client.set_unused_input(&0);
+    let payment = f.payment(10_000, 1, 10_000);
+
+    let result = f.client.route_payment_with_partial_fill(&payment);
+
+    assert_eq!(result.refunded_amount, 0);
+    assert_eq!(result.filled_amount, 9_900);
+    assert_eq!(f.buy_client.balance(&f.recipient), 9_900);
+    assert_eq!(f.buy_client.balance(&f.treasury), 100);
+    assert_eq!(f.sell_client.balance(&f.sender), 990_000);
+}
+
+#[test]
+fn test_partial_fill_80_percent_min_fill_bps_accepts_full_delivery() {
+    let f = setup_partial_fill_fixture();
+    f.dex_client.set_unused_input(&0);
+    let payment = f.payment(10_000, 1, 8_000);
+
+    let result = f.client.route_payment_with_partial_fill(&payment);
+
+    assert_eq!(result.refunded_amount, 0);
+    assert_eq!(result.filled_amount, 9_900);
+    assert_eq!(f.buy_client.balance(&f.recipient), 9_900);
+    assert_eq!(f.buy_client.balance(&f.treasury), 100);
+}
+
+#[test]
+fn test_partial_fill_50_percent_with_sell_refund() {
+    let f = setup_partial_fill_fixture();
+    f.dex_client.set_unused_input(&5_000);
+    let payment = f.payment(10_000, 1, 5_000);
+
+    let result = f.client.route_payment_with_partial_fill(&payment);
+
+    assert_eq!(result.refunded_amount, 5_000);
+    assert_eq!(f.sell_client.balance(&f.sender), 990_000 + 5_000);
+    assert!(result.filled_amount > 0);
+    assert_eq!(f.buy_client.balance(&f.recipient), result.filled_amount);
+}
+
+#[test]
+fn test_partial_fill_below_min_fill_bps_reverts() {
+    let f = setup_partial_fill_fixture();
+    f.dex_client.set_unused_input(&5_000);
+    let payment = f.payment(10_000, 1, 6_000);
+
+    let res = f.client.try_route_payment_with_partial_fill(&payment);
+
+    assert_eq!(res.unwrap_err().unwrap(), Error::MinFillNotMet);
+    assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
+    assert_eq!(f.buy_client.balance(&f.recipient), 0);
+    assert_eq!(f.buy_client.balance(&f.treasury), 0);
 }
