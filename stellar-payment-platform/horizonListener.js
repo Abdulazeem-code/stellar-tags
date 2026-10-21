@@ -13,7 +13,7 @@ const {
   horizon,
   createBreaker,
 } = require('./src/services/stellarService');
-const { publishPaymentUpdate } = require('./src/websocket');
+const { publishPaymentUpdate } = require('./src/sse');
 
 
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
@@ -26,7 +26,7 @@ const HORIZON_URLS = {
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
-// Dedicated ioredis publisher for cross-process WebSocket payment events.
+// Dedicated ioredis publisher for cross-process SSE payment events.
 // When REDIS_URL is absent real-time updates are silently disabled.
 const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
 if (redisPublisher) {
@@ -35,7 +35,7 @@ if (redisPublisher) {
   );
 } else {
   logger.warn(
-    '[listener] REDIS_URL not set — real-time WebSocket payment updates are disabled.',
+    '[listener] REDIS_URL not set — real-time SSE payment updates are disabled.',
   );
 }
 
@@ -126,7 +126,21 @@ const watchAccount = (accountId) => {
               assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
               status: 'completed'
             }
-          }).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
+          }).then((created) =>
+            // Fan the new payment out to connected SSE clients via Redis, so
+            // every API process can stream the status update (#730).
+            publishPaymentUpdate(redisPublisher, created.id, {
+              status: created.status,
+              transactionHash: created.transactionHash,
+              fromAddress: created.fromAddress,
+              toAddress: created.toAddress,
+              amount: created.amount,
+              assetCode: created.assetCode,
+              detectedAt: created.createdAt,
+            }).catch((publishErr) =>
+              logger.error({ err: publishErr }, 'Failed to publish payment status update'),
+            ),
+          ).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
         }
       },
       onerror: (error) => {

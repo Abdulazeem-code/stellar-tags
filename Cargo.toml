@@ -12,7 +12,6 @@ members = [
     "pausable_token",
     "payment_proxy",
     "timelock_escrow",
-    "advanced_feature_35",
     "twap_oracle",
 ]
 exclude = [

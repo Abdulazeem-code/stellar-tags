@@ -1,5 +1,7 @@
 const express = require('express');
-const { normalizeNameTag, etagCache } = require('../../db');
+const db = require('../../db');
+const normalizeNameTag = db.normalizeNameTag || ((v) => v);
+const etagCache = db.etagCache || ((_req, _res, next) => next());
 const {
   federationNameKey,
   federationIdKey,
@@ -10,10 +12,18 @@ const { ApiError } = require('../../errors');
 const { federationQuerySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { resolveFederationId, resolveFederationName } = require('../../services/federationService');
+const { createTokenBucketLimiter } = require('../../middleware/tokenBucketLimiter');
 
 module.exports = (redisClient) => {
   const router = express.Router();
 
+  const ipLimiter = createTokenBucketLimiter(redisClient, {
+    capacity: 100,
+    refillRate: 100 / (15 * 60),
+    prefix: 'ip-rl:',
+    keyGenerator: (req) =>
+      req.ip || (req.connection && req.connection.remoteAddress) || '',
+  });
 
 /**
  * @openapi
@@ -26,7 +36,7 @@ module.exports = (redisClient) => {
  *       200:
  *         description: Success
  */
-router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
+router.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
 
     try {

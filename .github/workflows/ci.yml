@@ -7,6 +7,25 @@ on:
     branches: [ "main" ]
 
 jobs:
+  workspace-quality-gates:
+    name: Workspace Quality Gates & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install Root Dependencies
+        run: npm install
+
+      - name: Run Root ESLint
+        run: npm run lint
+
   backend-checks:
     name: Backend Build & Test
     runs-on: ubuntu-latest
@@ -24,9 +43,13 @@ jobs:
           cache: 'npm'
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
 
-
       - name: Install Backend Dependencies
         run: npm install
+
+      - name: Validate Prisma Schema
+        run: npm run prisma:validate
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/stellar_test?schema=public"
 
       # Run the full suite with coverage so the thresholds in package.json
       # fail the build whenever coverage regresses below the floor.
@@ -111,5 +134,8 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm install --legacy-peer-deps
         
+      - name: Run ESLint
+        run: npm run lint
+
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build

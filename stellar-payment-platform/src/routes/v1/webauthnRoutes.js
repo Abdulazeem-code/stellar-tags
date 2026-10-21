@@ -201,7 +201,7 @@ router.post(
     const result = await verifyAuthentication(authenticationResponse);
 
     // Issue JWT token for authenticated user
-    let token = null;
+    let token;
     try {
       token = signToken(
         {

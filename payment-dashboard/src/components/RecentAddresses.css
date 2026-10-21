@@ -1,24 +1,24 @@
-/* ─── RecentAddresses dropdown ───────────────────────────────────────── */
+/* RecentAddresses dropdown (Dark Glassmorphic) */
 
 .recent-addresses {
   position: absolute;
-  top: calc(100% + 4px);
+  top: calc(100% + 6px);
   left: 0;
   right: 0;
   z-index: 200;
-  background: var(--paper, #ffffff);
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: 12px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  background: rgba(14, 20, 34, 0.96);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-md, 14px);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
   overflow: hidden;
-  /* Subtle entrance animation */
-  animation: recent-fade-in 0.12s ease-out;
+  animation: recent-fade-in 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @keyframes recent-fade-in {
   from {
     opacity: 0;
-    transform: translateY(-4px);
+    transform: translateY(-6px);
   }
   to {
     opacity: 1;
@@ -30,38 +30,38 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .recent-addresses__title {
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--slate, #64748b);
+  color: var(--accent-cyan, #00f0ff);
 }
 
 .recent-addresses__clear {
   background: none;
   border: none;
-  padding: 2px 6px;
+  padding: 3px 8px;
   font-size: 11px;
-  color: var(--slate, #64748b);
+  color: var(--text-muted, #64748b);
   cursor: pointer;
-  border-radius: 4px;
-  transition: color 0.15s ease, background 0.15s ease;
+  border-radius: 6px;
+  transition: all 0.15s ease;
 }
 
 .recent-addresses__clear:hover {
-  color: #dc2626;
-  background: rgba(220, 38, 38, 0.08);
+  color: #f43f5e;
+  background: rgba(244, 63, 94, 0.1);
 }
 
 .recent-addresses__list {
   list-style: none;
   margin: 0;
-  padding: 4px 0;
+  padding: 6px 0;
 }
 
 .recent-addresses__item {
@@ -72,20 +72,23 @@
 .recent-addresses__option {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
-  padding: 8px 12px;
+  padding: 10px 14px;
   background: none;
   border: none;
   text-align: left;
   cursor: pointer;
-  transition: background 0.12s ease;
-  color: inherit;
+  transition: background 0.15s ease, color 0.15s ease;
+  color: var(--text-secondary, #94a3b8);
+  font-size: 13px;
+  font-family: 'Space Grotesk', monospace;
 }
 
 .recent-addresses__option:hover,
 .recent-addresses__option:focus-visible {
-  background: rgba(31, 124, 255, 0.07);
+  background: rgba(0, 240, 255, 0.1);
+  color: #ffffff;
   outline: none;
 }
 
@@ -93,27 +96,12 @@
   flex-shrink: 0;
   width: 14px;
   height: 14px;
-  color: var(--slate, #64748b);
+  color: var(--accent-cyan, #00f0ff);
 }
 
 .recent-addresses__label {
-  font-size: 13px;
-  font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 100%;
-}
-
-/* ─── Dark-mode ───────────────────────────────────────────────────────── */
-@media (prefers-color-scheme: dark) {
-  .recent-addresses {
-    background: #1e2535;
-    border-color: rgba(148, 163, 184, 0.15);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-  }
-
-  .recent-addresses__header {
-    border-bottom-color: rgba(148, 163, 184, 0.12);
-  }
 }

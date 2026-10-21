@@ -43,6 +43,7 @@ const REQUIRED_TABLES = {
     'risk_score',
     'fraud_status',
     'fraud_flagged_at',
+    'deleted_at',
   ],
   routing_rules: [
     'id',

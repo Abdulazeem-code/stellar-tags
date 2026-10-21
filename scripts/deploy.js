@@ -688,7 +688,7 @@ const executeDeploy = async (options) => {
   }
 
   let contractId;
-  let wasmHash;
+  let wasmHash = null;
 
   // Use stellar / soroban CLI to deploy
   try {

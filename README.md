@@ -676,6 +676,29 @@ before it is returned.
 - **Returns:** `success: true`, `id`, `discarded: true`. The message is dropped without being replayed, which is permanent.
 - **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`.
 
+### `GET /payments/:paymentId/events`
+
+Server-Sent Events stream of payment status updates (#730). The flow is
+strictly one-way (server → client), so clients use the browser's `EventSource`
+and reconnection is handled natively — no custom retry logic, and the server
+advertises its preferred reconnect delay with a `retry:` hint.
+- **Path Parameter:** `paymentId` (string, 1-128 chars of `[A-Za-z0-9_-]`) -
+  payment or payment-intent id.
+- **Returns:** a `text/event-stream` response that stays open until the client
+  disconnects, emitting:
+  - `connected` - `{ paymentId }`, sent as soon as the stream opens.
+  - `snapshot` - `{ paymentId, status, transactionHash? }`, the last known
+    status, so a client that just (re)connected converges immediately instead
+    of waiting for the next transition.
+  - `payment-update` - `{ paymentId, status, ... }` on every status change.
+    Publishers (e.g. the Horizon listener) push these to Redis, so every API
+    node fans them out to its own connected streams.
+- **Client usage:** open `new EventSource(url)` with
+  `url = "${API_BASE}/api/payments/<id>/events"`; a ready-made wrapper
+  (handlers + teardown) lives in `payment-dashboard/src/lib/paymentEvents.js`.
+- **Status Codes:** `200 OK`, `400 Bad Request` (invalid `paymentId`),
+  `429 Too Many Requests` (per-IP stream budget).
+
 ### `GET /metrics`
 
 Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the

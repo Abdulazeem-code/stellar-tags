@@ -159,6 +159,78 @@ function wrapPageWithBreaker(page) {
 }
 
 // ---------------------------------------------------------------------------
+// Transaction submission retry
+// ---------------------------------------------------------------------------
+const RETRYABLE_HTTP_STATUS = new Set([429, 503, 504]);
+const RETRYABLE_RESULT_CODE = 'tx_bad_seq';
+const SUBMIT_MAX_ATTEMPTS = 4;
+const SUBMIT_BASE_BACKOFF_MS = 200;
+const SUBMIT_MAX_BACKOFF_MS = 5000;
+
+/**
+ * Returns true when an error is transient and the transaction can be retried.
+ *
+ * Retryable cases are HTTP 429/503/504 and Stellar `tx_bad_seq`. Permanent
+ * failures such as `op_underfunded` or `op_bad_auth` are not retried.
+ */
+function isRetryableSubmissionError(error) {
+  const status = Number(error?.response?.status ?? error?.status);
+  if (RETRYABLE_HTTP_STATUS.has(status)) return true;
+
+  const codes = error?.response?.data?.extras?.result_codes;
+  const transactionCode = codes?.transaction;
+  if (transactionCode === RETRYABLE_RESULT_CODE) return true;
+  if (Array.isArray(transactionCode) && transactionCode.includes(RETRYABLE_RESULT_CODE)) {
+    return true;
+  }
+
+  return String(error?.message || '').includes(RETRYABLE_RESULT_CODE);
+}
+
+/**
+ * Full-jitter backoff: random_between(0, min(max, base * 2^attempt)).
+ *
+ * The random source is injectable so tests are deterministic.
+ */
+function computeBackoff(attempt, random = Math.random) {
+  const ceiling = Math.min(SUBMIT_MAX_BACKOFF_MS, SUBMIT_BASE_BACKOFF_MS * 2 ** attempt);
+  return Math.floor(random() * ceiling);
+}
+
+/**
+ * Submit a transaction with exponential backoff and full jitter.
+ *
+ * Options are injectable for tests: `submit`, `sleep`, and `random`.
+ * The function retries at most four attempts in total, including the first.
+ */
+async function submitTransactionWithRetry(transaction, options = {}) {
+  const submit = options.submit || ((tx) => horizon.submitTransaction(tx));
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const random = options.random || Math.random;
+  const maxAttempts = options.maxAttempts || SUBMIT_MAX_ATTEMPTS;
+
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await submit(transaction);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableSubmissionError(error) || attempt === maxAttempts - 1) {
+        throw error;
+      }
+      const waitMs = computeBackoff(attempt, random);
+      logger.warn(
+        { attempt: attempt + 1, waitMs },
+        '[Stellar] Transient submission failure, retrying',
+      );
+      await sleep(waitMs);
+    }
+  }
+
+  throw lastError;
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 module.exports = {
@@ -177,6 +249,14 @@ module.exports = {
   fetchPaymentsForTransaction,
   fetchPaymentsForAccount,
   fetchFirstPaymentsPage,
+
+  // Transaction submission with retry/backoff
+  submitTransactionWithRetry,
+  isRetryableSubmissionError,
+  computeBackoff,
+  SUBMIT_MAX_ATTEMPTS,
+  SUBMIT_BASE_BACKOFF_MS,
+  SUBMIT_MAX_BACKOFF_MS,
 
   // Low-level: create a breaker around any async function
   createBreaker,
