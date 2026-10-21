@@ -35,11 +35,15 @@
 //! 2. **Payment Intent**: Binds readable transaction parameters (`from`, `to`, `amount`, `nonce`, `fee`, `deadline`).
 //! 3. **Canonical Digest**: `SHA256("\x19\x01" || domain_separator_hash || intent_hash)`.
 //!
+//! ## Admin controls
+//!
 //! | Function             | Who can call | What it does                                  |
 //! |----------------------|--------------|-----------------------------------------------|
 //! | `initialize`         | One-time     | Sets admin and initial logic address          |
 //! | `upgrade_logic`      | Admin only   | Points proxy at a new logic contract address  |
 //! | `transfer_admin`     | Admin only   | Hands off proxy admin rights                  |
+//! | `authorize_session_key` | Session key | Grants the caller a temporary payment cap     |
+//! | `get_session_allowance` | Anyone    | Reads a session key's remaining cap and expiry |
 //! | `forward`            | Anyone       | Delegates an arbitrary call to logic contract |
 //! | `get_logic_contract` | Anyone       | Returns current logic address (view)          |
 //! | `get_admin`          | Anyone       | Returns current admin address (view)          |
@@ -82,7 +86,8 @@
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
 // ── Constants & Version ───────────────────────────────────────────────────────
@@ -146,10 +151,49 @@ pub enum ProxyDataKey {
     Admin,
     /// Current logic contract that this proxy delegates calls to.
     LogicContract,
+    /// A delegated signing key and its remaining spend allowance / expiry.
+    Session(Address),
+    /// Nonce for meta-transactions with relayer fee compensation.
+    MetaNonce(Address),
+    /// Replay protection nonce for meta-transactions per account.
+    Nonce(Address),
     /// 256-bit bitmap of consumed nonces for `(user, channel_id, word_index)`.
     /// Stored as `BytesN<32>` — four big-endian `u64` limbs ([u64; 4]) — in
     /// persistent storage (issue #918).
     NonceBitmap(Address, u32, u32),
+}
+
+/// Remaining spending allowance and expiry for a delegated session key.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionAllowance {
+    pub remaining: i128,
+    pub valid_until: u64,
+}
+
+/// Payment wire shape shared with `PaymentRouter::route_payments`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payment {
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
+    pub amount: i128,
+}
+
+/// Swap payment wire shape shared with `PaymentRouter`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapPayment {
+    pub sender: Address,
+    pub recipient: Address,
+    pub sell_token: Address,
+    pub buy_token: Address,
+    pub amount_in: i128,
+    pub min_amount_out: i128,
+    pub expected_amount_out: i128,
+    pub deadline: u64,
+    pub dex: Address,
 }
 
 // ── Error codes ───────────────────────────────────────────────────────────────
@@ -167,10 +211,50 @@ pub enum ProxyError {
     Unauthorized = 3,
     /// The supplied logic address equals the one already stored.
     SameLogicAddress = 4,
+    /// The supplied meta-transaction nonce does not match the account's next expected nonce.
+    InvalidNonce = 5,
+    /// The meta-transaction deadline has expired.
+    DeadlineExpired = 6,
+    /// The transfer amount is non-positive.
+    InvalidAmount = 7,
+    /// The relayer fee is negative.
+    InvalidFee = 8,
+    /// Arithmetic overflow calculating amount + fee.
+    MathOverflow = 9,
+    /// User token balance is insufficient to cover amount + fee.
+    InsufficientBalance = 10,
+    /// User token allowance to proxy is insufficient to cover amount + fee.
+    InsufficientAllowance = 11,
+    /// Signature verification failed (invalid Ed25519 signature).
+    InvalidSignature = 12,
+    /// Session allowances must be positive and expire in the future.
+    InvalidSessionAllowance = 13,
+    /// A session key attempted a payment after its expiry.
+    SessionExpired = 14,
+    /// A payment exceeds the session key's remaining allowance.
+    SessionAllowanceExceeded = 15,
+    /// Session keys can only call the supported payment-routing methods.
+    UnsupportedSessionCall = 16,
     /// The requested nonce bit was already consumed — replay attempt.
-    NonceAlreadyUsed = 5,
+    NonceAlreadyUsed = 17,
     /// `bit_index` exceeded 255; a word holds exactly 256 nonce bits.
-    InvalidBitIndex = 6,
+    InvalidBitIndex = 18,
+}
+
+// ── Meta-transaction payload ──────────────────────────────────────────────────
+
+/// Structured payload for meta-transactions with relayer gas fee compensation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaPayment {
+    pub nonce: u64,
+    pub deadline: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
+    pub amount: i128,
+    pub fee: i128,
+    pub fee_recipient: Address,
 }
 
 pub type MetaPaymentPayload = MetaPayment;
@@ -302,6 +386,49 @@ impl PaymentProxy {
         Ok(())
     }
 
+    /// Grants `session_key` a temporary allowance for routed payments.
+    ///
+    /// The session key itself authorizes this grant, so only the account that
+    /// will sign delegated payments can install or reset its cap. Allowances
+    /// are denominated in the same units as the forwarded payment amounts.
+    pub fn authorize_session_key(
+        env: Env,
+        session_key: Address,
+        spending_limit: i128,
+        valid_until: u64,
+    ) -> Result<(), ProxyError> {
+        session_key.require_auth();
+        if spending_limit <= 0 || valid_until <= env.ledger().timestamp() {
+            return Err(ProxyError::InvalidSessionAllowance);
+        }
+
+        env.storage().instance().set(
+            &ProxyDataKey::Session(session_key.clone()),
+            &SessionAllowance {
+                remaining: spending_limit,
+                valid_until,
+            },
+        );
+        Self::bump_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "SessionKeyAuthorized"), session_key),
+            (spending_limit, valid_until),
+        );
+        Ok(())
+    }
+
+    /// Returns the current allowance for a session key, or `NotInitialized`
+    /// when the key has not been authorized.
+    pub fn get_session_allowance(
+        env: Env,
+        session_key: Address,
+    ) -> Result<SessionAllowance, ProxyError> {
+        env.storage()
+            .instance()
+            .get(&ProxyDataKey::Session(session_key))
+            .ok_or(ProxyError::NotInitialized)
+    }
+
     // ── Delegation ─────────────────────────────────────────────────────────────
 
     /// Forwards an arbitrary call to the current logic contract.
@@ -324,6 +451,11 @@ impl PaymentProxy {
             .ok_or(ProxyError::NotInitialized)?;
 
         Self::bump_ttl(&env);
+
+        // Session allowances apply to the router's direct and batch payment
+        // entry points. Decode the original arguments before delegation so
+        // malformed calls cannot skip allowance accounting.
+        Self::charge_session_allowance(&env, &func, &args)?;
 
         let result: Val = env.invoke_contract(&logic, &func, args);
         Ok(result)
@@ -351,6 +483,240 @@ impl PaymentProxy {
             .instance()
             .get(&ProxyDataKey::Admin)
             .ok_or(ProxyError::NotInitialized)
+    }
+
+    /// Returns the contract version string.
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, CONTRACT_VERSION)
+    }
+
+    /// Returns the canonical domain separator for this proxy instance.
+    pub fn get_domain_separator(env: Env) -> DomainSeparator {
+        DomainSeparator {
+            contract_id: env.current_contract_address(),
+            network_id: env.ledger().network_id(),
+            version: Self::version(env),
+        }
+    }
+
+    /// Computes the SHA-256 hash of a domain separator.
+    pub fn hash_domain_separator(env: Env, domain: DomainSeparator) -> BytesN<32> {
+        env.crypto().sha256(&domain.to_xdr(&env))
+    }
+
+    /// Returns the hash of this proxy's canonical domain separator.
+    pub fn get_domain_separator_hash(env: Env) -> BytesN<32> {
+        let domain = Self::get_domain_separator(env.clone());
+        Self::hash_domain_separator(env, domain)
+    }
+
+    /// Computes the SHA-256 hash of a payment intent.
+    pub fn hash_payment_intent(env: Env, intent: PaymentIntent) -> BytesN<32> {
+        env.crypto().sha256(&intent.to_xdr(&env))
+    }
+
+    /// Computes the typed data hash for an explicit domain and intent.
+    pub fn compute_typed_hash_for_domain(
+        env: Env,
+        domain: DomainSeparator,
+        intent: PaymentIntent,
+    ) -> BytesN<32> {
+        Self::compute_typed_data_hash_internal(&env, &domain, &intent)
+    }
+
+    /// Computes the typed data hash using this proxy's domain separator.
+    pub fn compute_typed_data_hash(env: Env, intent: PaymentIntent) -> BytesN<32> {
+        let domain = Self::get_domain_separator(env.clone());
+        Self::compute_typed_data_hash_internal(&env, &domain, &intent)
+    }
+
+    /// Returns the next expected EIP-712 payment-intent nonce for an account.
+    pub fn get_nonce(env: Env, from: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&ProxyDataKey::Nonce(from))
+            .unwrap_or(0)
+    }
+
+    /// Verifies an intent signature without consuming its nonce.
+    pub fn verify_payment_intent(
+        env: Env,
+        signer_pubkey: BytesN<32>,
+        intent: PaymentIntent,
+        signature: BytesN<64>,
+    ) -> Result<(), ProxyError> {
+        Self::verify_payment_intent_internal(&env, &signer_pubkey, &intent, &signature)
+    }
+
+    /// Verifies an intent, consumes its nonce, and emits an execution event.
+    pub fn execute_payment_intent(
+        env: Env,
+        signer_pubkey: BytesN<32>,
+        intent: PaymentIntent,
+        signature: BytesN<64>,
+    ) -> Result<(), ProxyError> {
+        Self::verify_payment_intent_internal(&env, &signer_pubkey, &intent, &signature)?;
+
+        let next_nonce = intent
+            .nonce
+            .checked_add(1)
+            .ok_or(ProxyError::InvalidNonce)?;
+        let nonce_key = ProxyDataKey::Nonce(intent.from.clone());
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+        Self::bump_persistent_ttl(&env, &nonce_key);
+        Self::bump_ttl(&env);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "PaymentIntentExecuted"),
+                intent.from.clone(),
+            ),
+            (intent.to, intent.amount, intent.fee, intent.nonce),
+        );
+        Ok(())
+    }
+
+    /// Verifies and consumes an intent before forwarding its call to the router.
+    pub fn forward_with_meta(
+        env: Env,
+        signer_pubkey: BytesN<32>,
+        intent: PaymentIntent,
+        signature: BytesN<64>,
+        func: Symbol,
+        args: Vec<Val>,
+    ) -> Result<Val, ProxyError> {
+        Self::execute_payment_intent(env.clone(), signer_pubkey, intent, signature)?;
+        Self::forward(env, func, args)
+    }
+
+    /// Computes a network identifier from a Stellar network passphrase.
+    pub fn network_id_from_passphrase(env: Env, passphrase: Bytes) -> BytesN<32> {
+        env.crypto().sha256(&passphrase)
+    }
+
+    /// Returns the next expected nonce for a relayer-fee meta-payment.
+    pub fn get_meta_nonce(env: Env, user: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&ProxyDataKey::MetaNonce(user))
+            .unwrap_or(0)
+    }
+
+    fn build_meta_message(env: &Env, payload: &MetaPayment, signer_pubkey: &BytesN<32>) -> Bytes {
+        let mut message = Bytes::new(env);
+        message.append(&env.current_contract_address().to_xdr(env));
+        message.append(&payload.clone().to_xdr(env));
+        message.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
+        let hash = env.crypto().sha256(&message);
+        Bytes::from(&hash)
+    }
+
+    /// Executes a signed token payment with optional relayer fee compensation.
+    pub fn execute_meta_payment(
+        env: Env,
+        payload: MetaPayment,
+        signer_pubkey: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<(), ProxyError> {
+        if payload.deadline > 0 && env.ledger().timestamp() > payload.deadline {
+            return Err(ProxyError::DeadlineExpired);
+        }
+        if payload.amount <= 0 {
+            return Err(ProxyError::InvalidAmount);
+        }
+        if payload.fee < 0 {
+            return Err(ProxyError::InvalidFee);
+        }
+
+        let total_needed = payload
+            .amount
+            .checked_add(payload.fee)
+            .ok_or(ProxyError::MathOverflow)?;
+        if payload.nonce != Self::get_meta_nonce(env.clone(), payload.sender.clone()) {
+            return Err(ProxyError::InvalidNonce);
+        }
+
+        let message = Self::build_meta_message(&env, &payload, &signer_pubkey);
+        env.crypto()
+            .ed25519_verify(&signer_pubkey, &message, &signature);
+
+        let token_client = token::Client::new(&env, &payload.token_address);
+        if token_client.balance(&payload.sender) < total_needed {
+            return Err(ProxyError::InsufficientBalance);
+        }
+        let proxy_address = env.current_contract_address();
+        if token_client.allowance(&payload.sender, &proxy_address) < total_needed {
+            return Err(ProxyError::InsufficientAllowance);
+        }
+
+        let nonce_key = ProxyDataKey::MetaNonce(payload.sender.clone());
+        env.storage()
+            .persistent()
+            .set(&nonce_key, &(payload.nonce + 1));
+        Self::bump_persistent_ttl(&env, &nonce_key);
+
+        if payload.fee > 0 {
+            token_client.transfer_from(
+                &proxy_address,
+                &payload.sender,
+                &payload.fee_recipient,
+                &payload.fee,
+            );
+        }
+        token_client.transfer_from(
+            &proxy_address,
+            &payload.sender,
+            &payload.recipient,
+            &payload.amount,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "meta_payment"), payload.sender),
+            (
+                payload.recipient,
+                payload.fee_recipient,
+                payload.amount,
+                payload.fee,
+                payload.nonce,
+            ),
+        );
+        Ok(())
+    }
+
+    /// Alias for `execute_meta_payment`.
+    pub fn route_payment_meta(
+        env: Env,
+        payload: MetaPayment,
+        signer_pubkey: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<(), ProxyError> {
+        Self::execute_meta_payment(env, payload, signer_pubkey, signature)
+    }
+
+    /// Executes one typed meta-transaction for a batch.
+    pub fn execute_single_meta_tx(env: Env, call: MetaTxCall) -> Result<(), ProxyError> {
+        Self::execute_payment_intent(env, call.signer_pubkey, call.intent, call.signature)
+    }
+
+    /// Executes each meta-transaction independently and reports which succeeded.
+    pub fn execute_batch_tolerant(env: Env, calls: Vec<MetaTxCall>) -> Vec<bool> {
+        let mut results = Vec::new(&env);
+        for call in calls.iter() {
+            match Self::execute_single_meta_tx(env.clone(), call.clone()) {
+                Ok(()) => results.push_back(true),
+                Err(error) => {
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "meta_tx_failed"),
+                            call.intent.from.clone(),
+                        ),
+                        error as u32,
+                    );
+                    results.push_back(false);
+                }
+            }
+        }
+        results
     }
 
     // ── Bitmapped nonce management (issue #918) ───────────────────────
@@ -525,11 +891,95 @@ impl PaymentProxy {
         Ok(())
     }
 
+    /// Applies allowance accounting for session senders in payment calls.
+    fn charge_session_allowance(
+        env: &Env,
+        func: &Symbol,
+        args: &Vec<Val>,
+    ) -> Result<(), ProxyError> {
+        if func == &Symbol::new(env, "route_payment") {
+            let sender = Self::address_arg(env, args, 0)?;
+            let amount = Self::amount_arg(env, args, 3)?;
+            Self::charge_if_session(env, &sender, amount)?;
+        } else if func == &Symbol::new(env, "route_payments") {
+            let payments = args
+                .get(0)
+                .and_then(|value| Vec::<Payment>::try_from_val(env, &value).ok())
+                .ok_or(ProxyError::UnsupportedSessionCall)?;
+            for payment in payments.iter() {
+                Self::charge_if_session(env, &payment.sender, payment.amount)?;
+            }
+        } else if func == &Symbol::new(env, "route_payment_meta") {
+            let sender = Self::address_arg(env, args, 0)?;
+            let amount = Self::amount_arg(env, args, 4)?;
+            Self::charge_if_session(env, &sender, amount)?;
+        } else if func == &Symbol::new(env, "route_payment_with_swap_raw") {
+            let sender = Self::address_arg(env, args, 0)?;
+            let amount = Self::amount_arg(env, args, 5)?;
+            Self::charge_if_session(env, &sender, amount)?;
+        } else if func == &Symbol::new(env, "route_payment_with_swap") {
+            let payment = args
+                .get(0)
+                .and_then(|value| SwapPayment::try_from_val(env, &value).ok())
+                .ok_or(ProxyError::UnsupportedSessionCall)?;
+            Self::charge_if_session(env, &payment.sender, payment.amount_in)?;
+        } else if func == &Symbol::new(env, "route_payments_with_swap") {
+            let payments = args
+                .get(0)
+                .and_then(|value| Vec::<SwapPayment>::try_from_val(env, &value).ok())
+                .ok_or(ProxyError::UnsupportedSessionCall)?;
+            for payment in payments.iter() {
+                Self::charge_if_session(env, &payment.sender, payment.amount_in)?;
+            }
+        } else if func == &Symbol::new(env, "withdraw_refund") {
+            let sender = Self::address_arg(env, args, 0)?;
+            let amount = Self::amount_arg(env, args, 2)?;
+            Self::charge_if_session(env, &sender, amount)?;
+        }
+        Ok(())
+    }
+
+    fn address_arg(env: &Env, args: &Vec<Val>, index: u32) -> Result<Address, ProxyError> {
+        args.get(index)
+            .and_then(|value| Address::try_from_val(env, &value).ok())
+            .ok_or(ProxyError::UnsupportedSessionCall)
+    }
+
+    fn amount_arg(env: &Env, args: &Vec<Val>, index: u32) -> Result<i128, ProxyError> {
+        args.get(index)
+            .and_then(|value| i128::try_from_val(env, &value).ok())
+            .ok_or(ProxyError::UnsupportedSessionCall)
+    }
+
+    /// Decrements a registered key's allowance and rejects expired or
+    /// over-budget spends. Non-session senders keep the existing proxy flow.
+    fn charge_if_session(env: &Env, sender: &Address, amount: i128) -> Result<(), ProxyError> {
+        let key = ProxyDataKey::Session(sender.clone());
+        let Some(mut allowance) = env.storage().instance().get::<_, SessionAllowance>(&key) else {
+            return Ok(());
+        };
+        if env.ledger().timestamp() >= allowance.valid_until {
+            return Err(ProxyError::SessionExpired);
+        }
+        if amount <= 0 || amount > allowance.remaining {
+            return Err(ProxyError::SessionAllowanceExceeded);
+        }
+        allowance.remaining -= amount;
+        env.storage().instance().set(&key, &allowance);
+        Ok(())
+    }
+
     /// Extends the instance TTL so the proxy storage does not expire.
     fn bump_ttl(env: &Env) {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_THRESHOLD, INSTANCE_BUMP);
+    }
+
+    fn bump_persistent_ttl(env: &Env, key: &ProxyDataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, USER_LIFETIME_THRESHOLD, USER_BUMP_AMOUNT);
     }
 
     /// Loads the 256-bit nonce bitmap word ([u64; 4]) for
@@ -592,10 +1042,26 @@ impl PaymentProxy {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events, Ledger},
-        token, vec, Env, TryIntoVal,
+        contract, contractimpl,
+        testutils::{Address as _, Ledger as _, LedgerInfo},
+        vec, Env, IntoVal, TryIntoVal,
     };
 
+    #[contract]
+    struct MockPaymentLogic;
+
+    #[contractimpl]
+    impl MockPaymentLogic {
+        pub fn route_payment(
+            _env: Env,
+            _sender: Address,
+            _recipient: Address,
+            _token_address: Address,
+            amount: i128,
+        ) -> i128 {
+            amount
+        }
+    }
     // ── Fixtures ──────────────────────────────────────────────────────────────
 
     /// Convenience: register a fresh proxy, initialize it, and return the env,
@@ -609,6 +1075,46 @@ mod tests {
         let client = PaymentProxyClient::new(&env, &proxy_id);
         client.initialize(&admin, &logic_v1);
         (env, admin, logic_v1, client)
+    }
+
+    fn make_session_proxy() -> (Env, Address, PaymentProxyClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let logic = env.register_contract(None, MockPaymentLogic);
+        let proxy_id = env.register_contract(None, PaymentProxy);
+        let client = PaymentProxyClient::new(&env, &proxy_id);
+        client.initialize(&admin, &logic);
+        let session_key = Address::generate(&env);
+        (env, session_key, client)
+    }
+
+    fn authorize_session(client: &PaymentProxyClient, key: &Address, limit: i128, expiry: u64) {
+        client.authorize_session_key(key, &limit, &expiry);
+    }
+
+    fn route_as_session(
+        env: &Env,
+        client: &PaymentProxyClient,
+        key: &Address,
+        amount: i128,
+    ) -> Result<i128, ProxyError> {
+        let recipient = Address::generate(env);
+        let token = Address::generate(env);
+        match client.try_forward(
+            &Symbol::new(env, "route_payment"),
+            &vec![
+                env,
+                key.clone().into_val(env),
+                recipient.into_val(env),
+                token.into_val(env),
+                amount.into_val(env),
+            ],
+        ) {
+            Ok(Ok(value)) => Ok(value.try_into_val(env).unwrap()),
+            Err(Ok(error)) => Err(error),
+            _ => panic!("unexpected payment invocation failure"),
+        }
     }
 
     // ── initialize ────────────────────────────────────────────────────────────
@@ -819,6 +1325,48 @@ mod tests {
             .unwrap();
         assert_eq!(after, v2_admin);
         assert_ne!(after, v1_admin);
+    }
+
+    #[test]
+    fn session_key_spends_within_limit_and_decrements_allowance() {
+        let (env, key, client) = make_session_proxy();
+        authorize_session(&client, &key, 10, env.ledger().timestamp() + 100);
+
+        assert_eq!(route_as_session(&env, &client, &key, 6), Ok(6));
+        assert_eq!(route_as_session(&env, &client, &key, 4), Ok(4));
+        assert_eq!(client.get_session_allowance(&key).remaining, 0);
+    }
+
+    #[test]
+    fn session_key_cannot_exceed_remaining_allowance() {
+        let (env, key, client) = make_session_proxy();
+        authorize_session(&client, &key, 10, env.ledger().timestamp() + 100);
+        route_as_session(&env, &client, &key, 8).unwrap();
+
+        let result = route_as_session(&env, &client, &key, 3);
+        assert_eq!(result, Err(ProxyError::SessionAllowanceExceeded));
+        assert_eq!(client.get_session_allowance(&key).remaining, 2);
+    }
+
+    #[test]
+    fn session_key_cannot_pay_after_expiry() {
+        let (env, key, client) = make_session_proxy();
+        let expires_at = env.ledger().timestamp() + 10;
+        authorize_session(&client, &key, 10, expires_at);
+        env.ledger().set(LedgerInfo {
+            timestamp: expires_at,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+
+        let result = route_as_session(&env, &client, &key, 1);
+        assert_eq!(result, Err(ProxyError::SessionExpired));
+        assert_eq!(client.get_session_allowance(&key).remaining, 10);
     }
 
     // ── uninitialized guards ──────────────────────────────────────────────────

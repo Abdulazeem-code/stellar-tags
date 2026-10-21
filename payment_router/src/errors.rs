@@ -113,8 +113,8 @@ pub enum Error {
     AlreadyApproved = 41,
     /// A reentrant call was detected.
     ReentrantCall = 42,
-    /// A multi-hop swap path contains the same asset more than once.
-    CyclicSwapPath = 48,
-    /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
-    InvalidSlippageConfig = 49,
+    /// A configured slippage limit is outside its supported range.
+    InvalidSlippageConfig = 55,
+    /// A DEX swap path revisits an asset and would create a cycle.
+    CyclicSwapPath = 56,
 }
