@@ -105,7 +105,6 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
         );
       }
     } catch (err) {
-      console.error("TOKEN BUCKET ERROR:", err);
       // On error, let the request pass through to avoid blocking legitimate traffic
       req.log?.error(err, 'Token bucket rate limiter failed');
       if (failClosedOnRedisError) {

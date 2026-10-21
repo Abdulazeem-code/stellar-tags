@@ -95,7 +95,7 @@ async function closeRedis() {
  */
 async function eventually(probe, { timeoutMs = DEFAULT_EVENTUALLY_TIMEOUT_MS, intervalMs = DEFAULT_EVENTUALLY_INTERVAL_MS } = {}) {
   const deadline = Date.now() + timeoutMs;
-  let lastError = null;
+  let lastError;
 
   for (;;) {
     try {

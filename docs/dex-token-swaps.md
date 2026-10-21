@@ -114,7 +114,11 @@ execute_action(nonce)
 ```
 
 `ActionType::DeregisterDex` revokes a registration on the same delay, and
-`ActionType::SetMaxSlippageBps` changes the slippage ceiling. All three are
+`ActionType::SetMaxSlippageBps` changes the global slippage ceiling. A
+`SetPairMaxSlippageBps(token_in, token_out, bps)` action can override it for a
+specific ordered token pair, with a maximum of 500 bps. Pairs without an
+override continue to use the global value. `get_pair_max_slippage_bps` returns
+the effective value. All three are
 also available as direct admin-only setters (`register_dex`, `deregister_dex`,
 `set_max_slippage_bps`) for off-chain tooling, matching how the other sensitive
 setters in this contract work.

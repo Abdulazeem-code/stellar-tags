@@ -40,6 +40,7 @@ const {
   isRateLimitError,
 } = require('./src/horizonBackoff');
 const metrics = require('./src/metrics');
+const { publishPaymentUpdate } = require('./src/sse');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -76,6 +77,18 @@ const STREAM_RECONNECT_BASE_MS = toPositiveInt(
   process.env.STREAM_RECONNECT_BASE_MS,
   5_000,
 );
+// Dedicated ioredis publisher for cross-process SSE payment events.
+// When REDIS_URL is absent real-time updates are silently disabled.
+const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
+if (redisPublisher) {
+  redisPublisher.on('error', (err) =>
+    logger.error({ err }, '[listener] Redis publisher error'),
+  );
+} else {
+  logger.warn(
+    '[listener] REDIS_URL not set — real-time SSE payment updates are disabled.',
+  );
+}
 
 /** Ceiling for a repeatedly failing SSE reconnect. */
 const STREAM_RECONNECT_MAX_MS = toPositiveInt(
@@ -346,7 +359,21 @@ const watchAccount = (accountId) => {
               assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
               status: 'completed'
             }
-          }).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
+          }).then((created) =>
+            // Fan the new payment out to connected SSE clients via Redis, so
+            // every API process can stream the status update (#730).
+            publishPaymentUpdate(redisPublisher, created.id, {
+              status: created.status,
+              transactionHash: created.transactionHash,
+              fromAddress: created.fromAddress,
+              toAddress: created.toAddress,
+              amount: created.amount,
+              assetCode: created.assetCode,
+              detectedAt: created.createdAt,
+            }).catch((publishErr) =>
+              logger.error({ err: publishErr }, 'Failed to publish payment status update'),
+            ),
+          ).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
         }
       },
       onerror: onStreamError,

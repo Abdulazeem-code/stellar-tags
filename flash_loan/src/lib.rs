@@ -10,7 +10,7 @@ const BPS_DIVISOR: i128 = 10_000;
 
 #[contracttype]
 enum DataKey {
-    ActiveLoan,
+    ReentrancyLock,
 }
 
 #[contracterror]
@@ -22,6 +22,7 @@ pub enum Error {
     LoanAlreadyActive = 3,
     ArithmeticOverflow = 4,
     RepaymentTooLow = 5,
+    ReentrancyGuard = 6,
 }
 
 #[contract]
@@ -41,20 +42,23 @@ impl FlashLoanProvider {
         amount: i128,
         data: Bytes,
     ) -> Result<i128, Error> {
-        initiator.require_auth();
-
         if env
             .storage()
             .instance()
-            .get::<_, bool>(&DataKey::ActiveLoan)
+            .get::<_, bool>(&DataKey::ReentrancyLock)
             .unwrap_or(false)
         {
-            return Err(Error::LoanAlreadyActive);
+            return Err(Error::ReentrancyGuard);
         }
+
+        initiator.require_auth();
 
         let fee = Self::calculate_fee(amount)?;
         let provider = env.current_contract_address();
         let token_client = token::Client::new(&env, &token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
         let balance_before = token_client.balance(&provider);
 
         if balance_before < amount {
@@ -65,7 +69,6 @@ impl FlashLoanProvider {
             .checked_add(fee)
             .ok_or(Error::ArithmeticOverflow)?;
 
-        env.storage().instance().set(&DataKey::ActiveLoan, &true);
         token_client.transfer(&provider, &borrower, &amount);
 
         env.invoke_contract::<()>(
@@ -86,7 +89,7 @@ impl FlashLoanProvider {
             return Err(Error::RepaymentTooLow);
         }
 
-        env.storage().instance().set(&DataKey::ActiveLoan, &false);
+        env.storage().instance().remove(&DataKey::ReentrancyLock);
         env.events().publish(
             (symbol_short!("flashloan"), borrower, token_address),
             (initiator, amount, fee),

@@ -61,7 +61,7 @@ function Dashboard({
   const [isProcessing, setIsProcessing] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isReceiving, setIsReceiving] = useState(false)
-  const [activeBalancePanel, setActiveBalancePanel] = useState('')
+  const [activeBalancePanel, setActiveBalancePanel] = useState('transfer')
   const [showBalance, setShowBalance] = useState(true)
   const [receiveAddress, setReceiveAddress] = useState('')
   const [receiveTag, setReceiveTag] = useState('')
@@ -388,6 +388,7 @@ function Dashboard({
         <div className="brand">
           <div className="brand-mark">S</div>
           <h1>Stellar Pay</h1>
+          <span className="brand-badge">Testnet</span>
         </div>
         <div className="nav">
           <button type="button" aria-current="page" onClick={closeNav}>
@@ -472,8 +473,27 @@ function Dashboard({
               </button>
               {userPublicKey && isWalletMenuOpen && (
                 <div className="wallet-dropdown">
-                  <button type="button" onClick={handleDisconnect}>
-                    Disconnect wallet
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await navigator.clipboard.writeText(userPublicKey);
+                      toast.success("Address copied to clipboard!");
+                      setIsWalletMenuOpen(false);
+                    }}
+                  >
+                    📋 Copy address
+                  </button>
+                  <a
+                    href={`https://stellar.expert/explorer/testnet/account/${userPublicKey}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="wallet-dropdown-link"
+                    onClick={() => setIsWalletMenuOpen(false)}
+                  >
+                    🔍 View on Explorer ↗
+                  </a>
+                  <button type="button" onClick={handleDisconnect} className="disconnect-item">
+                    🔌 Disconnect wallet
                   </button>
                 </div>
               )}
@@ -604,7 +624,7 @@ function Dashboard({
                 <div className="form-actions">
                 <button
                   type="button"
-                  className="accent-btn disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="accent-btn"
                   onClick={handleLookup}
                   disabled={
                     !userPublicKey ||

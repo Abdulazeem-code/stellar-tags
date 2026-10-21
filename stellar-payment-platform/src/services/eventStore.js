@@ -69,7 +69,7 @@ async function appendEvent({ paymentId, eventType, data, metadata = {}, userId =
     if (error.code === "P2002") {
       logger.warn({ paymentId, eventType }, "Concurrent event write detected, retrying");
       // Retry logic could be implemented here
-      throw new Error("Concurrent modification detected");
+      throw new Error("Concurrent modification detected", { cause: error });
     }
     logger.error({ error, paymentId, eventType }, "Failed to append event");
     throw error;

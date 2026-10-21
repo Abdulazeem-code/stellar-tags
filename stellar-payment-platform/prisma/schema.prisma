@@ -89,17 +89,21 @@ model Payment {
   assetCode       String?  @map("asset_code")
   transactionHash String?  @map("transaction_hash")
   status          String   @default("completed")
-  riskScore       Float?   @map("risk_score")
+riskScore       Float?   @map("risk_score")
   fraudStatus     String   @default("clear") @map("fraud_status")
   fraudFlaggedAt  DateTime? @map("fraud_flagged_at")
+  deletedAt       DateTime? @map("deleted_at")
 
   @@index([fromAddress])
   @@index([toAddress])
-  // /admin/export keyset walk (issue #677): ORDER BY created_at, id with a
-  // cursor predicate becomes a backward index scan + seek instead of an
-  // OFFSET walk, keeping deep pages O(log n).
-  @@index([createdAt, id])
-  @@index([assetCode, createdAt], map: "payments_asset_code_created_at_idx")
+// /admin/export keyset walk (issue #677): ORDER BY created_at, id with a
+// cursor predicate becomes a backward index scan + seek instead of an
+// OFFSET walk, keeping deep pages O(log n).
+@@index([createdAt, id])
+@@index([assetCode, createdAt], map: "payments_asset_code_created_at_idx")
+// Serves the soft-delete admin listings and the `deleted_at IS NULL` filter
+// every payment read path now applies.
+@@index([deletedAt])
   @@map("payments")
 }
 
