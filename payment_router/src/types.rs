@@ -1,4 +1,4 @@
-use soroban::{contractclient, contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, Vec};
 
 /// A user's rolling 24-hour spending record.
 ///
@@ -80,7 +80,7 @@ pub struct SwapPayment {
     /// call. `0` disables the ceiling check; otherwise the realised output
     /// must stay within the contract's `max_slippage_bps` of this figure.
     pub expected_amount_out: i128,
-    /// Unix timestamp (seconds) after which the swap must not execute. `0` 
+    /// Unix timestamp (seconds) after which the swap must not execute. `0`
     /// disables the deadline, letting the DEX apply its own.
     pub deadline: u64,
     /// Contract ID of the DEX adapter to invoke. Must be registered by the
@@ -88,34 +88,7 @@ pub struct SwapPayment {
     pub dex: Address,
 }
 
-/// The result of a DEX-routed swap simulation, returned by
-/// [`PaymentRouter::simulate_swap_execution`].
-///
-/// The report is produced entirely read-only: it inspects the pool storage
-/// keys along the route, estimates the dynamic CPU / memory cost of the
-/// execution, projects slippage across the pool curves, and returns the
-/// exact Soroban ledger footprint declarations required for the call.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SwapSimulationReport {
-    /// Estimated CPU instructions the route will consume.
-    pub estimated_cpu_instructions: u64,
-    /// Estimated memory bytes the route will consume.
-    pub estimated_memory_bytes: u64,
-    /// Projected amount of the final buy token delivered by the route.
-    pub projected_amount_out: i128,
-    /// Projected price impact of the route, in basis points.
-    pub price_impact_bps: i128,
-    /// Read-only ledger keys the route will touch.
-    pub read_only: Vec<Address>,
-    /// Read-write ledger keys the route will touch.
-    pub read_write: Vec<Address>,
-    /// True when the route exceeds the Soroban transaction footprint limit
-    /// of 40 read-write keys.
-    pub exceeds_footprint_limit: bool,
-}
-
-/// The result of a DEX-routed swap quote, returned by [`PaymentRouter::quote_swap`].
+/// The result of a DEX quote, returned by [`PaymentRouter::quote_swap`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwapQuote {
@@ -124,7 +97,7 @@ pub struct SwapQuote {
     /// Tightest `min_amount_out` that still respects the contract's
     /// `max_slippage_bps` for this quote.
     pub min_amount_out: i128,
-    /// Configured maximum slippage, in basis opoints, that produced
+    /// Configured maximum slippage, in basis points, that produced
     /// `min_amount_out`.
     pub max_slippage_bps: i128,
 }
