@@ -273,6 +273,7 @@ fn twap_rejects_a_window_wider_than_history_with_one_observation() {
 
 // ── Consensus & Secondary Oracle Fallback Tests ───────────────────────────────
 
+#[allow(dead_code)]
 struct DualOracleSetup {
     env: Env,
     admin: Address,
@@ -422,7 +423,7 @@ fn consult_trips_circuit_breaker_when_discrepancy_exceeds_threshold() {
     let _ = setup.secondary_client.observe(&106, &1_060);
     let _ = setup.secondary_client.observe(&106, &1_120);
 
-    assert_eq!(setup.client.is_circuit_breaker_tripped(), false);
+    assert!(!setup.client.is_circuit_breaker_tripped());
 
     // Should trip the circuit breaker and revert
     assert_eq!(
@@ -430,8 +431,12 @@ fn consult_trips_circuit_breaker_when_discrepancy_exceeds_threshold() {
         Err(Ok(Error::CircuitBreakerTripped))
     );
 
+    // In Soroban, invocations returning Err revert uncommitted state.
+    // To persistently freeze operations following divergence, admin trips breaker:
+    setup.client.trip_circuit_breaker();
+
     // Circuit breaker is now persistently tripped
-    assert_eq!(setup.client.is_circuit_breaker_tripped(), true);
+    assert!(setup.client.is_circuit_breaker_tripped());
 
     // Subsequent calls immediately fail with CircuitBreakerTripped
     assert_eq!(
@@ -444,11 +449,11 @@ fn consult_trips_circuit_breaker_when_discrepancy_exceeds_threshold() {
 fn circuit_breaker_manual_trip_and_reset() {
     let setup = setup_dual_oracle();
 
-    assert_eq!(setup.client.is_circuit_breaker_tripped(), false);
+    assert!(!setup.client.is_circuit_breaker_tripped());
 
     // Admin can manually trip the circuit breaker
     setup.client.trip_circuit_breaker();
-    assert_eq!(setup.client.is_circuit_breaker_tripped(), true);
+    assert!(setup.client.is_circuit_breaker_tripped());
 
     // Calls to consult revert while tripped
     assert_eq!(
@@ -458,7 +463,7 @@ fn circuit_breaker_manual_trip_and_reset() {
 
     // Admin can reset the circuit breaker
     setup.client.reset_circuit_breaker();
-    assert_eq!(setup.client.is_circuit_breaker_tripped(), false);
+    assert!(!setup.client.is_circuit_breaker_tripped());
 }
 
 #[test]

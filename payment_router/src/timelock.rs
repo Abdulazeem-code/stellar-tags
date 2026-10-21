@@ -75,10 +75,9 @@ pub fn apply_action(env: &Env, action: ActionType) -> Result<(), Error> {
         }
     }
 
-    env.storage().instance().extend_ttl(
-        INSTANCE_LIFETIME_THRESHOLD,
-        INSTANCE_BUMP_AMOUNT,
-    );
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
     Ok(())
 }
@@ -126,6 +125,7 @@ pub fn execute_action(env: &Env, nonce: u64) -> Result<(), Error> {
 ///   before executing the first action.
 /// - Atomic rollback if any action in the batch fails execution.
 /// - Emits `batch_actions_executed` event with the list of nonces.
+#[allow(clippy::missing_panics_doc)]
 pub fn execute_batch_actions(env: &Env, nonces: Vec<u64>) -> Result<(), Error> {
     if is_frozen_internal(env) {
         return Err(Error::ContractFrozen);
@@ -189,10 +189,8 @@ pub fn execute_batch_actions(env: &Env, nonces: Vec<u64>) -> Result<(), Error> {
     }
 
     // Phase 3: Emit batch_actions_executed event with list of nonces.
-    env.events().publish(
-        (Symbol::new(env, "batch_actions_executed"), admin),
-        nonces,
-    );
+    env.events()
+        .publish((Symbol::new(env, "batch_actions_executed"), admin), nonces);
 
     Ok(())
 }
