@@ -2126,6 +2126,172 @@ fn sign_meta_payload(
     BytesN::from_array(env, &sig.to_bytes())
 }
 
+fn sign_quote_payload(
+    env: &Env,
+    contract_id: &Address,
+    sender: &Address,
+    recipient: &Address,
+    quote: &Quote,
+    maker_pubkey: &BytesN<32>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> BytesN<64> {
+    use ed25519_dalek::Signer;
+    use soroban_sdk::xdr::ToXdr;
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&contract_id.to_xdr(env));
+    payload.append(&sender.to_xdr(env));
+    payload.append(&recipient.to_xdr(env));
+    payload.append(&quote.to_xdr(env));
+    payload.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &maker_pubkey.to_array(),
+    ));
+    let hash = env.crypto().sha256(&payload);
+    let mut message = [0u8; 32];
+    soroban_sdk::Bytes::from(&hash).copy_into_slice(&mut message);
+    BytesN::from_array(env, &signing_key.sign(&message).to_bytes())
+}
+
+#[test]
+fn test_signed_quote_settles_input_and_output() {
+    let (env, client, contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let maker = Address::generate(&env);
+    let (token_in, input_client, input_admin) = setup_token(&env);
+    let (token_out, output_client, output_admin) = setup_token(&env);
+    input_admin.mint(&sender, &8_000);
+    output_admin.mint(&maker, &12_000);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
+    let maker_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    let quote = Quote {
+        quote_id: soroban_sdk::String::from_str(&env, "quote-1"),
+        maker: maker.clone(),
+        token_in,
+        token_out,
+        amount_in: 8_000,
+        amount_out: 12_000,
+        expires_at: env.ledger().timestamp() + 100,
+    };
+    let signature = sign_quote_payload(
+        &env,
+        &contract_id,
+        &sender,
+        &recipient,
+        &quote,
+        &maker_pubkey,
+        &signing_key,
+    );
+
+    assert_eq!(
+        client.route_payment_with_quote(
+            &sender,
+            &recipient,
+            &quote,
+            &maker_pubkey,
+            &signature,
+        ),
+        12_000
+    );
+    assert_eq!(input_client.balance(&sender), 0);
+    assert_eq!(input_client.balance(&maker), 8_000);
+    assert_eq!(output_client.balance(&maker), 0);
+    assert_eq!(output_client.balance(&recipient), 12_000);
+}
+
+#[test]
+fn test_expired_signed_quote_is_rejected() {
+    let (env, client, contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let maker = Address::generate(&env);
+    let (token_in, _, _) = setup_token(&env);
+    let (token_out, _, _) = setup_token(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+    set_timestamp(&env, 200);
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+    let maker_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    let quote = Quote {
+        quote_id: soroban_sdk::String::from_str(&env, "expired-quote"),
+        maker,
+        token_in,
+        token_out,
+        amount_in: 100,
+        amount_out: 100,
+        expires_at: 100,
+    };
+    let signature = sign_quote_payload(
+        &env,
+        &contract_id,
+        &sender,
+        &recipient,
+        &quote,
+        &maker_pubkey,
+        &signing_key,
+    );
+
+    let result = client.try_route_payment_with_quote(
+        &sender,
+        &recipient,
+        &quote,
+        &maker_pubkey,
+        &signature,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), Error::QuoteExpired);
+}
+
+#[test]
+fn test_tampered_signed_quote_fails_verification() {
+    let (env, client, contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let maker = Address::generate(&env);
+    let (token_in, _, _) = setup_token(&env);
+    let (token_out, _, _) = setup_token(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+    let maker_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    let signed_quote = Quote {
+        quote_id: soroban_sdk::String::from_str(&env, "tampered-quote"),
+        maker,
+        token_in,
+        token_out,
+        amount_in: 100,
+        amount_out: 100,
+        expires_at: env.ledger().timestamp() + 100,
+    };
+    let signature = sign_quote_payload(
+        &env,
+        &contract_id,
+        &sender,
+        &recipient,
+        &signed_quote,
+        &maker_pubkey,
+        &signing_key,
+    );
+    let mut tampered_quote = signed_quote;
+    tampered_quote.amount_out += 1;
+
+    let result = client.try_route_payment_with_quote(
+        &sender,
+        &recipient,
+        &tampered_quote,
+        &maker_pubkey,
+        &signature,
+    );
+    assert!(result.is_err());
+}
+
 #[test]
 fn test_meta_payment_success_and_nonce_increments() {
     let (env, client, contract_id) = setup_env();
@@ -3622,6 +3788,7 @@ pub enum MockDexKey {
     RateNum,
     RateDen,
     ShouldRevert,
+    OutputToken,
 }
 
 /// Errors the mock DEX can return.
@@ -4139,7 +4306,7 @@ fn test_rate_limit_admin_config_and_disable() {
 
 /// Minimal stand-in for a Soroban DEX, exposing the adapter interface the
 /// payment router expects:
-/// `swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> i128`
+/// `swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> (output_token, amount_out)`
 /// and `quote(sell_token, buy_token, amount_in) -> i128`.
 ///
 /// It trades at a configurable rate.  The router funds it with the sell
@@ -4163,6 +4330,13 @@ impl MockDex {
             .set(&MockDexKey::ShouldRevert, &should_revert);
     }
 
+    /// Makes the DEX settle and report an output asset other than the one requested.
+    pub fn set_output_token(env: Env, token: Address) {
+        env.storage()
+            .instance()
+            .set(&MockDexKey::OutputToken, &token);
+    }
+
     /// Prices a swap without moving any funds.
     pub fn quote(env: Env, _sell_token: Address, _buy_token: Address, amount_in: i128) -> i128 {
         Self::rate(&env, amount_in)
@@ -4177,7 +4351,7 @@ impl MockDex {
         amount_in: i128,
         _min_amount_out: i128,
         recipient: Address,
-    ) -> Result<i128, MockDexError> {
+    ) -> Result<(Address, i128), MockDexError> {
         if env
             .storage()
             .instance()
@@ -4191,10 +4365,15 @@ impl MockDex {
         // the buy token to `recipient`.
         let _ = sell_token;
         let amount_out = Self::rate(&env, amount_in);
-        let buy_client = token::Client::new(&env, &buy_token);
+        let output_token: Address = env
+            .storage()
+            .instance()
+            .get(&MockDexKey::OutputToken)
+            .unwrap_or(buy_token);
+        let buy_client = token::Client::new(&env, &output_token);
         buy_client.transfer(&env.current_contract_address(), &recipient, &amount_out);
 
-        Ok(amount_out)
+        Ok((output_token, amount_out))
     }
 
     /// PROBE: pull into self.
@@ -4515,6 +4694,24 @@ fn test_route_payment_with_swap_delivers_buy_token_after_fee() {
     assert_eq!(f.sell_client.balance(&f.dex), 10_000);
     assert_eq!(f.sell_client.balance(&f.contract_id), 0);
     assert_eq!(f.client.get_user_volume(&f.sender), 10_000);
+}
+
+#[test]
+fn test_swap_with_wrong_output_asset_reverts_with_asset_mismatch() {
+    let f = setup_swap_fixture(1, 1);
+    let (unexpected_token, unexpected_client, unexpected_admin) = setup_token(&f.env);
+    unexpected_admin.mint(&f.dex, &10_000);
+    f.dex_client.set_output_token(&unexpected_token);
+
+    let res = f
+        .client
+        .try_route_payment_with_swap(&f.payment(10_000, 1));
+    assert_eq!(res.unwrap_err().unwrap(), Error::AssetMismatch);
+
+    assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);
+    assert_eq!(f.buy_client.balance(&f.recipient), 0);
+    assert_eq!(unexpected_client.balance(&f.recipient), 0);
+    assert_eq!(f.client.get_user_volume(&f.sender), 0);
 }
 
 #[test]

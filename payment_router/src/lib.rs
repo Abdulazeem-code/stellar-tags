@@ -296,8 +296,8 @@ impl PaymentRouter {
             .unwrap_or(false)
     }
 
-    /// Invokes the DEX adapter and returns the amount it claims to have
-    /// delivered.
+    /// Invokes the DEX adapter and returns the output asset and amount it
+    /// claims to have delivered.
     ///
     /// A reverting, missing, or mistyped DEX call is reported as
     /// [`Error::SwapFailed`] instead of trapping, so the caller can abort with
@@ -312,7 +312,7 @@ impl PaymentRouter {
         buy_token: &Address,
         amount_in: i128,
         min_amount_out: i128,
-    ) -> Result<i128, Error> {
+    ) -> Result<(Address, i128), Error> {
         let fn_name = Symbol::new(env, "swap");
         let args = vec![
             env,
@@ -323,11 +323,11 @@ impl PaymentRouter {
             env.current_contract_address().into_val(env),
         ];
 
-        let res: Result<Result<i128, SdkError>, Result<InvokeError, InvokeError>> =
+        let res: Result<Result<(Address, i128), SdkError>, Result<InvokeError, InvokeError>> =
             env.try_invoke_contract(dex, &fn_name, args);
 
         match res {
-            Ok(Ok(amount_out)) => Ok(amount_out),
+            Ok(Ok(output)) => Ok(output),
             Ok(Err(_)) | Err(_) => Err(Error::SwapFailed),
         }
     }
@@ -435,6 +435,24 @@ impl PaymentRouter {
         payload.append(&amount.to_xdr(env));
         payload.append(&nonce.to_xdr(env));
         payload.append(&deadline.to_xdr(env));
+        let hash = env.crypto().sha256(&payload);
+        Bytes::from(&hash)
+    }
+
+    /// Builds the domain-separated message for a signed maker quote.
+    fn build_quote_message(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        quote: &Quote,
+        maker_pubkey: &BytesN<32>,
+    ) -> Bytes {
+        let mut payload = Bytes::new(env);
+        payload.append(&env.current_contract_address().to_xdr(env));
+        payload.append(&sender.to_xdr(env));
+        payload.append(&recipient.to_xdr(env));
+        payload.append(&quote.to_xdr(env));
+        payload.append(&Bytes::from_slice(env, &maker_pubkey.to_array()));
         let hash = env.crypto().sha256(&payload);
         Bytes::from(&hash)
     }
@@ -3202,6 +3220,99 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Settles a maker-signed cross-currency quote. The sender pays the
+    /// quoted input to the maker, who supplies the quoted output directly to
+    /// the recipient.
+    ///
+    /// The maker must authorize the settlement, and `signature` must be a
+    /// valid Ed25519 signature over the domain-separated quote payload using
+    /// `maker_pubkey`. Each `quote_id` can be settled only once.
+    pub fn route_payment_with_quote(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        quote: Quote,
+        maker_pubkey: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if quote.token_in == quote.token_out
+            || quote.amount_in <= 0
+            || quote.amount_out <= 0
+            || quote.quote_id.is_empty()
+        {
+            return Err(Error::InvalidSwapParams);
+        }
+        if env.ledger().timestamp() > quote.expires_at {
+            return Err(Error::QuoteExpired);
+        }
+
+        let used_quote_key = DataKey::UsedQuote(quote.maker.clone(), quote.quote_id.clone());
+        if env.storage().persistent().has(&used_quote_key) {
+            return Err(Error::QuoteAlreadyUsed);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if quote.amount_in > max_amount || quote.amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, quote.amount_in)?;
+        let _ = Self::load_fee_config(&env)?;
+
+        let message =
+            Self::build_quote_message(&env, &sender, &recipient, &quote, &maker_pubkey);
+        env.crypto()
+            .ed25519_verify(&maker_pubkey, &message, &signature);
+
+        sender.require_auth();
+        quote.maker.require_auth();
+        Self::check_rate_limit(&env, &sender)?;
+
+        let input_token = token::Client::new(&env, &quote.token_in);
+        let output_token = token::Client::new(&env, &quote.token_out);
+        if input_token.balance(&sender) < quote.amount_in
+            || output_token.balance(&quote.maker) < quote.amount_out
+        {
+            return Err(Error::InsufficientBalance);
+        }
+
+        Self::accrue_user_record(&env, &sender, quote.amount_in)?;
+        env.storage().persistent().set(&used_quote_key, &true);
+        env.storage().persistent().extend_ttl(
+            &used_quote_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        input_token.transfer(&sender, &quote.maker, &quote.amount_in);
+        output_token.transfer(&quote.maker, &recipient, &quote.amount_out);
+        Self::bump_heartbeat(&env);
+
+        Ok(quote.amount_out)
+    }
+
     /// Swaps `token_in` through a caller-supplied DEX path and routes the
     /// resulting `token_out` to the recipient. The DEX adapter must return the
     /// received output and any unused input as `[received, unused]`; unused
@@ -3656,7 +3767,8 @@ impl PaymentRouter {
     // The swap itself is a cross-contract call into a registered DEX adapter,
     // which must expose:
     //
-    //   swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> i128
+    //   swap(sell_token, buy_token, amount_in, min_amount_out, recipient)
+    //       -> (output_token, amount_out)
     //   quote(sell_token, buy_token, amount_in) -> i128
     //
     // By the time `swap` runs, the router has already transferred `amount_in`
@@ -3764,7 +3876,7 @@ impl PaymentRouter {
         // router's balance.
         sell_token_client.transfer(&contract_address, &swap.dex, &swap.amount_in);
 
-        Self::invoke_dex_swap(
+        let (output_token, _) = Self::invoke_dex_swap(
             env,
             &swap.dex,
             &swap.sell_token,
@@ -3772,6 +3884,9 @@ impl PaymentRouter {
             swap.amount_in,
             swap.min_amount_out,
         )?;
+        if output_token != swap.buy_token {
+            return Err(Error::AssetMismatch);
+        }
 
         // --- Verify the output against both slippage guards -------------------
         // The balance delta is authoritative: a DEX cannot claim an output it
