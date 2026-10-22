@@ -1,6 +1,13 @@
 'use strict';
 
-const { getCachedStats, invalidateStatsCache, STATS_CACHE_KEY } = require('../../src/cache/statsCache');
+const {
+  getCachedStats,
+  invalidateStatsCache,
+  getCachedExchangeRate,
+  rateCacheKey,
+  STATS_CACHE_KEY,
+  RATE_CACHE_TTL,
+} = require('../../src/cache/statsCache');
 
 const STATS_CACHE_TTL = 300;
 
@@ -115,5 +122,69 @@ describe('invalidateStatsCache', () => {
     };
 
     await expect(invalidateStatsCache(redisClient)).resolves.toBeUndefined();
+  });
+});
+
+describe('getCachedExchangeRate', () => {
+  const primary = jest.fn();
+  const secondary = jest.fn();
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('builds a rates:<asset_pair> key and serves cache hits without calling feeds', async () => {
+    const redisClient = {
+      isReady: true,
+      get: jest.fn().mockResolvedValue(JSON.stringify(0.12)),
+      setEx: jest.fn(),
+    };
+
+    const result = await getCachedExchangeRate(redisClient, 'xlm:usd', { primary, secondary });
+
+    expect(rateCacheKey('xlm:usd')).toBe('rates:XLM:USD');
+    expect(redisClient.get).toHaveBeenCalledWith('rates:XLM:USD');
+    expect(result).toBe(0.12);
+    expect(primary).not.toHaveBeenCalled();
+    expect(secondary).not.toHaveBeenCalled();
+  });
+
+  test('caches a primary-feed miss with a 60 second TTL', async () => {
+    const redisClient = {
+      isReady: true,
+      get: jest.fn().mockResolvedValue(null),
+      setEx: jest.fn().mockResolvedValue('OK'),
+    };
+    primary.mockResolvedValue(0.25);
+
+    const result = await getCachedExchangeRate(redisClient, 'XLM:USD', { primary, secondary });
+
+    expect(result).toBe(0.25);
+    expect(primary).toHaveBeenCalledWith('XLM:USD');
+    expect(redisClient.setEx).toHaveBeenCalledWith(
+      'rates:XLM:USD',
+      RATE_CACHE_TTL,
+      JSON.stringify(0.25),
+    );
+  });
+
+  test('falls back to the secondary feed when the primary fails', async () => {
+    const redisClient = { isReady: false };
+    primary.mockRejectedValue(new Error('primary unavailable'));
+    secondary.mockResolvedValue(0.3);
+
+    const result = await getCachedExchangeRate(redisClient, 'XLM:USD', { primary, secondary });
+
+    expect(result).toBe(0.3);
+    expect(secondary).toHaveBeenCalledWith('XLM:USD');
+  });
+
+  test('re-throws when both feeds fail', async () => {
+    primary.mockRejectedValue(new Error('primary unavailable'));
+    secondary.mockRejectedValue(new Error('secondary unavailable'));
+
+    await expect(
+      getCachedExchangeRate(null, 'XLM:USD', { primary, secondary }),
+    ).rejects.toThrow('secondary unavailable');
   });
 });

@@ -1,11 +1,11 @@
 #![no_std]
 
 use soroban_sdk::token::TokenInterface;
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     Bytes, BytesN, Env, String,
 };
-use soroban_sdk::xdr::ToXdr;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -321,7 +321,12 @@ impl PausableToken {
         if env.ledger().timestamp() > deadline {
             return Err(Error::PermitExpired);
         }
-        if deadline > env.ledger().timestamp().saturating_add(MAX_PERMIT_LIFETIME_SECONDS) {
+        if deadline
+            > env
+                .ledger()
+                .timestamp()
+                .saturating_add(MAX_PERMIT_LIFETIME_SECONDS)
+        {
             return Err(Error::PermitDeadlineTooFar);
         }
         Self::assert_movable(&env, &owner)?;
@@ -433,8 +438,8 @@ impl PausableToken {
         let mut i = 0usize;
         while i < STRKEY_LEN {
             let value = match encoded[i] {
-                b'A'..=b'Z' => (encoded[i] - b'A') as u32,
-                b'2'..=b'7' => (encoded[i] - b'2' + 26) as u32,
+                b'A'..=b'Z' => u32::from(encoded[i] - b'A'),
+                b'2'..=b'7' => u32::from(encoded[i] - b'2') + 26,
                 _ => return Err(Error::InvalidSignature),
             };
             accumulator = (accumulator << 5) | value;
