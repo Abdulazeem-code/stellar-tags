@@ -17,6 +17,7 @@
     "listener": "node horizonListener.js",
     "fraud-worker": "node fraud-worker.js",
     "event-processor": "node event-processor-worker.js",
+    "outbox-worker": "node settlement-outbox-worker.js",
     "db:seed": "node scripts/seed.js",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
