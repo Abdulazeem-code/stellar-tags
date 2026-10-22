@@ -187,6 +187,7 @@ jobs:
         run: >
           cargo tarpaulin
           --features testutils
+          --tests
           --out Xml
           --out Html
           --output-dir coverage
@@ -197,6 +198,7 @@ jobs:
         run: >
           cargo tarpaulin
           --features testutils
+          --tests
           --out Xml
           --out Html
           --output-dir coverage

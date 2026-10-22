@@ -211,7 +211,7 @@ const graphQLMiddleware = createGraphQLMiddleware({ prismaClient: prisma });
 const limiter = createTokenBucketLimiter(redisClient, {
   capacity: 100,
   refillRate: 100 / (15 * 60), // 100 requests per 15 minutes
-  prefix: 'global-rl:',
+  prefix: process.env.NODE_ENV === 'test' ? `global-rl:${crypto.randomUUID()}:` : 'global-rl:',
   // SSE streams are exempt: an EventSource reconnect loop must not consume a
   // caller's REST quota. They are bounded separately by a per-IP limiter on
   // the stream route itself (src/routes/v1/sseRoutes.js).

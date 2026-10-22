@@ -119,7 +119,10 @@ describe('Multi-Tenancy & Row-Level Security (RLS) Architecture', () => {
       };
 
       await setTenantContext(mockClient, 'tenant-alpha');
-      expect(mockClient.query).toHaveBeenCalledWith('SET LOCAL app.current_tenant_id = $1', ['tenant-alpha']);
+      expect(mockClient.query).toHaveBeenCalledWith(
+        'SELECT set_config($1, $2, true)',
+        ['app.current_tenant_id', 'tenant-alpha'],
+      );
     });
 
     it('clears tenant context securely', async () => {
@@ -152,8 +155,8 @@ describe('Multi-Tenancy & Row-Level Security (RLS) Architecture', () => {
       expect(result).toBe('success-payload');
       expect(mockPool.connect).toHaveBeenCalled();
       expect(executed[0].sql).toBe('BEGIN');
-      expect(executed[1].sql).toBe('SET LOCAL app.current_tenant_id = $1');
-      expect(executed[1].params).toEqual(['tenant-beta']);
+      expect(executed[1].sql).toBe('SELECT set_config($1, $2, true)');
+      expect(executed[1].params).toEqual(['app.current_tenant_id', 'tenant-beta']);
       expect(executed[2].sql).toBe('SELECT * FROM tenant_enterprises');
       expect(executed[3].sql).toBe('COMMIT');
       expect(mockClient.release).toHaveBeenCalled();
