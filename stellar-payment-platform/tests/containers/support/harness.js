@@ -37,12 +37,12 @@ function requireEnv(name) {
 
 /** The shared, real Prisma client. Created lazily so env vars are in place. */
 function prisma() {
-  return require('../../prismaClient').prisma;
+  return require('../../../prismaClient').prisma;
 }
 
 /** The `pg` pool used by the raw-SQL modules (src/db.js and friends). */
 function pgPool() {
-  return require('../../src/db').pool;
+  return require('../../../src/db').pool;
 }
 
 /**
@@ -138,7 +138,7 @@ async function waitForDependencies(app) {
 /** Truncate every app table, so each test starts from an empty schema. */
 async function resetPostgres() {
   const client = prisma();
-  const { rows } = await client.$queryRawUnsafe(
+  const rows = await client.$queryRawUnsafe(
     `SELECT tablename FROM pg_tables WHERE schemaname = current_schema()`,
   );
   const tables = rows
@@ -165,7 +165,7 @@ async function resetRedis() {
  * Flushed explicitly so a value cached by one test cannot answer another.
  */
 function resetInMemoryCaches() {
-  const { cache } = require('../../src/cache');
+  const { cache } = require('../../../src/cache');
   cache.flushAll();
 }
 

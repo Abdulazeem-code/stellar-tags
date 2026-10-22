@@ -65,7 +65,7 @@ async function setTenantContext(client, tenantId) {
   if (!isValidTenantId(tenantId)) {
     throw new Error(`Invalid tenantId provided: ${tenantId}`);
   }
-  await client.query('SET LOCAL app.current_tenant_id = $1', [tenantId]);
+  await client.query('SELECT set_config($1, $2, true)', ['app.current_tenant_id', tenantId]);
 }
 
 /**

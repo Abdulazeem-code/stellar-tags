@@ -8,6 +8,7 @@ const IDEMPOTENCY_HEADER = 'Idempotency-Key';
 const CACHE_EXPIRATION_SECONDS = 24 * 60 * 60;
 const PENDING_EXPIRATION_SECONDS = 5 * 60;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const IDEMPOTENCY_PROCESSED = Symbol('idempotencyProcessed');
 const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
 const requestFingerprint = (req) => digest(JSON.stringify([
@@ -37,6 +38,7 @@ const idempotencyMiddleware = (redisClient, options = {}) => {
 
   return async (req, res, next) => {
     if (!MUTATING_METHODS.has(req.method)) return next();
+    if (req[IDEMPOTENCY_PROCESSED]) return next();
 
     const rawKey = req.get(IDEMPOTENCY_HEADER);
     if (!rawKey) {
@@ -50,6 +52,8 @@ const idempotencyMiddleware = (redisClient, options = {}) => {
     if (!key || key.length > 128) {
       return next(new ApiError('INVALID_INPUT', 'Invalid or too long Idempotency-Key'));
     }
+
+    req[IDEMPOTENCY_PROCESSED] = true;
 
     const cacheKey = `idempotency:${req.method}:${req.path}:${digest(key)}`;
     const fingerprint = requestFingerprint(req);
