@@ -55,6 +55,8 @@ impl PaymentRouter {
     pub const USER_LIFETIME_THRESHOLD: u32 = storage::USER_LIFETIME_THRESHOLD;
     pub const PERSISTENT_BUMP_AMOUNT: u32 = storage::PERSISTENT_BUMP_AMOUNT;
     pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = storage::PERSISTENT_LIFETIME_THRESHOLD;
+    pub const TEMPORARY_BUMP_AMOUNT: u32 = storage::TEMPORARY_BUMP_AMOUNT;
+    pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = storage::TEMPORARY_LIFETIME_THRESHOLD;
 
     // ── Delegated Domain Helpers ─────────────────────────────────────────────
 
