@@ -1,27 +1,14 @@
 #![no_std]
 
+pub mod storage;
+
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     Bytes, BytesN, Env, String,
 };
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Admin,
-    Initialized,
-    Paused,
-    Name,
-    Symbol,
-    Decimals,
-    TotalSupply,
-    Balance(Address),
-    Frozen(Address),
-    Allowance(Address, Address),
-    PermitNonce(Address),
-}
+use storage::{pack_allowance, unpack_allowance, DataKey};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,70 +30,7 @@ struct PermitPayload {
     deadline: u64,
 }
 
-// ── Packed Allowance helpers (issue #714) ────────────────────────────────────
-//
-// Issue #714: the per-(owner, spender) allowance was stored as a two-field
-// `#[contracttype]` struct. Soroban encodes every contracttype value as an XDR
-// map, so each entry carried a struct discriminant plus a key/value pair per
-// field on top of the payload itself.
-//
-// Packing the two fields into one `BytesN<20>` removes that overhead entirely.
-//
-// Layout (big-endian):
-//   bytes  0..16 — amount            : i128 (16 bytes)
-//   bytes 16..20 — expiration_ledger : u32  (4 bytes)
-//
-// Both fields are already minimal width — an allowance is an `i128` because
-// token amounts are, and a ledger sequence is a `u32` — so 20 bytes is the
-// floor for this record. The saving is the eliminated XDR framing: one
-// persistent entry per (owner, spender) pair instead of a struct-encoded one.
-
-/// Pack an allowance amount and its expiry ledger into a 20-byte big-endian
-/// buffer.
-fn pack_allowance(env: &Env, amount: i128, expiration_ledger: u32) -> BytesN<20> {
-    let mut buf = [0u8; 20];
-
-    // Bytes 0..16 — amount (i128 big-endian, two's complement)
-    let a = amount.to_be_bytes();
-    let mut i = 0;
-    while i < 16 {
-        buf[i] = a[i];
-        i += 1;
-    }
-
-    // Bytes 16..20 — expiration_ledger (u32 big-endian)
-    let e = expiration_ledger.to_be_bytes();
-    buf[16] = e[0];
-    buf[17] = e[1];
-    buf[18] = e[2];
-    buf[19] = e[3];
-
-    BytesN::from_array(env, &buf)
-}
-
-/// Unpack a 20-byte buffer into `(amount, expiration_ledger)`.
-fn unpack_allowance(packed: &BytesN<20>) -> (i128, u32) {
-    let buf: [u8; 20] = packed.to_array();
-
-    let mut a = [0u8; 16];
-    let mut i = 0;
-    while i < 16 {
-        a[i] = buf[i];
-        i += 1;
-    }
-    let amount = i128::from_be_bytes(a);
-
-    let expiration_ledger = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
-
-    (amount, expiration_ledger)
-}
-
 /// Public-facing allowance record.
-///
-/// This remains a `#[contracttype]` because `allowance()` returns it to callers
-/// and it appears in the generated TS bindings. It is no longer what gets
-/// written to storage: `read_allowance` / `write_allowance` convert to and from
-/// the packed `BytesN<20>` form above.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Allowance {
@@ -261,7 +185,6 @@ impl PausableToken {
         Self::assert_settled(&env, &from, &to).is_ok()
     }
 
-    /// Returns the nonce consumed by the next successful permit for `owner`.
     pub fn permit_nonce(env: Env, owner: Address) -> u64 {
         env.storage()
             .persistent()
@@ -269,10 +192,6 @@ impl PausableToken {
             .unwrap_or(0)
     }
 
-    /// Returns the SHA-256 domain separator for this token instance.
-    ///
-    /// The domain is the XDR encoding of `(token name, version 1, network ID,
-    /// contract address)`.
     pub fn permit_domain_separator(env: Env) -> BytesN<32> {
         let domain = PermitDomain {
             name: Self::name(env.clone()),
@@ -283,11 +202,6 @@ impl PausableToken {
         env.crypto().sha256(&domain.to_xdr(&env))
     }
 
-    /// Returns the digest that a permit signer must sign with Ed25519.
-    ///
-    /// The digest is SHA-256 over the XDR-encoded domain separator, owner,
-    /// spender, value, nonce, and deadline. The nonce must be the owner's
-    /// current `permit_nonce`.
     pub fn permit_digest(
         env: Env,
         owner: Address,
@@ -299,11 +213,6 @@ impl PausableToken {
         Self::permit_digest_internal(&env, owner, spender, value, nonce, deadline)
     }
 
-    /// Approves `spender` using an off-chain Ed25519 signature from `owner`.
-    ///
-    /// The deadline is a Unix timestamp; after it expires the permit cannot be
-    /// submitted. As with SEP-41 approvals, the resulting allowance remains
-    /// valid until spent or its storage entry expires.
     pub fn permit(
         env: Env,
         owner: Address,
@@ -349,9 +258,6 @@ impl PausableToken {
         signature.copy_into_slice(&mut signature_array);
         let signature = BytesN::from_array(&env, &signature_array);
 
-        // Soroban's Ed25519 verifier traps on a bad signature. All persistent
-        // writes are deliberately below this call, so an invalid permit cannot
-        // consume its nonce or leave behind an allowance.
         env.crypto()
             .ed25519_verify(&public_key, &Bytes::from(digest), &signature);
 
@@ -416,8 +322,6 @@ impl PausableToken {
         env.crypto().sha256(&payload.to_xdr(env))
     }
 
-    /// Ed25519 Stellar account public keys are carried in the canonical G...
-    /// strkey. Contract addresses and non-account address forms are rejected.
     fn account_public_key(env: &Env, owner: &Address) -> Result<BytesN<32>, Error> {
         const STRKEY_LEN: usize = 56;
         const ACCOUNT_ID_VERSION: u8 = 48;
@@ -438,8 +342,8 @@ impl PausableToken {
         let mut i = 0usize;
         while i < STRKEY_LEN {
             let value = match encoded[i] {
-                b'A'..=b'Z' => u32::from(encoded[i] - b'A'),
-                b'2'..=b'7' => u32::from(encoded[i] - b'2') + 26,
+                b'A'..=b'Z' => (encoded[i] - b'A') as u32,
+                b'2'..=b'7' => (encoded[i] - b'2' + 26) as u32,
                 _ => return Err(Error::InvalidSignature),
             };
             accumulator = (accumulator << 5) | value;
@@ -516,11 +420,6 @@ impl PausableToken {
         Ok(())
     }
 
-    /// Reads the packed allowance for `(from, spender)`.
-    ///
-    /// An entry whose amount is non-zero but whose expiry has already passed
-    /// reads back as a zeroed amount, preserving the original expiration so a
-    /// later `approve` diff still sees the right baseline.
     fn read_allowance(env: &Env, from: &Address, spender: &Address) -> Allowance {
         let stored: Option<BytesN<20>> = env
             .storage()
