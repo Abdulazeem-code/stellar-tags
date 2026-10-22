@@ -115,6 +115,14 @@ pub enum DataKey {
     Role(Role),
     /// Monotonic nonce for meta-transaction replay protection.
     MetaNonce(Address),
+}
+
+/// Extended storage keys kept separate because Soroban limits the size of a
+/// generated contract enum. The associated constructors below preserve the
+/// existing `DataKey::...` call-site API.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKeyExt {
     /// Trusted issuer/oracle queried for high-value payment senders.
     KycOracle,
     /// Payments strictly above this amount require a valid KYC claim.
@@ -181,6 +189,68 @@ pub enum DataKey {
     /// upgrade ID. Stored in persistent storage so it survives instance
     /// eviction while the timelock runs.
     TwoPhaseCommit(BytesN<32>),
+}
+
+#[allow(non_upper_case_globals)]
+impl DataKey {
+    pub const KycOracle: DataKeyExt = DataKeyExt::KycOracle;
+    pub const KycThreshold: DataKeyExt = DataKeyExt::KycThreshold;
+    pub const BackupAdmin: DataKeyExt = DataKeyExt::BackupAdmin;
+    pub const LastHeartbeat: DataKeyExt = DataKeyExt::LastHeartbeat;
+    pub const DmsTimeout: DataKeyExt = DataKeyExt::DmsTimeout;
+    pub const RateLimitConfig: DataKeyExt = DataKeyExt::RateLimitConfig;
+    pub const OracleAddress: DataKeyExt = DataKeyExt::OracleAddress;
+    pub const StalenessThreshold: DataKeyExt = DataKeyExt::StalenessThreshold;
+    pub const GovernanceToken: DataKeyExt = DataKeyExt::GovernanceToken;
+    pub const GovernanceQuorum: DataKeyExt = DataKeyExt::GovernanceQuorum;
+    pub const GovernanceNonce: DataKeyExt = DataKeyExt::GovernanceNonce;
+    pub const ArchiveEpoch: DataKeyExt = DataKeyExt::ArchiveEpoch;
+    pub const YieldProtocol: DataKeyExt = DataKeyExt::YieldProtocol;
+    pub const MaxSlippageBps: DataKeyExt = DataKeyExt::MaxSlippageBps;
+    pub const MultisigSigners: DataKeyExt = DataKeyExt::MultisigSigners;
+    pub const MultisigThreshold: DataKeyExt = DataKeyExt::MultisigThreshold;
+    pub const ReentrancyGuard: DataKeyExt = DataKeyExt::ReentrancyGuard;
+
+    pub fn RateLimitCounter(address: Address) -> DataKeyExt {
+        DataKeyExt::RateLimitCounter(address)
+    }
+    pub fn RateLimitWhitelist(address: Address) -> DataKeyExt {
+        DataKeyExt::RateLimitWhitelist(address)
+    }
+
+    pub fn FallbackPrice(base: Address, quote: Address) -> DataKeyExt {
+        DataKeyExt::FallbackPrice(base, quote)
+    }
+    pub fn GovernanceProposal(id: u64) -> DataKeyExt {
+        DataKeyExt::GovernanceProposal(id)
+    }
+    pub fn GovernanceVote(id: u64, voter: Address) -> DataKeyExt {
+        DataKeyExt::GovernanceVote(id, voter)
+    }
+    pub fn ArchiveRoot(epoch: u64) -> DataKeyExt {
+        DataKeyExt::ArchiveRoot(epoch)
+    }
+    pub fn ArchiveMeta(epoch: u64) -> DataKeyExt {
+        DataKeyExt::ArchiveMeta(epoch)
+    }
+    pub fn YieldPrincipal(token: Address) -> DataKeyExt {
+        DataKeyExt::YieldPrincipal(token)
+    }
+    pub fn RegisteredDex(dex: Address) -> DataKeyExt {
+        DataKeyExt::RegisteredDex(dex)
+    }
+    pub fn PairSlippage(token_in: Address, token_out: Address) -> DataKeyExt {
+        DataKeyExt::PairSlippage(token_in, token_out)
+    }
+    pub fn UpgradeApproval(hash: BytesN<32>) -> DataKeyExt {
+        DataKeyExt::UpgradeApproval(hash)
+    }
+    pub fn MerkleClaimedBits(batch_id: u64) -> DataKeyExt {
+        DataKeyExt::MerkleClaimedBits(batch_id)
+    }
+    pub fn TwoPhaseCommit(id: BytesN<32>) -> DataKeyExt {
+        DataKeyExt::TwoPhaseCommit(id)
+    }
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

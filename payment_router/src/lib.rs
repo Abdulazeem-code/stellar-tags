@@ -2246,7 +2246,7 @@ impl PaymentRouter {
                 if let Some(fallback) = env
                     .storage()
                     .persistent()
-                    .get::<DataKey, PriceData>(&DataKey::FallbackPrice(base.clone(), quote.clone()))
+                    .get(&DataKey::FallbackPrice(base.clone(), quote.clone()))
                 {
                     log!(env, "Oracle error; using fallback price");
                     Ok(fallback)
