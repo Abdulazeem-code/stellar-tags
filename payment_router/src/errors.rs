@@ -100,8 +100,7 @@ pub enum Error {
     InvalidMultisigConfig = 37,
     /// The calling address is not a member of the multi-signature admin group.
     NotMultisigSigner = 38,
-    /// The number of collected upgrade approvals is below the configured
-    /// threshold, so the upgrade is not authorized yet.
+    /// The number of collected approvals is below the configured threshold.
     InsufficientApprovals = 39,
     /// No multi-signature admin group has been configured yet.  Upgrades fail
     /// closed until `set_multisig_config` has been called, so a freshly
