@@ -21,6 +21,7 @@ pub enum DataKey {
     Frozen(Address),
     Allowance(Address, Address),
     PermitNonce(Address),
+    FrozenUntil(Address),
 }
 
 #[contracttype]
@@ -231,6 +232,9 @@ impl PausableToken {
             env.storage()
                 .persistent()
                 .remove(&DataKey::Frozen(account.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::FrozenUntil(account.clone()));
         }
         let topic = if frozen {
             symbol_short!("frozen")
@@ -248,6 +252,66 @@ impl PausableToken {
 
     pub fn unfreeze(env: Env, account: Address) -> Result<(), Error> {
         Self::set_frozen(env, account, false)
+    }
+
+    pub fn freeze_account_until(
+        env: Env,
+        account: Address,
+        until_timestamp: u64,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        if until_timestamp <= env.ledger().timestamp() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::FrozenUntil(account.clone()));
+            env.events().publish(
+                (symbol_short!("unfreeze"), admin, account),
+                env.ledger().sequence(),
+            );
+        } else {
+            let key = DataKey::FrozenUntil(account.clone());
+            env.storage().persistent().set(&key, &until_timestamp);
+            Self::bump_user(&env, &key);
+            env.events().publish(
+                (symbol_short!("frz_until"), admin, account),
+                until_timestamp,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn cancel_freeze(env: Env, account: Address) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Frozen(account.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FrozenUntil(account.clone()));
+        env.events().publish(
+            (symbol_short!("unfreeze"), admin, account),
+            env.ledger().sequence(),
+        );
+        Ok(())
+    }
+
+    pub fn cancel_freeze_until(env: Env, account: Address) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FrozenUntil(account.clone()));
+        env.events().publish(
+            (symbol_short!("unfreeze"), admin, account),
+            env.ledger().sequence(),
+        );
+        Ok(())
+    }
+
+    pub fn frozen_until(env: Env, account: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FrozenUntil(account))
+            .unwrap_or(0)
     }
 
     pub fn total_supply(env: Env) -> i128 {
@@ -470,10 +534,24 @@ impl PausableToken {
     }
 
     fn is_frozen_internal(env: &Env, account: &Address) -> bool {
-        env.storage()
+        if env
+            .storage()
             .persistent()
             .get(&DataKey::Frozen(account.clone()))
             .unwrap_or(false)
+        {
+            return true;
+        }
+
+        if let Some(frozen_until) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::FrozenUntil(account.clone()))
+        {
+            return env.ledger().timestamp() < frozen_until;
+        }
+
+        false
     }
 
     fn assert_movable(env: &Env, account: &Address) -> Result<(), Error> {
