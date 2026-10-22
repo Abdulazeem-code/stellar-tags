@@ -24,6 +24,7 @@ jobs:
       - name: Cache cargo dependencies and artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v2
           workspaces: .
 
       - name: Verify formatting
