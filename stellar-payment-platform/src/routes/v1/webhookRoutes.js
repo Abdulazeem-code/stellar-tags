@@ -7,6 +7,9 @@ const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { webhookReplayBodySchema } = require('../../schemas');
+const { triggerReplay, previewReplay } = require('../../services/webhookReplayService');
 
 const router = express.Router();
 
@@ -467,6 +470,71 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     return next(generic);
   }
 }));
+
+/**
+ * POST /v1/webhooks/replay
+ * Time-travel webhook replay engine. Allows merchants to replay failed deliveries
+ * by event IDs or time range with controlled rate limiting.
+ *
+ * Body:
+ * - eventIds: array of event IDs to replay (optional)
+ * - startDate: ISO date string (YYYY-MM-DD) inclusive lower bound (optional)
+ * - endDate: ISO date string (YYYY-MM-DD) inclusive upper bound (optional)
+ * - status: filter by delivery status ('failed' | 'success' | 'replayed') (optional)
+ * - eventType: filter by event type (optional)
+ * - webhookId: filter by webhook ID (optional)
+ * - dryRun: preview the replay without executing (optional, default false)
+ * - limit: maximum number of deliveries to replay (optional, default 1000)
+ *
+ * Returns:
+ * - replayId: unique identifier for this replay request
+ * - results: { total, successful, failed, errors[] }
+ */
+router.post(
+  '/webhooks/replay',
+  validateSchema({ body: webhookReplayBodySchema }),
+  asyncHandler(async (req, res, next) => {
+    try {
+      const user = await authenticateWebhookCall(req);
+      const { eventIds, startDate, endDate, status, eventType, webhookId, dryRun, limit } = req.body;
+
+      const filters = {
+        eventIds,
+        startDate,
+        endDate,
+        status,
+        eventType,
+        webhookId,
+        username: user.username,
+        limit,
+      };
+
+      const idempotencyKey = req.headers['idempotency-key'] || req.body.idempotencyKey;
+      const result = await triggerReplay(filters, { dryRun, idempotencyKey });
+
+      if (!result.ok) {
+        return res.status(409).json({
+          ok: false,
+          error: { code: 'CONFLICT', message: result.error },
+          replayId: result.replayId,
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        replayId: result.replayId,
+        results: result.results,
+        dryRun,
+      });
+    } catch (err) {
+      if (err.statusCode) return next(err);
+      logger.error('[webhooks] POST /webhooks/replay failed:', err.message);
+      const error = new Error('Failed to trigger webhook replay');
+      error.statusCode = 500;
+      return next(error);
+    }
+  }),
+);
 
 router.all('/webhooks', (req, res) => {
   if (req.method !== 'GET' && req.method !== 'POST') {
