@@ -1,6 +1,7 @@
 #![no_std]
 pub mod access;
 mod archival;
+pub mod gas_sim;
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
@@ -12,6 +13,7 @@ pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
 pub use errors::*;
 pub use fees::*;
+pub use gas_sim::*;
 pub use rate_limit::*;
 pub use storage::*;
 pub use timelock::*;
@@ -326,6 +328,31 @@ impl PaymentRouter {
         } else {
             floor
         }
+    }
+
+    /// Read-only simulation of a multi-hop swap route.
+    ///
+    /// Inspects each hop's pool storage keys, projects slippage across the
+    /// pool curves, estimates CPU/memory cost, and returns the exact Soroban
+    /// ledger footprint declarations required to execute the route. Never
+    /// writes persistent state: only `env.storage().instance()` reads are
+    /// performed, so the call is safe to run off-chain before submission.
+    ///
+    /// # Parameters
+    /// - `route`: Ordered pool addresses from `token_in` to `token_out`.
+    /// - `amount_in`: Amount of the first token to swap, in its smallest unit.
+    ///
+    /// # Returns
+    /// A [`SwapSimulationReport`] with the estimated CPU instructions, memory
+    /// bytes, projected output, price impact in bps, and the required
+    /// read-only/read-write footprint keys. The report's `exceeds_footprint_limit`
+    /// flag is set when the read-write key count exceeds the Soroban limit.
+    pub fn simulate_swap_execution(
+        env: Env,
+        route: Vec<Address>,
+        amount_in: i128,
+    ) -> Result<SwapSimulationReport, Error> {
+        gas_sim::simulate_swap_execution(&env, route, amount_in)
     }
 
     /// Allocates and returns the next timelock nonce, incrementing the counter.

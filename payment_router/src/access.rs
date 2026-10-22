@@ -1,7 +1,7 @@
 use crate::errors::Error;
 use crate::storage::{
-    DataKey, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
+    DataKey, PauseLevel, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use crate::types::ActionType;
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
@@ -129,18 +129,91 @@ pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
 
 // ── Circuit Breaker & Emergency Checks ───────────────────────────────────────
 
-pub fn is_paused_internal(env: &Env) -> bool {
-    env.storage()
+/// Returns the current tiered pause level (issue #890).
+///
+/// Migration note: if only the legacy `DataKey::Paused` boolean is present
+/// (from a contract deployed before this change), it is promoted to
+/// `PauseLevel::FullHalt` so existing paused state is preserved.
+pub fn get_pause_level(env: &Env) -> PauseLevel {
+    // Primary source: the new tiered key.
+    if let Some(level) = env
+        .storage()
+        .instance()
+        .get::<DataKey, PauseLevel>(&DataKey::PauseLevel)
+    {
+        return level;
+    }
+    // Migration fallback: honour the legacy boolean.
+    let legacy: bool = env
+        .storage()
         .instance()
         .get(&DataKey::Paused)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if legacy {
+        PauseLevel::FullHalt
+    } else {
+        PauseLevel::None
+    }
 }
 
-pub fn require_circuit_closed(env: &Env) -> Result<(), Error> {
-    if is_paused_internal(env) {
+/// Persists `level` to `DataKey::PauseLevel`.
+/// Also keeps the legacy `DataKey::Paused` in sync so contracts that still
+/// read the old key see a consistent value.
+pub fn set_pause_level(env: &Env, level: PauseLevel) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PauseLevel, &level);
+    // Keep legacy key consistent so any external tooling that reads
+    // DataKey::Paused still gets a sensible answer.
+    let legacy_paused = level != PauseLevel::None;
+    env.storage()
+        .instance()
+        .set(&DataKey::Paused, &legacy_paused);
+    env.storage().instance().extend_ttl(
+        INSTANCE_LIFETIME_THRESHOLD,
+        INSTANCE_BUMP_AMOUNT,
+    );
+}
+
+/// Returns `true` when the contract is at `PauseLevel::FullHalt` **or** the
+/// legacy `DataKey::Paused` boolean is `true`.  Used by the legacy
+/// `is_paused()` public function so external clients that predated the tiered
+/// API still get the correct answer.
+pub fn is_paused_internal(env: &Env) -> bool {
+    get_pause_level(env) >= PauseLevel::FullHalt
+}
+
+/// Rejects the call with `Error::Paused` when the pause level is
+/// `PauseLevel::FullHalt`.  Used by `route_payments` (direct payments).
+///
+/// Under `PauseLevel::SwapsOnly`, direct payments continue to flow, so this
+/// function succeeds.
+pub fn require_not_fully_halted(env: &Env) -> Result<(), Error> {
+    if get_pause_level(env) >= PauseLevel::FullHalt {
         return Err(Error::Paused);
     }
     Ok(())
+}
+
+/// Rejects the call with `Error::Paused` when the pause level is **anything
+/// other than** `PauseLevel::None`.  Used by swap-routed entrypoints
+/// (`route_payment_with_swap`, `route_payments_with_swap`).
+///
+/// Under `PauseLevel::SwapsOnly`, swap operations revert while direct payments
+/// continue unaffected.
+pub fn require_swaps_not_paused(env: &Env) -> Result<(), Error> {
+    if get_pause_level(env) != PauseLevel::None {
+        return Err(Error::Paused);
+    }
+    Ok(())
+}
+
+/// Legacy circuit-breaker check kept for backward-compat internal callers
+/// (e.g. non-essential admin state changes that should block on any pause).
+/// Delegates to `require_not_fully_halted` so non-essential changes are only
+/// blocked under a full halt.
+pub fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+    require_not_fully_halted(env)
 }
 
 pub fn is_frozen_internal(env: &Env) -> bool {
@@ -248,6 +321,11 @@ pub fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Erro
         }
         ActionType::SetMultisigConfig(signers, threshold) => {
             validate_multisig_config(signers, *threshold)?;
+        }
+        ActionType::SetPairMaxSlippageBps(_, _, bps)
+            if !(0..=crate::storage::MAX_PAIR_SLIPPAGE_BPS).contains(bps) =>
+        {
+            return Err(Error::InvalidSlippageConfig);
         }
         _ => {}
     }

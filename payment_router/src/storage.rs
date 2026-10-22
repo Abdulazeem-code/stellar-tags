@@ -1,5 +1,29 @@
 use crate::errors::Error;
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
+
+// ── Tiered Circuit Breaker ───────────────────────────────────────────────────
+
+/// Tiered pause levels for the emergency circuit breaker (issue #890).
+///
+/// - `None` (0): Contract is fully operational — both direct payments and
+///   swap-routed payments are accepted.
+/// - `SwapsOnly` (1): Only DEX swap operations (`route_payment_with_swap` and
+///   `route_payments_with_swap`) are halted.  Direct `route_payments` calls
+///   continue to function normally, so core merchant payment flows remain
+///   unaffected during an isolated DEX exploit.
+/// - `FullHalt` (2): All routing operations are halted.  Equivalent to the
+///   legacy `Paused = true` behaviour.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PauseLevel {
+    /// Contract fully operational.
+    None = 0,
+    /// DEX swaps halted; direct payments continue.
+    SwapsOnly = 1,
+    /// All routing halted.
+    FullHalt = 2,
+}
 
 /// Role definitions for the Role-Based Access Control (RBAC) system.
 ///
@@ -131,6 +155,8 @@ pub enum DataKey {
     RegisteredDex(Address),
     /// Maximum tolerated swap slippage in basis points.
     MaxSlippageBps,
+    /// Maximum tolerated swap slippage for a specific input/output token pair.
+    PairSlippage(Address, Address),
     /// The N addresses of the multi-signature admin group for upgrades.
     MultisigSigners,
     /// The M signers threshold of the multi-signature admin group.
@@ -139,6 +165,29 @@ pub enum DataKey {
     UpgradeApproval(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
+    /// A Merkle batch distribution record keyed by its batch id.
+    /// Stores sender, token, total amount, merkle root, expiration, and
+    /// amount already claimed.
+    MerkleBatch(u64),
+    /// Monotonic nonce used to generate unique Merkle batch ids.
+    MerkleBatchNonce,
+    /// Per-batch claimed-amount record for a recipient, keyed by
+    /// (batch_id, recipient).  Presence indicates the recipient has claimed.
+    MerkleClaim(u64, Address),
+    /// Packed claimed-status bitset for a Merkle batch, keyed by batch id.
+    /// Bit `i` is set when leaf index `i` has been claimed.
+    MerkleClaimedBits(u64),
+    /// Total amount already claimed against a Merkle batch, keyed by batch id.
+    MerkleClaimedTotal(u64),
+    /// Tiered pause level for the emergency circuit breaker (issue #890).
+    /// Stored as `PauseLevel` in instance storage. Supersedes the legacy
+    /// `DataKey::Paused` boolean; both keys are honoured during migration so
+    /// existing paused state is preserved.
+    PauseLevel,
+    /// The operator address authorized to renew the dead man's switch heartbeat
+    /// without possessing full admin privileges (issue #889).
+    /// Stored as `Address` in instance storage.
+    HeartbeatOperator,
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -154,6 +203,8 @@ pub const DEFAULT_RATE_LIMIT: u32 = 10;
 pub const MAX_RATE_LIMIT: u32 = 1_000_000;
 pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
 pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = 10_000;
+/// Pair overrides are deliberately stricter than the legacy global ceiling.
+pub const MAX_PAIR_SLIPPAGE_BPS: i128 = 500;
 pub const DAY_IN_LEDGERS: u32 = 17280;
 pub const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
 pub const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
@@ -161,6 +212,8 @@ pub const USER_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 pub const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
 pub const PERSISTENT_BUMP_AMOUNT: u32 = USER_BUMP_AMOUNT;
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = USER_LIFETIME_THRESHOLD;
+/// Number of bits packed into each `u64` word of a Merkle claimed bitset.
+pub const MERKLE_BITS_PER_WORD: u32 = 64;
 
 // ── Reentrancy Guard ─────────────────────────────────────────────────────────
 
@@ -337,4 +390,74 @@ pub fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i
     }
 
     Ok(volume)
+}
+
+// ── Merkle Batch Helpers ─────────────────────────────────────────────────────
+
+/// Packed record describing a registered Merkle distribution batch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleBatchRecord {
+    /// Address that funded the batch and may reclaim unclaimed funds.
+    pub sender: Address,
+    /// Token contract used for disbursement.
+    pub token: Address,
+    /// Total amount deposited for the batch.
+    pub total_amount: i128,
+    /// Committed 32-byte Merkle root over (recipient, amount) leaves.
+    pub merkle_root: BytesN<32>,
+    /// Unix timestamp after which unclaimed funds may be reclaimed.
+    pub expiration: u64,
+    /// Total amount already claimed from this batch.
+    pub claimed_amount: i128,
+}
+
+/// Returns the number of `u64` words required to store `leaf_count` bits.
+pub fn merkle_bitset_words(leaf_count: u32) -> u32 {
+    if leaf_count == 0 {
+        return 0;
+    }
+    (leaf_count + MERKLE_BITS_PER_WORD - 1) / MERKLE_BITS_PER_WORD
+}
+
+/// Reads the packed claimed bitset for a batch, returning an empty vector when
+/// no claims have been recorded yet.
+pub fn load_merkle_bits(env: &Env, batch_id: u64) -> Vec<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MerkleClaimedBits(batch_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Persists the packed claimed bitset for a batch with an extended TTL.
+pub fn store_merkle_bits(env: &Env, batch_id: u64, bits: &Vec<u64>) {
+    let key = DataKey::MerkleClaimedBits(batch_id);
+    env.storage().persistent().set(&key, bits);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+/// Returns `true` when the bit at `index` is set in the packed bitset.
+pub fn merkle_bit_get(bits: &Vec<u64>, index: u32) -> bool {
+    let word = index / MERKLE_BITS_PER_WORD;
+    let offset = index % MERKLE_BITS_PER_WORD;
+    match bits.get(word) {
+        Some(w) => (w >> offset) & 1 == 1,
+        None => false,
+    }
+}
+
+/// Sets the bit at `index` in the packed bitset, growing it as needed.
+pub fn merkle_bit_set(env: &Env, bits: &mut Vec<u64>, index: u32) {
+    let word = index / MERKLE_BITS_PER_WORD;
+    let offset = index % MERKLE_BITS_PER_WORD;
+    while bits.len() <= word {
+        bits.push_back(0u64);
+    }
+    let current = bits.get(word).unwrap_or(0);
+    bits.set(word, current | (1u64 << offset));
+    let _ = env;
 }

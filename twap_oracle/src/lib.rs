@@ -487,8 +487,7 @@ impl TwapOracle {
         let mut primary_price = 0i128;
         let mut primary_timestamp = 0u64;
 
-        if !observations.is_empty() {
-            let latest = observations.get(observations.len() - 1).unwrap();
+        if let Some(latest) = observations.get(observations.len().saturating_sub(1)) {
             primary_timestamp = latest.timestamp;
             let elapsed = current_time.saturating_sub(latest.timestamp);
             let is_stale = staleness_limit > 0 && elapsed > staleness_limit;
