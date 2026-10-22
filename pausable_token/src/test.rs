@@ -1195,3 +1195,342 @@ fn emits_compliance_hook_events() {
     assert!(names.contains(symbol_short!("set_hook")));
     assert!(names.contains(symbol_short!("del_hook")));
 }
+
+#[test]
+fn max_supply_reported_after_initialization() {
+    let f = Fixture::new();
+    assert_eq!(f.token.max_supply(), DEFAULT_MAX_SUPPLY);
+}
+
+#[test]
+fn admin_can_set_max_supply() {
+    let f = Fixture::new();
+    let new_cap = 5_000_000;
+    f.token.set_max_supply(&new_cap);
+    assert_eq!(f.token.max_supply(), new_cap);
+
+    let mut found_event = false;
+    for (_, topics, data) in f.env.events().all() {
+        if let Some(first) = topics.first() {
+            if let Ok(name) = Symbol::try_from_val(&f.env, &first) {
+                if name == symbol_short!("set_cap") {
+                    let admin_val = topics.get(1).unwrap();
+                    let admin: Address = Address::try_from_val(&f.env, &admin_val).unwrap();
+                    let cap: i128 = i128::try_from_val(&f.env, &data).unwrap();
+                    assert_eq!(admin, f.admin);
+                    assert_eq!(cap, new_cap);
+                    found_event = true;
+                }
+            }
+        }
+    }
+    assert!(found_event);
+}
+
+#[test]
+fn set_max_supply_below_current_total_supply_fails() {
+    let f = Fixture::new();
+    let res = f.token.try_set_max_supply(&1_999_999);
+    assert_eq!(res.unwrap_err().unwrap(), Error::SupplyCapExceeded);
+    assert_eq!(f.token.max_supply(), DEFAULT_MAX_SUPPLY);
+}
+
+#[test]
+fn set_max_supply_negative_fails() {
+    let f = Fixture::new();
+    let res = f.token.try_set_max_supply(&-1);
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidAmount);
+}
+
+#[test]
+fn mint_enforces_max_supply() {
+    let f = Fixture::new();
+    let carol = Address::generate(&f.env);
+
+    f.token.set_max_supply(&2_000_500);
+
+    f.token.mint(&carol, &500);
+    assert_eq!(f.token.balance(&carol), 500);
+    assert_eq!(f.token.total_supply(), 2_000_500);
+
+    let res = f.token.try_mint(&carol, &1);
+    assert_eq!(res.unwrap_err().unwrap(), Error::SupplyCapExceeded);
+    assert_eq!(f.token.balance(&carol), 500);
+    assert_eq!(f.token.total_supply(), 2_000_500);
+}
+
+#[test]
+fn batch_mint_distributes_tokens_accurately() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+    let r3 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    recipients.push_back(r3.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(200);
+    amounts.push_back(300);
+
+    f.token.batch_mint(&recipients, &amounts);
+
+    assert_eq!(f.token.balance(&r1), 100);
+    assert_eq!(f.token.balance(&r2), 200);
+    assert_eq!(f.token.balance(&r3), 300);
+    assert_eq!(f.token.total_supply(), 2_000_600);
+
+    let mut mint_count = 0;
+    let mut found_batch_event = false;
+    for (_, topics, data) in f.env.events().all() {
+        if let Some(first) = topics.first() {
+            if let Ok(name) = Symbol::try_from_val(&f.env, &first) {
+                if name == symbol_short!("mint") {
+                    mint_count += 1;
+                } else if name == symbol_short!("batchmint") {
+                    let total: i128 = i128::try_from_val(&f.env, &data).unwrap();
+                    assert_eq!(total, 600);
+                    found_batch_event = true;
+                }
+            }
+        }
+    }
+    assert_eq!(mint_count, 5);
+    assert!(found_batch_event);
+}
+
+#[test]
+fn batch_mint_up_to_30_recipients_succeeds() {
+    let f = Fixture::new();
+    let mut recipients = Vec::new(&f.env);
+    let mut amounts = Vec::new(&f.env);
+
+    for _ in 0..30 {
+        recipients.push_back(Address::generate(&f.env));
+        amounts.push_back(10);
+    }
+
+    assert_eq!(recipients.len(), 30);
+    f.token.batch_mint(&recipients, &amounts);
+
+    assert_eq!(f.token.total_supply(), 2_000_000 + 300);
+    for i in 0..30 {
+        let r = recipients.get(i).unwrap();
+        assert_eq!(f.token.balance(&r), 10);
+    }
+}
+
+#[test]
+fn batch_mint_exceeding_30_recipients_fails() {
+    let f = Fixture::new();
+    let mut recipients = Vec::new(&f.env);
+    let mut amounts = Vec::new(&f.env);
+
+    for _ in 0..31 {
+        recipients.push_back(Address::generate(&f.env));
+        amounts.push_back(10);
+    }
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::BatchSizeExceeded);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+    for i in 0..31 {
+        let r = recipients.get(i).unwrap();
+        assert_eq!(f.token.balance(&r), 0);
+    }
+}
+
+#[test]
+fn batch_mint_length_mismatch_fails() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::BatchLengthMismatch);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_empty_fails() {
+    let f = Fixture::new();
+    let recipients = Vec::new(&f.env);
+    let amounts = Vec::new(&f.env);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidAmount);
+}
+
+#[test]
+fn batch_mint_invalid_amount_fails() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(0);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidAmount);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_supply_cap_exceeded_reverts_atomically() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    f.token.set_max_supply(&2_000_250);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(200);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::SupplyCapExceeded);
+
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_blocked_when_paused() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+
+    f.token.pause();
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
+    assert_eq!(f.token.balance(&r1), 0);
+
+    f.token.unpause();
+    f.token.batch_mint(&recipients, &amounts);
+    assert_eq!(f.token.balance(&r1), 100);
+}
+
+#[test]
+fn batch_mint_blocked_for_frozen_recipient() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    f.token.freeze(&r2);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(100);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::AccountFrozen);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_blocked_for_time_bound_frozen_recipient_until_timestamp() {
+    let f = Fixture::new();
+    f.env.ledger().with_mut(|info| info.timestamp = 1_000);
+
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+    let freeze_until = 2_000;
+    f.token.freeze_account_until(&r2, &freeze_until);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(100);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::AccountFrozen);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+
+    f.env.ledger().with_mut(|info| info.timestamp = 2_000);
+    f.token.batch_mint(&recipients, &amounts);
+    assert_eq!(f.token.balance(&r1), 100);
+    assert_eq!(f.token.balance(&r2), 100);
+    assert_eq!(f.token.total_supply(), 2_000_200);
+}
+
+#[test]
+fn batch_mint_with_repeated_recipient_accumulates_balance() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    recipients.push_back(r1.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(200);
+    amounts.push_back(300);
+
+    f.token.batch_mint(&recipients, &amounts);
+    assert_eq!(f.token.balance(&r1), 400);
+    assert_eq!(f.token.balance(&r2), 200);
+    assert_eq!(f.token.total_supply(), 2_000_600);
+}
+
+#[test]
+fn supply_cap_and_batch_mint_require_initialization() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, PausableToken);
+    let token = PausableTokenClient::new(&env, &contract_id);
+
+    let r1 = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1);
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100);
+
+    assert_eq!(
+        token.try_set_max_supply(&1_000_000),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        token.try_batch_mint(&recipients, &amounts),
+        Err(Ok(Error::NotInitialized))
+    );
+}
