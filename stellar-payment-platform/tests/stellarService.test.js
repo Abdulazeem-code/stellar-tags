@@ -60,6 +60,9 @@ const {
   fetchFirstPaymentsPage,
   wrapPageWithBreaker,
   createBreaker,
+  submitTransactionWithRetry,
+  isRetryableSubmissionError,
+  computeBackoff,
   HORIZON_BASE,
   BREAKER_THRESHOLD,
 } = require('../src/services/stellarService');
@@ -306,5 +309,83 @@ describe('StellarService — Circuit Breaker', () => {
         expect(err.code).toBe('EOPENBREAKER');
       }
     });
+  });
+});
+
+describe('submitTransactionWithRetry', () => {
+  const ok = { hash: 'abc' };
+  const tx = { toXDR: () => 'xdr' };
+
+  it('retries transient HTTP failures and succeeds', async () => {
+    const submit = jest
+      .fn()
+      .mockRejectedValueOnce({ response: { status: 429 } })
+      .mockResolvedValueOnce(ok);
+
+    const result = await submitTransactionWithRetry(tx, {
+      submit,
+      sleep: jest.fn().mockResolvedValue(undefined),
+      random: () => 0.5,
+    });
+
+    expect(result).toEqual(ok);
+    expect(submit).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries tx_bad_seq', async () => {
+    const submit = jest
+      .fn()
+      .mockRejectedValueOnce({ message: 'tx_bad_seq' })
+      .mockResolvedValueOnce(ok);
+
+    const result = await submitTransactionWithRetry(tx, {
+      submit,
+      sleep: jest.fn().mockResolvedValue(undefined),
+    });
+
+    expect(result).toEqual(ok);
+    expect(submit).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry permanent failures', async () => {
+    const permanent = { message: 'op_underfunded', response: { status: 400 } };
+    const submit = jest.fn().mockRejectedValue(permanent);
+
+    await expect(
+      submitTransactionWithRetry(tx, { submit, sleep: jest.fn() }),
+    ).rejects.toBe(permanent);
+    expect(submit).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws the last error after the maximum attempts', async () => {
+    const last = { response: { status: 504 } };
+    const submit = jest
+      .fn()
+      .mockRejectedValueOnce({ response: { status: 503 } })
+      .mockRejectedValueOnce({ response: { status: 504 } })
+      .mockRejectedValueOnce({ response: { status: 429 } })
+      .mockRejectedValueOnce(last);
+
+    await expect(
+      submitTransactionWithRetry(tx, {
+        submit,
+        sleep: jest.fn().mockResolvedValue(undefined),
+        random: () => 0,
+      }),
+    ).rejects.toBe(last);
+    expect(submit).toHaveBeenCalledTimes(4);
+  });
+
+  it('detects retryable status codes and computed jitter bounds', () => {
+    expect(isRetryableSubmissionError({ response: { status: 429 } })).toBe(true);
+    expect(isRetryableSubmissionError({ response: { status: 503 } })).toBe(true);
+    expect(isRetryableSubmissionError({ response: { status: 504 } })).toBe(true);
+    expect(isRetryableSubmissionError({ message: 'tx_bad_seq' })).toBe(true);
+    expect(isRetryableSubmissionError({ message: 'op_bad_auth' })).toBe(false);
+
+    expect(computeBackoff(0, () => 0)).toBe(0);
+    expect(computeBackoff(0, () => 0.999)).toBeLessThanOrEqual(200);
+    expect(computeBackoff(3, () => 0.999)).toBeLessThanOrEqual(1600);
+    expect(computeBackoff(10, () => 0.999)).toBeLessThanOrEqual(5000);
   });
 });
