@@ -1,4 +1,4 @@
-use soroban::{contractclient, contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, Vec};
 
 /// A user's rolling 24-hour spending record.
 ///
@@ -80,7 +80,7 @@ pub struct SwapPayment {
     /// call. `0` disables the ceiling check; otherwise the realised output
     /// must stay within the contract's `max_slippage_bps` of this figure.
     pub expected_amount_out: i128,
-    /// Unix timestamp (seconds) after which the swap must not execute. `0` 
+    /// Unix timestamp (seconds) after which the swap must not execute. `0`
     /// disables the deadline, letting the DEX apply its own.
     pub deadline: u64,
     /// Contract ID of the DEX adapter to invoke. Must be registered by the
@@ -152,6 +152,10 @@ pub enum ActionType {
     /// Arm the dead man's switch: nominate a backup admin and its claim
     /// timeout in seconds.
     SetBackupAdmin(Address, u64),
+    /// Configure tiered dead man's switch succession:
+    /// Tier 1 backup address, Tier 1 delay (seconds),
+    /// Tier 2 council signers, Tier 2 threshold, Tier 2 delay (seconds).
+    SetTieredDeadMansSwitch(Address, u64, Vec<Address>, u32, u64),
     /// Allow swap routing to invoke a DEX router contract.
     RegisterDex(Address),
     /// Stop swap routing from invoking a DEX router contract.

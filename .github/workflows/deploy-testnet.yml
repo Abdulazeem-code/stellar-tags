@@ -25,6 +25,9 @@ jobs:
         with:
           workspaces: ./payment_router
 
+      - name: Install Stellar CLI dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Install Stellar CLI
         run: cargo install --locked stellar-cli
 

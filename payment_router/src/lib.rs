@@ -1,9 +1,10 @@
 #![no_std]
 pub mod access;
 mod archival;
-pub mod gas_sim;
+pub mod dead_mans_switch;
 pub mod errors;
 pub mod fees;
+pub mod gas_sim;
 pub mod rate_limit;
 pub mod storage;
 pub mod timelock;
@@ -11,6 +12,7 @@ pub mod types;
 
 pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
+pub use dead_mans_switch::*;
 pub use errors::*;
 pub use fees::*;
 pub use gas_sim::*;
@@ -40,11 +42,14 @@ impl PaymentRouter {
     pub const VOLUME_THRESHOLD: i128 = storage::VOLUME_THRESHOLD;
     pub const SECONDS_IN_24H: u64 = storage::SECONDS_IN_24H;
     pub const MIN_DMS_TIMEOUT: u64 = storage::MIN_DMS_TIMEOUT;
+    pub const DMS_GRACE_PERIOD: u64 = storage::DMS_GRACE_PERIOD;
+    pub const TIER1_EXCLUSIVE_WINDOW: u64 = 7 * storage::SECONDS_IN_24H;
     pub const DEFAULT_RATE_LIMIT: u32 = storage::DEFAULT_RATE_LIMIT;
     pub const MAX_RATE_LIMIT: u32 = storage::MAX_RATE_LIMIT;
     pub const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
     pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = storage::DEFAULT_MAX_SLIPPAGE_BPS;
     pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = storage::MAX_SLIPPAGE_BPS_LIMIT;
+    pub const MAX_PAIR_SLIPPAGE_BPS: i128 = storage::MAX_PAIR_SLIPPAGE_BPS;
     pub const DAY_IN_LEDGERS: u32 = storage::DAY_IN_LEDGERS;
     pub const INSTANCE_BUMP_AMOUNT: u32 = storage::INSTANCE_BUMP_AMOUNT;
     pub const INSTANCE_LIFETIME_THRESHOLD: u32 = storage::INSTANCE_LIFETIME_THRESHOLD;
@@ -52,6 +57,10 @@ impl PaymentRouter {
     pub const USER_LIFETIME_THRESHOLD: u32 = storage::USER_LIFETIME_THRESHOLD;
     pub const PERSISTENT_BUMP_AMOUNT: u32 = storage::PERSISTENT_BUMP_AMOUNT;
     pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = storage::PERSISTENT_LIFETIME_THRESHOLD;
+    pub const TEMPORARY_BUMP_AMOUNT: u32 = storage::TEMPORARY_BUMP_AMOUNT;
+    pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = storage::TEMPORARY_LIFETIME_THRESHOLD;
+    pub const DEFAULT_TELEMETRY_CAPACITY: u32 = storage::DEFAULT_TELEMETRY_CAPACITY;
+    pub const MAX_TELEMETRY_CAPACITY: u32 = storage::MAX_TELEMETRY_CAPACITY;
 
     // ── Delegated Domain Helpers ─────────────────────────────────────────────
 
@@ -124,10 +133,6 @@ impl PaymentRouter {
         access::store_multisig_config(env, signers, threshold);
     }
     #[inline]
-    fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
-        access::validate_queued_action(env, action)
-    }
-    #[inline]
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
         fees::load_fee_config(env)
     }
@@ -145,7 +150,9 @@ impl PaymentRouter {
     }
     #[inline]
     fn bump_heartbeat(env: &Env) {
-        if env.storage().instance().has(&DataKey::BackupAdmin) {
+        if env.storage().instance().has(&DataKey::BackupAdmin)
+            || env.storage().instance().has(&DataKey::DmsTier2Council)
+        {
             env.storage()
                 .instance()
                 .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
@@ -174,6 +181,22 @@ impl PaymentRouter {
     #[inline]
     fn require_circuit_closed(env: &Env) -> Result<(), Error> {
         access::require_circuit_closed(env)
+    }
+    #[inline]
+    fn get_pause_level_internal(env: &Env) -> PauseLevel {
+        access::get_pause_level(env)
+    }
+    #[inline]
+    fn set_pause_level_internal(env: &Env, level: PauseLevel) {
+        access::set_pause_level(env, level);
+    }
+    #[inline]
+    fn require_not_fully_halted(env: &Env) -> Result<(), Error> {
+        access::require_not_fully_halted(env)
+    }
+    #[inline]
+    fn require_swaps_not_paused(env: &Env) -> Result<(), Error> {
+        access::require_swaps_not_paused(env)
     }
     #[inline]
     fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
@@ -246,6 +269,23 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::MaxSlippageBps)
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Resolve a token-pair override, falling back to the global slippage cap.
+    fn pair_max_slippage_bps(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<i128, Error> {
+        let configured: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairSlippage(token_in.clone(), token_out.clone()));
+        match configured {
+            Some(bps) if (0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&bps) => Ok(bps),
+            Some(_) => Err(Error::InvalidSlippageConfig),
+            None => Ok(Self::max_slippage_bps(env)),
+        }
     }
 
     /// Returns whether a DEX router has been approved for swap routing.
@@ -332,11 +372,9 @@ impl PaymentRouter {
 
     /// Read-only simulation of a multi-hop swap route.
     ///
-    /// Inspects each hop's pool storage keys, projects slippage across the
-    /// pool curves, estimates CPU/memory cost, and returns the exact Soroban
-    /// ledger footprint declarations required to execute the route. Never
-    /// writes persistent state: only `env.storage().instance()` reads are
-    /// performed, so the call is safe to run off-chain before submission.
+    /// Projects slippage across a deterministic constant-product pool model,
+    /// estimates CPU/memory cost, and lists the route addresses needed to
+    /// execute the swap. The call does not write contract storage.
     ///
     /// # Parameters
     /// - `route`: Ordered pool addresses from `token_in` to `token_out`.
@@ -344,9 +382,9 @@ impl PaymentRouter {
     ///
     /// # Returns
     /// A [`SwapSimulationReport`] with the estimated CPU instructions, memory
-    /// bytes, projected output, price impact in bps, and the required
-    /// read-only/read-write footprint keys. The report's `exceeds_footprint_limit`
-    /// flag is set when the read-write key count exceeds the Soroban limit.
+    /// bytes, projected output, price impact in bps, and route addresses for
+    /// read-only and read-write access. The report's `exceeds_footprint_limit`
+    /// flag estimates whether the route exceeds the Soroban write-key limit.
     pub fn simulate_swap_execution(
         env: Env,
         route: Vec<Address>,
@@ -916,6 +954,65 @@ impl PaymentRouter {
         Ok(())
     }
 
+    // ── Two-phase commit: cross-contract timelocked upgrades ────────────────
+
+    /// Phase 1 of a cross-contract upgrade: validate the upgrade manifest and
+    /// register it on every participating contract under one synchronized
+    /// 48-hour timelock.
+    ///
+    /// See [`timelock`] for the protocol description.  Both entry points
+    /// require admin authorization and a non-frozen contract, and both are
+    /// atomic: if any participating contract rejects its manifest, the whole
+    /// invocation reverts and no contract keeps a registration.
+    ///
+    /// # Parameters
+    /// - `upgrade_id`: unique identifier of the upgrade attempt.
+    /// - `contract_addresses`: every contract taking part in the upgrade.
+    /// - `code_hashes`: code hash for the contract at the matching index;
+    ///   must contain exactly one entry per address.
+    ///
+    /// # Returns
+    /// The stored [`TwoPhaseCommit`] manifest, including `execution_deadline`.
+    pub fn prepare_cross_contract_upgrade(
+        env: Env,
+        upgrade_id: BytesN<32>,
+        contract_addresses: Vec<Address>,
+        code_hashes: Vec<BytesN<32>>,
+    ) -> Result<TwoPhaseCommit, Error> {
+        timelock::prepare_cross_contract_upgrade(&env, upgrade_id, contract_addresses, code_hashes)
+    }
+
+    /// Phase 2 of a cross-contract upgrade: after the 48-hour delay has
+    /// elapsed, upgrade every participating contract in one atomic step.
+    ///
+    /// Every manifest entry is validated before the first cross-contract call
+    /// is made.  If any participating contract rejects its own manifest
+    /// validation, the error unwinds the entire invocation, so contracts
+    /// upgraded earlier in the same call roll back with it — the protocol
+    /// ends up either fully upgraded or not upgraded at all.
+    ///
+    /// # Parameters
+    /// - `upgrade_id`: the upgrade prepared by `prepare_cross_contract_upgrade`.
+    ///
+    /// # Errors
+    /// - [`Error::TimelockNotFound`]: unknown or already committed ID.
+    /// - [`Error::TimelockNotReady`]: the 48-hour delay has not elapsed.
+    /// - [`Error::UpgradeManifestExpired`]: past `execution_deadline`.
+    /// - [`Error::UpgradeCommitFailed`]: a participating contract rejected its
+    ///   manifest; the whole commit was rolled back.
+    pub fn commit_cross_contract_upgrade(env: Env, upgrade_id: BytesN<32>) -> Result<(), Error> {
+        timelock::commit_cross_contract_upgrade(&env, upgrade_id)
+    }
+
+    /// Returns the prepared [`TwoPhaseCommit`] manifest for `upgrade_id`, or
+    /// [`Error::TimelockNotFound`] if there is none.
+    pub fn get_cross_contract_upgrade(
+        env: Env,
+        upgrade_id: BytesN<32>,
+    ) -> Result<TwoPhaseCommit, Error> {
+        timelock::get_cross_contract_upgrade(&env, upgrade_id)
+    }
+
     // ── Freeze / unfreeze ────────────────────────────────────────────────────
 
     /// Instantly freezes the contract, blocking all payments and timelock
@@ -1402,11 +1499,14 @@ impl PaymentRouter {
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         Self::require_role(&env, Role::Pauser)?;
 
-        env.storage().instance().set(&DataKey::Paused, &paused);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
+        // Convert the boolean to a tiered level for backward compatibility.
+        // `true` → `FullHalt`, `false` → `None`.
+        let level = if paused {
+            PauseLevel::FullHalt
+        } else {
+            PauseLevel::None
+        };
+        Self::set_pause_level_internal(&env, level);
 
         env.events().publish((symbol_short!("pause"),), (paused,));
 
@@ -1427,10 +1527,52 @@ impl PaymentRouter {
         Self::set_pause(env, paused)
     }
 
-    /// Returns whether the contract is currently paused.
+    /// Sets the tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `PauseLevel::None` (0) — all routing enabled.
+    /// - `PauseLevel::SwapsOnly` (1) — DEX swap calls blocked; direct payments continue.
+    /// - `PauseLevel::FullHalt` (2) — all routing blocked (equivalent to `set_pause(true)`).
+    ///
+    /// Pauser role is required. This call is NOT timelocked so the Pauser can
+    /// react immediately to an exploit.
+    ///
+    /// # Panics
+    /// Panics if the current Pauser does not authorize the call.
+    pub fn set_pause_level(env: Env, level: PauseLevel) -> Result<(), Error> {
+        Self::require_role(&env, Role::Pauser)?;
+
+        Self::set_pause_level_internal(&env, level);
+
+        env.events()
+            .publish((Symbol::new(&env, "pause_level"),), (level as u32,));
+
+        Ok(())
+    }
+
+    /// Returns the current tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `0` = None (fully operational)
+    /// - `1` = SwapsOnly (swaps halted, direct payments active)
+    /// - `2` = FullHalt (all routing halted)
     ///
     /// # Returns
-    /// `true` if paused, `false` if unpaused or not yet initialized.
+    /// The active [`PauseLevel`].
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_pause_level(env: Env) -> PauseLevel {
+        Self::get_pause_level_internal(&env)
+    }
+
+    /// Returns whether the contract is currently paused.
+    ///
+    /// Returns `true` only when the pause level is `FullHalt`.  Under
+    /// `SwapsOnly`, direct payments still work so this returns `false` to
+    /// preserve backward compatibility for callers that only need to know
+    /// whether core transfers are allowed.
+    ///
+    /// # Returns
+    /// `true` if fully halted, `false` otherwise.
     ///
     /// # Panics
     /// Does not panic.
@@ -1480,6 +1622,22 @@ impl PaymentRouter {
             volume,
             last_reset_time,
         }
+    }
+
+    /// Returns the rolling average volume computed across the temporary storage telemetry ring buffer.
+    pub fn get_telemetry_average(env: Env) -> u64 {
+        storage::get_telemetry_average(&env)
+    }
+
+    /// Computes the statistical percentile (0..=100) of payment volume in the circular telemetry buffer.
+    pub fn get_telemetry_percentile(env: Env, p: u32) -> u32 {
+        storage::get_telemetry_percentile(&env, p)
+    }
+
+    /// Appends a new payment telemetry observation to the temporary storage ring buffer.
+    pub fn record_telemetry(env: Env, volume: u32, status: u8) -> PackedTelemetryRecord {
+        let timestamp = env.ledger().timestamp() as u32;
+        storage::append_telemetry(&env, timestamp, volume, status)
     }
 
     /// Permissionless migration of a sender's legacy pre-#663 split entries
@@ -1749,9 +1907,96 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Disables the dead man's switch, removing the backup admin and its
-    /// claim window. The inactivity timeout is left in storage untouched so
-    /// a later re-arming (via timelock) can reuse it.
+    /// Arms the dead man's switch with a multi-tier succession model:
+    /// - Tier 1: Primary backup address with an initial activation delay (`tier1_timeout_seconds`).
+    /// - Tier 2: Multi-sig council of M-of-N signers with a longer activation delay (`tier2_timeout_seconds`).
+    ///
+    /// Admin authorization is required.
+    pub fn set_tiered_dead_mans_switch(
+        env: Env,
+        backup: Address,
+        tier1_timeout_seconds: u64,
+        council: Vec<Address>,
+        threshold: u32,
+        tier2_timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        Self::apply_set_tiered_dead_mans_switch(
+            &env,
+            backup,
+            tier1_timeout_seconds,
+            council,
+            threshold,
+            tier2_timeout_seconds,
+        )
+    }
+
+    /// Shared implementation for arming the tiered dead man's switch:
+    /// validates parameters, stores Tier 1 and Tier 2 configurations, and resets the heartbeat clock.
+    pub(crate) fn apply_set_tiered_dead_mans_switch(
+        env: &Env,
+        backup: Address,
+        tier1_timeout_seconds: u64,
+        council: Vec<Address>,
+        threshold: u32,
+        tier2_timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        if tier1_timeout_seconds < Self::MIN_DMS_TIMEOUT {
+            return Err(Error::InvalidDmsConfig);
+        }
+        if tier2_timeout_seconds <= tier1_timeout_seconds {
+            return Err(Error::InvalidDmsConfig);
+        }
+        let admin = Self::require_admin(env)?;
+        if backup == admin {
+            return Err(Error::InvalidDmsConfig);
+        }
+        access::validate_multisig_config(&council, threshold)?;
+
+        env.storage().instance().set(&DataKey::BackupAdmin, &backup);
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsTimeout, &tier1_timeout_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsTier2Council, &council);
+        env.storage().instance().set(
+            &DataKey::DmsTier2Config,
+            &(threshold, tier2_timeout_seconds),
+        );
+
+        // Clear any pending in-flight claim or council approvals
+        env.storage().instance().remove(&DataKey::DmsPendingClaim);
+        env.storage()
+            .instance()
+            .remove(&DataKey::DmsCouncilApprovals);
+
+        // The claim clock starts ticking from the moment the switch is armed.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "tiered_dms_set"), admin),
+            (
+                backup,
+                tier1_timeout_seconds,
+                threshold,
+                tier2_timeout_seconds,
+            ),
+        );
+
+        log!(env, "Tiered dead man's switch armed");
+        Ok(())
+    }
+
+    /// Disables the dead man's switch, removing both Tier 1 and Tier 2 configurations,
+    /// pending claims, and council approvals.
     ///
     /// Admin authorization is required.
     pub fn remove_backup_admin(env: Env) -> Result<(), Error> {
@@ -1760,6 +2005,14 @@ impl PaymentRouter {
 
         env.storage().instance().remove(&DataKey::BackupAdmin);
         env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().remove(&DataKey::DmsTimeout);
+        env.storage().instance().remove(&DataKey::DmsTier2Council);
+        env.storage().instance().remove(&DataKey::DmsTier2Config);
+        env.storage().instance().remove(&DataKey::DmsPendingClaim);
+        env.storage()
+            .instance()
+            .remove(&DataKey::DmsCouncilApprovals);
+
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -2211,10 +2464,14 @@ impl PaymentRouter {
     ///   backup admin and must authorize the call.
     ///
     /// # Returns
-    /// `Ok(())` on success, `Err(Error::NoBackupAdmin)` if no backup is
-    /// configured, `Err(Error::Unauthorized)` if `claimant` is not the
-    /// backup, or `Err(Error::DmsNotReady)` if the timeout has not elapsed.
-    pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
+    /// Initiates a claim for admin rights by the Tier 1 primary backup admin.
+    /// Starts a 72-hour grace period challenge window during which the primary admin
+    /// can re-arm the switch if the claim was illegitimate or accidental.
+    ///
+    /// # Parameters
+    /// - `claimant`: Address claiming admin rights. Must be the configured
+    ///   backup admin and must authorize the call.
+    pub fn initiate_claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
         claimant.require_auth();
 
         let backup: Address = env
@@ -2225,6 +2482,10 @@ impl PaymentRouter {
 
         if claimant != backup {
             return Err(Error::Unauthorized);
+        }
+
+        if env.storage().instance().has(&DataKey::DmsPendingClaim) {
+            return Err(Error::DmsClaimPending);
         }
 
         let timeout: u64 = env
@@ -2243,23 +2504,397 @@ impl PaymentRouter {
             return Err(Error::DmsNotReady);
         }
 
-        env.storage().instance().set(&DataKey::Admin, &claimant);
-        // Fully disarm the switch: the backup is consumed and the clock is
-        // cleared so the new admin starts from a clean slate (re-arm via the
-        // timelock if desired).
-        env.storage().instance().remove(&DataKey::BackupAdmin);
-        env.storage().instance().remove(&DataKey::LastHeartbeat);
-        env.storage().instance().remove(&DataKey::DmsTimeout);
+        let grace_period_end = now.saturating_add(Self::DMS_GRACE_PERIOD);
+        let pending = DmsClaimStatus {
+            claimant: claimant.clone(),
+            initiated_at: now,
+            grace_period_end,
+            candidate_admin: claimant.clone(),
+            tier: 1,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsPendingClaim, &pending);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "dms_claim_initiated"), claimant),
+            (1u32, now, grace_period_end),
+        );
+
+        log!(&env, "Tier 1 dead man's switch claim initiated");
+        Ok(())
+    }
+
+    /// Finalizes a pending Tier 1 claim once the 72-hour challenge grace period has expired.
+    pub fn execute_claim_admin(env: Env) -> Result<(), Error> {
+        let pending: DmsClaimStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsPendingClaim)
+            .ok_or(Error::TimelockNotFound)?;
+
+        if pending.tier != 1 {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < pending.grace_period_end {
+            return Err(Error::DmsGracePeriodActive);
+        }
+
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+        Ok(())
+    }
+
+    /// Dead man's switch claim (backward compatible):
+    /// - If no claim is currently pending: checks eligibility and initiates the claim.
+    /// - If a claim is already pending for `claimant` and the 72-hour grace period has expired:
+    ///   finalizes the claim and transfers admin power.
+    /// - If the grace period is still active: returns `Err(Error::DmsGracePeriodActive)`.
+    pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
+        claimant.require_auth();
+
+        let backup: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackupAdmin)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if claimant != backup {
+            return Err(Error::Unauthorized);
+        }
+
+        if let Some(pending) = env
+            .storage()
+            .instance()
+            .get::<DataKey, DmsClaimStatus>(&DataKey::DmsPendingClaim)
+        {
+            if pending.claimant != claimant || pending.tier != 1 {
+                return Err(Error::DmsClaimPending);
+            }
+            let now = env.ledger().timestamp();
+            if now < pending.grace_period_end {
+                return Err(Error::DmsGracePeriodActive);
+            }
+            Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+            return Ok(());
+        }
+
+        // Not yet initiated: check timeout and initiate
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .ok_or(Error::InvalidDmsConfig)?;
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .ok_or(Error::InvalidDmsConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < last_heartbeat.saturating_add(timeout) {
+            return Err(Error::DmsNotReady);
+        }
+
+        let grace_period_end = now.saturating_add(Self::DMS_GRACE_PERIOD);
+        let pending = DmsClaimStatus {
+            claimant: claimant.clone(),
+            initiated_at: now,
+            grace_period_end,
+            candidate_admin: claimant.clone(),
+            tier: 1,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsPendingClaim, &pending);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "dms_claim_initiated"), claimant),
+            (1u32, now, grace_period_end),
+        );
+
+        log!(
+            &env,
+            "Tier 1 dead man's switch claim initiated via claim_admin"
+        );
+        Ok(())
+    }
+
+    /// Initiates a Tier 2 succession claim by a member of the multi-sig council.
+    /// Requires that:
+    /// - Tier 2 is configured with council members.
+    /// - The Tier 2 activation timeout (e.g. 37 days) has elapsed since the last heartbeat,
+    ///   and any Tier 1 exclusive window (7 days after Tier 1 timeout) has elapsed.
+    /// - No conflicting claim is pending.
+    pub fn initiate_tier2_claim(
+        env: Env,
+        caller: Address,
+        candidate_admin: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let council: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTier2Council)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if !council.contains(&caller) {
+            return Err(Error::NotCouncilSigner);
+        }
+
+        if env.storage().instance().has(&DataKey::DmsPendingClaim) {
+            return Err(Error::DmsClaimPending);
+        }
+
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .ok_or(Error::InvalidDmsConfig)?;
+        let (_threshold, tier2_timeout): (u32, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTier2Config)
+            .ok_or(Error::InvalidDmsConfig)?;
+
+        let now = env.ledger().timestamp();
+        // Tier 2 timeout must have elapsed
+        if now < last_heartbeat.saturating_add(tier2_timeout) {
+            return Err(Error::DmsNotReady);
+        }
+
+        // Tier 1 exclusive window check: if Tier 1 backup exists, Tier 1 has a 7-day exclusive window
+        if let Some(_backup) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::BackupAdmin)
+        {
+            let tier1_timeout: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DmsTimeout)
+                .unwrap_or(0);
+            let tier1_exclusive_until = last_heartbeat
+                .saturating_add(tier1_timeout)
+                .saturating_add(Self::TIER1_EXCLUSIVE_WINDOW);
+            if now < tier1_exclusive_until {
+                return Err(Error::DmsNotReady);
+            }
+        }
+
+        let grace_period_end = now.saturating_add(Self::DMS_GRACE_PERIOD);
+        let pending = DmsClaimStatus {
+            claimant: caller.clone(),
+            initiated_at: now,
+            grace_period_end,
+            candidate_admin: candidate_admin.clone(),
+            tier: 2,
+        };
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(caller.clone());
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsPendingClaim, &pending);
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsCouncilApprovals, &approvals);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "dms_claim_initiated"), candidate_admin),
+            (2u32, now, grace_period_end),
+        );
+
+        log!(&env, "Tier 2 council dead man's switch claim initiated");
+        Ok(())
+    }
+
+    /// Casts an approval vote for an in-flight Tier 2 council claim by a council signer.
+    pub fn approve_tier2_claim(env: Env, signer: Address) -> Result<u32, Error> {
+        signer.require_auth();
+
+        let council: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTier2Council)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if !council.contains(&signer) {
+            return Err(Error::NotCouncilSigner);
+        }
+
+        let pending: DmsClaimStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsPendingClaim)
+            .ok_or(Error::TimelockNotFound)?;
+
+        if pending.tier != 2 {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsCouncilApprovals)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if approvals.contains(&signer) {
+            return Err(Error::AlreadyApproved);
+        }
+
+        approvals.push_back(signer.clone());
+        let count = approvals.len();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsCouncilApprovals, &approvals);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
         env.events()
-            .publish((Symbol::new(&env, "admin_claimed"), claimant.clone()), now);
+            .publish((Symbol::new(&env, "tier2_claim_approved"), signer), count);
 
-        log!(&env, "Admin claimed via dead man's switch");
+        log!(&env, "Tier 2 claim approval registered");
+        Ok(count)
+    }
+
+    /// Finalizes a Tier 2 claim once:
+    /// 1. The 72-hour grace period challenge window has passed.
+    /// 2. At least M-of-N council approvals have been gathered.
+    pub fn execute_tier2_claim(env: Env) -> Result<(), Error> {
+        let pending: DmsClaimStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsPendingClaim)
+            .ok_or(Error::TimelockNotFound)?;
+
+        if pending.tier != 2 {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < pending.grace_period_end {
+            return Err(Error::DmsGracePeriodActive);
+        }
+
+        let (threshold, _timeout): (u32, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTier2Config)
+            .ok_or(Error::InvalidMultisigConfig)?;
+        let approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsCouncilApprovals)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if approvals.len() < threshold {
+            return Err(Error::InsufficientApprovals);
+        }
+
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 2)?;
         Ok(())
+    }
+
+    /// Allows the primary admin to re-arm the switch during the 72-hour grace period
+    /// if a false or premature claim was initiated. Cancels pending claim and resets the heartbeat clock.
+    pub fn rearm_switch(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let pending_exists = env.storage().instance().has(&DataKey::DmsPendingClaim);
+        if !pending_exists {
+            return Err(Error::TimelockNotFound);
+        }
+
+        env.storage().instance().remove(&DataKey::DmsPendingClaim);
+        env.storage()
+            .instance()
+            .remove(&DataKey::DmsCouncilApprovals);
+
+        // Reset the heartbeat clock to now
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::LastHeartbeat, &now);
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "dms_rearmed"), admin), now);
+
+        log!(&env, "Dead man's switch rearmed by admin");
+        Ok(())
+    }
+
+    /// Internal helper to finalize a dead-man's switch claim and transfer admin power.
+    pub(crate) fn finalize_dms_claim(
+        env: &Env,
+        new_admin: Address,
+        tier: u32,
+    ) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::set_role_internal(env, Role::SuperAdmin, &new_admin);
+
+        // Disarm switch completely
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().remove(&DataKey::DmsTimeout);
+        env.storage().instance().remove(&DataKey::DmsTier2Council);
+        env.storage().instance().remove(&DataKey::DmsTier2Config);
+        env.storage().instance().remove(&DataKey::DmsPendingClaim);
+        env.storage()
+            .instance()
+            .remove(&DataKey::DmsCouncilApprovals);
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(env, "admin_claimed"), new_admin), (tier, now));
+
+        log!(env, "Admin claimed via dead man's switch");
+        Ok(())
+    }
+
+    /// Returns the current pending claim status, if any.
+    pub fn get_pending_dms_claim(env: Env) -> Option<DmsClaimStatus> {
+        env.storage().instance().get(&DataKey::DmsPendingClaim)
+    }
+
+    /// Returns the Tier 2 council configuration: `(Option<Vec<Address>>, u32, u64)`.
+    pub fn get_tier2_council(env: Env) -> (Option<Vec<Address>>, u32, u64) {
+        let council = env.storage().instance().get(&DataKey::DmsTier2Council);
+        let (threshold, timeout) = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTier2Config)
+            .unwrap_or((0, 0));
+        (council, threshold, timeout)
     }
 
     /// Returns the current admin address.
@@ -2295,7 +2930,8 @@ impl PaymentRouter {
             .get(&DataKey::LastHeartbeat)
             .unwrap_or(0);
         let now = env.ledger().timestamp();
-        let elapsed = if backup.is_some() {
+        let elapsed = if backup.is_some() || env.storage().instance().has(&DataKey::DmsTier2Council)
+        {
             now.saturating_sub(last)
         } else {
             0
@@ -2303,28 +2939,147 @@ impl PaymentRouter {
         (backup, timeout, last, elapsed)
     }
 
-    /// Returns `true` if the dead man's switch is armed (a backup admin is
-    /// configured) and the timeout has elapsed, i.e. `claim_admin` would
-    /// currently succeed for the backup.
+    /// Returns `true` if the dead man's switch is armed (a backup admin or council is
+    /// configured) and the timeout has elapsed, i.e. `claim_admin` or council claim would
+    /// currently be eligible to initiate.
     ///
     /// # Panics
     /// Does not panic.
     pub fn is_dead_mans_switch_expired(env: Env) -> bool {
         let backup_set = env.storage().instance().has(&DataKey::BackupAdmin);
-        if !backup_set {
+        let council_set = env.storage().instance().has(&DataKey::DmsTier2Council);
+        if !backup_set && !council_set {
             return false;
         }
-        let timeout: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DmsTimeout)
-            .unwrap_or(0);
         let last: u64 = env
             .storage()
             .instance()
             .get(&DataKey::LastHeartbeat)
             .unwrap_or(0);
-        env.ledger().timestamp().saturating_sub(last) >= timeout
+        let now = env.ledger().timestamp();
+        if backup_set {
+            let timeout: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DmsTimeout)
+                .unwrap_or(0);
+            if now.saturating_sub(last) >= timeout {
+                return true;
+            }
+        }
+        if council_set {
+            let (_threshold, timeout2): (u32, u64) = env
+                .storage()
+                .instance()
+                .get(&DataKey::DmsTier2Config)
+                .unwrap_or((0, 0));
+            if now.saturating_sub(last) >= timeout2 {
+                return true;
+            }
+        }
+        false
+    }
+
+    // ── Dead Man's Switch — Operator Heartbeat (issue #889) ──────────────────
+
+    /// Appoints `operator` as the designated heartbeat renewal address.
+    ///
+    /// The operator can call `renew_heartbeat` to reset the DMS clock without
+    /// holding any other admin privileges.  This avoids exposing cold-storage
+    /// admin keys for routine monthly renewals.
+    ///
+    /// Only one operator may be designated at a time; calling this again
+    /// overwrites the previous designation.
+    ///
+    /// # Parameters
+    /// - `operator`: Address to designate as the heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    /// - `Error::Unauthorized` — caller is not the admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn set_heartbeat_operator(env: Env, operator: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::set_heartbeat_operator_internal(&env, &operator);
+
+        env.events()
+            .publish((Symbol::new(&env, "hb_operator_set"), admin), operator);
+
+        log!(&env, "Heartbeat operator set");
+        Ok(())
+    }
+
+    /// Removes the designated heartbeat operator.
+    ///
+    /// After removal, only the primary admin (`ping`) or a routed payment can
+    /// reset the DMS clock.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn remove_heartbeat_operator(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::remove_heartbeat_operator_internal(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "hb_operator_rm"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Heartbeat operator removed");
+        Ok(())
+    }
+
+    /// Returns the currently designated heartbeat operator, if any.
+    ///
+    /// # Returns
+    /// `Some(operator)` if one is configured, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_heartbeat_operator(env: Env) -> Option<Address> {
+        dead_mans_switch::get_heartbeat_operator_internal(&env)
+    }
+
+    /// Renews the dead man's switch heartbeat on behalf of the configured
+    /// heartbeat operator (issue #889).
+    ///
+    /// The `operator` address must match the stored `DataKey::HeartbeatOperator`
+    /// and must authorize this call.  The operator may **only** reset the
+    /// heartbeat timestamp — it cannot modify the backup admin address, the
+    /// DMS timeout, or any other contract parameter.
+    ///
+    /// # Parameters
+    /// - `operator`: The address claiming operator privileges.  Must match the
+    ///   configured heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::Unauthorized` — `operator` does not match the stored operator
+    ///   or no operator has been configured.
+    /// - `Error::InvalidDmsConfig` — the dead man's switch is not currently
+    ///   armed (no heartbeat timestamp exists).
+    ///
+    /// # Panics
+    /// Panics if `operator` does not authorize the call.
+    pub fn renew_heartbeat(env: Env, operator: Address) -> Result<(), Error> {
+        dead_mans_switch::renew_heartbeat(&env, &operator)
     }
 
     /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
@@ -2712,9 +3467,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): direct payments are only
+        // blocked at FullHalt.  SwapsOnly leaves them unaffected.
+        Self::require_not_fully_halted(&env)?;
 
         // Pre-validate the whole batch before authorizing or moving any
         // funds, so a rejected payment never triggers an auth rollback.
@@ -3027,7 +3782,8 @@ impl PaymentRouter {
             return Err(Error::SlippageExceeded);
         }
         if swap.expected_amount_out > 0 {
-            let max_slippage_bps = Self::max_slippage_bps(env);
+            let max_slippage_bps =
+                Self::pair_max_slippage_bps(env, &swap.sell_token, &swap.buy_token)?;
             let slippage_floor = Self::slippage_floor(swap.expected_amount_out, max_slippage_bps);
             if amount_out < slippage_floor {
                 log!(
@@ -3113,9 +3869,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3143,9 +3899,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3202,7 +3958,7 @@ impl PaymentRouter {
             return Err(Error::InvalidSwapParams);
         }
 
-        let max_slippage_bps = Self::max_slippage_bps(&env);
+        let max_slippage_bps = Self::pair_max_slippage_bps(&env, &sell_token, &buy_token)?;
 
         Ok(SwapQuote {
             amount_out,
@@ -3339,6 +4095,39 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_max_slippage_bps(env: Env) -> i128 {
         Self::max_slippage_bps(&env)
+    }
+
+    /// Returns a pair-specific slippage cap, or the global cap when unset.
+    pub fn get_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+    ) -> Result<i128, Error> {
+        Self::pair_max_slippage_bps(&env, &token_in, &token_out)
+    }
+
+    /// Sets a pair-specific slippage cap. Prefer the timelocked action in
+    /// production configuration.
+    pub fn set_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        max_slippage_bps: i128,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        if !(0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&max_slippage_bps) {
+            return Err(Error::InvalidSlippageConfig);
+        }
+
+        let key = DataKey::PairSlippage(token_in, token_out);
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
     }
 
     /// Returns the available internal refund balance for a user and token.
