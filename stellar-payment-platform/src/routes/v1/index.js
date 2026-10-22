@@ -2,6 +2,7 @@ const express = require('express');
 
 const userRoutes = require('./userRoutes');
 const receiptRoutes = require('./receiptRoutes');
+const receiptProofRoutes = require('./receiptProofRoutes');
 const webhookRoutes = require('./webhookRoutes');
 const statsRoutes = require('./statsRoutes');
 const historyRoutes = require('./historyRoutes');
@@ -20,6 +21,7 @@ module.exports = (redisClient) => {
 
   router.use('/', userRoutes(redisClient));
   router.use('/', receiptRoutes);
+  router.use('/', receiptProofRoutes(redisClient));
   router.use('/', contractRoutes);
   router.use('/', historyRoutes);
   router.use('/', exportRoutes);
