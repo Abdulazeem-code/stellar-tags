@@ -543,4 +543,3 @@ fn consult_with_zero_window_returns_latest_spot_consensus() {
     // Spot consensus: (300 + 310) / 2 = 305
     assert_eq!(setup.client.consult(&0), 305);
 }
-

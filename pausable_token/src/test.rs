@@ -1,9 +1,9 @@
 #![cfg(test)]
 
 use super::*;
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::{Address, Bytes, Env, String, Symbol, TryFromVal, Vec};
-use ed25519_dalek::{Signer, SigningKey};
 
 struct Fixture {
     env: Env,
@@ -146,7 +146,9 @@ fn permit_rejects_expired_deadline_without_mutating_state() {
     let spender = Address::generate(&f.env);
     let deadline = f.env.ledger().timestamp();
     let signature = sign_permit(&f, &signing_key, &owner, &spender, 50, 0, deadline);
-    f.env.ledger().with_mut(|info| info.timestamp = deadline + 1);
+    f.env
+        .ledger()
+        .with_mut(|info| info.timestamp = deadline + 1);
 
     let result = f
         .token

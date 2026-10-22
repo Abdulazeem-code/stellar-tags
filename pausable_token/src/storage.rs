@@ -1,35 +1,39 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    Allowance(AllowanceDataKey),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[contracttype]
-pub struct AllowanceDataKey {
-    pub from: Address,
-    pub spender: Address,
+    Admin,
+    Initialized,
+    Paused,
+    Name,
+    Symbol,
+    Decimals,
+    TotalSupply,
+    Balance(Address),
+    Frozen(Address),
+    Allowance(Address, Address),
+    PermitNonce(Address),
 }
 
 /// Packs an allowance amount (i128, 16 bytes) and expiration ledger (u32, 4 bytes)
 /// into a compact 20-byte big-endian byte array using zero-copy / slice copy operations.
-pub fn pack_allowance(amount: i128, expiration_ledger: u32) -> [u8; 20] {
+pub fn pack_allowance(env: &Env, amount: i128, expiration_ledger: u32) -> BytesN<20> {
     let mut packed = [0u8; 20];
     let amount_bytes = amount.to_be_bytes();
     let exp_bytes = expiration_ledger.to_be_bytes();
     packed[0..16].copy_from_slice(&amount_bytes);
     packed[16..20].copy_from_slice(&exp_bytes);
-    packed
+    BytesN::from_array(env, &packed)
 }
 
 /// Unpacks a 20-byte big-endian byte array into `(amount: i128, expiration_ledger: u32)`.
-pub fn unpack_allowance(packed: &[u8; 20]) -> (i128, u32) {
+pub fn unpack_allowance(packed: &BytesN<20>) -> (i128, u32) {
+    let arr = packed.to_array();
     let mut amount_bytes = [0u8; 16];
     let mut exp_bytes = [0u8; 4];
-    amount_bytes.copy_from_slice(&packed[0..16]);
-    exp_bytes.copy_from_slice(&packed[16..20]);
+    amount_bytes.copy_from_slice(&arr[0..16]);
+    exp_bytes.copy_from_slice(&arr[16..20]);
     let amount = i128::from_be_bytes(amount_bytes);
     let expiration_ledger = u32::from_be_bytes(exp_bytes);
     (amount, expiration_ledger)
@@ -41,10 +45,11 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_basic() {
+        let env = Env::default();
         let amount = 1000i128;
         let expiration = 50000u32;
-        let packed = pack_allowance(amount, expiration);
-        assert_eq!(packed.len(), 20);
+        let packed = pack_allowance(&env, amount, expiration);
+        assert_eq!(packed.to_array().len(), 20);
         let (unpacked_amount, unpacked_exp) = unpack_allowance(&packed);
         assert_eq!(unpacked_amount, amount);
         assert_eq!(unpacked_exp, expiration);
@@ -52,9 +57,10 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_max_values() {
+        let env = Env::default();
         let amount = i128::MAX;
         let expiration = u32::MAX;
-        let packed = pack_allowance(amount, expiration);
+        let packed = pack_allowance(&env, amount, expiration);
         let (unpacked_amount, unpacked_exp) = unpack_allowance(&packed);
         assert_eq!(unpacked_amount, i128::MAX);
         assert_eq!(unpacked_exp, u32::MAX);
@@ -62,9 +68,10 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_zero_values() {
+        let env = Env::default();
         let amount = 0i128;
         let expiration = 0u32;
-        let packed = pack_allowance(amount, expiration);
+        let packed = pack_allowance(&env, amount, expiration);
         let (unpacked_amount, unpacked_exp) = unpack_allowance(&packed);
         assert_eq!(unpacked_amount, 0);
         assert_eq!(unpacked_exp, 0);
@@ -72,6 +79,7 @@ mod tests {
 
     #[test]
     fn test_property_roundtrip_fuzz() {
+        let env = Env::default();
         let test_cases = [
             (0i128, 0u32),
             (1i128, 1u32),
@@ -83,10 +91,16 @@ mod tests {
         ];
 
         for (amount, expiration) in test_cases {
-            let packed = pack_allowance(amount, expiration);
+            let packed = pack_allowance(&env, amount, expiration);
             let (u_amount, u_exp) = unpack_allowance(&packed);
-            assert_eq!(u_amount, amount, "Amount mismatch for amount={amount}, exp={expiration}");
-            assert_eq!(u_exp, expiration, "Expiration mismatch for amount={amount}, exp={expiration}");
+            assert_eq!(
+                u_amount, amount,
+                "Amount mismatch for amount={amount}, exp={expiration}"
+            );
+            assert_eq!(
+                u_exp, expiration,
+                "Expiration mismatch for amount={amount}, exp={expiration}"
+            );
         }
     }
 }

@@ -359,7 +359,8 @@ impl PaymentProxy {
         }
 
         let message = Self::build_meta_message(&env, &payload, &signer_pubkey);
-        env.crypto().ed25519_verify(&signer_pubkey, &message, &signature);
+        env.crypto()
+            .ed25519_verify(&signer_pubkey, &message, &signature);
 
         let token_client = token::Client::new(&env, &payload.token_address);
         let user_balance = token_client.balance(&payload.sender);
@@ -911,13 +912,19 @@ mod tests {
         let mut tampered_recipient = payload.clone();
         tampered_recipient.recipient = attacker.clone();
         let res = client.try_execute_meta_payment(&tampered_recipient, &pubkey, &signature);
-        assert!(res.is_err(), "altering recipient must fail signature verification");
+        assert!(
+            res.is_err(),
+            "altering recipient must fail signature verification"
+        );
 
         // Relayer tries to inflate amount
         let mut tampered_amount = payload.clone();
         tampered_amount.amount = 5_000;
         let res = client.try_execute_meta_payment(&tampered_amount, &pubkey, &signature);
-        assert!(res.is_err(), "altering amount must fail signature verification");
+        assert!(
+            res.is_err(),
+            "altering amount must fail signature verification"
+        );
 
         // Balances untouched
         assert_eq!(token_client.balance(&sender), 10_000);
