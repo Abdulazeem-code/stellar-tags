@@ -137,7 +137,11 @@ impl PaymentRouter {
         fees::load_fee_config(env)
     }
     #[inline]
-    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+    fn load_user_record(
+        env: &Env,
+        sender: &Address,
+        current_time: u64,
+    ) -> (u64, i128, i128, BytesN<32>, bool) {
         storage::load_user_record(env, sender, current_time)
     }
     #[inline]
@@ -1614,13 +1618,14 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_user_record(env: Env, user: Address) -> UserRecord {
         let current_time = env.ledger().timestamp();
-        let (last_reset_time, accumulated_amount, volume, _) =
+        let (last_reset_time, accumulated_amount, volume, flags, _) =
             Self::load_user_record(&env, &user, current_time);
 
         UserRecord {
             accumulated_amount,
             volume,
             last_reset_time,
+            flags,
         }
     }
 
@@ -1635,8 +1640,8 @@ impl PaymentRouter {
     }
 
     /// Appends a new payment telemetry observation to the temporary storage ring buffer.
-    pub fn record_telemetry(env: Env, volume: u32, status: u8) -> PackedTelemetryRecord {
-        let timestamp = env.ledger().timestamp() as u32;
+    pub fn record_telemetry(env: Env, volume: u32, status: u32) -> PackedTelemetryRecord {
+        let timestamp = u32::try_from(env.ledger().timestamp()).unwrap_or(0);
         storage::append_telemetry(&env, timestamp, volume, status)
     }
 
@@ -1684,9 +1689,17 @@ impl PaymentRouter {
             // The legacy `UserVolume` already counts every amount in the
             // current window (each payment incremented both counters), so the
             // window balance must not be added again here.
+            // Legacy data carries no flags, so the bitmap starts zeroed.
+            let zero_flags = BytesN::from_array(&env, &[0u8; 32]);
             env.storage().persistent().set(
                 &record_key,
-                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
+                &pack_user_record(
+                    &env,
+                    last_reset_time,
+                    accumulated_amount,
+                    legacy_volume,
+                    &zero_flags,
+                ),
             );
             env.storage().persistent().extend_ttl(
                 &record_key,
@@ -2547,7 +2560,7 @@ impl PaymentRouter {
             return Err(Error::DmsGracePeriodActive);
         }
 
-        Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 1);
         Ok(())
     }
 
@@ -2581,7 +2594,7 @@ impl PaymentRouter {
             if now < pending.grace_period_end {
                 return Err(Error::DmsGracePeriodActive);
             }
-            Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+            Self::finalize_dms_claim(&env, pending.candidate_admin, 1);
             return Ok(());
         }
 
@@ -2812,7 +2825,7 @@ impl PaymentRouter {
             return Err(Error::InsufficientApprovals);
         }
 
-        Self::finalize_dms_claim(&env, pending.candidate_admin, 2)?;
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 2);
         Ok(())
     }
 
@@ -2849,11 +2862,7 @@ impl PaymentRouter {
     }
 
     /// Internal helper to finalize a dead-man's switch claim and transfer admin power.
-    pub(crate) fn finalize_dms_claim(
-        env: &Env,
-        new_admin: Address,
-        tier: u32,
-    ) -> Result<(), Error> {
+    pub(crate) fn finalize_dms_claim(env: &Env, new_admin: Address, tier: u32) {
         let now = env.ledger().timestamp();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         Self::set_role_internal(env, Role::SuperAdmin, &new_admin);
@@ -2878,7 +2887,6 @@ impl PaymentRouter {
             .publish((Symbol::new(env, "admin_claimed"), new_admin), (tier, now));
 
         log!(env, "Admin claimed via dead man's switch");
-        Ok(())
     }
 
     /// Returns the current pending claim status, if any.
@@ -3690,6 +3698,10 @@ impl PaymentRouter {
         fee_cap: i128,
     ) -> Result<i128, Error> {
         swap.sender.require_auth();
+
+        // Tiered circuit breaker: swap routing is halted under any pause
+        // level other than `None`, before any DEX or balance check.
+        access::require_swaps_not_paused(env)?;
 
         // --- Validate the swap parameters -----------------------------------
         if swap.sell_token == swap.buy_token {
