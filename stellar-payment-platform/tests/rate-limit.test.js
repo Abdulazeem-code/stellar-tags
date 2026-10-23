@@ -25,6 +25,20 @@ jest.mock('redis', () => {
         on: jest.fn(),
         connect: jest.fn().mockResolvedValue(),
         eval: jest.fn(async (script, numkeys, key, capacityStr, refillRateStr, nowStr, requestedStr) => {
+          if (numkeys && typeof numkeys === 'object') {
+            const redisKey = numkeys.keys[0];
+            const args = numkeys.arguments.map(Number);
+            const now = args[0];
+            const windowMs = args[1];
+            const maximum = args[2];
+            const timestamps = (store.get(redisKey) || []).filter((timestamp) => timestamp > now - windowMs);
+            const allowed = timestamps.length < maximum;
+            if (allowed) timestamps.push(now);
+            store.set(redisKey, timestamps);
+            const oldest = timestamps[0] || now;
+            return [allowed ? 1 : 0, timestamps.length, oldest];
+          }
+
           const capacity = Number(capacityStr);
           const refillRate = Number(refillRateStr);
           const now = Number(nowStr);
