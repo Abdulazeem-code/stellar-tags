@@ -2,21 +2,21 @@
 //!
 //! Allows the admin to appoint a dedicated "heartbeat operator" address that
 //! can renew the dead man's switch heartbeat timestamp without holding any
-//! other administrative privileges.  This avoids requiring the cold-storage
+//! other administrative privileges. This avoids requiring the cold-storage
 //! primary admin key for routine monthly renewal operations.
 //!
 //! # Design invariants
-//! - The operator can **only** reset `DataKey::LastHeartbeat`.  It cannot
+//! - The operator can **only** reset `DataKey::LastHeartbeat`. It cannot
 //!   change the backup admin address, the DMS timeout, or any other contract
 //!   parameter.
-//! - The operator address is stored under `DataKey::HeartbeatOperator` in
+//! - The operator address is stored under `HeartbeatKey::HeartbeatOperator` in
 //!   instance storage.
 //! - There is at most one operator at a time; setting a new one overwrites
 //!   the previous one.
 //! - Removing the operator (by the admin) clears the key entirely.
 
 use crate::errors::Error;
-use crate::storage::{DataKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
+use crate::storage::{DataKey, HeartbeatKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use soroban_sdk::{Address, Env, Symbol};
 
 // ── Operator storage helpers ─────────────────────────────────────────────────
@@ -28,7 +28,7 @@ use soroban_sdk::{Address, Env, Symbol};
 pub fn set_heartbeat_operator_internal(env: &Env, operator: &Address) {
     env.storage()
         .instance()
-        .set(&DataKey::HeartbeatOperator, operator);
+        .set(&HeartbeatKey::HeartbeatOperator, operator);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -39,7 +39,9 @@ pub fn set_heartbeat_operator_internal(env: &Env, operator: &Address) {
 /// No authorization is performed here — callers must verify admin auth before
 /// calling this function.
 pub fn remove_heartbeat_operator_internal(env: &Env) {
-    env.storage().instance().remove(&DataKey::HeartbeatOperator);
+    env.storage()
+        .instance()
+        .remove(&HeartbeatKey::HeartbeatOperator);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -47,7 +49,9 @@ pub fn remove_heartbeat_operator_internal(env: &Env) {
 
 /// Returns the current heartbeat operator, or `None` if none is configured.
 pub fn get_heartbeat_operator_internal(env: &Env) -> Option<Address> {
-    env.storage().instance().get(&DataKey::HeartbeatOperator)
+    env.storage()
+        .instance()
+        .get(&HeartbeatKey::HeartbeatOperator)
 }
 
 // ── Heartbeat renewal ────────────────────────────────────────────────────────
@@ -55,14 +59,14 @@ pub fn get_heartbeat_operator_internal(env: &Env) -> Option<Address> {
 /// Renews the dead man's switch heartbeat on behalf of `operator`.
 ///
 /// # Authorization
-/// `operator` must match the stored `DataKey::HeartbeatOperator` value and
+/// `operator` must match the stored `HeartbeatKey::HeartbeatOperator` value and
 /// must have signed the transaction (i.e. `operator.require_auth()` is called
 /// internally).
 ///
 /// # Restrictions
-/// The operator may **only** reset the heartbeat timestamp.  It cannot modify
+/// The operator may **only** reset the heartbeat timestamp. It cannot modify
 /// the backup admin address, the DMS timeout, or any other contract
-/// parameter.  Those operations remain exclusive to the primary admin.
+/// parameter. Those operations remain exclusive to the primary admin.
 ///
 /// # Errors
 /// - `Error::Unauthorized` — if `operator` does not match the stored operator
@@ -75,7 +79,7 @@ pub fn renew_heartbeat(env: &Env, operator: &Address) -> Result<(), Error> {
     let stored_operator: Address = env
         .storage()
         .instance()
-        .get(&DataKey::HeartbeatOperator)
+        .get(&HeartbeatKey::HeartbeatOperator)
         .ok_or(Error::Unauthorized)?;
 
     if *operator != stored_operator {

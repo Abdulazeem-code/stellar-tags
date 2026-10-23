@@ -76,7 +76,7 @@ The oracle provides a dual-source consensus engine to protect downstream contrac
 * **Dual-Feed Staleness Checks.** `consult(window_seconds)` checks timestamps against `staleness_threshold` (default 3,600s).
 * **Consensus Pricing.** If both primary and secondary feeds are fresh and within `max_divergence_bps` (default 500 bps = 5%), `consult` returns the weighted average (default 50/50, configurable via `set_consensus_weights`).
 * **Fallback Switchover.** If the primary feed exceeds the staleness threshold, `consult` falls back to the secondary feed and emits an `(oracle, fallback)` warning event.
-* **Dynamic Discrepancy Circuit Breaker.** If price discrepancy exceeds `max_divergence_bps` (500 bps), the circuit breaker trips, updates persistent storage, emits a `(breaker, tripped)` event, and reverts with `Error::CircuitBreakerTripped`. The contract remains frozen until reset by the admin via `reset_circuit_breaker`.
+* **Dynamic Discrepancy Circuit Breaker.** If price discrepancy exceeds `max_divergence_bps` (500 bps), `consult` rejects the call with `Error::CircuitBreakerTripped` instead of serving a price. A rejected invocation is rolled back in full, so the trip itself cannot be persisted from that call: to freeze pricing until an admin resets it, trip the breaker in its own transaction with `trip_circuit_breaker`, and clear it with `reset_circuit_breaker`.
 
 ## Building and testing
 

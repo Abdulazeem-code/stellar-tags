@@ -464,7 +464,11 @@ impl TwapOracle {
     /// - Checks primary and secondary price feeds against the staleness limit.
     /// - If both feeds are fresh:
     ///   - Validates that discrepancy between feeds does not exceed `max_divergence_bps` (500 bps).
-    ///   - If divergence exceeds threshold, trips the circuit breaker and reverts with [`Error::CircuitBreakerTripped`].
+    ///   - If divergence exceeds the threshold, rejects the consultation with
+    ///     [`Error::CircuitBreakerTripped`]. Because the caller's invocation is
+    ///     rolled back, the breaker itself has to be tripped separately with
+    ///     [`Self::trip_circuit_breaker`] to freeze pricing until an admin
+    ///     resets it.
     ///   - If within threshold, returns the weighted consensus average.
     /// - If primary is stale and secondary is fresh, falls back to secondary with a warning event emission.
     /// - If primary is fresh and secondary is stale or absent, returns the primary price.
@@ -487,7 +491,7 @@ impl TwapOracle {
         let mut primary_price = 0i128;
         let mut primary_timestamp = 0u64;
 
-        if let Some(latest) = observations.get(observations.len().saturating_sub(1)) {
+        if let Some(latest) = observations.last() {
             primary_timestamp = latest.timestamp;
             let elapsed = current_time.saturating_sub(latest.timestamp);
             let is_stale = staleness_limit > 0 && elapsed > staleness_limit;
@@ -543,15 +547,13 @@ impl TwapOracle {
                 diff.checked_mul(BPS_DIVISOR).ok_or(Error::PriceOverflow)? / primary_price;
 
             if divergence_bps > i128::from(max_bps) {
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::CircuitBreakerTripped, &true);
-
-                env.events().publish(
-                    (symbol_short!("breaker"), symbol_short!("tripped")),
-                    (primary_price, secondary_price, divergence_bps),
-                );
-
+                // Soroban rolls an invocation back in full as soon as an
+                // entrypoint returns an error, so a trip recorded here (and its
+                // event) could never outlive this failing call.  The
+                // disagreement is enforced by rejecting the consultation;
+                // freezing pricing until an admin resets it is the job of
+                // `trip_circuit_breaker`, which runs as its own successful
+                // transaction.
                 return Err(Error::CircuitBreakerTripped);
             }
 

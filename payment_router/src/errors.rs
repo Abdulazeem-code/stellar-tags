@@ -18,21 +18,24 @@ pub enum Error {
     NotInitialized = 5,
     /// The contract is currently paused; routing calls are rejected until unpaused.
     Paused = 6,
-    /// A fee configuration value (basis points or cap) is out of the allowed range.
-    InvalidFeeRate = 7,
     /// Sender and recipient addresses are the same (self-routing not allowed).
     InvalidRecipient = 8,
     /// Recipient address is blacklisted.
     Blacklisted = 9,
     /// Requested refund withdrawal amount is zero or exceeds available refund balance.
     NoRefundAvailable = 10,
-    /// An action is already pending in the timelock queue; it must be executed
-    /// or cancelled before a duplicate can be queued (not currently enforced,
-    /// but reserved for future deduplication logic).
+    /// An entry is already pending in the timelock queue; it must be executed
+    /// or cancelled before a duplicate can be queued.  Also reported when a
+    /// cross-contract upgrade manifest is prepared twice under the same
+    /// upgrade ID.
     TimelockPending = 11,
-    /// The 24-hour delay for the given timelock entry has not elapsed yet.
+    /// The delay for the given timelock entry has not elapsed yet.  Also
+    /// reported while a prepared cross-contract upgrade is still serving its
+    /// 48-hour delay.
     TimelockNotReady = 12,
-    /// No timelock entry exists for the supplied nonce ID.
+    /// No timelock entry exists for the supplied nonce ID.  Also reported when
+    /// no cross-contract upgrade manifest is stored under the supplied upgrade
+    /// ID (never prepared, already committed, or outside its window).
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
@@ -57,12 +60,12 @@ pub enum Error {
     RateLimited = 46,
     /// The caller does not hold the role required by the entrypoint.
     RoleNotFound = 47,
-    /// A governance proposal id is unknown or no longer votable.
+    /// A governance proposal id is unknown or no longer votable.  A caller
+    /// that has already voted on a proposal is rejected with this variant
+    /// rather than a separate "already voted" code.
     InvalidProposal = 21,
     /// A governance operation was attempted before governance was configured.
     GovernanceNotConfigured = 22,
-    /// The caller has already voted on this proposal.
-    AlreadyVoted = 23,
     /// The configured KYC threshold is negative.
     InvalidKycThreshold = 24,
     /// A yield operation was attempted before the yield protocol was configured.
@@ -91,8 +94,6 @@ pub enum Error {
     KycRequired = 34,
     /// A swap path is empty, malformed, or does not connect the requested assets.
     InvalidSwapPath = 35,
-    /// The DEX returned less than the caller's minimum acceptable output.
-    SlippageExceededSwap = 36,
     /// The multi-signature configuration is unusable: the signer set is empty,
     /// contains a duplicate address, the threshold is zero, or the threshold
     /// exceeds the number of signers (so the upgrade could never be authorized).
@@ -117,4 +118,17 @@ pub enum Error {
     CyclicSwapPath = 48,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
     InvalidSlippageConfig = 49,
+    /// The upgrade manifest is malformed: no target contracts, a different
+    /// number of code hashes than addresses, or a duplicated target.
+    InvalidUpgradeManifest = 51,
+    /// The execution deadline of the prepared upgrade has passed; the upgrade
+    /// must be prepared again.
+    UpgradeManifestExpired = 52,
+    /// A participating contract rejected the manifest during preparation. The
+    /// entire invocation was rolled back, so no contract was registered.
+    UpgradePrepareFailed = 53,
+    /// A participating contract rejected the manifest during the atomic
+    /// commit. The entire invocation was rolled back, so no contract was
+    /// upgraded: the protocol is still fully on its previous version.
+    UpgradeCommitFailed = 54,
 }
