@@ -2698,7 +2698,7 @@ fn test_dms_tiered_primary_admin_rearm_during_grace_period() {
     // Premature execution fails during grace period
     advance_time(&env, 24 * 3600); // 24 hours into 72-hour grace period
     let res = client.try_execute_claim_admin();
-    assert_eq!(res.unwrap_err().unwrap(), Error::DmsGracePeriodActive);
+    assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
 
     // Primary admin detects false/premature claim and re-arms switch during grace period
     client.rearm_switch();
@@ -2752,7 +2752,7 @@ fn test_dms_tiered_missed_tier1_and_tier2_council_claim() {
     // Non-council member cannot initiate Tier 2 claim
     let non_signer = Address::generate(&env);
     let res = client.try_initiate_tier2_claim(&non_signer, &candidate_admin);
-    assert_eq!(res.unwrap_err().unwrap(), Error::NotCouncilSigner);
+    assert_eq!(res.unwrap_err().unwrap(), Error::Unauthorized);
 
     // Signer 1 initiates Tier 2 claim (voting 1/3)
     client.initiate_tier2_claim(&s1, &candidate_admin);
@@ -2771,7 +2771,7 @@ fn test_dms_tiered_missed_tier1_and_tier2_council_claim() {
 
     // Trying to execute before 72-hour grace period fails
     let res = client.try_execute_tier2_claim();
-    assert_eq!(res.unwrap_err().unwrap(), Error::DmsGracePeriodActive);
+    assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
 
     // 3. Grace period passes (72 hours)
     advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
@@ -5240,7 +5240,9 @@ fn test_operator_renews_heartbeat_resets_dms_clock() {
     // Advance past the new timeout.
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
 
-    // Now the backup can claim.
+    // Now the backup can initiate a claim, then finalize it after the grace period.
+    client.claim_admin(&backup);
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
     client.claim_admin(&backup);
     assert_eq!(client.get_admin(), Some(backup));
 }

@@ -1635,8 +1635,9 @@ impl PaymentRouter {
     }
 
     /// Appends a new payment telemetry observation to the temporary storage ring buffer.
-    pub fn record_telemetry(env: Env, volume: u32, status: u8) -> PackedTelemetryRecord {
-        let timestamp = env.ledger().timestamp() as u32;
+    pub fn record_telemetry(env: Env, volume: u32, status: u32) -> PackedTelemetryRecord {
+        let timestamp = u32::try_from(env.ledger().timestamp()).unwrap_or(u32::MAX);
+        let status = u8::try_from(status).unwrap_or(u8::MAX);
         storage::append_telemetry(&env, timestamp, volume, status)
     }
 
@@ -2485,7 +2486,7 @@ impl PaymentRouter {
         }
 
         if env.storage().instance().has(&DataKey::DmsPendingClaim) {
-            return Err(Error::DmsClaimPending);
+            return Err(Error::TimelockPending);
         }
 
         let timeout: u64 = env
@@ -2544,10 +2545,10 @@ impl PaymentRouter {
 
         let now = env.ledger().timestamp();
         if now < pending.grace_period_end {
-            return Err(Error::DmsGracePeriodActive);
+            return Err(Error::TimelockNotReady);
         }
 
-        Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 1);
         Ok(())
     }
 
@@ -2555,7 +2556,7 @@ impl PaymentRouter {
     /// - If no claim is currently pending: checks eligibility and initiates the claim.
     /// - If a claim is already pending for `claimant` and the 72-hour grace period has expired:
     ///   finalizes the claim and transfers admin power.
-    /// - If the grace period is still active: returns `Err(Error::DmsGracePeriodActive)`.
+    /// - If the grace period is still active: returns `Err(Error::TimelockNotReady)`.
     pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
         claimant.require_auth();
 
@@ -2575,13 +2576,13 @@ impl PaymentRouter {
             .get::<DataKey, DmsClaimStatus>(&DataKey::DmsPendingClaim)
         {
             if pending.claimant != claimant || pending.tier != 1 {
-                return Err(Error::DmsClaimPending);
+                return Err(Error::TimelockPending);
             }
             let now = env.ledger().timestamp();
             if now < pending.grace_period_end {
-                return Err(Error::DmsGracePeriodActive);
+                return Err(Error::TimelockNotReady);
             }
-            Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+            Self::finalize_dms_claim(&env, pending.candidate_admin, 1);
             return Ok(());
         }
 
@@ -2651,11 +2652,11 @@ impl PaymentRouter {
             .ok_or(Error::NoBackupAdmin)?;
 
         if !council.contains(&caller) {
-            return Err(Error::NotCouncilSigner);
+            return Err(Error::Unauthorized);
         }
 
         if env.storage().instance().has(&DataKey::DmsPendingClaim) {
-            return Err(Error::DmsClaimPending);
+            return Err(Error::TimelockPending);
         }
 
         let last_heartbeat: u64 = env
@@ -2737,7 +2738,7 @@ impl PaymentRouter {
             .ok_or(Error::NoBackupAdmin)?;
 
         if !council.contains(&signer) {
-            return Err(Error::NotCouncilSigner);
+            return Err(Error::Unauthorized);
         }
 
         let pending: DmsClaimStatus = env
@@ -2794,7 +2795,7 @@ impl PaymentRouter {
 
         let now = env.ledger().timestamp();
         if now < pending.grace_period_end {
-            return Err(Error::DmsGracePeriodActive);
+            return Err(Error::TimelockNotReady);
         }
 
         let (threshold, _timeout): (u32, u64) = env
@@ -2812,7 +2813,7 @@ impl PaymentRouter {
             return Err(Error::InsufficientApprovals);
         }
 
-        Self::finalize_dms_claim(&env, pending.candidate_admin, 2)?;
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 2);
         Ok(())
     }
 
@@ -2849,11 +2850,7 @@ impl PaymentRouter {
     }
 
     /// Internal helper to finalize a dead-man's switch claim and transfer admin power.
-    pub(crate) fn finalize_dms_claim(
-        env: &Env,
-        new_admin: Address,
-        tier: u32,
-    ) -> Result<(), Error> {
+    pub(crate) fn finalize_dms_claim(env: &Env, new_admin: Address, tier: u32) {
         let now = env.ledger().timestamp();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         Self::set_role_internal(env, Role::SuperAdmin, &new_admin);
@@ -2878,7 +2875,6 @@ impl PaymentRouter {
             .publish((Symbol::new(env, "admin_claimed"), new_admin), (tier, now));
 
         log!(env, "Admin claimed via dead man's switch");
-        Ok(())
     }
 
     /// Returns the current pending claim status, if any.

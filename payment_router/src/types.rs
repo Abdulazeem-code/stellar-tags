@@ -241,6 +241,22 @@ pub struct MerkleBatch {
     pub reclaimed: bool,
 }
 
+/// Status of an in-flight dead man's switch claim challenge window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmsClaimStatus {
+    /// Address that initiated the claim.
+    pub claimant: Address,
+    /// Ledger timestamp when the claim was initiated.
+    pub initiated_at: u64,
+    /// Timestamp when the grace period challenge window expires.
+    pub grace_period_end: u64,
+    /// Target candidate admin address to be granted ownership.
+    pub candidate_admin: Address,
+    /// Succession tier (1 = primary backup, 2 = multi-sig council).
+    pub tier: u32,
+}
+
 /// Adapter interface implemented by the DEX used for an arbitrary token swap.
 #[contractclient(name = "DexRouterClient")]
 pub trait DexRouter {

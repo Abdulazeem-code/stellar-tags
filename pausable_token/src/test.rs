@@ -332,6 +332,48 @@ fn allowance_expires_and_reads_as_zero() {
 }
 
 #[test]
+fn transfer_from_succeeds_before_expiration_ledger() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+
+    f.token
+        .approve(&f.alice, &spender, &300_000, &(f.ledger() + 1));
+    assert_eq!(f.token.allowance(&f.alice, &spender), 300_000);
+
+    f.token.transfer_from(&spender, &f.alice, &f.bob, &1_000);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 299_000);
+    assert_eq!(f.token.balance(&f.alice), 999_000);
+    assert_eq!(f.token.balance(&f.bob), 1_001_000);
+}
+
+#[test]
+fn expired_allowance_is_zeroed_and_pruned_from_state() {
+    let f = Fixture::new();
+    let spender = Address::generate(&f.env);
+
+    f.token
+        .approve(&f.alice, &spender, &300_000, &(f.ledger() + 10));
+    assert_eq!(f.token.allowance(&f.alice, &spender), 300_000);
+
+    let expired_at = f.ledger() + 11;
+    f.env
+        .ledger()
+        .with_mut(|info| info.sequence_number = expired_at);
+
+    // The allowance reads as zero after expiration.
+    assert_eq!(f.token.allowance(&f.alice, &spender), 0);
+
+    // The expired entry is pruned from persistent storage.
+    let stored: Option<BytesN<20>> = f.env.as_contract(&f.id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(f.alice.clone(), spender.clone()))
+    });
+    assert!(stored.is_none());
+}
+
+#[test]
 fn pause_blocks_every_movement_and_unpause_restores_it() {
     let f = Fixture::new();
     let spender = Address::generate(&f.env);
