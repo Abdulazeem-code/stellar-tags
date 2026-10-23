@@ -2407,10 +2407,8 @@ impl PaymentRouter {
 
         dead_mans_switch::set_heartbeat_operator_internal(&env, &operator);
 
-        env.events().publish(
-            (Symbol::new(&env, "hb_operator_set"), admin),
-            operator,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "hb_operator_set"), admin), operator);
 
         log!(&env, "Heartbeat operator set");
         Ok(())

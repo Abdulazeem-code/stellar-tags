@@ -16,9 +16,7 @@
 //! - Removing the operator (by the admin) clears the key entirely.
 
 use crate::errors::Error;
-use crate::storage::{
-    DataKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
-};
+use crate::storage::{DataKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use soroban_sdk::{Address, Env, Symbol};
 
 // ── Operator storage helpers ─────────────────────────────────────────────────
@@ -41,9 +39,7 @@ pub fn set_heartbeat_operator_internal(env: &Env, operator: &Address) {
 /// No authorization is performed here — callers must verify admin auth before
 /// calling this function.
 pub fn remove_heartbeat_operator_internal(env: &Env) {
-    env.storage()
-        .instance()
-        .remove(&DataKey::HeartbeatOperator);
+    env.storage().instance().remove(&DataKey::HeartbeatOperator);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -51,9 +47,7 @@ pub fn remove_heartbeat_operator_internal(env: &Env) {
 
 /// Returns the current heartbeat operator, or `None` if none is configured.
 pub fn get_heartbeat_operator_internal(env: &Env) -> Option<Address> {
-    env.storage()
-        .instance()
-        .get(&DataKey::HeartbeatOperator)
+    env.storage().instance().get(&DataKey::HeartbeatOperator)
 }
 
 // ── Heartbeat renewal ────────────────────────────────────────────────────────
@@ -98,9 +92,7 @@ pub fn renew_heartbeat(env: &Env, operator: &Address) -> Result<(), Error> {
 
     // Reset only the heartbeat timestamp — nothing else.
     let now = env.ledger().timestamp();
-    env.storage()
-        .instance()
-        .set(&DataKey::LastHeartbeat, &now);
+    env.storage().instance().set(&DataKey::LastHeartbeat, &now);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
