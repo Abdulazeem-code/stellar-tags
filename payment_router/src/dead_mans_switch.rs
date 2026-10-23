@@ -2,14 +2,14 @@
 //!
 //! Allows the admin to appoint a dedicated "heartbeat operator" address that
 //! can renew the dead man's switch heartbeat timestamp without holding any
-//! other administrative privileges.  This avoids requiring the cold-storage
+//! other administrative privileges. This avoids requiring the cold-storage
 //! primary admin key for routine monthly renewal operations.
 //!
 //! # Design invariants
-//! - The operator can **only** reset `DataKey::LastHeartbeat`.  It cannot
+//! - The operator can **only** reset `DataKey::LastHeartbeat`. It cannot
 //!   change the backup admin address, the DMS timeout, or any other contract
 //!   parameter.
-//! - The operator address is stored under `DataKey::HeartbeatOperator` in
+//! - The operator address is stored under `HeartbeatKey::HeartbeatOperator` in
 //!   instance storage.
 //! - There is at most one operator at a time; setting a new one overwrites
 //!   the previous one.
@@ -59,14 +59,14 @@ pub fn get_heartbeat_operator_internal(env: &Env) -> Option<Address> {
 /// Renews the dead man's switch heartbeat on behalf of `operator`.
 ///
 /// # Authorization
-/// `operator` must match the stored `DataKey::HeartbeatOperator` value and
+/// `operator` must match the stored `HeartbeatKey::HeartbeatOperator` value and
 /// must have signed the transaction (i.e. `operator.require_auth()` is called
 /// internally).
 ///
 /// # Restrictions
-/// The operator may **only** reset the heartbeat timestamp.  It cannot modify
+/// The operator may **only** reset the heartbeat timestamp. It cannot modify
 /// the backup admin address, the DMS timeout, or any other contract
-/// parameter.  Those operations remain exclusive to the primary admin.
+/// parameter. Those operations remain exclusive to the primary admin.
 ///
 /// # Errors
 /// - `Error::Unauthorized` — if `operator` does not match the stored operator

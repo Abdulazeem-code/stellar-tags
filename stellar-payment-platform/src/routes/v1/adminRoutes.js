@@ -45,6 +45,7 @@ const {
   replayDlqMessages,
   discardDlqMessage,
 } = require('../../dlq');
+const { triggerManualReplay } = require('../../dlqWorker');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const {
   softDeletePayment,
@@ -542,6 +543,26 @@ router.get(
       failingOver24h,
     });
   }));
+
+  // ── POST /admin/webhooks/dlq/replay ─────────────────────────────────────────
+  // Manually trigger reprocessing of DLQ messages with a fresh attempt budget.
+  // This bypasses the automated backoff schedule and immediately re-queues
+  // selected messages onto their original delivery queues.
+  router.post(
+    '/admin/webhooks/dlq/replay',
+    adminAuth,
+    validateSchema({ body: adminDlqReplayBodySchema }),
+    asyncHandler(async (req, res) => {
+      const { limit, username } = req.body;
+      const result = await triggerManualReplay({ limit, username });
+
+      return res.status(200).json({
+        success: true,
+        replayed: result.replayed.length,
+        failed: result.failed,
+      });
+    }),
+  );
 
   // ── Soft delete / restore (#731) ─────────────────────────────────────────
   // Deleting stamps `deletedAt` instead of removing the row. The matching

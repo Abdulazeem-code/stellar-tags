@@ -6,6 +6,7 @@ const { shouldFallbackToLocalRegistry } = require('./utils');
 const { context, propagation, trace } = require('@opentelemetry/api');
 const { internalFetch } = require('./utils/internalClient');
 const { routeToDlq, isDlqAvailable, DLQ_QUEUE_NAME } = require('./dlq');
+const { prisma } = require('../prismaClient');
 
 /** Reads a positive integer env var, falling back when unset or malformed. */
 const parseEnvInt = (value, fallback) => {
@@ -41,6 +42,41 @@ let webhookQueue;
 let webhookWorker;
 let queueConnection;
 let workerConnection;
+
+/** Record a webhook delivery attempt to the database for replay history. */
+const recordWebhookDelivery = async ({
+  webhookId,
+  username,
+  eventType,
+  eventId,
+  payload,
+  status,
+  responseCode,
+  responseBody,
+  errorMessage,
+  attemptNumber,
+  replayId,
+}) => {
+  try {
+    await prisma.webhookDelivery.create({
+      data: {
+        webhookId,
+        username,
+        eventType,
+        eventId,
+        payload,
+        status,
+        responseCode,
+        responseBody,
+        errorMessage,
+        attemptNumber,
+        replayId,
+      },
+    });
+  } catch (err) {
+    logger.error(`[webhook-worker] Failed to record delivery for webhook ${webhookId}: ${err.message}`);
+  }
+};
 
 const computeSignature = (secret, rawBody) => {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
@@ -98,7 +134,7 @@ const getWebhooksExhaustedRetries = async (prisma) => {
   });
 };
 
-const sendWebhook = async (url, payload, secret) => {
+const sendWebhook = async (url, payload, secret, webhookId, username) => {
   const rawBody = JSON.stringify(payload);
   const signature = computeSignature(secret, rawBody);
   // `Stellar-Timestamp` is the ISO 8601 dispatch timestamp already present
@@ -110,9 +146,9 @@ const sendWebhook = async (url, payload, secret) => {
   const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
   try {
     // internalFetch is a pass-through to `fetch` for merchant endpoints on the
-  // public internet, and presents this service's client certificate when a
-  // webhook points at another internal service.
-  const response = await internalFetch(url, {
+    // public internet, and presents this service's client certificate when a
+    // webhook points at another internal service.
+    const response = await internalFetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -128,10 +164,21 @@ const sendWebhook = async (url, payload, secret) => {
       body: rawBody,
       signal: controller.signal,
     });
-    if (!response.ok) {
-      throw new Error(`Webhook responded with HTTP ${response.status}`);
+    
+    let responseBody = null;
+    try {
+      responseBody = await response.text();
+    } catch {
+      responseBody = null;
     }
-    return { ok: true };
+    
+    if (!response.ok) {
+      const error = new Error(`Webhook responded with HTTP ${response.status}`);
+      error.responseCode = response.status;
+      error.responseBody = responseBody;
+      throw error;
+    }
+    return { ok: true, responseBody };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -161,30 +208,42 @@ const markWebhookFailure = async (prisma, webhookId, now) => {
 const processWebhookJobImpl = async (job, { prisma }) => {
   const { webhook, payload } = job.data;
   const now = new Date();
+  const attemptNumber = job.attemptsMade + 1;
 
+  let result;
   try {
-    await sendWebhook(webhook.url, payload, webhook.secret);
+    result = await sendWebhook(webhook.url, payload, webhook.secret, webhook.id, webhook.username);
+    await markWebhookSuccess(prisma, webhook.id, now);
+    await recordWebhookDelivery({
+      webhookId: webhook.id,
+      username: webhook.username,
+      eventType: payload.event,
+      eventId: payload.event_id,
+      payload,
+      status: 'success',
+      responseCode: 200,
+      responseBody: result.responseBody,
+      attemptNumber,
+    });
   } catch (error) {
-    try {
-      await markWebhookFailure(prisma, webhook.id, now);
-    } catch (databaseError) {
-      logger.error(
-        `[webhook-worker] Failed to mark failure for webhook ${webhook.id}: ${databaseError.message}`,
-      );
-    }
+    await markWebhookFailure(prisma, webhook.id, now);
+    await recordWebhookDelivery({
+      webhookId: webhook.id,
+      username: webhook.username,
+      eventType: payload.event,
+      eventId: payload.event_id,
+      payload,
+      status: 'failed',
+      responseCode: error.responseCode,
+      responseBody: error.responseBody,
+      errorMessage: error.message,
+      attemptNumber,
+    });
     throw error;
   }
 
-  try {
-    await markWebhookSuccess(prisma, webhook.id, now);
-  } catch (databaseError) {
-    logger.error(
-      `[webhook-worker] Failed to mark success for webhook ${webhook.id}: ${databaseError.message}`,
-    );
-  }
-
   logger.info(
-    `[webhook-worker] Delivered event=${payload.event_id} webhook=${webhook.id} attempt=${job.attemptsMade + 1}`,
+    `[webhook-worker] Delivered event=${payload.event_id} webhook=${webhook.id} attempt=${attemptNumber}`,
   );
 };
 
@@ -459,11 +518,21 @@ const replayFromDLQ = async (prisma, dqlId) => {
   const secret = entry.webhookSecret;
 
   try {
-    await sendWebhook(entry.webhookUrl, payload, secret);
+    await sendWebhook(entry.webhookUrl, payload, secret, entry.webhookId, entry.username);
     const now = new Date();
     await prisma.webhookDLQ.update({
       where: { id: dqlId },
       data: { replayed: true, replayedAt: now },
+    });
+    await recordWebhookDelivery({
+      webhookId: entry.webhookId,
+      username: entry.username,
+      eventType: payload.event,
+      eventId: payload.event_id,
+      payload,
+      status: 'replayed',
+      responseCode: 200,
+      attemptNumber: (entry.deliveryAttempts || 0) + 1,
     });
     logger.info(`[webhook-worker] DLQ entry ${dqlId} replayed successfully`);
     return { ok: true };
@@ -504,6 +573,7 @@ module.exports = {
   moveToDLQ,
   listDLQEntries,
   replayFromDLQ,
+  recordWebhookDelivery,
 };
 
 
