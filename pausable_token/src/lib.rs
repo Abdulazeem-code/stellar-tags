@@ -439,7 +439,7 @@ impl PausableToken {
         while i < STRKEY_LEN {
             let value = match encoded[i] {
                 b'A'..=b'Z' => u32::from(encoded[i] - b'A'),
-                b'2'..=b'7' => u32::from(encoded[i] - b'2' + 26),
+                b'2'..=b'7' => u32::from(encoded[i] - b'2') + 26,
                 _ => return Err(Error::InvalidSignature),
             };
             accumulator = (accumulator << 5) | value;
