@@ -164,7 +164,7 @@ pub struct SwapPayment {
     pub dex: Address,
 }
 
-// ── Error codes ───────────────────────────────────────────────────────────────
+// ── Error codes ──────────────────────────────────────────────────────────────
 
 /// Errors specific to the proxy contract.
 #[contracterror]
