@@ -41,14 +41,7 @@ impl UserRecord {
     pub fn has_flag(&self, bit: u8) -> bool {
         let byte = (bit / 8) as usize;
         let offset = bit % 8;
-        self.flags
-            .to_array()
-            .get(byte)
-            .copied()
-            .unwrap_or(0)
-            >> offset
-            & 1
-            == 1
+        self.flags.to_array().get(byte).copied().unwrap_or(0) >> offset & 1 == 1
     }
 
     /// Sets the flag at `bit` (0..=255) to `val` on `self`.

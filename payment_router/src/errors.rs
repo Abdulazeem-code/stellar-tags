@@ -2,7 +2,7 @@ use soroban_sdk::contracterror;
 
 /// Contract-level errors returned instead of panicking, so callers get a
 /// specific, stable error code to branch on rather than an opaque trap.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
@@ -129,4 +129,8 @@ pub enum Error {
     /// The claimed amount does not match the amount committed in the Merkle
     /// leaf for this recipient.
     MerkleAmountMismatch = 54,
+    /// A persisted pair-specific slippage override is out of the allowed range.
+    InvalidSlippageConfig = 55,
+    /// A swap path revisits the same asset, forming a cycle.
+    CyclicSwapPath = 56,
 }

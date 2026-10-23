@@ -1,7 +1,6 @@
 #![no_std]
 pub mod access;
 mod archival;
-pub mod batch;
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
@@ -11,7 +10,6 @@ pub mod types;
 
 pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
-pub use batch::*;
 pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
@@ -1432,6 +1430,36 @@ impl PaymentRouter {
         Self::is_paused_internal(&env)
     }
 
+    /// Returns the current tiered pause level.
+    ///
+    /// # Returns
+    /// The configured [`PauseLevel`], defaulting to [`PauseLevel::None`].
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_pause_level(env: Env) -> PauseLevel {
+        access::get_pause_level(&env)
+    }
+
+    /// Sets the tiered pause level. Requires the `Pauser` role.
+    ///
+    /// # Parameters
+    /// - `level`: The new [`PauseLevel`].
+    ///
+    /// # Panics
+    /// Panics if the current `Pauser` does not authorize the call.
+    pub fn set_pause_level(env: Env, level: PauseLevel) -> Result<(), Error> {
+        Self::require_role(&env, Role::Pauser)?;
+        access::set_pause_level(&env, level);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("plevel"),), level as u32);
+        Ok(())
+    }
+
     /// Returns the cumulative amount a given sender has routed through the contract.
     ///
     /// # Parameters
@@ -1525,7 +1553,13 @@ impl PaymentRouter {
             let zero_flags = BytesN::from_array(&env, &[0u8; 32]);
             env.storage().persistent().set(
                 &record_key,
-                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume, &zero_flags),
+                &pack_user_record(
+                    &env,
+                    last_reset_time,
+                    accumulated_amount,
+                    legacy_volume,
+                    &zero_flags,
+                ),
             );
             env.storage().persistent().extend_ttl(
                 &record_key,
@@ -2300,6 +2334,100 @@ impl PaymentRouter {
         (backup, timeout, last, elapsed)
     }
 
+    /// Returns the configured heartbeat operator, if any.
+    ///
+    /// # Returns
+    /// `Some(operator)` when an operator has been appointed, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_heartbeat_operator(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::HeartbeatOperator)
+    }
+
+    /// Appoints a heartbeat operator. Admin-only.
+    ///
+    /// The operator is authorized to renew the dead man's switch heartbeat via
+    /// [`Self::renew_heartbeat`] without holding full admin rights.
+    ///
+    /// # Parameters
+    /// - `operator`: Address to appoint as heartbeat operator.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_heartbeat_operator(env: Env, operator: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::HeartbeatOperator, &operator);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events()
+            .publish((symbol_short!("operset"), admin), operator);
+        Ok(())
+    }
+
+    /// Removes the heartbeat operator. Admin-only.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn remove_heartbeat_operator(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().remove(&DataKey::HeartbeatOperator);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events().publish((symbol_short!("hbrem"), admin), ());
+        Ok(())
+    }
+
+    /// Renews the dead man's switch heartbeat. Callable only by the configured
+    /// heartbeat operator. Requires the switch to be armed (a backup admin
+    /// configured). Resets the claim clock so `claim_admin` cannot fire until
+    /// the timeout elapses again.
+    ///
+    /// # Parameters
+    /// - `operator`: Address asserting to be the heartbeat operator.
+    ///
+    /// # Returns
+    /// `Err(Error::Unauthorized)` if `operator` is not the configured operator,
+    /// or `Err(Error::InvalidDmsConfig)` if the switch is not armed.
+    ///
+    /// # Panics
+    /// Panics if `operator` does not authorize the call.
+    pub fn renew_heartbeat(env: Env, operator: Address) -> Result<(), Error> {
+        let configured = env.storage().instance().get(&DataKey::HeartbeatOperator);
+        let Some(expected) = configured else {
+            return Err(Error::Unauthorized);
+        };
+        if operator != expected {
+            return Err(Error::Unauthorized);
+        }
+        operator.require_auth();
+
+        if !env.storage().instance().has(&DataKey::BackupAdmin) {
+            return Err(Error::InvalidDmsConfig);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("hbren"), operator), env.ledger().timestamp());
+        log!(&env, "Heartbeat renewed by operator");
+        Ok(())
+    }
+
     /// Returns `true` if the dead man's switch is armed (a backup admin is
     /// configured) and the timeout has elapsed, i.e. `claim_admin` would
     /// currently succeed for the backup.
@@ -2932,6 +3060,10 @@ impl PaymentRouter {
         fee_cap: i128,
     ) -> Result<i128, Error> {
         swap.sender.require_auth();
+
+        // Tiered circuit breaker: swap routing is halted under any pause
+        // level other than `None`, before any DEX or balance check.
+        access::require_swaps_not_paused(env)?;
 
         // --- Validate the swap parameters -----------------------------------
         if swap.sell_token == swap.buy_token {

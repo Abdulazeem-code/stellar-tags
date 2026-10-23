@@ -53,7 +53,7 @@ pub enum Role {
 }
 
 /// Storage keys for all contract instance and persistent data.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// The current admin address.
@@ -271,10 +271,7 @@ pub fn pack_user_record(
     BytesN::from_array(env, &buf)
 }
 
-pub fn unpack_user_record(
-    env: &Env,
-    packed: &BytesN<72>,
-) -> (u64, i128, i128, BytesN<32>) {
+pub fn unpack_user_record(env: &Env, packed: &BytesN<72>) -> (u64, i128, i128, BytesN<32>) {
     let buf: [u8; 72] = packed.to_array();
     let last_reset_time = u64::from_be_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
@@ -287,7 +284,10 @@ pub fn unpack_user_record(
         buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33],
         buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
     ]);
-    let flags: [u8; 32] = buf[40..72].try_into().unwrap();
+    // `buf` is always 72 bytes, so `buf[40..72]` is exactly 32 bytes and the
+    // conversion below is infallible.
+    let mut flags = [0u8; 32];
+    flags.copy_from_slice(&buf[40..72]);
     (
         last_reset_time,
         accumulated_amount,
@@ -403,8 +403,7 @@ pub fn load_user_record(
         .persistent()
         .get::<DataKey, BytesN<72>>(&record_key)
     {
-        let (last_reset_time, accumulated_amount, volume, flags) =
-            unpack_user_record(env, &packed);
+        let (last_reset_time, accumulated_amount, volume, flags) = unpack_user_record(env, &packed);
         return (last_reset_time, accumulated_amount, volume, flags, false);
     }
 
@@ -495,10 +494,7 @@ pub struct MerkleBatchRecord {
 
 /// Returns the number of `u64` words required to store `leaf_count` bits.
 pub fn merkle_bitset_words(leaf_count: u32) -> u32 {
-    if leaf_count == 0 {
-        return 0;
-    }
-    (leaf_count + MERKLE_BITS_PER_WORD - 1) / MERKLE_BITS_PER_WORD
+    leaf_count.div_ceil(MERKLE_BITS_PER_WORD)
 }
 
 /// Reads the packed claimed bitset for a batch, returning an empty vector when
