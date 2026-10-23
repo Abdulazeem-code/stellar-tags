@@ -276,11 +276,8 @@ fn twap_rejects_a_window_wider_than_history_with_one_observation() {
 #[allow(dead_code)]
 struct DualOracleSetup {
     env: Env,
-    admin: Address,
     client: TwapOracleClient<'static>,
-    secondary_admin: Address,
     secondary_client: TwapOracleClient<'static>,
-    secondary_id: Address,
 }
 
 fn setup_dual_oracle() -> DualOracleSetup {
@@ -303,11 +300,8 @@ fn setup_dual_oracle() -> DualOracleSetup {
 
     DualOracleSetup {
         env,
-        admin,
         client,
-        secondary_admin,
         secondary_client,
-        secondary_id,
     }
 }
 
@@ -425,24 +419,27 @@ fn consult_trips_circuit_breaker_when_discrepancy_exceeds_threshold() {
 
     assert!(!setup.client.is_circuit_breaker_tripped());
 
-    // Should trip the circuit breaker and revert
+    // Should reject the consultation with the circuit-breaker error
     assert_eq!(
         setup.client.try_consult(&60),
         Err(Ok(Error::CircuitBreakerTripped))
     );
 
-    // In Soroban, invocations returning Err revert uncommitted state.
-    // To persistently freeze operations following divergence, admin trips breaker:
+    // The rejected call was rolled back in full, so it did not leave the
+    // breaker tripped: nothing an invocation writes survives its own failure.
+    // Freezing pricing across transactions therefore needs an explicit trip.
+    assert!(!setup.client.is_circuit_breaker_tripped());
+
+    // The disagreement is still there, so every further consultation is
+    // rejected instead of being served a price.
+    assert_eq!(
+        setup.client.try_consult(&60),
+        Err(Ok(Error::CircuitBreakerTripped))
+    );
+
+    // An admin trip is what freezes pricing until a reset.
     setup.client.trip_circuit_breaker();
-
-    // Circuit breaker is now persistently tripped
     assert!(setup.client.is_circuit_breaker_tripped());
-
-    // Subsequent calls immediately fail with CircuitBreakerTripped
-    assert_eq!(
-        setup.client.try_consult(&60),
-        Err(Ok(Error::CircuitBreakerTripped))
-    );
 }
 
 #[test]

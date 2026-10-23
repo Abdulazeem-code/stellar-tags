@@ -16,9 +16,7 @@
 //! - Removing the operator (by the admin) clears the key entirely.
 
 use crate::errors::Error;
-use crate::storage::{
-    DataKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
-};
+use crate::storage::{DataKey, HeartbeatKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use soroban_sdk::{Address, Env, Symbol};
 
 // ── Operator storage helpers ─────────────────────────────────────────────────
@@ -30,7 +28,7 @@ use soroban_sdk::{Address, Env, Symbol};
 pub fn set_heartbeat_operator_internal(env: &Env, operator: &Address) {
     env.storage()
         .instance()
-        .set(&DataKey::HeartbeatOperator, operator);
+        .set(&HeartbeatKey::HeartbeatOperator, operator);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -43,7 +41,7 @@ pub fn set_heartbeat_operator_internal(env: &Env, operator: &Address) {
 pub fn remove_heartbeat_operator_internal(env: &Env) {
     env.storage()
         .instance()
-        .remove(&DataKey::HeartbeatOperator);
+        .remove(&HeartbeatKey::HeartbeatOperator);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -53,7 +51,7 @@ pub fn remove_heartbeat_operator_internal(env: &Env) {
 pub fn get_heartbeat_operator_internal(env: &Env) -> Option<Address> {
     env.storage()
         .instance()
-        .get(&DataKey::HeartbeatOperator)
+        .get(&HeartbeatKey::HeartbeatOperator)
 }
 
 // ── Heartbeat renewal ────────────────────────────────────────────────────────
@@ -81,7 +79,7 @@ pub fn renew_heartbeat(env: &Env, operator: &Address) -> Result<(), Error> {
     let stored_operator: Address = env
         .storage()
         .instance()
-        .get(&DataKey::HeartbeatOperator)
+        .get(&HeartbeatKey::HeartbeatOperator)
         .ok_or(Error::Unauthorized)?;
 
     if *operator != stored_operator {
@@ -98,9 +96,7 @@ pub fn renew_heartbeat(env: &Env, operator: &Address) -> Result<(), Error> {
 
     // Reset only the heartbeat timestamp — nothing else.
     let now = env.ledger().timestamp();
-    env.storage()
-        .instance()
-        .set(&DataKey::LastHeartbeat, &now);
+    env.storage().instance().set(&DataKey::LastHeartbeat, &now);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
