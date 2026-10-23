@@ -4567,6 +4567,49 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Approves a multi-signature proposal with expiration and nonce replay protection.
+    pub fn approve_proposal(
+        env: Env,
+        signer: Address,
+        proposal: MultisigProposal,
+    ) -> Result<BytesN<32>, Error> {
+        access::approve_proposal(&env, &signer, &proposal)
+    }
+
+    /// Revokes an approval for a multi-signature proposal.
+    pub fn revoke_proposal_approval(
+        env: Env,
+        signer: Address,
+        proposal: MultisigProposal,
+    ) -> Result<(), Error> {
+        access::revoke_proposal_approval(&env, &signer, &proposal)
+    }
+
+    /// Checks if a multi-signature proposal has reached the threshold of approvals.
+    pub fn is_proposal_authorized(env: Env, proposal: MultisigProposal) -> Result<bool, Error> {
+        access::check_proposal_authorized(&env, &proposal)
+    }
+
+    /// Executes an authorized multi-signature proposal: marks proposal hash as consumed
+    /// and applies the proposed administrative state transition.
+    pub fn execute_proposal(env: Env, proposal: MultisigProposal) -> Result<(), Error> {
+        access::execute_proposal(&env, &proposal)
+    }
+
+    /// Returns the effective approvals currently collected for a proposal.
+    pub fn get_proposal_approvals(env: Env, proposal: MultisigProposal) -> Vec<Address> {
+        let digest = access::compute_proposal_hash(&env, &proposal);
+        match access::load_multisig_config(&env) {
+            Ok((signers, _)) => access::load_effective_proposal_approvals(&env, &signers, &digest),
+            Err(_) => Vec::new(&env),
+        }
+    }
+
+    /// Returns whether a proposal hash has already been executed.
+    pub fn is_proposal_executed(env: Env, proposal_hash: BytesN<32>) -> bool {
+        access::is_proposal_executed(&env, &proposal_hash)
+    }
+
     /// Returns the contract version.
     ///
     /// This is a read-only view function: it does not write to ledger storage

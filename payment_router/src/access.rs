@@ -3,7 +3,8 @@ use crate::storage::{
     DataKey, PauseLevel, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
-use crate::types::ActionType;
+use crate::types::{ActionType, MultisigProposal};
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 // ── Role-Based Access Control (RBAC) Helpers ─────────────────────────────────
@@ -297,6 +298,7 @@ pub fn apply_upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
     env.storage()
         .persistent()
         .remove(&DataKey::UpgradeApproval(new_wasm_hash.clone()));
+    mark_proposal_executed(env, new_wasm_hash);
 }
 
 pub fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
@@ -326,5 +328,182 @@ pub fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Erro
         }
         _ => {}
     }
+    Ok(())
+}
+
+// ── Multi-signature Proposal Expiration & Nonce Protection ───────────────────
+
+/// Computes the cryptographic digest (SHA-256) of a multi-signature proposal.
+/// Incorporates `action`, `deadline_ledger`, and `nonce` into the digest.
+pub fn compute_proposal_hash(env: &Env, proposal: &MultisigProposal) -> BytesN<32> {
+    env.crypto().sha256(&proposal.clone().to_xdr(env))
+}
+
+/// Convenience alias for `compute_proposal_hash`.
+pub fn proposal_digest(env: &Env, proposal: &MultisigProposal) -> BytesN<32> {
+    compute_proposal_hash(env, proposal)
+}
+
+/// Returns true if a proposal digest has already been marked as executed.
+pub fn is_proposal_executed(env: &Env, proposal_hash: &BytesN<32>) -> bool {
+    env.storage()
+        .persistent()
+        .get::<DataKey, bool>(&DataKey::ExecutedProposal(proposal_hash.clone()))
+        .unwrap_or(false)
+}
+
+/// Marks a proposal digest as executed in persistent storage, preventing replay attacks.
+pub fn mark_proposal_executed(env: &Env, proposal_hash: &BytesN<32>) {
+    let key = DataKey::ExecutedProposal(proposal_hash.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+    env.storage()
+        .persistent()
+        .remove(&DataKey::UpgradeApproval(proposal_hash.clone()));
+}
+
+/// Validates a multi-signature proposal:
+/// - Reverts with `Error::ApprovalExpired` if current ledger sequence exceeds `deadline_ledger`.
+/// - Reverts with `Error::ProposalAlreadyExecuted` if the proposal has already been executed.
+pub fn validate_proposal(env: &Env, proposal: &MultisigProposal) -> Result<BytesN<32>, Error> {
+    if env.ledger().sequence() > proposal.deadline_ledger {
+        return Err(Error::ApprovalExpired);
+    }
+    let digest = compute_proposal_hash(env, proposal);
+    if is_proposal_executed(env, &digest) {
+        return Err(Error::ProposalAlreadyExecuted);
+    }
+    Ok(digest)
+}
+
+/// Loads collected signer approvals for a given proposal hash.
+pub fn load_proposal_approvals(env: &Env, proposal_hash: &BytesN<32>) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UpgradeApproval(proposal_hash.clone()))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Filters collected approvals to only include current members of the multisig group.
+pub fn load_effective_proposal_approvals(
+    env: &Env,
+    signers: &Vec<Address>,
+    proposal_hash: &BytesN<32>,
+) -> Vec<Address> {
+    let stored = load_proposal_approvals(env, proposal_hash);
+    let mut effective = Vec::new(env);
+    for i in 0..stored.len() {
+        if let Some(approver) = stored.get(i) {
+            if signers.contains(&approver) {
+                effective.push_back(approver);
+            }
+        }
+    }
+    effective
+}
+
+/// Checks if a proposal has reached the required threshold of effective signer approvals.
+pub fn check_proposal_authorized(env: &Env, proposal: &MultisigProposal) -> Result<bool, Error> {
+    let digest = validate_proposal(env, proposal)?;
+    let (signers, threshold) = load_multisig_config(env)?;
+    Ok(load_effective_proposal_approvals(env, &signers, &digest).len() >= threshold)
+}
+
+/// Ensures a proposal has reached threshold approvals, returning `(digest, count)`.
+pub fn require_proposal_authorized(
+    env: &Env,
+    proposal: &MultisigProposal,
+) -> Result<(BytesN<32>, u32), Error> {
+    let digest = validate_proposal(env, proposal)?;
+    let (signers, threshold) = load_multisig_config(env)?;
+    let approvals = load_effective_proposal_approvals(env, &signers, &digest);
+    if approvals.len() < threshold {
+        return Err(Error::InsufficientApprovals);
+    }
+    Ok((digest, approvals.len()))
+}
+
+/// Records a signer's approval for a multi-signature proposal.
+/// - Validates deadline and replay status.
+/// - Validates signer membership and requires authorization.
+pub fn approve_proposal(
+    env: &Env,
+    signer: &Address,
+    proposal: &MultisigProposal,
+) -> Result<BytesN<32>, Error> {
+    let digest = validate_proposal(env, proposal)?;
+
+    let (signers, _) = load_multisig_config(env)?;
+    if !signers.contains(signer) {
+        return Err(Error::NotMultisigSigner);
+    }
+    signer.require_auth();
+
+    let key = DataKey::UpgradeApproval(digest.clone());
+    let mut approvals: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if approvals.contains(signer) {
+        return Err(Error::AlreadyApproved);
+    }
+    approvals.push_back(signer.clone());
+    env.storage().persistent().set(&key, &approvals);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+
+    Ok(digest)
+}
+
+/// Revokes a signer's approval for a multi-signature proposal.
+pub fn revoke_proposal_approval(
+    env: &Env,
+    signer: &Address,
+    proposal: &MultisigProposal,
+) -> Result<(), Error> {
+    let digest = validate_proposal(env, proposal)?;
+
+    let (signers, _) = load_multisig_config(env)?;
+    if !signers.contains(signer) {
+        return Err(Error::NotMultisigSigner);
+    }
+    signer.require_auth();
+
+    let key = DataKey::UpgradeApproval(digest);
+    let mut approvals: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    if let Some(index) = approvals.first_index_of(signer) {
+        approvals.remove(index);
+        if approvals.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &approvals);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Executes an authorized proposal: marks digest as consumed and applies the state transition.
+pub fn execute_proposal(env: &Env, proposal: &MultisigProposal) -> Result<(), Error> {
+    let (digest, _) = require_proposal_authorized(env, proposal)?;
+    mark_proposal_executed(env, &digest);
+    crate::timelock::apply_action(env, proposal.action.clone())?;
     Ok(())
 }

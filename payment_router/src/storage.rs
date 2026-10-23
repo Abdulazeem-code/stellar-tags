@@ -181,6 +181,8 @@ pub enum DataKey {
     MultisigThreshold,
     /// Signer approvals collected for a specific upgrade WASM hash.
     UpgradeApproval(BytesN<32>),
+    /// Executed proposal hashes recorded to prevent replay attacks.
+    ExecutedProposal(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
     /// Packed claimed-leaf bitmap for a Merkle payment batch.
