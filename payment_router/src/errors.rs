@@ -131,4 +131,10 @@ pub enum Error {
     /// commit. The entire invocation was rolled back, so no contract was
     /// upgraded: the protocol is still fully on its previous version.
     UpgradeCommitFailed = 54,
+    /// A dead man's switch claim is already pending and in its grace period.
+    DmsClaimPending = 55,
+    /// The 72-hour challenge grace period for a DMS claim is still active.
+    DmsGracePeriodActive = 56,
+    /// The caller is not a member of the Tier 2 council.
+    NotCouncilSigner = 57,
 }

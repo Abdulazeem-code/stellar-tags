@@ -1584,36 +1584,6 @@ impl PaymentRouter {
         Self::is_paused_internal(&env)
     }
 
-    /// Returns the current tiered pause level.
-    ///
-    /// # Returns
-    /// The configured [`PauseLevel`], defaulting to [`PauseLevel::None`].
-    ///
-    /// # Panics
-    /// Does not panic.
-    pub fn get_pause_level(env: Env) -> PauseLevel {
-        access::get_pause_level(&env)
-    }
-
-    /// Sets the tiered pause level. Requires the `Pauser` role.
-    ///
-    /// # Parameters
-    /// - `level`: The new [`PauseLevel`].
-    ///
-    /// # Panics
-    /// Panics if the current `Pauser` does not authorize the call.
-    pub fn set_pause_level(env: Env, level: PauseLevel) -> Result<(), Error> {
-        Self::require_role(&env, Role::Pauser)?;
-        access::set_pause_level(&env, level);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        env.events()
-            .publish((symbol_short!("plevel"),), level as u32);
-        Ok(())
-    }
-
     /// Returns the cumulative amount a given sender has routed through the contract.
     ///
     /// # Parameters
@@ -1670,8 +1640,8 @@ impl PaymentRouter {
     }
 
     /// Appends a new payment telemetry observation to the temporary storage ring buffer.
-    pub fn record_telemetry(env: Env, volume: u32, status: u8) -> PackedTelemetryRecord {
-        let timestamp = env.ledger().timestamp() as u32;
+    pub fn record_telemetry(env: Env, volume: u32, status: u32) -> PackedTelemetryRecord {
+        let timestamp = u32::try_from(env.ledger().timestamp()).unwrap_or(0);
         storage::append_telemetry(&env, timestamp, volume, status)
     }
 
@@ -2590,7 +2560,7 @@ impl PaymentRouter {
             return Err(Error::DmsGracePeriodActive);
         }
 
-        Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 1);
         Ok(())
     }
 
@@ -2624,7 +2594,7 @@ impl PaymentRouter {
             if now < pending.grace_period_end {
                 return Err(Error::DmsGracePeriodActive);
             }
-            Self::finalize_dms_claim(&env, pending.candidate_admin, 1)?;
+            Self::finalize_dms_claim(&env, pending.candidate_admin, 1);
             return Ok(());
         }
 
@@ -2855,7 +2825,7 @@ impl PaymentRouter {
             return Err(Error::InsufficientApprovals);
         }
 
-        Self::finalize_dms_claim(&env, pending.candidate_admin, 2)?;
+        Self::finalize_dms_claim(&env, pending.candidate_admin, 2);
         Ok(())
     }
 
@@ -2892,11 +2862,7 @@ impl PaymentRouter {
     }
 
     /// Internal helper to finalize a dead-man's switch claim and transfer admin power.
-    pub(crate) fn finalize_dms_claim(
-        env: &Env,
-        new_admin: Address,
-        tier: u32,
-    ) -> Result<(), Error> {
+    pub(crate) fn finalize_dms_claim(env: &Env, new_admin: Address, tier: u32) {
         let now = env.ledger().timestamp();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         Self::set_role_internal(env, Role::SuperAdmin, &new_admin);
@@ -2921,7 +2887,6 @@ impl PaymentRouter {
             .publish((Symbol::new(env, "admin_claimed"), new_admin), (tier, now));
 
         log!(env, "Admin claimed via dead man's switch");
-        Ok(())
     }
 
     /// Returns the current pending claim status, if any.

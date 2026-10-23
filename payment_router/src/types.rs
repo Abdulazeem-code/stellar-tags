@@ -1,5 +1,21 @@
 use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, Vec};
 
+/// Status of a pending dead man's switch claim.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmsClaimStatus {
+    /// The address that initiated the claim (backup admin or council member).
+    pub claimant: Address,
+    /// Unix timestamp when the claim was initiated.
+    pub initiated_at: u64,
+    /// Unix timestamp when the 72-hour grace period ends.
+    pub grace_period_end: u64,
+    /// The candidate admin address that will become admin if claim succeeds.
+    pub candidate_admin: Address,
+    /// The claim tier (1 = backup admin, 2 = council multi-sig).
+    pub tier: u32,
+}
+
 /// A user's rolling 24-hour spending record.
 ///
 /// Retained purely so existing test snapshots that reference this type by

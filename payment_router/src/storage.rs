@@ -224,6 +224,16 @@ pub const USER_FLAG_BITS: u32 = 256;
 /// Byte length of the packed flag bitmap (256 bits = 32 bytes).
 pub const USER_FLAG_BYTES: usize = 32;
 
+/// TTL bump for temporary storage entries (shorter than persistent).
+pub const TEMPORARY_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
+/// Lifetime threshold for temporary storage entries.
+pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = TEMPORARY_BUMP_AMOUNT - DAY_IN_LEDGERS;
+
+/// Default capacity for the telemetry ring buffer.
+pub const DEFAULT_TELEMETRY_CAPACITY: u32 = 1000;
+/// Maximum capacity for the telemetry ring buffer.
+pub const MAX_TELEMETRY_CAPACITY: u32 = 10000;
+
 // ── Reentrancy Guard ─────────────────────────────────────────────────────────
 
 pub struct ReentrancyGuard<'a> {
@@ -542,4 +552,179 @@ pub fn merkle_bit_set(env: &Env, bits: &mut Vec<u64>, index: u32) {
     let current = bits.get(word).unwrap_or(0);
     bits.set(word, current | (1u64 << offset));
     let _ = env;
+}
+
+/// A packed telemetry record stored in the temporary ring buffer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackedTelemetryRecord {
+    /// Unix timestamp (seconds) when the observation was recorded.
+    pub timestamp: u32,
+    /// Payment volume in smallest token units.
+    pub volume: u32,
+    /// Status code (e.g., 0 = success, 1 = failed, etc.).
+    pub status: u32,
+    /// Reserved for alignment/padding.
+    pub reserved: u32,
+}
+
+/// Internal key for the telemetry ring buffer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TelemetryKey {
+    /// Ring buffer of packed telemetry records.
+    Buffer,
+    /// Current write position in the ring buffer.
+    Head,
+    /// Number of valid entries in the buffer.
+    Length,
+}
+
+/// Appends a new telemetry observation to the temporary ring buffer.
+pub fn append_telemetry(
+    env: &Env,
+    timestamp: u32,
+    volume: u32,
+    status: u32,
+) -> PackedTelemetryRecord {
+    let capacity = env
+        .storage()
+        .temporary()
+        .get::<TelemetryKey, u32>(&TelemetryKey::Buffer)
+        .map(|_| {
+            // Buffer exists, get its current capacity by checking length
+            env.storage()
+                .temporary()
+                .get::<TelemetryKey, u32>(&TelemetryKey::Length)
+                .unwrap_or(0)
+        })
+        .unwrap_or(DEFAULT_TELEMETRY_CAPACITY);
+
+    let record = PackedTelemetryRecord {
+        timestamp,
+        volume,
+        status,
+        reserved: 0,
+    };
+
+    // Read current buffer
+    let mut buffer: Vec<PackedTelemetryRecord> = env
+        .storage()
+        .temporary()
+        .get(&TelemetryKey::Buffer)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let head: u32 = env
+        .storage()
+        .temporary()
+        .get(&TelemetryKey::Head)
+        .unwrap_or(0);
+    let length: u32 = env
+        .storage()
+        .temporary()
+        .get(&TelemetryKey::Length)
+        .unwrap_or(0);
+
+    if buffer.len() < capacity {
+        buffer.push_back(record.clone());
+    } else {
+        buffer.set(head, record.clone());
+    }
+
+    let new_head = (head + 1) % capacity;
+    let new_length = if length < capacity {
+        length + 1
+    } else {
+        length
+    };
+
+    env.storage()
+        .temporary()
+        .set(&TelemetryKey::Buffer, &buffer);
+    env.storage()
+        .temporary()
+        .set(&TelemetryKey::Head, &new_head);
+    env.storage()
+        .temporary()
+        .set(&TelemetryKey::Length, &new_length);
+
+    // Extend TTL for temporary storage
+    env.storage().temporary().extend_ttl(
+        &TelemetryKey::Buffer,
+        TEMPORARY_LIFETIME_THRESHOLD,
+        TEMPORARY_BUMP_AMOUNT,
+    );
+    env.storage().temporary().extend_ttl(
+        &TelemetryKey::Head,
+        TEMPORARY_LIFETIME_THRESHOLD,
+        TEMPORARY_BUMP_AMOUNT,
+    );
+    env.storage().temporary().extend_ttl(
+        &TelemetryKey::Length,
+        TEMPORARY_LIFETIME_THRESHOLD,
+        TEMPORARY_BUMP_AMOUNT,
+    );
+
+    record
+}
+
+/// Returns the rolling average volume from the telemetry ring buffer.
+pub fn get_telemetry_average(env: &Env) -> u64 {
+    let buffer: Vec<PackedTelemetryRecord> = env
+        .storage()
+        .temporary()
+        .get(&TelemetryKey::Buffer)
+        .unwrap_or_else(|| Vec::new(env));
+
+    if buffer.is_empty() {
+        return 0;
+    }
+
+    let sum: u128 = buffer.iter().map(|r| u128::from(r.volume)).sum();
+    let avg = sum / u128::from(buffer.len());
+    u64::try_from(avg).unwrap_or(0)
+}
+
+/// Computes the statistical percentile (0..=100) of payment volume in the telemetry ring buffer.
+///
+/// # Panics
+/// Panics if the internal buffer iteration encounters an unexpected empty value
+/// (should not occur as the buffer is checked for emptiness at the start).
+pub fn get_telemetry_percentile(env: &Env, p: u32) -> u32 {
+    let buffer: Vec<PackedTelemetryRecord> = env
+        .storage()
+        .temporary()
+        .get(&TelemetryKey::Buffer)
+        .unwrap_or_else(|| Vec::new(env));
+
+    if buffer.is_empty() || p > 100 {
+        return 0;
+    }
+
+    // Manually build volumes array from buffer
+    let mut volumes = Vec::new(env);
+    for i in 0..buffer.len() {
+        if let Some(record) = buffer.get(i) {
+            volumes.push_back(record.volume);
+        }
+    }
+
+    // Simple selection sort for small arrays
+    let len = volumes.len();
+    for i in 0..len {
+        let mut min_idx = i;
+        for j in (i + 1)..len {
+            if volumes.get(j).unwrap_or(0) < volumes.get(min_idx).unwrap_or(0) {
+                min_idx = j;
+            }
+        }
+        if min_idx != i {
+            let temp = volumes.get(i).unwrap_or(0);
+            volumes.set(i, volumes.get(min_idx).unwrap_or(0));
+            volumes.set(min_idx, temp);
+        }
+    }
+
+    let index = (len - 1) * p / 100;
+    volumes.get(index).unwrap_or(0)
 }

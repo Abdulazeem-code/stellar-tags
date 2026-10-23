@@ -5447,8 +5447,15 @@ fn test_operator_renews_heartbeat_resets_dms_clock() {
     // Advance past the new timeout.
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
 
-    // Now the backup can claim.
+    // Now the backup can initiate a claim.
     client.claim_admin(&backup);
+
+    // Advance past the 72-hour grace period.
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
+
+    // Execute the claim to transfer admin.
+    client.execute_claim_admin();
+
     assert_eq!(client.get_admin(), Some(backup));
 }
 
@@ -5534,6 +5541,7 @@ fn test_operator_cannot_change_backup_admin() {
     let (env, client, _) = setup_env();
     let admin = Address::generate(&env);
     let _treasury = Address::generate(&env);
+    let backup = Address::generate(&env);
     let operator = Address::generate(&env);
     setup_dms_env(
         &env,
