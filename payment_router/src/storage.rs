@@ -136,6 +136,14 @@ pub enum DataKeyExt {
     /// Inactivity window (seconds) after which the backup admin may claim.
     /// Stored as `u64` in instance storage.
     DmsTimeout,
+    /// Tier 2 council signers for multi-sig succession.
+    DmsTier2Council,
+    /// Tier 2 configuration tuple (threshold: u32, timeout_seconds: u64).
+    DmsTier2Config,
+    /// Pending in-flight dead man's switch claim (DmsClaimStatus) during grace period.
+    DmsPendingClaim,
+    /// List of council signers who approved the pending Tier 2 claim.
+    DmsCouncilApprovals,
     /// Per-address payment invocation cap per ledger sequence.
     /// Stored as `u32` in instance storage (`0` disables rate limiting).
     RateLimitConfig,
@@ -262,6 +270,7 @@ pub const DAILY_MAX_LIMIT: i128 = 1_000_000 * XLM_DECIMALS; // 1M tokens limit
 pub const VOLUME_THRESHOLD: i128 = 10_000 * XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
 pub const SECONDS_IN_24H: u64 = 24 * 3600;
 pub const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
+pub const DMS_GRACE_PERIOD: u64 = 72 * 3600;
 pub const DEFAULT_RATE_LIMIT: u32 = 10;
 pub const MAX_RATE_LIMIT: u32 = 1_000_000;
 pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;

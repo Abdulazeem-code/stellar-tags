@@ -2454,8 +2454,12 @@ fn test_dms_claim_fails_before_timeout_then_succeeds() {
     let res = client.try_claim_admin(&backup);
     assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
 
-    // After the timeout since the *ping*, the claim succeeds.
+    // After the timeout since the *ping*, the claim is initiated (or finalized after grace period).
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+    // Initiating claim
+    client.claim_admin(&backup);
+    // Grace period of 72 hours must pass before final execution
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
     client.claim_admin(&backup);
     assert_eq!(client.get_admin(), Some(backup.clone()));
 
@@ -2487,8 +2491,10 @@ fn test_dms_ping_resets_timer() {
         assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
     }
 
-    // Silence for the full timeout, then the backup takes over.
+    // Silence for the full timeout, then the backup initiates and claims after grace period.
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+    client.claim_admin(&backup);
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
     client.claim_admin(&backup);
     assert_eq!(client.get_admin(), Some(backup.clone()));
 }
@@ -2528,8 +2534,10 @@ fn test_dms_routing_payment_bumps_heartbeat() {
     let res = client.try_route_payment(&broke_sender, &recipient, &token_addr, &1_000);
     assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
 
-    // The failed payment did not reset the clock, so the claim succeeds.
+    // The failed payment did not reset the clock, so the claim succeeds after timeout + grace period.
     advance_time(&env, 2);
+    client.claim_admin(&backup);
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
     client.claim_admin(&backup);
     assert_eq!(client.get_admin(), Some(backup.clone()));
 }
@@ -2552,6 +2560,8 @@ fn test_dms_claim_works_while_frozen_and_paused() {
     client.set_pause(&true);
 
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+    client.claim_admin(&backup);
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
     client.claim_admin(&backup);
     assert_eq!(client.get_admin(), Some(backup.clone()));
 }
@@ -2611,6 +2621,8 @@ fn test_dms_new_admin_can_rearm_after_claim() {
     // Silence long enough for the backup to take over.
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
     client.claim_admin(&backup);
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
+    client.claim_admin(&backup);
     assert_eq!(client.get_admin(), Some(backup.clone()));
 
     // The new admin arms a fresh switch with a new backup.
@@ -2650,6 +2662,131 @@ fn test_dms_heartbeat_is_noop_without_backup() {
 
     let res = client.try_claim_admin(&Address::generate(&env));
     assert_eq!(res.unwrap_err().unwrap(), Error::NoBackupAdmin);
+}
+
+#[test]
+fn test_dms_tiered_primary_admin_rearm_during_grace_period() {
+    let (env, client, _) = setup_env();
+
+    let admin = Address::generate(&env);
+    let backup = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let mut council = Vec::new(&env);
+    for _ in 0..5 {
+        council.push_back(Address::generate(&env));
+    }
+
+    let tier1_delay: u64 = 30 * 24 * 3600;
+    let tier2_delay: u64 = 37 * 24 * 3600;
+
+    // Arm tiered switch
+    client.set_tiered_dead_mans_switch(&backup, &tier1_delay, &council, &3, &tier2_delay);
+
+    // Advance past Tier 1 timeout
+    advance_time(&env, tier1_delay + 1);
+
+    // Backup initiates claim
+    client.initiate_claim_admin(&backup);
+
+    // Verify claim is pending in grace period
+    let pending = client.get_pending_dms_claim();
+    assert!(pending.is_some());
+    assert_eq!(pending.unwrap().tier, 1);
+
+    // Premature execution fails during grace period
+    advance_time(&env, 24 * 3600); // 24 hours into 72-hour grace period
+    let res = client.try_execute_claim_admin();
+    assert_eq!(res.unwrap_err().unwrap(), Error::DmsGracePeriodActive);
+
+    // Primary admin detects false/premature claim and re-arms switch during grace period
+    client.rearm_switch();
+
+    // Verify claim was cancelled
+    assert!(client.get_pending_dms_claim().is_none());
+
+    // Switch was reset with new timestamp, so immediate claim fails
+    let res = client.try_initiate_claim_admin(&backup);
+    assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+}
+
+#[test]
+fn test_dms_tiered_missed_tier1_and_tier2_council_claim() {
+    let (env, client, _) = setup_env();
+
+    let admin = Address::generate(&env);
+    let backup = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+    let mut council = Vec::new(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+    let s4 = Address::generate(&env);
+    let s5 = Address::generate(&env);
+    council.push_back(s1.clone());
+    council.push_back(s2.clone());
+    council.push_back(s3.clone());
+    council.push_back(s4.clone());
+    council.push_back(s5.clone());
+
+    let tier1_delay: u64 = 30 * 24 * 3600;
+    let tier2_delay: u64 = 37 * 24 * 3600;
+
+    // Arm tiered dead man's switch
+    client.set_tiered_dead_mans_switch(&backup, &tier1_delay, &council, &3, &tier2_delay);
+
+    // 1. Advance to 31 days (Tier 1 is eligible, but Tier 2 is NOT eligible yet)
+    advance_time(&env, 31 * 24 * 3600);
+
+    let candidate_admin = Address::generate(&env);
+    // Tier 2 council attempt fails because Tier 1 exclusive window is active
+    let res = client.try_initiate_tier2_claim(&s1, &candidate_admin);
+    assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+
+    // 2. Advance to 38 days: Tier 1 deadline missed (7-day exclusive window expired at 37 days)
+    advance_time(&env, 7 * 24 * 3600);
+
+    // Non-council member cannot initiate Tier 2 claim
+    let non_signer = Address::generate(&env);
+    let res = client.try_initiate_tier2_claim(&non_signer, &candidate_admin);
+    assert_eq!(res.unwrap_err().unwrap(), Error::NotCouncilSigner);
+
+    // Signer 1 initiates Tier 2 claim (voting 1/3)
+    client.initiate_tier2_claim(&s1, &candidate_admin);
+
+    // Signer 1 cannot vote twice
+    let res = client.try_approve_tier2_claim(&s1);
+    assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyApproved);
+
+    // Signer 2 approves (voting 2/3)
+    let approvals = client.approve_tier2_claim(&s2);
+    assert_eq!(approvals, 2);
+
+    // Signer 3 approves (voting 3/3 - threshold reached)
+    let approvals = client.approve_tier2_claim(&s3);
+    assert_eq!(approvals, 3);
+
+    // Trying to execute before 72-hour grace period fails
+    let res = client.try_execute_tier2_claim();
+    assert_eq!(res.unwrap_err().unwrap(), Error::DmsGracePeriodActive);
+
+    // 3. Grace period passes (72 hours)
+    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
+
+    // Execute Tier 2 multi-sig council claim succeeds!
+    client.execute_tier2_claim();
+
+    // Verify candidate admin is now the contract admin
+    assert_eq!(client.get_admin(), Some(candidate_admin));
+
+    // Verify switch is disarmed
+    let (b, _, _, _) = client.get_dead_mans_switch();
+    assert!(b.is_none());
+    let (c, _, _) = client.get_tier2_council();
+    assert!(c.is_none());
 }
 
 #[test]
