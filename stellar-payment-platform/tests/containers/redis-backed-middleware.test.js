@@ -278,10 +278,12 @@ describe('Redis-backed middleware (real Redis)', () => {
       // with the injected clock — never an in-process array.
       const client = await redis();
       const keys = await keysWithPrefix('probe-rl:');
-      expect(keys).toEqual(['probe-rl:a']);
+      expect(keys).toEqual(['probe-rl:a', 'probe-rl:b']);
       expect(await client.zCard('probe-rl:a')).toBe(MAX);
-      const scores = (await client.zRange('probe-rl:a', 0, -1, { WITHSCORES: true })).filter((_, i) => i % 2 === 1);
-      for (const score of scores) {
+      expect(await client.zCard('probe-rl:b')).toBe(1);
+      const entries = await client.zRangeWithScores('probe-rl:a', 0, -1);
+      for (const entry of entries) {
+        const score = typeof entry === 'object' ? entry.score : entry;
         expect(Number(score)).toBe(clock);
       }
 

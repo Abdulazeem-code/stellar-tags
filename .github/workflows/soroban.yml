@@ -22,6 +22,7 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v2
           workspaces: .
 
       - name: Run payment_router tests
@@ -62,6 +63,7 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v2
           workspaces: ./payment_router
 
       # Runs the storage-cost benchmark tests (test_benchmark_*). These fail
@@ -89,6 +91,7 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v2
           workspaces: ./twap_oracle
 
       - name: Check formatting
@@ -121,6 +124,7 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v2
           workspaces: ./yield_escrow
 
       - name: Run contract tests
@@ -144,6 +148,7 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v2
           workspaces: ./payment_router
 
       - name: Download stellar CLI (pinned)
@@ -177,6 +182,7 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v2
           workspaces: .
 
       - name: Install cargo-tarpaulin
@@ -187,6 +193,7 @@ jobs:
         run: >
           cargo tarpaulin
           --features testutils
+          --tests
           --out Xml
           --out Html
           --output-dir coverage
@@ -197,6 +204,7 @@ jobs:
         run: >
           cargo tarpaulin
           --features testutils
+          --tests
           --out Xml
           --out Html
           --output-dir coverage

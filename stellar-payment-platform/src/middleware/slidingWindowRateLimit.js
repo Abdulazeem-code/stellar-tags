@@ -154,6 +154,9 @@ const createSlidingWindowRateLimiter = ({
       res.setHeader("RateLimit-Limit", String(max));
       res.setHeader("RateLimit-Remaining", String(remaining));
       res.setHeader("RateLimit-Reset", String(retryAfterSeconds));
+      res.setHeader("X-RateLimit-Limit", String(max));
+      res.setHeader("X-RateLimit-Remaining", String(remaining));
+      res.setHeader("X-RateLimit-Reset", String(retryAfterSeconds));
 
       if (!result.allowed) {
         res.setHeader("Retry-After", String(retryAfterSeconds));

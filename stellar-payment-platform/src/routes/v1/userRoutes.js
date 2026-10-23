@@ -199,7 +199,9 @@ router.post('/register', signatureRateLimiter, idempotency, requireJson, validat
       username: normalizedUsername,
       address,
       is_primary: isPrimary,
-      federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      federation_address: normalizedUsername.includes('*')
+        ? normalizedUsername
+        : `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,

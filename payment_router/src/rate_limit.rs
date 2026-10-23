@@ -28,7 +28,7 @@ pub fn rate_limit_used(env: &Env, sender: &Address) -> u32 {
     let packed = env
         .storage()
         .persistent()
-        .get::<DataKey, BytesN<8>>(&DataKey::RateLimitCounter(sender.clone()));
+        .get::<_, BytesN<8>>(&DataKey::RateLimitCounter(sender.clone()));
 
     match packed {
         Some(packed) => {
