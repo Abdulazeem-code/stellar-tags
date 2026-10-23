@@ -30,15 +30,16 @@ fn set_time(env: &Env, timestamp: u64) {
     env.ledger().with_mut(|ledger| ledger.timestamp = timestamp);
 }
 
-/// 100 for 60s, then 200 for 60s, then 300. Segment integrals:
-/// obs0.cumulative = 0, obs1.cumulative = 6_000, obs2.cumulative = 18_000.
+/// 100 for 60s, then 105 for 60s, then 110. Each step is within the default
+/// 1000 bps (10%) single-update deviation threshold. Segment integrals:
+/// obs0.cumulative = 0, obs1.cumulative = 6_000, obs2.cumulative = 12_300.
 fn seed_observations(setup: &Setup) {
     set_time(&setup.env, 1_000);
     let _ = setup.client.observe(&100, &1_000);
     set_time(&setup.env, 1_060);
-    let _ = setup.client.observe(&200, &1_060);
+    let _ = setup.client.observe(&105, &1_060);
     set_time(&setup.env, 1_120);
-    let _ = setup.client.observe(&300, &1_120);
+    let _ = setup.client.observe(&110, &1_120);
 }
 
 #[test]
@@ -93,7 +94,7 @@ fn observe_appends_and_derives_cumulative_price() {
     assert_eq!(second.cumulative_price, 6_000);
 
     let third = observations.get(2).unwrap();
-    assert_eq!(third.cumulative_price, 18_000);
+    assert_eq!(third.cumulative_price, 12_300);
 
     let latest = setup.client.latest_observation().unwrap();
     assert_eq!(latest, third);
@@ -159,9 +160,9 @@ fn observe_enforces_the_minimum_interval() {
         Err(Ok(Error::ObservationTooSoon))
     );
 
-    // Exactly MIN_INTERVAL_SECONDS later is accepted.
+    // Exactly MIN_INTERVAL_SECONDS later is accepted (5% drop <= 10% limit).
     set_time(&setup.env, 1_060);
-    assert_eq!(setup.client.observe(&200, &1_060), 2);
+    assert_eq!(setup.client.observe(&105, &1_060), 2);
 }
 
 #[test]
@@ -204,15 +205,84 @@ fn observe_rejects_accumulator_overflow() {
     );
 }
 
+// ── Single-Update Deviation Circuit Breaker ─────────────────────────────────
+
+#[test]
+fn observe_accepts_update_within_max_deviation() {
+    let setup = setup();
+
+    set_time(&setup.env, 1_000);
+    let _ = setup.client.observe(&100, &1_000);
+
+    // 5% drop (500 bps) is within the 1000 bps default threshold.
+    set_time(&setup.env, 1_060);
+    assert_eq!(setup.client.observe(&95, &1_060), 2);
+
+    assert!(!setup.client.is_circuit_breaker_tripped());
+    assert!(!setup
+        .client
+        .is_circuit_breaker_active(&setup.admin, &setup.admin));
+}
+
+#[test]
+fn observe_excessive_single_block_deviation_trips_breaker() {
+    let setup = setup();
+
+    set_time(&setup.env, 1_000);
+    let _ = setup.client.observe(&100, &1_000);
+
+    // 15% instant crash (1500 bps) exceeds the 1000 bps (10%) threshold.
+    // Returning Ok keeps the breaker state persisted; the flawed price is not
+    // stored, so the observation count stays at 1.
+    set_time(&setup.env, 1_060);
+    assert_eq!(setup.client.try_observe(&85, &1_060), Ok(Ok(1)));
+
+    // The pair is now frozen: the breaker is active and further updates are
+    // rejected.
+    assert!(setup.client.is_circuit_breaker_tripped());
+    assert!(setup
+        .client
+        .is_circuit_breaker_active(&setup.admin, &setup.admin));
+
+    set_time(&setup.env, 1_120);
+    assert_eq!(
+        setup.client.try_observe(&85, &1_120),
+        Err(Ok(Error::CircuitBreakerTripped))
+    );
+
+    // Admin intervention restores operation.
+    setup.client.reset_circuit_breaker();
+    assert!(!setup.client.is_circuit_breaker_tripped());
+    set_time(&setup.env, 1_180);
+    // 95 is a 5% drop from the last stored price (100), within the 10% limit.
+    assert_eq!(setup.client.observe(&95, &1_180), 2);
+}
+
+#[test]
+fn is_circuit_breaker_active_view_matches_tripped_state() {
+    let setup = setup();
+
+    let base = Address::generate(&setup.env);
+    let quote = Address::generate(&setup.env);
+
+    assert!(!setup.client.is_circuit_breaker_active(&base, &quote));
+
+    setup.client.trip_circuit_breaker();
+    assert!(setup.client.is_circuit_breaker_active(&base, &quote));
+
+    setup.client.reset_circuit_breaker();
+    assert!(!setup.client.is_circuit_breaker_active(&base, &quote));
+}
+
 #[test]
 fn twap_averages_over_the_requested_window() {
     let setup = setup();
     seed_observations(&setup);
 
-    // The full 120s of history: (100*60 + 200*60) / 120.
-    assert_eq!(setup.client.twap(&120), 150);
+    // The full 120s of history: (100*60 + 105*60) / 120.
+    assert_eq!(setup.client.twap(&120), 102);
     // Only the last segment, exactly one observation wide.
-    assert_eq!(setup.client.twap(&60), 200);
+    assert_eq!(setup.client.twap(&60), 105);
 }
 
 #[test]
@@ -220,10 +290,10 @@ fn twap_interpolates_the_window_start() {
     let setup = setup();
     seed_observations(&setup);
 
-    // Window starts inside the first segment: (100*30 + 200*60) / 90.
-    assert_eq!(setup.client.twap(&90), 166);
-    // Window starts inside the second segment: (200*30 + 300*0) / 30.
-    assert_eq!(setup.client.twap(&30), 200);
+    // Window starts inside the first segment: (100*30 + 105*60) / 90.
+    assert_eq!(setup.client.twap(&90), 103);
+    // Window starts inside the second segment: (105*30 + 110*0) / 30.
+    assert_eq!(setup.client.twap(&30), 105);
 }
 
 #[test]
@@ -520,7 +590,7 @@ fn consult_without_secondary_uses_primary_if_fresh() {
 
     // Ledger clock at 1120 (same as latest observation)
     set_time(&setup.env, 1_120);
-    assert_eq!(setup.client.consult(&60), 200);
+    assert_eq!(setup.client.consult(&60), 105);
 }
 
 #[test]
@@ -544,4 +614,21 @@ fn consult_with_zero_window_returns_latest_spot_consensus() {
     // Divergence: (310 - 300) * 10_000 / 300 = 333 bps <= 500 bps
     // Spot consensus: (300 + 310) / 2 = 305
     assert_eq!(setup.client.consult(&0), 305);
+}
+
+#[test]
+fn consult_stops_routing_when_breaker_is_active() {
+    let setup = setup();
+    seed_observations(&setup);
+
+    // 100 -> 200 -> 300; an 85 print is a ~71% crash, well over the 10% limit.
+    set_time(&setup.env, 1_180);
+    let _ = setup.client.try_observe(&85, &1_180);
+    assert!(setup.client.is_circuit_breaker_tripped());
+
+    // Routing is frozen while the breaker is active.
+    assert_eq!(
+        setup.client.try_consult(&60),
+        Err(Ok(Error::CircuitBreakerTripped))
+    );
 }

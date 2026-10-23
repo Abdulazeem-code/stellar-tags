@@ -45,6 +45,9 @@ pub const MAX_PRICE: i128 = i128::MAX / 1_000_000_000;
 /// Default maximum divergence between primary and secondary price feeds (500 bps = 5%).
 pub const DEFAULT_MAX_DIVERGENCE_BPS: u32 = 500;
 
+/// Default maximum single-update price deviation (1000 bps = 10%).
+pub const DEFAULT_MAX_SINGLE_UPDATE_DEVIATION_BPS: u32 = 1_000;
+
 /// Default staleness threshold for observations (1 hour = 3600 seconds).
 pub const DEFAULT_STALENESS_THRESHOLD: u64 = 3_600;
 
@@ -74,6 +77,7 @@ pub enum DataKey {
     StalenessThreshold,
     Weights,
     CircuitBreakerTripped,
+    MaxSingleUpdateDeviationBps,
 }
 
 /// Oracle errors surfaced to callers.
@@ -160,6 +164,10 @@ impl TwapOracle {
         let admin = read_admin(&env)?;
         admin.require_auth();
 
+        if Self::is_circuit_breaker_tripped(env.clone()) {
+            return Err(Error::CircuitBreakerTripped);
+        }
+
         if price <= 0 || price > MAX_PRICE {
             return Err(Error::InvalidPrice);
         }
@@ -178,6 +186,32 @@ impl TwapOracle {
             }
             if timestamp - previous.timestamp < MIN_INTERVAL_SECONDS {
                 return Err(Error::ObservationTooSoon);
+            }
+
+            // Circuit breaker: reject single-block price deviations exceeding the
+            // configured maximum, then freeze the oracle pair.
+            let max_deviation_bps = Self::max_single_update_dev_bps(env.clone());
+            let deviation_bps = (price - previous.price)
+                .abs()
+                .checked_mul(BPS_DIVISOR)
+                .ok_or(Error::PriceOverflow)?
+                / previous.price;
+
+            if deviation_bps > i128::from(max_deviation_bps) {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::CircuitBreakerTripped, &true);
+
+                env.events().publish(
+                    (symbol_short!("breaker"), symbol_short!("tripped")),
+                    (previous.price, price, deviation_bps),
+                );
+
+                // Do not append the rejected observation. Returning Ok (rather
+                // than Err) keeps the breaker state persisted; the pair is now
+                // frozen and subsequent observations are rejected by the guard
+                // at the top of this function.
+                return Ok(observations.len());
             }
 
             let elapsed = i128::from(timestamp - previous.timestamp);
@@ -356,6 +390,36 @@ impl TwapOracle {
             .unwrap_or(DEFAULT_MAX_DIVERGENCE_BPS)
     }
 
+    /// Configures the maximum allowed single-update price deviation in basis
+    /// points (e.g. 1000 bps = 10%). If a new observation differs from the last
+    /// observation by more than this deviation, the circuit breaker is tripped
+    /// and the pair is frozen.
+    ///
+    /// Requires authorization from the configured admin.
+    pub fn set_max_single_update_dev_bps(env: Env, max_deviation_bps: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        if max_deviation_bps > 10_000 {
+            return Err(Error::InvalidConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxSingleUpdateDeviationBps, &max_deviation_bps);
+
+        Ok(())
+    }
+
+    /// Returns the maximum single-update deviation threshold in basis points
+    /// (defaults to 1000 bps = 10%).
+    pub fn max_single_update_dev_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxSingleUpdateDeviationBps)
+            .unwrap_or(DEFAULT_MAX_SINGLE_UPDATE_DEVIATION_BPS)
+    }
+
     /// Configures the maximum age in seconds for observations before they are considered stale.
     ///
     /// Requires authorization from the configured admin.
@@ -418,6 +482,15 @@ impl TwapOracle {
             .persistent()
             .get(&DataKey::CircuitBreakerTripped)
             .unwrap_or(false)
+    }
+
+    /// Returns whether the circuit breaker is active for the given pair.
+    ///
+    /// This contract tracks a single global breaker state; `base` and `quote`
+    /// identify the pair but the breaker state is shared across pairs.
+    pub fn is_circuit_breaker_active(env: Env, base: Address, quote: Address) -> bool {
+        let _ = (base, quote);
+        Self::is_circuit_breaker_tripped(env)
     }
 
     /// Resets the circuit breaker, allowing normal oracle operations to resume.
