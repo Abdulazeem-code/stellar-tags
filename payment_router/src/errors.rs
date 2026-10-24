@@ -84,8 +84,6 @@ pub enum Error {
     DeadlineExpired = 31,
     /// The meta-transaction nonce does not match the sender's stored nonce.
     InvalidNonce = 32,
-    /// The meta-transaction signature did not verify against the payload.
-    InvalidSignature = 33,
     /// Swap parameters are self-contradictory or unusable (for example
     /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
     InvalidSwapParams = 19,

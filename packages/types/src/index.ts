@@ -511,10 +511,6 @@ export const Errors = {
    */
   32: {message:"InvalidNonce"},
   /**
-   * The meta-transaction signature did not verify against the payload.
-   */
-  33: {message:"InvalidSignature"},
-  /**
    * Swap parameters are self-contradictory or unusable (for example
    * `sell_token == buy_token`, or a non-positive `min_amount_out`).
    */
@@ -613,7 +609,7 @@ export enum Role {
 /**
  * Storage keys for all contract instance and persistent data.
  */
-export type DataKey = {tag: "Admin", values: void} | {tag: "Governance", values: void} | {tag: "PlatformTreasury", values: void} | {tag: "FeeBps", values: void} | {tag: "FeeCap", values: void} | {tag: "MinLimit", values: void} | {tag: "Paused", values: void} | {tag: "MaxAmount", values: void} | {tag: "UserRecord", values: readonly [string]} | {tag: "UserSpending", values: readonly [string]} | {tag: "UserVolume", values: readonly [string]} | {tag: "Blacklist", values: readonly [string]} | {tag: "RefundBalance", values: readonly [string, string]} | {tag: "TimelockNonce", values: void} | {tag: "TimelockEntry", values: readonly [u64]} | {tag: "Frozen", values: void} | {tag: "UserRole", values: readonly [string, Role]} | {tag: "Role", values: readonly [Role]} | {tag: "MetaNonce", values: readonly [string]} | {tag: "KycOracle", values: void} | {tag: "KycThreshold", values: void} | {tag: "BackupAdmin", values: void} | {tag: "LastHeartbeat", values: void} | {tag: "DmsTimeout", values: void} | {tag: "RateLimitConfig", values: void} | {tag: "RateLimitCounter", values: readonly [string]} | {tag: "RateLimitWhitelist", values: readonly [string]} | {tag: "OracleAddress", values: void} | {tag: "StalenessThreshold", values: void} | {tag: "FallbackPrice", values: readonly [string, string]} | {tag: "GovernanceToken", values: void} | {tag: "GovernanceQuorum", values: void} | {tag: "GovernanceNonce", values: void} | {tag: "GovernanceProposal", values: readonly [u64]} | {tag: "GovernanceVote", values: readonly [u64, string]} | {tag: "ArchiveEpoch", values: void} | {tag: "ArchiveRoot", values: readonly [u64]} | {tag: "ArchiveMeta", values: readonly [u64]} | {tag: "YieldProtocol", values: void} | {tag: "YieldPrincipal", values: readonly [string]} | {tag: "RegisteredDex", values: readonly [string]} | {tag: "MaxSlippageBps", values: void} | {tag: "PairSlippage", values: readonly [string, string]} | {tag: "PoolMetadata", values: readonly [string]} | {tag: "MultisigSigners", values: void} | {tag: "MultisigThreshold", values: void} | {tag: "UpgradeApproval", values: readonly [Buffer]} | {tag: "ReentrancyGuard", values: void} | {tag: "PauseLevel", values: void} | {tag: "HeartbeatOperator", values: void} | {tag: "MerkleClaimedBits", values: readonly [u64]} | {tag: "TwoPhaseCommit", values: readonly [Buffer]};
+export type DataKey = {tag: "Admin", values: void} | {tag: "Governance", values: void} | {tag: "PlatformTreasury", values: void} | {tag: "FeeBps", values: void} | {tag: "FeeCap", values: void} | {tag: "MinLimit", values: void} | {tag: "Paused", values: void} | {tag: "MaxAmount", values: void} | {tag: "UserRecord", values: readonly [string]} | {tag: "UserSpending", values: readonly [string]} | {tag: "UserVolume", values: readonly [string]} | {tag: "Blacklist", values: readonly [string]} | {tag: "RefundBalance", values: readonly [string, string]} | {tag: "TimelockNonce", values: void} | {tag: "TimelockEntry", values: readonly [u64]} | {tag: "Frozen", values: void} | {tag: "UserRole", values: readonly [string, Role]} | {tag: "Role", values: readonly [Role]} | {tag: "MetaNonce", values: readonly [string]} | {tag: "KycOracle", values: void} | {tag: "KycThreshold", values: void} | {tag: "BackupAdmin", values: void} | {tag: "LastHeartbeat", values: void} | {tag: "DmsTimeout", values: void} | {tag: "OracleAddress", values: void} | {tag: "StalenessThreshold", values: void} | {tag: "FallbackPrice", values: readonly [string, string]} | {tag: "GovernanceToken", values: void} | {tag: "GovernanceQuorum", values: void} | {tag: "GovernanceNonce", values: void} | {tag: "GovernanceProposal", values: readonly [u64]} | {tag: "ArchiveEpoch", values: void} | {tag: "ArchiveRoot", values: readonly [u64]} | {tag: "ArchiveMeta", values: readonly [u64]} | {tag: "YieldProtocol", values: void} | {tag: "YieldPrincipal", values: readonly [string]} | {tag: "RegisteredDex", values: readonly [string]} | {tag: "MaxSlippageBps", values: void} | {tag: "PairSlippage", values: readonly [string, string]} | {tag: "PoolMetadata", values: readonly [string]} | {tag: "MultisigSigners", values: void} | {tag: "MultisigThreshold", values: void} | {tag: "UpgradeApproval", values: readonly [Buffer]} | {tag: "ReentrancyGuard", values: void} | {tag: "PauseLevel", values: void} | {tag: "TwoPhaseCommit", values: readonly [Buffer]};
 
 /**
  * Tiered pause levels for the emergency circuit breaker (issue #890).
@@ -638,6 +634,12 @@ export enum PauseLevel {
  * Soroban's generated enum size limit for `DataKey`.
  */
 export type HeartbeatKey = {tag: "HeartbeatOperator", values: void};
+
+/**
+ * Storage keys for the rate-limiting subsystem.  Kept separate from `DataKey`
+ * to stay within Soroban's generated enum size limit.
+ */
+export type RateLimitKey = {tag: "RateLimitConfig", values: void} | {tag: "RateLimitCounter", values: readonly [string]} | {tag: "RateLimitWhitelist", values: readonly [string]};
 
 
 /**

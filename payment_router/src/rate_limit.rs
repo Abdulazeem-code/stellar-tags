@@ -1,13 +1,13 @@
 use crate::errors::Error;
 use crate::storage::{
-    current_window, pack_rate_counter, unpack_rate_counter, DataKey, DEFAULT_RATE_LIMIT,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    current_window, pack_rate_counter, unpack_rate_counter, DEFAULT_RATE_LIMIT,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, RateLimitKey,
 };
 use soroban_sdk::{log, Address, BytesN, Env};
 
 /// Returns the stored per-ledger invocation cap, or `None` when no configuration has been written.
 pub fn get_rate_limit_config(env: &Env) -> Option<u32> {
-    env.storage().instance().get(&DataKey::RateLimitConfig)
+    env.storage().instance().get(&RateLimitKey::RateLimitConfig)
 }
 
 /// Returns the effective per-ledger invocation cap. Falls back to `DEFAULT_RATE_LIMIT`.
@@ -19,7 +19,7 @@ pub fn rate_limit_raw(env: &Env) -> u32 {
 pub fn is_whitelisted(env: &Env, address: &Address) -> bool {
     env.storage()
         .persistent()
-        .get(&DataKey::RateLimitWhitelist(address.clone()))
+        .get(&RateLimitKey::RateLimitWhitelist(address.clone()))
         .unwrap_or(false)
 }
 
@@ -28,7 +28,7 @@ pub fn rate_limit_used(env: &Env, sender: &Address) -> u32 {
     let packed = env
         .storage()
         .persistent()
-        .get::<DataKey, BytesN<8>>(&DataKey::RateLimitCounter(sender.clone()));
+        .get::<RateLimitKey, BytesN<8>>(&RateLimitKey::RateLimitCounter(sender.clone()));
 
     match packed {
         Some(packed) => {
@@ -56,7 +56,7 @@ pub fn check_rate_limit(env: &Env, sender: &Address) -> Result<(), Error> {
         return Err(Error::RateLimited);
     }
 
-    let key = DataKey::RateLimitCounter(sender.clone());
+    let key = RateLimitKey::RateLimitCounter(sender.clone());
     let updated = pack_rate_counter(env, current_window(env), used + 1);
     env.storage().persistent().set(&key, &updated);
     env.storage().persistent().extend_ttl(

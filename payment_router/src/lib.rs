@@ -1099,7 +1099,7 @@ impl PaymentRouter {
 
         env.storage()
             .instance()
-            .set(&DataKey::RateLimitConfig, &max_calls_per_ledger);
+            .set(&RateLimitKey::RateLimitConfig, &max_calls_per_ledger);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1130,7 +1130,7 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        let key = DataKey::RateLimitWhitelist(address.clone());
+        let key = RateLimitKey::RateLimitWhitelist(address.clone());
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(
             &key,
@@ -1165,7 +1165,7 @@ impl PaymentRouter {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::RateLimitWhitelist(address.clone()));
+            .remove(&RateLimitKey::RateLimitWhitelist(address.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "rate_limit_whitelist_removed"), address),
@@ -3059,7 +3059,7 @@ impl PaymentRouter {
     /// Renews the dead man's switch heartbeat on behalf of the configured
     /// heartbeat operator (issue #889).
     ///
-    /// The `operator` address must match the stored `DataKey::HeartbeatOperator`
+    /// The `operator` address must match the stored `HeartbeatKey::HeartbeatOperator`
     /// and must authorize this call.  The operator may **only** reset the
     /// heartbeat timestamp — it cannot modify the backup admin address, the
     /// DMS timeout, or any other contract parameter.
