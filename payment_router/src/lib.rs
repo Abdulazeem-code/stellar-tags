@@ -27,6 +27,322 @@ use soroban_sdk::{
     Error as SdkError, IntoVal, InvokeError, String, Symbol, Vec,
 };
 
+// ── Packed UserSpending helpers ──────────────────────────────────────────────
+//
+// Issue #519: Replace the two-field UserSpending contracttype with a single
+// BytesN<24> value packed with bitwise operations.
+//
+// Layout (big-endian):
+//   bytes  0..8  — last_reset_time  : u64   (8 bytes)
+//   bytes  8..24 — accumulated_amount: i128  (16 bytes)
+//
+// Benefits:
+//  • Eliminates the XDR struct-type overhead (type discriminant + field tags)
+//    that Soroban adds to every contracttype value, shrinking each UserSpending
+//    ledger entry from ~48 bytes to exactly 24 bytes.
+//  • Smaller entries → lower state-rent fee per ledger entry per TTL period.
+
+/// Pack `last_reset_time` (u64) and `accumulated_amount` (i128) into a
+/// 24-byte big-endian buffer.
+fn pack_spending(env: &Env, last_reset_time: u64, accumulated_amount: i128) -> BytesN<24> {
+    let mut buf = [0u8; 24];
+
+    // Bytes 0..8 — last_reset_time (u64 big-endian)
+    let t_bytes = last_reset_time.to_be_bytes();
+    buf[0] = t_bytes[0];
+    buf[1] = t_bytes[1];
+    buf[2] = t_bytes[2];
+    buf[3] = t_bytes[3];
+    buf[4] = t_bytes[4];
+    buf[5] = t_bytes[5];
+    buf[6] = t_bytes[6];
+    buf[7] = t_bytes[7];
+
+    // Bytes 8..24 — accumulated_amount (i128 big-endian)
+    let a_bytes = accumulated_amount.to_be_bytes();
+    buf[8] = a_bytes[0];
+    buf[9] = a_bytes[1];
+    buf[10] = a_bytes[2];
+    buf[11] = a_bytes[3];
+    buf[12] = a_bytes[4];
+    buf[13] = a_bytes[5];
+    buf[14] = a_bytes[6];
+    buf[15] = a_bytes[7];
+    buf[16] = a_bytes[8];
+    buf[17] = a_bytes[9];
+    buf[18] = a_bytes[10];
+    buf[19] = a_bytes[11];
+    buf[20] = a_bytes[12];
+    buf[21] = a_bytes[13];
+    buf[22] = a_bytes[14];
+    buf[23] = a_bytes[15];
+
+    BytesN::from_array(env, &buf)
+}
+
+/// Unpack a 24-byte buffer into `(last_reset_time, accumulated_amount)`.
+fn unpack_spending(packed: &BytesN<24>) -> (u64, i128) {
+    // BytesN::to_array() is available in soroban-sdk v20.
+    let buf: [u8; 24] = packed.to_array();
+
+    // last_reset_time — bytes 0..8
+    let last_reset_time = u64::from_be_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+
+    // accumulated_amount — bytes 8..24
+    let accumulated_amount = i128::from_be_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    ]);
+
+    (last_reset_time, accumulated_amount)
+}
+
+// ── Legacy struct kept for test snapshot compatibility ───────────────────────
+//
+// The UserSpending contracttype is retained so existing tests that reference
+// it directly continue to compile.  All runtime code now uses the packed
+// BytesN<24> representation stored under DataKey::UserSpending.
+
+/// A user's rolling 24-hour spending record.
+///
+/// Retained purely so existing test snapshots that reference this type by
+/// name keep compiling. Live contract state is stored as a packed
+/// `BytesN<24>` (see `pack_spending` / `unpack_spending`); this struct is not
+/// read from or written to storage at runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSpending {
+    /// Unix timestamp (seconds) at which the 24-hour window last reset.
+    pub last_reset_time: u64,
+    /// Total amount routed by the user since `last_reset_time`.
+    pub accumulated_amount: i128,
+}
+
+/// A single transfer instruction for use with [`PaymentRouter::route_payments`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payment {
+    /// Address the funds are debited from. Must authorize the call.
+    pub sender: Address,
+    /// Address the funds (minus the platform fee) are credited to.
+    pub recipient: Address,
+    /// Contract ID of the token (or Stellar Asset Contract) being transferred.
+    pub token_address: Address,
+    /// Amount to route, denominated in the token's smallest unit. Must be
+    /// positive and within the contract's configured min/max bounds.
+    pub amount: i128,
+}
+
+/// Interface implemented by supported Soroban lending protocols.
+///
+/// Keeping the protocol behind this small adapter lets the router integrate
+/// with Blend-compatible deployments while tests use an in-process mock.
+#[contractclient(name = "LendingProtocolClient")]
+pub trait LendingProtocol {
+    fn deposit(env: Env, from: Address, token: Address, amount: i128);
+    fn withdraw(env: Env, to: Address, token: Address, amount: i128);
+    fn harvest(env: Env, to: Address, token: Address) -> i128;
+}
+
+/// Minimal interface for an admin-selected KYC issuer or oracle contract.
+#[contractclient(name = "KycOracleClient")]
+pub trait KycOracle {
+    fn is_verified(env: Env, account: Address) -> bool;
+}
+
+// ── Timelock data structures ─────────────────────────────────────────────────
+//
+// Admin actions that change sensitive contract parameters (treasury, fees,
+// governance, admin transfer) are not applied instantly.  Instead the admin
+// queues an ActionType intent that gets a nonce ID and a ledger timestamp.
+// Only after SECONDS_IN_24H (86 400 s) has elapsed can execute_action be
+// called to apply the change.  This gives observers a 24-hour window to
+// detect and respond to a compromised-admin scenario.
+//
+// The freeze mechanism is the complementary emergency tool: calling
+// emergency_freeze instantly blocks all payments and all timelock executions.
+// A freeze does NOT require going through the timelock itself so it is always
+// available to the admin as an immediate last resort.  Unfreezing likewise
+// takes effect immediately so the admin can restore service once the threat is
+// resolved.
+
+/// Describes which administrative parameter change a timelock entry represents.
+/// Each variant carries all the arguments needed to apply that change when the
+/// delay period is over.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionType {
+    /// Change the platform treasury address.
+    SetPlatformTreasury(Address),
+    /// Update fee basis-points and fee cap together (legacy / combined setter).
+    SetFeeConfig(i128, i128),
+    /// Update fee basis-points only.
+    SetFeeBps(i128),
+    /// Set the governance contract address.
+    SetGovernance(Address),
+    /// Change the minimum routing limit.
+    SetMinLimit(i128),
+    /// Transfer admin rights to a new address.
+    TransferAdmin(Address),
+    /// Upgrade the contract WASM.
+    Upgrade(BytesN<32>),
+    /// Arm the dead man's switch: nominate a backup admin and its claim
+    /// timeout in seconds (see `set_backup_admin_internal`).
+    SetBackupAdmin(Address, u64),
+}
+
+/// A pending timelock entry stored in persistent ledger storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockEntry {
+    /// Ledger timestamp (seconds since epoch) when this action was queued.
+    pub queued_at: u64,
+    /// The action payload to apply once the delay has elapsed.
+    pub action: ActionType,
+}
+
+/// Role definitions for the Role-Based Access Control (RBAC) system.
+///
+/// Segregates operational privileges across dedicated role boundaries:
+/// SuperAdmin, TreasuryManager, ComplianceOfficer, FeeManager.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Role {
+    /// Supreme administrator with exclusive authority over role assignments,
+    /// contract upgrades, emergency freeze/unfreeze, and root governance.
+    SuperAdmin = 1,
+    /// Manager with exclusive authority over platform treasury, yield operations,
+    /// token recovery, and emergency asset withdrawals.
+    TreasuryManager = 2,
+    /// Compliance officer with authority over address blacklisting, KYC oracle
+    /// configurations, and emergency operational pause switches.
+    ComplianceOfficer = 3,
+    /// Fee manager with authority over platform fee basis points, fee caps, and
+    /// minimum payment limits.
+    FeeManager = 4,
+}
+
+/// Storage keys for all contract instance and persistent data.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    /// The current admin address.
+    Admin,
+    /// Governance contract address; if set, it takes over fee-authority from the admin.
+    Governance,
+    /// Address that receives collected platform fees.
+    PlatformTreasury,
+    /// Platform fee rate, in basis points (1/100th of a percent).
+    FeeBps,
+    /// Upper bound on the fee taken from a single payment.
+    FeeCap,
+    /// Minimum amount accepted by `route_payment` / `route_payments`, if set.
+    MinLimit,
+    /// Whether routing is currently paused.
+    Paused,
+    /// Maximum amount accepted by a single payment.
+    MaxAmount,
+    /// Cumulative lifetime amount routed by a given sender.
+    UserVolume(Address),
+    /// Packed 24-hour spending window for a given sender.
+    UserSpending(Address),
+    /// Whether a given recipient address is blacklisted.
+    Blacklist(Address),
+    /// Internal refund balance for a (user, token) pair, credited when a
+    /// direct transfer to the recipient fails.
+    RefundBalance(Address, Address),
+    /// Monotonically-increasing nonce counter used to generate unique IDs for
+    /// timelock entries.  Stored as `u64` in instance storage.
+    TimelockNonce,
+    /// A pending timelock entry keyed by its nonce ID.
+    /// Stored in persistent storage so it survives instance eviction.
+    TimelockEntry(u64),
+    /// When `true` the contract is frozen: payments and timelock executions
+    /// are blocked.  Stored as `bool` in instance storage.
+    Frozen,
+    /// The backup admin that can claim ownership via the dead man's switch.
+    /// Stored as `Address` in instance storage.
+    BackupAdmin,
+    /// Unix timestamp of the last admin heartbeat (see `ping`).
+    /// Stored as `u64` in instance storage.
+    LastHeartbeat,
+    /// Inactivity window (seconds) after which the backup admin may claim.
+    /// Stored as `u64` in instance storage.
+    DmsTimeout,
+    /// Lending protocol contract used for treasury yield operations.
+    YieldProtocol,
+    /// Principal currently deposited for a treasury asset.
+    YieldPrincipal(Address),
+    /// Trusted issuer/oracle queried for high-value payment senders.
+    KycOracle,
+    /// Payments strictly above this amount require a valid KYC claim.
+    KycThreshold,
+    /// Active designated address for an administrative role: Role -> Address.
+    Role(Role),
+    /// Whether an address has been assigned a specific role: (Address, Role) -> bool.
+    UserRole(Address, Role),
+}
+
+/// Contract-level errors returned instead of panicking, so callers get a
+/// specific, stable error code to branch on rather than an opaque trap.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// Caller is not authorized to perform this action (e.g. not the admin).
+    Unauthorized = 1,
+    /// Sender's token balance is lower than the requested payment amount.
+    InsufficientBalance = 2,
+    /// Requested amount is outside allowed bounds, or a spending limit was exceeded.
+    LimitExceeded = 3,
+    /// `initialize` was called on a contract that already has an admin set.
+    AlreadyInitialized = 4,
+    /// An admin-configured value (treasury, fee, admin) was read before `initialize`.
+    NotInitialized = 5,
+    /// The contract is currently paused; routing calls are rejected until unpaused.
+    Paused = 6,
+    /// A fee configuration value (basis points or cap) is out of the allowed range.
+    InvalidFeeRate = 7,
+    /// Sender and recipient addresses are the same (self-routing not allowed).
+    InvalidRecipient = 8,
+    /// Recipient address is blacklisted.
+    Blacklisted = 9,
+    /// Requested refund withdrawal amount is zero or exceeds available refund balance.
+    NoRefundAvailable = 10,
+    /// An action is already pending in the timelock queue; it must be executed
+    /// or cancelled before a duplicate can be queued (not currently enforced,
+    /// but reserved for future deduplication logic).
+    TimelockPending = 11,
+    /// The 24-hour delay for the given timelock entry has not elapsed yet.
+    TimelockNotReady = 12,
+    /// No timelock entry exists for the supplied nonce ID.
+    TimelockNotFound = 13,
+    /// The contract is frozen; all payments and timelock executions are blocked.
+    ContractFrozen = 14,
+    /// No backup admin has been configured for the dead man's switch.
+    NoBackupAdmin = 15,
+    /// The dead man's switch timeout period has not elapsed yet.
+    DmsNotReady = 16,
+    /// A dead man's switch parameter is invalid (e.g. zero timeout,
+    /// timeout shorter than the minimum, or identical admin/backup).
+    InvalidDmsConfig = 17,
+    /// No lending protocol has been configured by the admin.
+    YieldProtocolNotConfigured = 15,
+    /// Yield amount must be positive and withdrawals cannot exceed principal.
+    InvalidYieldAmount = 16,
+    /// The sender lacks a valid KYC claim for a high-value payment.
+    KycRequired = 17,
+    /// The configured KYC threshold must not be negative.
+    InvalidKycThreshold = 18,
+    /// Account lacks the required role or role does not exist.
+    RoleNotFound = 19,
+    /// Invalid role assignment or revocation (e.g. revoking the last SuperAdmin).
+    InvalidRole = 20,
+}
+
 /// Soroban contract that routes token payments between addresses while
 /// collecting a configurable platform fee, enforcing per-user daily spending
 /// limits, and supporting an admin-managed blacklist and pause switch.
@@ -35,6 +351,29 @@ pub struct PaymentRouter;
 
 #[contractimpl]
 impl PaymentRouter {
+    const BPS_DIVISOR: i128 = 10_000;
+    const XLM_DECIMALS: i128 = 10_000_000;
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens with 7 decimals
+    const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
+    const VOLUME_THRESHOLD: i128 = 10_000 * Self::XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
+    const SECONDS_IN_24H: u64 = 24 * 3600;
+    /// Minimum configurable dead man's switch timeout (7 days). Keeps the
+    /// claim window long enough that a briefly-offline admin cannot lose
+    /// the contract, while still guaranteeing recoverability.
+    const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
+    const VERSION: u32 = 1;
+
+    const DAY_IN_LEDGERS: u32 = 17280;
+    const INSTANCE_BUMP_AMOUNT: u32 = 7 * Self::DAY_IN_LEDGERS;
+    const INSTANCE_LIFETIME_THRESHOLD: u32 = Self::INSTANCE_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+
+    const USER_BUMP_AMOUNT: u32 = 30 * Self::DAY_IN_LEDGERS;
+    const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
+    const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
+    const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
+
+    // ── Private helpers ──────────────────────────────────────────────────────
+
     pub const BPS_DIVISOR: i128 = storage::BPS_DIVISOR;
     pub const XLM_DECIMALS: i128 = storage::XLM_DECIMALS;
     pub const MAX_AMOUNT: i128 = storage::MAX_AMOUNT;
@@ -246,6 +585,25 @@ impl PaymentRouter {
         );
     }
 
+    /// Returns whether the contract is currently frozen.
+    fn is_frozen_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false)
+    }
+
+    /// Records an admin heartbeat (`now`) if the dead man's switch has a
+    /// timeout configured, so the claim clock restarts from the current
+    /// ledger timestamp. Cheap no-op when no backup admin is configured.
+    fn bump_heartbeat(env: &Env) {
+        if env.storage().instance().has(&DataKey::BackupAdmin) {
+            env.storage()
+                .instance()
+                .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        }
+    /// Enforces KYC only after the admin has configured a threshold. This
+    /// preserves existing routing behavior until compliance is enabled.
     fn verify_kyc_for_amount(env: &Env, sender: &Address, amount: i128) -> Result<(), Error> {
         let threshold: Option<i128> = env.storage().instance().get(&DataKey::KycThreshold);
         if threshold.is_none() || amount <= threshold.unwrap_or(0) {
@@ -697,6 +1055,7 @@ impl PaymentRouter {
             .instance()
             .set(&DataKey::MaxSlippageBps, &Self::DEFAULT_MAX_SLIPPAGE_BPS);
         env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
+        env.storage().instance().set(&DataKey::LastHeartbeat, &0u64);
         // RBAC Initialization: assign initial admin to all operational roles
         Self::set_role_internal(&env, Role::SuperAdmin, &admin);
         Self::set_role_internal(&env, Role::TreasuryManager, &admin);
@@ -843,6 +1202,19 @@ impl PaymentRouter {
     /// Queues an admin action to be executed after a 24-hour delay.
     ///
     /// The admin provides the desired `ActionType` variant and receives a
+    /// numeric nonce that uniquely identifies this pending entry.  Pass this
+    /// nonce to `execute_action` after 24 hours, or to `cancel_action` to
+    /// abort the intent.
+    ///
+    /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
+    /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
+    /// `upgrade`, arming the dead man's switch) must go through the timelock.
+    /// Use the direct setter functions only for actions that are not sensitive
+    /// (e.g. `set_pause` which can also be called directly for immediate
+    /// operational pauses).
+    ///
+    /// The contract must not be frozen when queuing, and the admin must
+    /// authorize the call.
     /// numeric nonce identifying this entry. Pass this nonce to `execute_action`
     /// after 24 hours, or to `cancel_action` to abort the intent.
     ///
@@ -911,6 +1283,67 @@ impl PaymentRouter {
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::TimelockEntry(nonce);
+        let entry: TimelockEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now < entry.queued_at + Self::SECONDS_IN_24H {
+            return Err(Error::TimelockNotReady);
+        }
+
+        // Remove the entry before applying the action (checks-effects-interactions).
+        env.storage().persistent().remove(&key);
+
+        // Apply the action.
+        match entry.action {
+            ActionType::SetPlatformTreasury(new_treasury) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PlatformTreasury, &new_treasury);
+            }
+            ActionType::SetFeeConfig(fee_bps, fee_cap) => {
+                env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+                env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+            }
+            ActionType::SetFeeBps(new_fee_bps) => {
+                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+            }
+            ActionType::SetGovernance(gov) => {
+                env.storage().instance().set(&DataKey::Governance, &gov);
+            }
+            ActionType::SetMinLimit(min_limit) => {
+                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
+            }
+            ActionType::TransferAdmin(new_admin) => {
+                env.storage().instance().set(&DataKey::Admin, &new_admin);
+                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
+            }
+            ActionType::SetBackupAdmin(backup, timeout_seconds) => {
+                Self::apply_set_backup_admin(&env, backup, timeout_seconds)?;
+            }
+            ActionType::Upgrade(new_wasm_hash) => {
+                env.deployer().update_current_contract_wasm(new_wasm_hash);
+            }
+        }
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
         timelock::execute_action(&env, nonce)
     }
 
@@ -1843,6 +2276,272 @@ impl PaymentRouter {
         Ok(())
     }
 
+    // ── Dead man's switch (Issue #720) ───────────────────────────────────────
+    //
+    // If the admin loses their keys, the contract would otherwise become
+    // permanently unmanageable.  The dead man's switch lets the admin nominate
+    // a backup address: if the admin does not `ping` the contract (or process
+    // any payment, which bumps the heartbeat automatically) for longer than
+    // the configured timeout, the backup may claim admin rights.
+    //
+    // The timeout is enforced in *claim* only, so an active admin is never
+    // disrupted: every admin heartbeat simply restarts the clock.
+
+    /// Configures the dead man's switch: nominates `backup` as the recovery
+    /// address and sets the inactivity `timeout_seconds` after which the
+    /// backup may claim admin rights.
+    ///
+    /// This is a sensitive administrative change and therefore goes through
+    /// the timelock: call `queue_action` with
+    /// `ActionType::SetBackupAdmin { backup, timeout_seconds }` and execute
+    /// after the 24-hour delay.  The claim itself is NOT timelocked — if the
+    /// admin is gone, nobody would be left to execute a queued claim.
+    ///
+    /// # Parameters
+    /// - `backup`: Address allowed to claim admin rights after the timeout.
+    /// - `timeout_seconds`: Inactivity window in seconds. Must be at least
+    ///   `MIN_DMS_TIMEOUT` (7 days).
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet, or `Err(Error::InvalidDmsConfig)` if
+    /// `timeout_seconds` is below the minimum or `backup` equals the
+    /// current admin.
+    ///
+    /// # Panics
+    /// Panics if the current admin does not authorize the call.
+    pub fn set_backup_admin_internal(
+        env: Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        Self::apply_set_backup_admin(&env, backup, timeout_seconds)
+    }
+
+    /// Shared implementation for arming the dead man's switch: validates the
+    /// configuration, stores the backup admin and timeout, and starts the
+    /// claim clock. Performs NO authorization; callers must do that first
+    /// (direct admin call or timelock execution).
+    fn apply_set_backup_admin(
+        env: &Env,
+        backup: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        if timeout_seconds < Self::MIN_DMS_TIMEOUT {
+            return Err(Error::InvalidDmsConfig);
+        }
+        let admin = Self::require_admin(env)?;
+        if backup == admin {
+            return Err(Error::InvalidDmsConfig);
+        }
+
+        env.storage().instance().set(&DataKey::BackupAdmin, &backup);
+        env.storage()
+            .instance()
+            .set(&DataKey::DmsTimeout, &timeout_seconds);
+        // The claim clock starts ticking from the moment the switch is armed.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHeartbeat, &env.ledger().timestamp());
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "backup_admin_set"), admin),
+            (backup, timeout_seconds),
+        );
+
+        log!(env, "Dead man's switch armed");
+        Ok(())
+    }
+
+    /// Disables the dead man's switch, removing the backup admin and its
+    /// claim window. The inactivity timeout is left in storage untouched so
+    /// a later re-arming (via timelock) can reuse it.
+    ///
+    /// Admin authorization is required.
+    pub fn remove_backup_admin(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "backup_admin_removed"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Dead man's switch disarmed");
+        Ok(())
+    }
+
+    /// Heartbeat: records the current ledger timestamp as the admin's last
+    /// sign of life, restarting the dead man's switch claim clock.
+    ///
+    /// This is the primary way for the admin to reset the timer without
+    /// changing any contract state. Routing a payment also bumps the
+    /// heartbeat automatically. A no-op when no backup admin is configured.
+    ///
+    /// Admin authorization is required. Works even while the contract is
+    /// frozen so the legitimate admin can keep the switch alive.
+    pub fn ping(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        Self::bump_heartbeat(&env);
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("ping"), admin), env.ledger().timestamp());
+
+        log!(&env, "Admin heartbeat recorded");
+        Ok(())
+    }
+
+    /// Dead man's switch claim: transfers admin rights to `claimant` if they
+    /// are the configured backup admin and the admin has not pinged (directly
+    /// or via routing a payment) for at least the configured timeout.
+    ///
+    /// Deliberately NOT timelocked and NOT blocked by a contract freeze: if
+    /// the primary admin is gone there is nobody left to execute a queued
+    /// action, and freezing must not be able to brick recovery.
+    ///
+    /// # Parameters
+    /// - `claimant`: Address claiming admin rights. Must be the configured
+    ///   backup admin and must authorize the call.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err(Error::NoBackupAdmin)` if no backup is
+    /// configured, `Err(Error::Unauthorized)` if `claimant` is not the
+    /// backup, or `Err(Error::DmsNotReady)` if the timeout has not elapsed.
+    pub fn claim_admin(env: Env, claimant: Address) -> Result<(), Error> {
+        claimant.require_auth();
+
+        let backup: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackupAdmin)
+            .ok_or(Error::NoBackupAdmin)?;
+
+        if claimant != backup {
+            return Err(Error::Unauthorized);
+        }
+
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .ok_or(Error::InvalidDmsConfig)?;
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .ok_or(Error::InvalidDmsConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < last_heartbeat.saturating_add(timeout) {
+            return Err(Error::DmsNotReady);
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &claimant);
+        // Fully disarm the switch: the backup is consumed and the clock is
+        // cleared so the new admin starts from a clean slate (re-arm via the
+        // timelock if desired).
+        env.storage().instance().remove(&DataKey::BackupAdmin);
+        env.storage().instance().remove(&DataKey::LastHeartbeat);
+        env.storage().instance().remove(&DataKey::DmsTimeout);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_claimed"), claimant.clone()), now);
+
+        log!(&env, "Admin claimed via dead man's switch");
+        Ok(())
+    }
+
+    /// Returns the current admin address.
+    ///
+    /// # Returns
+    /// `Some(admin)` if the contract is initialized, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Returns the dead man's switch configuration.
+    ///
+    /// # Returns
+    /// `(backup_admin, timeout_seconds, last_heartbeat, seconds_since_heartbeat)`.
+    /// `backup_admin` is `None` and the timestamps `0` when no backup is
+    /// configured.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_dead_mans_switch(env: Env) -> (Option<Address>, u64, u64, u64) {
+        let backup = env.storage().instance().get(&DataKey::BackupAdmin);
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let elapsed = if backup.is_some() {
+            now.saturating_sub(last)
+        } else {
+            0
+        };
+        (backup, timeout, last, elapsed)
+    }
+
+    /// Returns `true` if the dead man's switch is armed (a backup admin is
+    /// configured) and the timeout has elapsed, i.e. `claim_admin` would
+    /// currently succeed for the backup.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn is_dead_mans_switch_expired(env: Env) -> bool {
+        let backup_set = env.storage().instance().has(&DataKey::BackupAdmin);
+        if !backup_set {
+            return false;
+        }
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DmsTimeout)
+            .unwrap_or(0);
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHeartbeat)
+            .unwrap_or(0);
+        env.ledger().timestamp().saturating_sub(last) >= timeout
+    }
+
+    /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
+    /// Recovers tokens accidentally sent directly to the contract address. TreasuryManager-protected.
     /// Arms the dead man's switch directly (bypassing the timelock).
     ///
     /// # Parameters
@@ -2207,6 +2906,21 @@ impl PaymentRouter {
             Self::INSTANCE_BUMP_AMOUNT,
         );
 
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )?;
+
+        // A successful routing proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
+
         env.events().publish((symbol_short!("price_cfg"),), oracle);
         Ok(())
     }
@@ -2272,6 +2986,27 @@ impl PaymentRouter {
         decimals: u32,
     ) -> Result<(), Error> {
         Self::require_role(&env, Role::ComplianceOfficer)?;
+
+        // Successful routing proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
+
+        for payment in payments.iter() {
+            Self::process_single_payment(
+                &env,
+                &payment.sender,
+                &payment.recipient,
+                &payment.token_address,
+                payment.amount,
+                &platform_treasury,
+                fee_bps,
+                fee_cap,
+            )?;
+        }
+
+        // A successful batch proves the platform is alive and serving, so
+        // bump the dead man's switch heartbeat (no-op without a backup admin).
+        Self::bump_heartbeat(&env);
 
         let key = DataKey::FallbackPrice(base_asset.clone(), quote_asset.clone());
         if fallback_price == 0 {
@@ -3055,6 +3790,315 @@ impl PaymentRouter {
         dead_mans_switch::get_heartbeat_operator_internal(&env)
     }
 
+    /// Advances the ledger clock by `seconds`.
+    fn advance_time(env: &Env, seconds: u64) {
+        let current_time = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: current_time + seconds,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+    }
+
+    /// Initializes the contract and arms the dead man's switch through the
+    /// full timelock path (queue → wait 24h → execute), returning the
+    /// addresses involved.
+    fn setup_dms_env(
+        env: &Env,
+        client: &PaymentRouterClient<'static>,
+        admin: &Address,
+        backup: &Address,
+        timeout: u64,
+    ) {
+        let treasury = Address::generate(env);
+        client.initialize(admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.queue_action(&ActionType::SetBackupAdmin(backup.clone(), timeout));
+        advance_time(env, PaymentRouter::SECONDS_IN_24H + 1);
+        client.execute_action(&nonce);
+    }
+
+    #[test]
+    fn test_dms_configure_via_timelock_and_getter() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        let timeout: u64 = 30 * 24 * 3600;
+
+        // Unarmed before configuration.
+        let (b, t, last, elapsed) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+        assert_eq!((t, last, elapsed), (0, 0, 0));
+        assert!(!client.is_dead_mans_switch_expired());
+
+        setup_dms_env(&env, &client, &admin, &backup, timeout);
+
+        let (b, t, _last, elapsed) = client.get_dead_mans_switch();
+        assert_eq!(b.unwrap(), backup);
+        assert_eq!(t, timeout);
+        assert!(elapsed < 5, "clock should start at arm time");
+        assert!(!client.is_dead_mans_switch_expired());
+    }
+
+    #[test]
+    fn test_dms_rejects_short_timeout_and_admin_as_backup() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Timeout below MIN_DMS_TIMEOUT.
+        let res = client.try_set_backup_admin_internal(
+            &Address::generate(&env),
+            &(PaymentRouter::MIN_DMS_TIMEOUT - 1),
+        );
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidDmsConfig);
+
+        // Backup identical to the current admin.
+        let res = client.try_set_backup_admin_internal(&admin, &PaymentRouter::MIN_DMS_TIMEOUT);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InvalidDmsConfig);
+
+        // Nothing was armed.
+        let (b, _, _, _) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+    }
+
+    #[test]
+    fn test_dms_claim_fails_before_timeout_then_succeeds() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        // Not the backup cannot claim.
+        let res = client.try_claim_admin(&Address::generate(&env));
+        assert_eq!(res.unwrap_err().unwrap(), Error::Unauthorized);
+
+        // Backup cannot claim before the timeout elapses.
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+
+        // Admin pings just before the deadline; the clock restarts.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        client.ping();
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+
+        // After the timeout since the *ping*, the claim succeeds.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+
+        // The switch is disarmed after a successful claim.
+        let (b, t, last, elapsed) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+        assert_eq!((t, last, elapsed), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_dms_ping_resets_timer() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        // Repeated pings keep the switch alive indefinitely.
+        for _ in 0..3 {
+            advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+            client.ping();
+            let res = client.try_claim_admin(&backup);
+            assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+        }
+
+        // Silence for the full timeout, then the backup takes over.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+    }
+
+    #[test]
+    fn test_dms_routing_payment_bumps_heartbeat() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        let (token_addr, _token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        // Advance almost to the deadline, then route a payment: the
+        // successful payment is a sign of life and restarts the clock.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        client.route_payment(&sender, &recipient, &token_addr, &1_000);
+
+        advance_time(&env, 1);
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+
+        // Failed routing must NOT bump the heartbeat: sender without funds.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        let broke_sender = Address::generate(&env);
+        let res = client.try_route_payment(&broke_sender, &recipient, &token_addr, &1_000);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
+
+        // The failed payment did not reset the clock, so the claim succeeds.
+        advance_time(&env, 2);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+    }
+
+    #[test]
+    fn test_dms_claim_works_while_frozen_and_paused() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        client.emergency_freeze();
+        client.set_pause(&true);
+
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+    }
+
+    #[test]
+    fn test_dms_remove_backup_admin_disarms_switch() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        client.remove_backup_admin();
+
+        let (b, _, last, _) = client.get_dead_mans_switch();
+        assert!(b.is_none());
+        assert_eq!(last, 0);
+
+        // Even after a long silence the claim fails: no backup is configured.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT * 10);
+        let res = client.try_claim_admin(&backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoBackupAdmin);
+    }
+
+    #[test]
+    fn test_dms_no_backup_claim_fails() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_claim_admin(&Address::generate(&env));
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoBackupAdmin);
+    }
+
+    #[test]
+    fn test_dms_new_admin_can_rearm_after_claim() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let backup = Address::generate(&env);
+        setup_dms_env(
+            &env,
+            &client,
+            &admin,
+            &backup,
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        );
+
+        // Silence long enough for the backup to take over.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
+        client.claim_admin(&backup);
+        assert_eq!(client.get_admin(), Some(backup.clone()));
+
+        // The new admin arms a fresh switch with a new backup.
+        let new_backup = Address::generate(&env);
+        let nonce = client.queue_action(&ActionType::SetBackupAdmin(
+            new_backup.clone(),
+            PaymentRouter::MIN_DMS_TIMEOUT,
+        ));
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H + 1);
+        client.execute_action(&nonce);
+
+        let (b, _, _, _) = client.get_dead_mans_switch();
+        assert_eq!(b.unwrap(), new_backup);
+
+        // And the new admin's own ping keeps the fresh switch alive.
+        advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
+        client.ping();
+        let res = client.try_claim_admin(&new_backup);
+        assert_eq!(res.unwrap_err().unwrap(), Error::DmsNotReady);
+    }
+
+    #[test]
+    fn test_dms_heartbeat_is_noop_without_backup() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        // Ping works before any backup exists but is a no-op for the
+        // heartbeat: the switch is unarmed, so there is no clock to reset.
+        advance_time(&env, 1_000);
+        client.ping();
+        let (_, _, last, elapsed) = client.get_dead_mans_switch();
+        assert_eq!(last, 0);
+        assert_eq!(elapsed, 0);
+
+        let res = client.try_claim_admin(&Address::generate(&env));
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoBackupAdmin);
+    }
+
+    #[test]
+    fn test_prevent_self_routing() {
+        let (env, client, _) = setup_env();
     /// Renews the dead man's switch heartbeat on behalf of the configured
     /// heartbeat operator (issue #889).
     ///
