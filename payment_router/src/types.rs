@@ -1,4 +1,4 @@
-use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, String, Vec};
 
 /// A user's rolling 24-hour spending record.
 ///
@@ -30,6 +30,20 @@ pub struct UserRecord {
     pub last_reset_time: u64,
 }
 
+/// Stellar memo forms supported by the payment router.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Memo {
+    /// No memo was supplied for this payment.
+    None,
+    /// Numeric memo (up to 64 bits).
+    Id(u64),
+    /// UTF-8 text memo, limited to Stellar's 28-byte maximum.
+    Text(String),
+    /// Fixed-size 32-byte hash memo.
+    Hash(BytesN<32>),
+}
+
 /// A single transfer instruction for use with [`PaymentRouter::route_payments`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +57,8 @@ pub struct Payment {
     /// Amount to route, denominated in the token's smallest unit. Must be
     /// positive and within the contract's configured min/max bounds.
     pub amount: i128,
+    /// Optional Stellar memo attached to the routed transfer event.
+    pub memo: Memo,
 }
 
 /// Structured payload for meta-transactions.

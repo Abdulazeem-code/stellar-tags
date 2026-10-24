@@ -424,6 +424,7 @@ impl PaymentRouter {
         platform_treasury: &Address,
         fee_bps: i128,
         fee_cap: i128,
+        memo: Memo,
     ) -> Result<(), Error> {
         env.events().publish(
             (Symbol::new(env, "payment_initiated"), sender.clone()),
@@ -496,9 +497,32 @@ impl PaymentRouter {
             (symbol_short!("routed"), sender.clone(), recipient.clone()),
             amount,
         );
+        // Keep the long-standing `routed` event payload stable and publish
+        // memo data alongside it under a separate, address-correlated event.
+        if memo != Memo::None {
+            env.events().publish(
+                (
+                    Symbol::new(env, "payment_memo"),
+                    sender.clone(),
+                    recipient.clone(),
+                ),
+                memo,
+            );
+        }
 
         log!(env, "Platform fee routed to treasury");
 
+        Ok(())
+    }
+
+    /// Reject text memos exceeding Stellar's protocol limit (measured in
+    /// UTF-8 bytes, not Unicode scalar values).
+    fn validate_memo(memo: &Memo) -> Result<(), Error> {
+        if let Memo::Text(text) = memo {
+            if text.len() > 28 {
+                return Err(Error::InvalidMemo);
+            }
+        }
         Ok(())
     }
 
@@ -2591,6 +2615,7 @@ impl PaymentRouter {
             &platform_treasury,
             fee_bps,
             fee_cap,
+            Memo::None,
         )?;
 
         // A successful routing proves the platform is alive and serving, so
@@ -2683,6 +2708,7 @@ impl PaymentRouter {
             &platform_treasury,
             fee_bps,
             fee_cap,
+            Memo::None,
         )
     }
 
@@ -2885,6 +2911,7 @@ impl PaymentRouter {
         // Collect unique senders to require auth only once per sender.
         let mut seen_senders = Vec::new(&env);
         for payment in payments.iter() {
+            Self::validate_memo(&payment.memo)?;
             if payment.sender == payment.recipient {
                 return Err(Error::InvalidRecipient);
             }
@@ -2934,6 +2961,7 @@ impl PaymentRouter {
                 &platform_treasury,
                 fee_bps,
                 fee_cap,
+                payment.memo,
             )?;
         }
 

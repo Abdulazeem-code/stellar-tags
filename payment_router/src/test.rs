@@ -7,7 +7,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype,
     testutils::{Address as _, Events, Ledger as _, LedgerInfo, MockAuth, MockAuthInvoke},
     token::StellarAssetClient,
-    Address, Env, Symbol, TryIntoVal, Val,
+    Address, Env, String, Symbol, TryIntoVal, Val,
 };
 
 #[contracttype]
@@ -527,12 +527,108 @@ fn test_batch_payments_enforce_kyc_for_each_sender() {
             recipient,
             token_address,
             amount: 2_000,
+            memo: Memo::None,
         }],
     );
     assert_eq!(
         client.try_route_payments(&payments),
         Err(Ok(Error::KycRequired))
     );
+}
+
+#[test]
+fn test_batch_rejects_text_memos_over_stellar_byte_limit() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let (token_address, token_client, token_admin_client) = setup_token(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+    token_admin_client.mint(&sender, &1_000);
+
+    let payments = Vec::from_array(
+        &env,
+        [Payment {
+            sender,
+            recipient: recipient.clone(),
+            token_address,
+            amount: 100,
+            memo: Memo::Text(String::from_str(&env, "12345678901234567890123456789")),
+        }],
+    );
+
+    assert_eq!(
+        client.try_route_payments(&payments),
+        Err(Ok(Error::InvalidMemo))
+    );
+    assert_eq!(token_client.balance(&recipient), 0);
+}
+
+#[test]
+fn test_memo_validation_accepts_supported_forms_and_counts_utf8_bytes() {
+    let env = Env::default();
+    assert_eq!(PaymentRouter::validate_memo(&Memo::Id(42)), Ok(()));
+    assert_eq!(
+        PaymentRouter::validate_memo(&Memo::Text(String::from_str(
+            &env,
+            "1234567890123456789012345678",
+        ))),
+        Ok(())
+    );
+    assert_eq!(
+        PaymentRouter::validate_memo(&Memo::Hash(BytesN::from_array(&env, &[0; 32],))),
+        Ok(())
+    );
+    // Fifteen two-byte characters are only 15 characters, but exceed the
+    // protocol's 28-byte limit.
+    assert_eq!(
+        PaymentRouter::validate_memo(&Memo::Text(String::from_str(&env, "ééééééééééééééé",))),
+        Err(Error::InvalidMemo)
+    );
+}
+
+#[test]
+fn test_batch_preserves_memo_in_transfer_event() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let (token_address, token_client, token_admin_client) = setup_token(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+    token_admin_client.mint(&sender, &1_000);
+    let memo = Memo::Text(String::from_str(&env, "invoice-42"));
+    let payments = Vec::from_array(
+        &env,
+        [Payment {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token_address,
+            amount: 100,
+            memo: memo.clone(),
+        }],
+    );
+
+    client.route_payments(&payments);
+
+    assert_eq!(token_client.balance(&recipient), 99);
+    let mut memo_event = None;
+    for (_, topics, data) in env.events().all().iter() {
+        if topics.len() != 3 {
+            continue;
+        }
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == Symbol::new(&env, "payment_memo") {
+            let event_sender: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            let event_recipient: Address = topics.get(2).unwrap().try_into_val(&env).unwrap();
+            if event_sender == sender && event_recipient == recipient {
+                let decoded_memo: Memo = data.try_into_val(&env).unwrap();
+                memo_event = Some(decoded_memo);
+            }
+        }
+    }
+    assert_eq!(memo_event, Some(memo));
 }
 
 /// Regression test for the `route_payments` trap on a repeated sender.
@@ -580,6 +676,7 @@ fn test_batch_with_a_repeated_sender_succeeds() {
             recipient: recipient.clone(),
             token_address: token_address.clone(),
             amount,
+            memo: Memo::None,
         });
     }
 
@@ -635,12 +732,14 @@ fn test_batch_with_a_repeated_sender_rejects_gracefully() {
                 recipient: recipient.clone(),
                 token_address: token_address.clone(),
                 amount: 1_000_000,
+                memo: Memo::None,
             },
             Payment {
                 sender,
                 recipient: recipient.clone(),
                 token_address,
                 amount: PaymentRouter::MAX_AMOUNT + 1,
+                memo: Memo::None,
             },
         ],
     );
@@ -698,18 +797,21 @@ fn test_batch_with_several_distinct_senders_succeeds() {
                 recipient: first_recipient.clone(),
                 token_address: token_address.clone(),
                 amount,
+                memo: Memo::None,
             },
             Payment {
                 sender: senders.get(0).unwrap().clone(),
                 recipient: second_recipient.clone(),
                 token_address: token_address.clone(),
                 amount,
+                memo: Memo::None,
             },
             Payment {
                 sender: senders.get(1).unwrap().clone(),
                 recipient: first_recipient.clone(),
                 token_address: token_address.clone(),
                 amount,
+                memo: Memo::None,
             },
         ],
     );
@@ -3776,6 +3878,7 @@ fn single_payment_batch(
         recipient: recipient.clone(),
         token_address: token_address.clone(),
         amount: 100,
+        memo: Memo::None,
     });
     payments
 }
@@ -3822,6 +3925,7 @@ fn test_rate_limit_batch_rejection_is_atomic() {
         recipient: recipient.clone(),
         token_address: token_address.clone(),
         amount: 100,
+        memo: Memo::None,
     });
     let res = client.try_route_payments(&payments);
     assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
@@ -3872,6 +3976,7 @@ fn test_rate_limit_batch_counts_each_sender_independently() {
         recipient: recipient.clone(),
         token_address: token_address.clone(),
         amount: 100,
+        memo: Memo::None,
     });
     client.route_payments(&payments);
     assert_eq!(token_client.balance(&a), 1_000_000 - 100);
@@ -3887,6 +3992,7 @@ fn test_rate_limit_batch_counts_each_sender_independently() {
         recipient: recipient.clone(),
         token_address: token_address.clone(),
         amount: 100,
+        memo: Memo::None,
     });
     let res = client.try_route_payments(&payments);
     assert_eq!(res.unwrap_err().unwrap(), Error::RateLimited);
