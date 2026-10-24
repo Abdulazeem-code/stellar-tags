@@ -157,6 +157,11 @@ pub enum DataKey {
     MaxSlippageBps,
     /// Maximum tolerated swap slippage for a specific input/output token pair.
     PairSlippage(Address, Address),
+    /// Published reserve and fee metadata for a DEX pool, read by the
+    /// read-only gas and slippage simulation engine (issue #881).
+    /// Pools without published metadata fall back to deterministic
+    /// derived reserves, so simulation never requires a mutating call.
+    PoolMetadata(Address),
     /// The N addresses of the multi-signature admin group for upgrades.
     MultisigSigners,
     /// The M signers threshold of the multi-signature admin group.

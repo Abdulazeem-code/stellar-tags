@@ -88,7 +88,7 @@ pub struct SwapPayment {
     pub dex: Address,
 }
 
-/// The result of a DEX quote, returned by [`PaymentRouter::quote_swap`].
+/// The result of a DEX-routed swap quote, returned by [`PaymentRouter::quote_swap`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwapQuote {

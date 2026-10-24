@@ -117,4 +117,6 @@ pub enum Error {
     InvalidSlippageConfig = 55,
     /// A DEX swap path revisits an asset and would create a cycle.
     CyclicSwapPath = 56,
+    /// A simulated hop reported unusable reserves, so the route cannot be priced.
+    InsufficientLougity = 50,
 }
