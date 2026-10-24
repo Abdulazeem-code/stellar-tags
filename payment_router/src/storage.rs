@@ -1,5 +1,5 @@
 use crate::errors::Error;
-use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 // ── Tiered Circuit Breaker ───────────────────────────────────────────────────
 
@@ -52,14 +52,6 @@ pub enum Role {
     Pauser = 5,
 }
 
-/// Dedicated key type for the heartbeat operator, kept separate to stay within
-/// Soroban's generated enum size limit for `DataKey`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeartbeatKey {
-    HeartbeatOperator,
-}
-
 /// Storage keys for all contract instance and persistent data.
 #[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,8 +70,6 @@ pub enum DataKey {
     MinLimit,
     /// Whether routing is currently paused.
     Paused,
-    /// Tiered circuit-breaker pause level.
-    PauseLevel,
     /// Maximum amount accepted by a single payment.
     MaxAmount,
     /// Cumulative lifetime amount routed by a given sender.
@@ -111,8 +101,6 @@ pub enum DataKey {
     Frozen,
     /// Whether an address holds a given role.
     UserRole(Address, Role),
-    /// The primary address currently holding a role.
-    Role(Role),
     /// Monotonic nonce for meta-transaction replay protection.
     MetaNonce(Address),
     /// Trusted issuer/oracle queried for high-value payment senders.
@@ -128,14 +116,6 @@ pub enum DataKey {
     /// Inactivity window (seconds) after which the backup admin may claim.
     /// Stored as `u64` in instance storage.
     DmsTimeout,
-    /// Tier 2 council signers for multi-sig succession.
-    DmsTier2Council,
-    /// Tier 2 configuration tuple (threshold: u32, timeout_seconds: u64).
-    DmsTier2Config,
-    /// Pending in-flight dead man's switch claim (DmsClaimStatus) during grace period.
-    DmsPendingClaim,
-    /// List of council signers who approved the pending Tier 2 claim.
-    DmsCouncilApprovals,
     /// Per-address payment invocation cap per ledger sequence.
     /// Stored as `u32` in instance storage (`0` disables rate limiting).
     RateLimitConfig,
@@ -183,12 +163,15 @@ pub enum DataKey {
     UpgradeApproval(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
-    /// Packed claimed-leaf bitmap for a Merkle payment batch.
-    MerkleClaimedBits(u64),
-    /// A prepared two-phase cross-contract upgrade manifest, keyed by its
-    /// upgrade ID. Stored in persistent storage so it survives instance
-    /// eviction while the timelock runs.
-    TwoPhaseCommit(BytesN<32>),
+    /// Tiered pause level for the emergency circuit breaker (issue #890).
+    /// Stored as `PauseLevel` in instance storage. Supersedes the legacy
+    /// `DataKey::Paused` boolean; both keys are honoured during migration so
+    /// existing paused state is preserved.
+    PauseLevel,
+    /// The operator address authorized to renew the dead man's switch heartbeat
+    /// without possessing full admin privileges (issue #889).
+    /// Stored as `Address` in instance storage.
+    HeartbeatOperator,
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -200,7 +183,6 @@ pub const DAILY_MAX_LIMIT: i128 = 1_000_000 * XLM_DECIMALS; // 1M tokens limit
 pub const VOLUME_THRESHOLD: i128 = 10_000 * XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
 pub const SECONDS_IN_24H: u64 = 24 * 3600;
 pub const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
-pub const DMS_GRACE_PERIOD: u64 = 72 * 3600;
 pub const DEFAULT_RATE_LIMIT: u32 = 10;
 pub const MAX_RATE_LIMIT: u32 = 1_000_000;
 pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
@@ -214,8 +196,6 @@ pub const USER_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 pub const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
 pub const PERSISTENT_BUMP_AMOUNT: u32 = USER_BUMP_AMOUNT;
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = USER_LIFETIME_THRESHOLD;
-/// Number of bits packed into each `u64` word of a Merkle claimed bitset.
-pub const MERKLE_BITS_PER_WORD: u32 = 64;
 
 /// Number of boolean user flags packed into the per-user `u256` bitmap
 /// (issue #894). Bit `i` records the state of user flag `i` (e.g. KYC
@@ -482,249 +462,4 @@ pub fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i
     }
 
     Ok(volume)
-}
-
-// ── Merkle Batch Helpers ─────────────────────────────────────────────────────
-
-/// Packed record describing a registered Merkle distribution batch.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MerkleBatchRecord {
-    /// Address that funded the batch and may reclaim unclaimed funds.
-    pub sender: Address,
-    /// Token contract used for disbursement.
-    pub token: Address,
-    /// Total amount deposited for the batch.
-    pub total_amount: i128,
-    /// Committed 32-byte Merkle root over (recipient, amount) leaves.
-    pub merkle_root: BytesN<32>,
-    /// Unix timestamp after which unclaimed funds may be reclaimed.
-    pub expiration: u64,
-    /// Total amount already claimed from this batch.
-    pub claimed_amount: i128,
-}
-
-/// Returns the number of `u64` words required to store `leaf_count` bits.
-pub fn merkle_bitset_words(leaf_count: u32) -> u32 {
-    if leaf_count == 0 {
-        return 0;
-    }
-    leaf_count.div_ceil(MERKLE_BITS_PER_WORD)
-}
-
-/// Reads the packed claimed bitset for a batch, returning an empty vector when
-/// no claims have been recorded yet.
-pub fn load_merkle_bits(env: &Env, batch_id: u64) -> Vec<u64> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::MerkleClaimedBits(batch_id))
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-/// Persists the packed claimed bitset for a batch with an extended TTL.
-pub fn store_merkle_bits(env: &Env, batch_id: u64, bits: &Vec<u64>) {
-    let key = DataKey::MerkleClaimedBits(batch_id);
-    env.storage().persistent().set(&key, bits);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
-}
-
-/// Returns `true` when the bit at `index` is set in the packed bitset.
-pub fn merkle_bit_get(bits: &Vec<u64>, index: u32) -> bool {
-    let word = index / MERKLE_BITS_PER_WORD;
-    let offset = index % MERKLE_BITS_PER_WORD;
-    match bits.get(word) {
-        Some(w) => (w >> offset) & 1 == 1,
-        None => false,
-    }
-}
-
-/// Sets the bit at `index` in the packed bitset, growing it as needed.
-pub fn merkle_bit_set(env: &Env, bits: &mut Vec<u64>, index: u32) {
-    let word = index / MERKLE_BITS_PER_WORD;
-    let offset = index % MERKLE_BITS_PER_WORD;
-    while bits.len() <= word {
-        bits.push_back(0u64);
-    }
-    let current = bits.get(word).unwrap_or(0);
-    bits.set(word, current | (1u64 << offset));
-    let _ = env;
-}
-
-/// A packed telemetry record stored in the temporary ring buffer.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackedTelemetryRecord {
-    /// Unix timestamp (seconds) when the observation was recorded.
-    pub timestamp: u32,
-    /// Payment volume in smallest token units.
-    pub volume: u32,
-    /// Status code (e.g., 0 = success, 1 = failed, etc.).
-    pub status: u32,
-    /// Reserved for alignment/padding.
-    pub reserved: u32,
-}
-
-/// Internal key for the telemetry ring buffer.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TelemetryKey {
-    /// Ring buffer of packed telemetry records.
-    Buffer,
-    /// Current write position in the ring buffer.
-    Head,
-    /// Number of valid entries in the buffer.
-    Length,
-}
-
-/// Appends a new telemetry observation to the temporary ring buffer.
-pub fn append_telemetry(
-    env: &Env,
-    timestamp: u32,
-    volume: u32,
-    status: u32,
-) -> PackedTelemetryRecord {
-    let capacity = env
-        .storage()
-        .temporary()
-        .get::<TelemetryKey, u32>(&TelemetryKey::Buffer)
-        .map(|_| {
-            // Buffer exists, get its current capacity by checking length
-            env.storage()
-                .temporary()
-                .get::<TelemetryKey, u32>(&TelemetryKey::Length)
-                .unwrap_or(0)
-        })
-        .unwrap_or(DEFAULT_TELEMETRY_CAPACITY);
-
-    let record = PackedTelemetryRecord {
-        timestamp,
-        volume,
-        status,
-        reserved: 0,
-    };
-
-    // Read current buffer
-    let mut buffer: Vec<PackedTelemetryRecord> = env
-        .storage()
-        .temporary()
-        .get(&TelemetryKey::Buffer)
-        .unwrap_or_else(|| Vec::new(env));
-
-    let head: u32 = env
-        .storage()
-        .temporary()
-        .get(&TelemetryKey::Head)
-        .unwrap_or(0);
-    let length: u32 = env
-        .storage()
-        .temporary()
-        .get(&TelemetryKey::Length)
-        .unwrap_or(0);
-
-    if buffer.len() < capacity {
-        buffer.push_back(record.clone());
-    } else {
-        buffer.set(head, record.clone());
-    }
-
-    let new_head = (head + 1) % capacity;
-    let new_length = if length < capacity {
-        length + 1
-    } else {
-        length
-    };
-
-    env.storage()
-        .temporary()
-        .set(&TelemetryKey::Buffer, &buffer);
-    env.storage()
-        .temporary()
-        .set(&TelemetryKey::Head, &new_head);
-    env.storage()
-        .temporary()
-        .set(&TelemetryKey::Length, &new_length);
-
-    // Extend TTL for temporary storage
-    env.storage().temporary().extend_ttl(
-        &TelemetryKey::Buffer,
-        TEMPORARY_LIFETIME_THRESHOLD,
-        TEMPORARY_BUMP_AMOUNT,
-    );
-    env.storage().temporary().extend_ttl(
-        &TelemetryKey::Head,
-        TEMPORARY_LIFETIME_THRESHOLD,
-        TEMPORARY_BUMP_AMOUNT,
-    );
-    env.storage().temporary().extend_ttl(
-        &TelemetryKey::Length,
-        TEMPORARY_LIFETIME_THRESHOLD,
-        TEMPORARY_BUMP_AMOUNT,
-    );
-
-    record
-}
-
-/// Returns the rolling average volume from the telemetry ring buffer.
-pub fn get_telemetry_average(env: &Env) -> u64 {
-    let buffer: Vec<PackedTelemetryRecord> = env
-        .storage()
-        .temporary()
-        .get(&TelemetryKey::Buffer)
-        .unwrap_or_else(|| Vec::new(env));
-
-    if buffer.is_empty() {
-        return 0;
-    }
-
-    let sum: u128 = buffer.iter().map(|r| u128::from(r.volume)).sum();
-    let avg = sum / u128::from(buffer.len());
-    u64::try_from(avg).unwrap_or(0)
-}
-
-/// Computes the statistical percentile (0..=100) of payment volume in the telemetry ring buffer.
-///
-/// # Panics
-/// Panics if the internal buffer iteration encounters an unexpected empty value
-/// (should not occur as the buffer is checked for emptiness at the start).
-pub fn get_telemetry_percentile(env: &Env, p: u32) -> u32 {
-    let buffer: Vec<PackedTelemetryRecord> = env
-        .storage()
-        .temporary()
-        .get(&TelemetryKey::Buffer)
-        .unwrap_or_else(|| Vec::new(env));
-
-    if buffer.is_empty() || p > 100 {
-        return 0;
-    }
-
-    // Manually build volumes array from buffer
-    let mut volumes = Vec::new(env);
-    for i in 0..buffer.len() {
-        if let Some(record) = buffer.get(i) {
-            volumes.push_back(record.volume);
-        }
-    }
-
-    // Simple selection sort for small arrays
-    let len = volumes.len();
-    for i in 0..len {
-        let mut min_idx = i;
-        for j in (i + 1)..len {
-            if volumes.get(j).unwrap_or(0) < volumes.get(min_idx).unwrap_or(0) {
-                min_idx = j;
-            }
-        }
-        if min_idx != i {
-            let temp = volumes.get(i).unwrap_or(0);
-            volumes.set(i, volumes.get(min_idx).unwrap_or(0));
-            volumes.set(min_idx, temp);
-        }
-    }
-
-    let index = (len - 1) * p / 100;
-    volumes.get(index).unwrap_or(0)
 }
