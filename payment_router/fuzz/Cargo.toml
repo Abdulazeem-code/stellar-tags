@@ -7,6 +7,13 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# `cargo fuzz` builds this manifest directly, outside the root workspace.
+# Declaring it as its own workspace root keeps the `[patch.crates-io]` and
+# `[profile.release]` tables below honored (Cargo ignores both on a non-root
+# package) and stops Cargo erroring that the package is in a workspace it is
+# not a member of.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "=1.3.2", features = ["derive"] }
@@ -16,6 +23,13 @@ payment_router = { path = "..", features = ["testutils"] }
 [[bin]]
 name = "route_payments"
 path = "fuzz_targets/route_payments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "router_fuzz"
+path = "fuzz_targets/router_fuzz.rs"
 test = false
 doc = false
 bench = false

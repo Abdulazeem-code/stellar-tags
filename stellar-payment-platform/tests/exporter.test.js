@@ -71,25 +71,28 @@ const writtenText = (res) =>
 // ── buildDateFilter ──────────────────────────────────────────────────────────
 
 describe('buildDateFilter', () => {
-  it('returns an empty clause when neither date is given', () => {
-    expect(exporter.buildDateFilter()).toEqual({});
-    expect(exporter.buildDateFilter(undefined, undefined)).toEqual({});
+  it('scopes the filter to live rows when neither date is given', () => {
+    expect(exporter.buildDateFilter()).toEqual({ deletedAt: null });
+    expect(exporter.buildDateFilter(undefined, undefined)).toEqual({ deletedAt: null });
   });
 
   it('builds a gte filter when only startDate is given', () => {
     const result = exporter.buildDateFilter('2026-08-01');
+    expect(result.deletedAt).toBeNull();
     expect(result.createdAt.gte).toEqual(new Date('2026-08-01'));
     expect(result.createdAt.lte).toBeUndefined();
   });
 
   it('builds an end-of-day lte filter when only endDate is given', () => {
     const result = exporter.buildDateFilter(undefined, '2026-08-15');
+    expect(result.deletedAt).toBeNull();
     expect(result.createdAt.gte).toBeUndefined();
     expect(result.createdAt.lte.toISOString()).toBe('2026-08-15T23:59:59.999Z');
   });
 
   it('builds both bounds when startDate and endDate are given', () => {
     const result = exporter.buildDateFilter('2026-08-01', '2026-08-15');
+    expect(result.deletedAt).toBeNull();
     expect(result.createdAt.gte).toEqual(new Date('2026-08-01'));
     expect(result.createdAt.lte.toISOString()).toBe('2026-08-15T23:59:59.999Z');
   });
@@ -159,6 +162,7 @@ describe('streamAdminExport CSV', () => {
     expect(prisma.payment.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
+          deletedAt: null,
           createdAt: expect.objectContaining({
             gte: expect.any(Date),
             lte: expect.any(Date),
@@ -206,6 +210,52 @@ describe('streamAdminExport CSV', () => {
     } finally {
       delete process.env.EXPORT_MAX_PAGES;
     }
+  });
+
+  it('walks pages by keyset seek on (createdAt, id) instead of OFFSET', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const lastRow = makeRecord(exporter.PAGE_SIZE - 1);
+    const page1 = Array.from({ length: exporter.PAGE_SIZE }, (_, i) => makeRecord(i));
+    const page2 = [makeRecord(500), makeRecord(501)];
+    const prisma = makePrisma();
+    prisma.payment.findMany
+      .mockResolvedValueOnce(page1)
+      .mockResolvedValueOnce(page2)
+      .mockResolvedValueOnce([]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'corr-keyset',
+    });
+
+    const calls = prisma.payment.findMany.mock.calls.map(([args]) => args);
+    // No call may carry OFFSET/skip, and ordering must be deterministic on
+    // (createdAt, id).
+    for (const args of calls) {
+      expect(args.skip).toBeUndefined();
+      expect(args.orderBy).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
+    }
+    // Page 1 has no cursor predicate; page 2 seeks strictly past the last row
+    // of page 1. Every page stays scoped to live (non soft-deleted) rows.
+    expect(calls[0].where).toEqual({ deletedAt: null });
+    expect(calls[1].where).toEqual({
+      AND: [
+        { deletedAt: null },
+        {
+          OR: [
+            { createdAt: { lt: lastRow.createdAt } },
+            { AND: [{ createdAt: { equals: lastRow.createdAt } }, { id: { lt: lastRow.id } }] },
+          ],
+        },
+      ],
+    });
+
+    const lines = writtenText(res).trim().split('\n').filter(Boolean);
+    expect(lines.length).toBe(exporter.PAGE_SIZE + 2);
   });
 });
 

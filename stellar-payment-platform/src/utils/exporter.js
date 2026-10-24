@@ -9,6 +9,8 @@
  * Design goals (issue #489):
  *  - Accept `format` (csv | json), optional `startDate` / `endDate` filters.
  *  - Stream records in pages so heap use is bounded regardless of export size.
+ *  - Walk pages by keyset seek on (createdAt, id) instead of OFFSET, so page
+ *    cost is flat no matter how deep the export goes (issue #677).
  *  - Write JSON as a newline-delimited stream (one object per line) to avoid
  *    buffering the full array before the first byte is flushed.
  *  - Respect socket backpressure by awaiting drain when needed.
@@ -17,6 +19,7 @@
 const { once } = require('events');
 const { Transform } = require('stream');
 const { Parser: CsvParser } = require('json2csv');
+const { keysetWhereDescById } = require('../pagination');
 
 /** Number of rows fetched from the database per round-trip. */
 const PAGE_SIZE = 500;
@@ -60,7 +63,10 @@ const writeChunk = async (res, chunk) => {
  * @returns {object} Prisma where clause fragment.
  */
 const buildDateFilter = (startDate, endDate) => {
-  if (!startDate && !endDate) return {};
+  // Soft-deleted payments stay out of every export; the predicate is always
+  // present so a date-less export is still scoped to live rows.
+  const where = { deletedAt: null };
+  if (!startDate && !endDate) return where;
 
   const filter = {};
   if (startDate) filter.gte = new Date(startDate);
@@ -70,7 +76,8 @@ const buildDateFilter = (startDate, endDate) => {
     end.setUTCHours(23, 59, 59, 999);
     filter.lte = end;
   }
-  return { createdAt: filter };
+  where.createdAt = filter;
+  return where;
 };
 
 /**
@@ -88,12 +95,17 @@ const streamCsv = async (res, prisma, filter, logger, correlationId) => {
   let totalRows = 0;
   let truncated = false;
   let headerWritten = false;
+  // Sort-key tuple of the last row of the previous page. The next query seeks
+  // strictly past it (keyset pagination) instead of skipping OFFSET rows, so
+  // deep pages cost the same as the first one.
+  let cursor = null;
 
   for (; page < MAX_PAGES; page++) {
     if (res.writableEnded) break;
 
+    const where = cursor ? { AND: [filter, keysetWhereDescById(cursor)] } : filter;
     const records = await prisma.payment.findMany({
-      where: filter,
+      where,
       select: {
         id: true,
         createdAt: true,
@@ -104,8 +116,7 @@ const streamCsv = async (res, prisma, filter, logger, correlationId) => {
         transactionHash: true,
         status: true,
       },
-      orderBy: { createdAt: 'desc' },
-      skip: page * PAGE_SIZE,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: PAGE_SIZE,
     });
 
@@ -130,6 +141,9 @@ const streamCsv = async (res, prisma, filter, logger, correlationId) => {
     totalRows += records.length;
 
     if (records.length < PAGE_SIZE) break; // last page
+
+    const last = records[records.length - 1];
+    cursor = { createdAt: last.createdAt, id: last.id };
 
     if (page === MAX_PAGES - 1) {
       truncated = true;
@@ -161,12 +175,14 @@ const streamJson = async (res, prisma, filter, logger, correlationId) => {
   let page = 0;
   let totalRows = 0;
   let truncated = false;
+  let cursor = null;
 
   for (; page < MAX_PAGES; page++) {
     if (res.writableEnded) break;
 
+    const where = cursor ? { AND: [filter, keysetWhereDescById(cursor)] } : filter;
     const records = await prisma.payment.findMany({
-      where: filter,
+      where,
       select: {
         id: true,
         createdAt: true,
@@ -177,8 +193,7 @@ const streamJson = async (res, prisma, filter, logger, correlationId) => {
         transactionHash: true,
         status: true,
       },
-      orderBy: { createdAt: 'desc' },
-      skip: page * PAGE_SIZE,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: PAGE_SIZE,
     });
 
@@ -191,6 +206,9 @@ const streamJson = async (res, prisma, filter, logger, correlationId) => {
     }
 
     if (records.length < PAGE_SIZE) break;
+
+    const last = records[records.length - 1];
+    cursor = { createdAt: last.createdAt, id: last.id };
 
     if (page === MAX_PAGES - 1) {
       truncated = true;

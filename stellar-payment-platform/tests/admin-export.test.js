@@ -192,4 +192,41 @@ describe('GET /admin/export', () => {
     const lines = res.text.trim().split('\n').filter(Boolean);
     expect(lines.length).toBe(502);
   });
+
+  it('walks pages by keyset seek on (createdAt, id) instead of OFFSET (issue #677)', async () => {
+    const page1 = Array.from({ length: 500 }, (_, i) => makeRecord(i));
+    const lastRow = page1[page1.length - 1];
+    const page2 = [makeRecord(500), makeRecord(501)];
+    mockFindMany
+      .mockResolvedValueOnce(page1)
+      .mockResolvedValueOnce(page2)
+      .mockResolvedValueOnce([]);
+
+    const res = await request(app)
+      .get('/api/v1/admin/export')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(200);
+
+    const calls = mockFindMany.mock.calls.map(([args]) => args);
+    for (const args of calls) {
+      expect(args.skip).toBeUndefined();
+      expect(args.orderBy).toEqual([{ createdAt: 'asc' }, { id: 'asc' }]);
+    }
+    // Page 1 has no cursor predicate; page 2 seeks strictly past the last row
+    // of page 1 (ascending tuple compare). Every page stays scoped to live
+    // (non soft-deleted) rows.
+    expect(calls[0].where).toEqual({ deletedAt: null });
+    expect(calls[1].where).toEqual({
+      AND: [
+        { deletedAt: null },
+        {
+          OR: [
+            { createdAt: { gt: lastRow.createdAt } },
+            { AND: [{ createdAt: { equals: lastRow.createdAt } }, { id: { gt: lastRow.id } }] },
+          ],
+        },
+      ],
+    });
+  });
 });

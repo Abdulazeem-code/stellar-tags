@@ -250,6 +250,35 @@ const adminRoutingStatsQuerySchema = z
     },
     { error: 'startDate must be on or before endDate', path: ['startDate'] },
   );
+/**
+ * GET /admin/dlq query.
+ *
+ * `limit` and `page` clamp rather than reject, so `?limit=1000` returns the
+ * maximum page size and `?page=0` returns the first page instead of erroring.
+ * `username` narrows the listing to one merchant's failed deliveries.
+ */
+const adminDlqQuerySchema = z
+  .object({
+    limit: clampedInt(20, 1, 100),
+    page: clampedInt(1, 1, Number.MAX_SAFE_INTEGER),
+    username: optionalLookupString,
+  })
+  .loose();
+
+/**
+ * POST /admin/dlq/replay body.
+ *
+ * `limit` caps how many messages one bulk replay may re-enqueue, and
+ * `username` narrows the batch to a single merchant. Both are optional: an
+ * empty body replays up to the batch cap.
+ */
+const adminDlqReplayBodySchema = z
+  .object({
+    limit: clampedInt(100, 1, 100),
+    username: optionalLookupString,
+  })
+  .loose();
+
 /** POST /auth/api-keys - generate a new API key */
 const createApiKeyBodySchema = z
   .object({
@@ -333,6 +362,8 @@ module.exports = {
   exportQuerySchema,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
+  adminDlqQuerySchema,
+  adminDlqReplayBodySchema,
   createApiKeyBodySchema,
   revokeApiKeyBodySchema,
   rotateApiKeyBodySchema,

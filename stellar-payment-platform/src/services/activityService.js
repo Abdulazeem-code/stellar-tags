@@ -16,6 +16,7 @@ const ACTIVITY_ACTIONS = {
   USER_UNREGISTERED: 'user.unregistered',
   USER_TRANSFERRED: 'user.transferred',
   USER_BLOCKED: 'user.blocked',
+  USER_RESTORED: 'user.restored',
   WEBHOOK_CREATED: 'webhook.created',
   WEBHOOK_DELETED: 'webhook.deleted',
 };

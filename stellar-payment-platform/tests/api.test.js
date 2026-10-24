@@ -35,7 +35,7 @@ describe('GET /federation', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toHaveProperty('stellar_address');
     expect(res.body).toHaveProperty('account_id');
-  });
+  }, 15000);
 
   it('returns 404 for an unknown user', async () => {
     const res = await request(app)

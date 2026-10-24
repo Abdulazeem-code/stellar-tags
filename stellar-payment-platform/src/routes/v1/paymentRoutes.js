@@ -12,7 +12,7 @@ const routingRuleService = require('../../services/routingRuleService');
 module.exports = (redisClient) => {
   const router = express.Router();
   
-  router.use(idempotencyMiddleware(redisClient));
+
 
   // POST /payments/route — Evaluate payment context against dynamic routing rules
   router.post('/payments/route', requireJson, asyncHandler(async (req, res) => {
@@ -32,6 +32,9 @@ module.exports = (redisClient) => {
       durationMs: evaluation.durationMs,
     });
   }));
+// --- Idempotency protection for payment intent creation (POST /payments/bulk).
+// Duplicate submissions within 24h return the originally created intents. ---
+router.use(idempotencyMiddleware(redisClient, { enforce: true }));
 
   // POST /payments/bulk
 

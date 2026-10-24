@@ -1,7 +1,25 @@
-npx lint-staged
+#!/bin/sh
 
-if git diff --cached --name-only --diff-filter=ACM | grep -q '\.prisma$'; then
-  echo "Prisma schema changed — running prisma validate..."
+# Invoke lint-staged through the locally installed binary rather than `npx`.
+# `npx lint-staged` intermittently fails with
+#   ETARGET  No matching version found for undefined@lint-staged
+# when it decides to consult the registry instead of resolving the local
+# install: npx builds the spec as name@version and gets "undefined" for the
+# version, so the registry lookup can never match. Calling the binary
+# directly removes the registry from the path entirely and makes the hook
+# work offline.
+LINT_STAGED=./node_modules/.bin/lint-staged
+
+if [ ! -x "$LINT_STAGED" ]; then
+  echo "lint-staged is not installed at $LINT_STAGED."
+  echo "Run npm install before committing."
+  exit 1
+fi
+
+"$LINT_STAGED"
+
+if git diff --cached --name-only --diff-filter=ACM | grep -q "\.prisma$"; then
+  echo "Prisma schema changed - running prisma validate..."
   npm --prefix stellar-payment-platform run prisma:validate || {
     echo "Prisma schema is invalid. Fix the errors above before committing."
     exit 1

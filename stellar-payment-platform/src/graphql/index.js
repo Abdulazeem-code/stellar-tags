@@ -146,7 +146,12 @@ const resolvers = {
 
 const schema = buildSubgraphSchema([{ typeDefs, resolvers }]);
 
-const createGraphQLServer = () => new ApolloServer({ schema });
+const depthLimit = require("graphql-depth-limit");
+
+const createGraphQLServer = () => new ApolloServer({ 
+  schema,
+  validationRules: [depthLimit(5)],
+});
 
 const createGraphQLMiddleware = ({ prismaClient }) => {
   const server = createGraphQLServer();

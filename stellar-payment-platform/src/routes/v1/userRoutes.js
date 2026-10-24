@@ -2,6 +2,7 @@ const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { prisma } = require('../../../prismaClient');
+const { getBalances } = require('../../services/ledgerService');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
 const { transferAccount } = require('../../services/registrationService');
@@ -21,7 +22,13 @@ const {
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,
+  RESERVED_USERNAMES,
+  MAX_USERNAMES_PER_ADDRESS,
+  PRIMARY_USERNAME_ORDER,
 } = require('../../utils');
+const Filter = require('bad-words');
+const profanityFilter = new Filter();
+const { verifyFreighterRegistrationSignature } = require('../../services/signatureService');
 const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { requireJson } = require('../../middleware/requireJson');
@@ -31,8 +38,8 @@ const {
   usersQuerySchema,
   activityQuerySchema,
 } = require('../../schemas');
-
-const router = express.Router();
+const { createSignatureRateLimiter } = require('../../middleware/signatureRateLimit');
+const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 
 const buildUserSearchWhere = (search) => {
   if (!search) return {};
@@ -45,13 +52,19 @@ const buildUserSearchWhere = (search) => {
   };
 };
 
-const serializeUser = (user) => ({
+const serializeUser = (user, balances = {}) => ({
   username: user.username,
   address: user.address,
   created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+  balances,
 });
 
-router.post('/register', requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
+function createUserRouter(redisClient) {
+  const router = express.Router();
+  const signatureRateLimiter = createSignatureRateLimiter(redisClient);
+  const idempotency = idempotencyMiddleware(redisClient);
+
+router.post('/register', signatureRateLimiter, idempotency, requireJson, validateSchema({ body: registerBodySchema }), asyncHandler(async (req, res, next) => {
   const safeUsername = xss(req.body.username);
   const username = normalizeNameTag(safeUsername);
   const { address, memo_type: memoType, memo, signature = '', signerAddress = '' } = req.body;
@@ -65,23 +78,10 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
     );
   }
 
-  if (!username || !address) {
-    return next(new ApiError('INVALID_INPUT', 'Missing required fields: username and address are both required.'));
-  }
-
-  const BLOCKED_EXCHANGES = [
-    "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
-    "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
-    "GBV4ZDEPNQ2FKSPKGJP2YKDAIZWQ2XKRQD4V4ACH3TCTXTGLWEBDU3OS"
-  ];
-
-  if (BLOCKED_EXCHANGES.includes(address) && !memo) {
-    return next(new ApiError('INVALID_INPUT', "Cannot map federation addresses directly to custodial exchange master wallets."));
-  }
-
   const usernameLocalPart = username.includes('*') ? username.split('*')[0] : username;
-  if (usernameLocalPart.length < 3) {
-    return next(new ApiError('INVALID_INPUT', "Username must be at least 3 characters long."));
+
+  if (profanityFilter.isProfane(usernameLocalPart)) {
+    return next(new ApiError('INVALID_INPUT', 'Username contains restricted words'));
   }
 
   if (!StrKey.isValidEd25519PublicKey(address)) {
@@ -96,33 +96,79 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
   }
 
   const normalizedUsername = username.toLowerCase();
+  
+  const normalizedLocalPart = normalizedUsername.includes('*') ? normalizedUsername.split('*')[0] : normalizedUsername;
+  if (RESERVED_USERNAMES.includes(normalizedLocalPart)) {
+    return res.status(403).json({ error: "Username is reserved." });
+  }
 
   if (RESERVED_NAMES.includes(normalizedUsername)) {
     return next(new ApiError('FORBIDDEN', 'This username is reserved and cannot be registered.'));
   }
 
   try {
-    const existingCount = await prisma.user.count({
-      where: { address, deletedAt: null }
+    let usernameCount = await prisma.user.count({
+      where: { address, deletedAt: null },
     });
 
-    if (existingCount >= 5) {
-      return next(new ApiError('CONFLICT', 'Address already registered - maximum of 5 usernames allowed per address'));
+    if (usernameCount >= MAX_USERNAMES_PER_ADDRESS) {
+      return next(
+        new ApiError(
+          'CONFLICT',
+          `This address already has the maximum of ${MAX_USERNAMES_PER_ADDRESS} federation usernames.`,
+        ),
+      );
     }
+    const isPrimary = usernameCount === 0;
 
     let verificationResult = null;
-    const signerToVerify = signerAddress || address;
-    if (signerToVerify) {
-      verificationResult = await verifyMultiSignerThreshold(address, [signerToVerify], {
-        operationType: 'management',
-      });
+    if (signature) {
+      const isLegacyPublicKeyFlow =
+        StrKey.isValidEd25519PublicKey(signature) && !signerAddress;
 
-      if (!verificationResult.success) {
-        const verificationError = new Error(
-          verificationResult.errorMessage || 'Signature verification failed'
-        );
-        verificationError.statusCode = 401;
-        throw verificationError;
+      if (isLegacyPublicKeyFlow) {
+        verificationResult = await verifyMultiSignerThreshold(address, [signature], {
+          operationType: 'management',
+        });
+
+        if (!verificationResult.success) {
+          const verificationError = new Error(
+            verificationResult.errorMessage || 'Signature verification failed'
+          );
+          verificationError.statusCode = 401;
+          throw verificationError;
+        }
+      } else {
+        const claimedSigner = verifyFreighterRegistrationSignature({
+          username: req.body.username,
+          address: req.body.address,
+          signature,
+          signerAddress,
+        });
+
+        verificationResult = {
+          success: true,
+          accountId: claimedSigner,
+          operationType: 'message',
+          requiredThreshold: 1,
+          totalWeight: 1,
+          signatureCount: 1,
+          uniqueSignerCount: 1,
+          signatures: [
+            {
+              publicKey: claimedSigner,
+              weight: 1,
+              isValid: true,
+            },
+          ],
+          thresholds: {
+            low_threshold: 1,
+            med_threshold: 1,
+            high_threshold: 1,
+          },
+          signerCount: 1,
+          errorMessage: null,
+        };
       }
     }
 
@@ -130,19 +176,30 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       data: {
         username: normalizedUsername,
         address,
-        isPrimary: existingCount === 0,
+        isPrimary,
         ...(memoType && { memoType, memo }),
       },
     });
     // Invalidate any stale federation cache entries for this username/address
     invalidateFederationCache(normalizedUsername, address);
 
+    await recordActivity(prisma, {
+      username: normalizedUsername,
+      action: ACTIVITY_ACTIONS.USER_REGISTERED,
+      metadata: {
+        address,
+        is_primary: isPrimary,
+        ...(memoType && { memo_type: memoType }),
+      },
+      req,
+    });
+
     return res.status(201).json({
       ok: true,
       username: normalizedUsername,
       address,
+      is_primary: isPrimary,
       federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
-      is_primary: existingCount === 0,
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,
@@ -154,14 +211,25 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       }),
       ...(memoType && { memo_type: memoType, memo }),
     });
+
   } catch (error) {
-    // Prisma unique constraint violation (PostgreSQL error code 23505)
-    if (error.code === 'P2002' || (error.message && error.message.includes('UNIQUE'))) {
-      return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
+    if (
+      error.code === '23505' ||
+      error.code === 'P2002' ||
+      (error.message && error.message.includes('UNIQUE'))
+    ) {
+      return next(
+        new ApiError(
+          'CONFLICT',
+          'Username is already taken. Please choose another.',
+        ),
+      );
     }
-    
+
     if (error.message && error.message.includes('Account not found')) {
-      const notFoundError = new Error(`Account not found on Horizon: ${address}`);
+      const notFoundError = new Error(
+        `Account not found on Horizon: ${address}`,
+      );
       notFoundError.statusCode = 404;
       return next(notFoundError);
     }
@@ -170,8 +238,12 @@ router.post('/register', requireJson, validateSchema({ body: registerBodySchema 
       return next(error);
     }
 
-    logger.error('Registration error:', error.message);
-    const registrationError = new Error(`Registration verification failed: ${error.message}`, { cause: error });
+    logger.error({ err: error.message }, 'Registration error:');
+    const registrationError = new Error(
+      `Registration verification failed: ${error.message}`,
+      { cause: error },
+    );
+    registrationError.code = error.code;
     registrationError.statusCode = 500;
     return next(registrationError);
   }
@@ -256,11 +328,14 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
   if (address) {
     try {
       const result = await lookupCached(address, async () => {
-        const row = await prisma.user.findFirst({
+        let row = await prisma.user.findFirst({
           where: { address, deletedAt: null },
           select: { username: true },
+          orderBy: PRIMARY_USERNAME_ORDER,
         });
-        return row ? { username: row.username, address } : null;
+        if (!row) return null;
+        const balances = await getBalances(row.username);
+        return { username: row.username, address, balances };
       });
 
       if (!result) {
@@ -271,7 +346,6 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
 
       return res.json(result);
     } catch (error) {
-      console.warn('USER ROUTES ERROR:', error);
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
@@ -298,10 +372,14 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt.toISOString(),
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt.toISOString(),
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -320,17 +398,19 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
     ]);
 
     const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt.toISOString(),
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt.toISOString(),
+        balances,
+      };
     }));
 
-    return res.json({ data, totalCount, totalPages, currentPage: page });
+    return res.json(paginatedResponse(data, totalCount, { page, limit }));
   } catch (error) {
-    const dbError = new Error('Database lookup failed', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
@@ -356,10 +436,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
         take: cursorLimit + 1,
       });
       const { rows, hasMore, nextCursor } = paginateByKeyset(candidates, cursorLimit);
-      const data = rows.map((user) => ({
-        username: user.username,
-        address: user.address,
-        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+      const data = await Promise.all(rows.map(async (user) => {
+        const balances = await getBalances(user.username);
+        return {
+          username: user.username,
+          address: user.address,
+          created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+          balances,
+        };
       }));
       return res.json(cursorPaginatedResponse(data, { limit: cursorLimit, nextCursor, hasMore }));
     }
@@ -378,10 +462,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
     ]);
 
     const totalPages = Math.ceil(totalCount / limit);
-    const data = rows.map((user) => ({
-      username: user.username,
-      address: user.address,
-      created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+    const data = await Promise.all(rows.map(async (user) => {
+      const balances = await getBalances(user.username);
+      return {
+        username: user.username,
+        address: user.address,
+        created_at: user.createdAt ? user.createdAt.toISOString() : undefined,
+        balances,
+      };
     }));
 
     res.json({
@@ -399,9 +487,7 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
       currentPage: page,
     });
   } catch (error) {
-    const dbError = new Error('Database error', { cause: error });
-    dbError.statusCode = 500;
-    return next(dbError);
+    return next(error);
   }
 }));
 
@@ -471,4 +557,30 @@ router.get(
   }),
 );
 
-module.exports = router;
+  return router;
+}
+
+const defaultRouter = createUserRouter(null);
+
+function exportWrapper(arg) {
+  if (arg && (arg.isOpen !== undefined || typeof arg.get === 'function' || typeof arg === 'object')) {
+    return createUserRouter(arg);
+  }
+  return defaultRouter;
+}
+
+Object.setPrototypeOf(exportWrapper, defaultRouter);
+Object.assign(exportWrapper, defaultRouter);
+
+module.exports = new Proxy(exportWrapper, {
+  get(target, prop) {
+    if (prop in target) return target[prop];
+    return defaultRouter[prop];
+  },
+  apply(target, thisArg, argArray) {
+    if (argArray.length >= 2 && typeof argArray[1]?.send === 'function') {
+      return defaultRouter(...argArray);
+    }
+    return target(...argArray);
+  },
+});

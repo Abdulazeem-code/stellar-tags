@@ -15,6 +15,11 @@ rustflags = [
   "-Aclippy::needless_pass_by_value",
   "-Aclippy::used_underscore_binding",
 
+  # A contract entrypoint's parameter list is its ABI: it is fixed by the
+  # on-chain interface and cannot be collapsed into a struct without changing
+  # the contract's public interface.
+  "-Aclippy::too_many_arguments",
+
   # Contract results are consumed through the generated client, and their
   # failure modes are enumerated once in the Error enum rather than repeated
   # in an # Errors section on every entrypoint.

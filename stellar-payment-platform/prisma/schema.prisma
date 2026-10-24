@@ -34,6 +34,7 @@ model User {
   deletedAt DateTime? @map("deleted_at")
   webhooks  Webhook[] // <-- add this line
   activity  ActivityLog[]
+  balances  WalletBalance[]
 
   @@index([username])
   // Reverse federation lookups (type=id) and /lookup?address= filter by
@@ -88,11 +89,44 @@ model Payment {
   assetCode       String?  @map("asset_code")
   transactionHash String?  @map("transaction_hash")
   status          String   @default("completed")
+riskScore       Float?   @map("risk_score")
+  fraudStatus     String   @default("clear") @map("fraud_status")
+  fraudFlaggedAt  DateTime? @map("fraud_flagged_at")
+  deletedAt       DateTime? @map("deleted_at")
 
-  @@index([createdAt])
   @@index([fromAddress])
   @@index([toAddress])
+// /admin/export keyset walk (issue #677): ORDER BY created_at, id with a
+// cursor predicate becomes a backward index scan + seek instead of an
+// OFFSET walk, keeping deep pages O(log n).
+@@index([createdAt, id])
+@@index([assetCode, createdAt], map: "payments_asset_code_created_at_idx")
+// Serves the soft-delete admin listings and the `deleted_at IS NULL` filter
+// every payment read path now applies.
+@@index([deletedAt])
   @@map("payments")
+}
+
+// Durable result of the fraud stream consumer. Keeping the raw event and the
+// model score makes decisions auditable without coupling the worker to the
+// payment ingestion path.
+model FraudAlert {
+  id              String   @id @default(uuid())
+  eventId         String   @unique @map("event_id")
+  transactionHash String?  @map("transaction_hash")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  riskScore       Float    @map("risk_score")
+  status          String   @default("open")
+  reason          String
+  rawEvent        Json     @map("raw_event")
+  createdAt       DateTime @default(now()) @map("created_at")
+  resolvedAt      DateTime? @map("resolved_at")
+
+  @@index([toAddress, createdAt])
+  @@index([status, createdAt])
+  @@map("fraud_alerts")
 }
 
 // Dead-letter queue: holds webhook delivery attempts that have permanently
@@ -202,7 +236,41 @@ model ActivityLog {
   @@map("activity_logs")
 }
 
-// Custom Dynamic Rules Engine for enterprise payment routing.
+// #667 — Data archival strategy.
+// ArchiveEpoch records each on-chain commit_archive_root call so the
+// off-chain service can reconstruct Merkle paths without hitting the RPC.
+model ArchiveEpoch {
+  id          String         @id @default(uuid())
+  epoch       BigInt         @unique
+  merkleRoot  String         @map("merkle_root")
+  recordCount Int            @default(0) @map("record_count")
+  description String?
+  committedAt DateTime       @default(now()) @map("committed_at")
+  createdAt   DateTime       @default(now()) @map("created_at")
+  leaves      ArchiveLeaf[]
+
+  @@index([epoch])
+  @@map("archive_epochs")
+}
+
+// One row per leaf in an archive epoch.
+// leaf_hash is the hex-encoded SHA-256 of the canonical leaf bytes so the
+// Merkle path can be recomputed without re-reading Soroban state.
+model ArchiveLeaf {
+  id           String       @id @default(uuid())
+  epochId      String       @map("epoch_id")
+  epoch        ArchiveEpoch @relation(fields: [epochId], references: [id], onDelete: Cascade)
+  recordType   String       @map("record_type")  // UserVolume | UserSpending | RefundBalance
+  primaryKey   String       @map("primary_key")   // sender / user address
+  secondaryKey String?      @map("secondary_key") // token address (RefundBalance only)
+  leafHash     String       @map("leaf_hash")     // hex SHA-256 of canonical leaf bytes
+  valueJson    Json?        @map("value_json")    // on-chain value snapshot
+  createdAt    DateTime     @default(now()) @map("created_at")
+
+  @@index([epochId])
+  @@index([primaryKey])
+  @@map("archive_leaves")
+}
 // Evaluated safely in a sandboxed AST environment against incoming payment intents.
 model RoutingRule {
   id          String    @id @default(uuid())
@@ -220,4 +288,120 @@ model RoutingRule {
   @@index([active, priority])
   @@index([clientOrg])
   @@map("routing_rules")
+}
+
+// WalletBalance tracks multi-currency balances per user
+model WalletBalance {
+  id        String   @id @default(uuid())
+  username  String
+  user      User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  assetCode String   @map("asset_code") // e.g., 'XLM', 'USDC'
+  amount    Float    @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@unique([username, assetCode])
+  @@index([username])
+  @@map("wallet_balances")
+}
+
+// Event Sourcing: Payment Events Store
+// Immutable append-only log of all payment-related events
+model PaymentEvent {
+  id              String   @id @default(uuid())
+  paymentId       String   @map("payment_id")
+  eventType       String   @map("event_type") // PAYMENT_CREATED, PAYMENT_ROUTED, PAYMENT_COMPLETED, PAYMENT_FAILED, etc.
+  eventVersion    Int      @default(1) @map("event_version")
+  aggregateId     String   @map("aggregate_id") // Aggregate root identifier (same as paymentId for grouping)
+  sequence        Int      // Sequential order within the aggregate
+  timestamp       DateTime @default(now())
+  userId          String?  @map("user_id")
+  eventData       Json     @map("event_data") // Full event payload
+  metadata        Json?    // Additional context (IP, user agent, correlation ID, etc.)
+  
+  @@unique([aggregateId, sequence])
+  @@index([paymentId])
+  @@index([eventType])
+  @@index([timestamp])
+  @@index([aggregateId, sequence])
+  @@map("payment_events")
+}
+
+// Read Model: Denormalized payment state derived from events
+// Updated asynchronously by event processors
+model PaymentReadModel {
+  id              String   @id // Same as payment aggregate ID
+  currentState    String   @map("current_state")
+  fromAddress     String   @map("from_address")
+  toAddress       String   @map("to_address")
+  amount          Float
+  fee             Float    @default(0)
+  assetCode       String?  @map("asset_code")
+  transactionHash String?  @map("transaction_hash")
+  riskScore       Float?   @map("risk_score")
+  fraudStatus     String   @default("clear") @map("fraud_status")
+  createdAt       DateTime @map("created_at")
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
+  lastEventSeq    Int      @default(0) @map("last_event_seq") // Last processed event sequence
+  version         Int      @default(1) // Optimistic locking version
+  
+  @@index([currentState])
+  @@index([fromAddress])
+  @@index([toAddress])
+  @@index([createdAt])
+  @@map("payment_read_models")
+}
+
+// Event Processing Checkpoint: tracks last processed event for each consumer
+model EventCheckpoint {
+  id              String   @id @default(uuid())
+  consumerName    String   @unique @map("consumer_name")
+  lastEventId     String   @map("last_event_id")
+  lastSequence    Int      @map("last_sequence")
+  lastTimestamp   DateTime @map("last_timestamp")
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
+  
+  @@map("event_checkpoints")
+}
+
+// WebAuthn/Passkey Credentials: stores public keys and credential data
+model WebAuthnCredential {
+  id                  String   @id @default(uuid())
+  userId              String   @map("user_id") // User identifier (email, username, etc.)
+  credentialId        String   @unique @map("credential_id") // Base64URL-encoded credential ID
+  publicKey           String   @map("public_key") // Base64-encoded public key
+  counter             BigInt   @default(0) // Signature counter for replay protection
+  deviceType          String   @default("unknown") @map("device_type") // 'platform' or 'cross-platform'
+  transports          String[] @default([]) // ['usb', 'nfc', 'ble', 'internal']
+  aaguid              String?  @map("aaguid") // Authenticator AAGUID
+  credentialBackedUp  Boolean  @default(false) @map("credential_backed_up")
+  credentialDeviceType String? @map("credential_device_type")
+  friendlyName        String?  @map("friendly_name") // User-provided name for the credential
+  createdAt           DateTime @default(now()) @map("created_at")
+  lastUsedAt          DateTime @default(now()) @map("last_used_at")
+  revokedAt           DateTime? @map("revoked_at")
+  
+  @@index([userId])
+  @@index([credentialId])
+  @@index([userId, revokedAt])
+  @@map("webauthn_credentials")
+}
+
+// WebAuthn Challenges: stores temporary challenges for registration/authentication
+model WebAuthnChallenge {
+  id              String   @id @default(uuid())
+  challenge       String   @unique // Base64URL-encoded challenge
+  userId          String?  @map("user_id") // Optional for registration
+  type            String   // 'registration' or 'authentication'
+  expiresAt       DateTime @map("expires_at")
+  used            Boolean  @default(false)
+  usedAt          DateTime? @map("used_at")
+  ipAddress       String?  @map("ip_address")
+  userAgent       String?  @map("user_agent")
+  createdAt       DateTime @default(now()) @map("created_at")
+  
+  @@index([challenge])
+  @@index([expiresAt])
+  @@index([userId, type])
+  @@map("webauthn_challenges")
 }

@@ -99,7 +99,8 @@ async function getContractStatus() {
       status.version = Number(scValToNative(sim.result.retval));
     }
   } catch (error) {
-    console.error('Failed to simulate version() call:', error);
+    const { logger } = require('../logger');
+    logger.error({ err: error }, 'Failed to simulate version() call');
   }
 
   cache.data = status;

@@ -37,9 +37,11 @@ describe('payment intent creation idempotency', () => {
   });
 
   const buildApp = () => {
+    const { buildErrorHandler } = require('../src/middleware/errorHandler');
     const app = express();
     app.use(express.json());
     app.use('/', buildPaymentRouter(null));
+    app.use(buildErrorHandler(() => false));
     return app;
   };
 
@@ -69,5 +71,16 @@ describe('payment intent creation idempotency', () => {
     await request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'pay-b').send([baseIntent]);
 
     expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(2);
+  });
+
+  test('rejects requests without an idempotency key', async () => {
+    const app = buildApp();
+    const response = await request(app)
+      .post('/payments/bulk')
+      .send([baseIntent]);
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBeDefined();
+    expect(mockPaymentIntentCreate).not.toHaveBeenCalled();
   });
 });

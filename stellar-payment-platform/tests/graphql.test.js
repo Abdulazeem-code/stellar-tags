@@ -166,4 +166,30 @@ describe("federated GraphQL API", () => {
     });
     await handler.apolloServer.stop();
   });
+
+  it("rejects queries exceeding the maximum depth limit", async () => {
+    const query = `
+      query TooDeep {
+        user(username: "alice*stellar.test") {
+          payments {
+            token {
+              payments {
+                token {
+                  payments {
+                    token { code }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+    const response = await server.executeOperation(
+      { query },
+      { contextValue: createGraphQLContext(createPrismaMock()) }
+    );
+    expect(response.body.singleResult.errors).toBeDefined();
+    expect(response.body.singleResult.errors[0].message).toMatch(/exceeds maximum operation depth/);
+  });
 });
