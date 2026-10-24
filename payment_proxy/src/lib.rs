@@ -602,6 +602,12 @@ impl PaymentProxy {
             .unwrap_or(0)
     }
 
+    /// Builds the domain-separated message hash for meta-transactions.
+    /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
+    ///
+    /// Private helper: [`ToXdr::to_xdr`] consumes its receiver, and a borrowed
+    /// `payload` cannot be exported as a contract entrypoint argument, so this
+    /// stays out of the contract's public interface.
     fn build_meta_message(env: &Env, payload: &MetaPayment, signer_pubkey: &BytesN<32>) -> Bytes {
         let mut message = Bytes::new(env);
         message.append(&env.current_contract_address().to_xdr(env));

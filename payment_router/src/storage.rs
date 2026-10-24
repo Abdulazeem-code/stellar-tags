@@ -1,5 +1,5 @@
 use crate::errors::Error;
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 
 // ── Tiered Circuit Breaker ───────────────────────────────────────────────────
 
@@ -52,6 +52,14 @@ pub enum Role {
     Pauser = 5,
 }
 
+/// Dedicated key type for the heartbeat operator, kept separate to stay within
+/// Soroban's generated enum size limit for `DataKey`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeartbeatKey {
+    HeartbeatOperator,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +78,8 @@ pub enum DataKey {
     MinLimit,
     /// Whether routing is currently paused.
     Paused,
+    /// Tiered circuit-breaker pause level.
+    PauseLevel,
     /// Maximum amount accepted by a single payment.
     MaxAmount,
     /// Cumulative lifetime amount routed by a given sender.
@@ -118,6 +128,14 @@ pub enum DataKey {
     /// Inactivity window (seconds) after which the backup admin may claim.
     /// Stored as `u64` in instance storage.
     DmsTimeout,
+    /// Tier 2 council signers for multi-sig succession.
+    DmsTier2Council,
+    /// Tier 2 configuration tuple (threshold: u32, timeout_seconds: u64).
+    DmsTier2Config,
+    /// Pending in-flight dead man's switch claim (DmsClaimStatus) during grace period.
+    DmsPendingClaim,
+    /// List of council signers who approved the pending Tier 2 claim.
+    DmsCouncilApprovals,
     /// Per-address payment invocation cap per ledger sequence.
     /// Stored as `u32` in instance storage (`0` disables rate limiting).
     RateLimitConfig,
@@ -170,15 +188,16 @@ pub enum DataKey {
     UpgradeApproval(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
-    /// Tiered pause level for the emergency circuit breaker (issue #890).
-    /// Stored as `PauseLevel` in instance storage. Supersedes the legacy
-    /// `DataKey::Paused` boolean; both keys are honoured during migration so
-    /// existing paused state is preserved.
-    PauseLevel,
     /// The operator address authorized to renew the dead man's switch heartbeat
     /// without possessing full admin privileges (issue #889).
     /// Stored as `Address` in instance storage.
     HeartbeatOperator,
+    /// Packed claimed-leaf bitmap for a Merkle payment batch.
+    MerkleClaimedBits(u64),
+    /// A prepared two-phase cross-contract upgrade manifest, keyed by its
+    /// upgrade ID. Stored in persistent storage so it survives instance
+    /// eviction while the timelock runs.
+    TwoPhaseCommit(BytesN<32>),
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -190,6 +209,7 @@ pub const DAILY_MAX_LIMIT: i128 = 1_000_000 * XLM_DECIMALS; // 1M tokens limit
 pub const VOLUME_THRESHOLD: i128 = 10_000 * XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
 pub const SECONDS_IN_24H: u64 = 24 * 3600;
 pub const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
+pub const DMS_GRACE_PERIOD: u64 = 72 * 3600;
 pub const DEFAULT_RATE_LIMIT: u32 = 10;
 pub const MAX_RATE_LIMIT: u32 = 1_000_000;
 pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
@@ -203,6 +223,7 @@ pub const USER_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 pub const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
 pub const PERSISTENT_BUMP_AMOUNT: u32 = USER_BUMP_AMOUNT;
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = USER_LIFETIME_THRESHOLD;
+pub const MERKLE_BITS_PER_WORD: u32 = 64;
 // ── Reentrancy Guard ─────────────────────────────────────────────────────────
 
 pub struct ReentrancyGuard<'a> {
@@ -378,4 +399,74 @@ pub fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i
     }
 
     Ok(volume)
+}
+
+// ── Merkle Batch Helpers ─────────────────────────────────────────────────────
+
+/// Packed record describing a registered Merkle distribution batch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleBatchRecord {
+    /// Address that funded the batch and may reclaim unclaimed funds.
+    pub sender: Address,
+    /// Token contract used for disbursement.
+    pub token: Address,
+    /// Total amount deposited for the batch.
+    pub total_amount: i128,
+    /// Committed 32-byte Merkle root over (recipient, amount) leaves.
+    pub merkle_root: BytesN<32>,
+    /// Unix timestamp after which unclaimed funds may be reclaimed.
+    pub expiration: u64,
+    /// Total amount already claimed from this batch.
+    pub claimed_amount: i128,
+}
+
+/// Returns the number of `u64` words required to store `leaf_count` bits.
+pub fn merkle_bitset_words(leaf_count: u32) -> u32 {
+    if leaf_count == 0 {
+        return 0;
+    }
+    leaf_count.div_ceil(MERKLE_BITS_PER_WORD)
+}
+
+/// Reads the packed claimed bitset for a batch, returning an empty vector when
+/// no claims have been recorded yet.
+pub fn load_merkle_bits(env: &Env, batch_id: u64) -> Vec<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MerkleClaimedBits(batch_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Persists the packed claimed bitset for a batch with an extended TTL.
+pub fn store_merkle_bits(env: &Env, batch_id: u64, bits: &Vec<u64>) {
+    let key = DataKey::MerkleClaimedBits(batch_id);
+    env.storage().persistent().set(&key, bits);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+/// Returns `true` when the bit at `index` is set in the packed bitset.
+pub fn merkle_bit_get(bits: &Vec<u64>, index: u32) -> bool {
+    let word = index / MERKLE_BITS_PER_WORD;
+    let offset = index % MERKLE_BITS_PER_WORD;
+    match bits.get(word) {
+        Some(w) => (w >> offset) & 1 == 1,
+        None => false,
+    }
+}
+
+/// Sets the bit at `index` in the packed bitset, growing it as needed.
+pub fn merkle_bit_set(env: &Env, bits: &mut Vec<u64>, index: u32) {
+    let word = index / MERKLE_BITS_PER_WORD;
+    let offset = index % MERKLE_BITS_PER_WORD;
+    while bits.len() <= word {
+        bits.push_back(0u64);
+    }
+    let current = bits.get(word).unwrap_or(0);
+    bits.set(word, current | (1u64 << offset));
+    let _ = env;
 }
