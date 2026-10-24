@@ -6,6 +6,7 @@ pub mod errors;
 pub mod fees;
 pub mod rate_limit;
 pub mod storage;
+pub mod swaps;
 pub mod timelock;
 pub mod types;
 
@@ -16,6 +17,7 @@ pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
 pub use storage::*;
+pub use swaps::*;
 pub use timelock::*;
 pub use types::*;
 
