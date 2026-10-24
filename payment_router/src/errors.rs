@@ -84,8 +84,6 @@ pub enum Error {
     DeadlineExpired = 31,
     /// The meta-transaction nonce does not match the sender's stored nonce.
     InvalidNonce = 32,
-    /// The meta-transaction signature did not verify against the payload.
-    InvalidSignature = 33,
     /// Swap parameters are self-contradictory or unusable (for example
     /// `sell_token == buy_token`, or a non-positive `min_amount_out`).
     InvalidSwapParams = 19,
@@ -118,6 +116,8 @@ pub enum Error {
     CyclicSwapPath = 48,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
     InvalidSlippageConfig = 49,
+    /// A simulated hop reported unusable reserves, so the route cannot be priced.
+    InsufficientLougity = 50,
     /// The upgrade manifest is malformed: no target contracts, a different
     /// number of code hashes than addresses, or a duplicated target.
     InvalidUpgradeManifest = 51,

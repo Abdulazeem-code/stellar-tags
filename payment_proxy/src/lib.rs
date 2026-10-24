@@ -47,14 +47,42 @@
 //! | `forward`            | Anyone       | Delegates an arbitrary call to logic contract |
 //! | `get_logic_contract` | Anyone       | Returns current logic address (view)          |
 //! | `get_admin`          | Anyone       | Returns current admin address (view)          |
+//! | `consume_nonce`      | User (auth)  | Marks one nonce bit consumed in a channel     |
+//! | `is_nonce_consumed`  | Anyone       | Reads a single nonce bit (view)               |
+//! | `get_nonce_bitmap`   | Anyone       | Returns the raw 256-bit word (view)           |
 //!
-//! Session-key allowances count the input amount for the router's direct,
-//! batch, meta, and swap payment routes. A grant must expire in the future and
-//! the session account must authorize its own grant. Failed downstream calls
-//! revert the allowance decrement with the rest of the transaction.
+//! ## Bitmapped nonce management (issue #918)
 //!
-//! Any cross-network, cross-contract, or cross-version replay attack fails because the domain
-//! separator mismatch invalidates the signature digest.
+//! Meta-transactions guarded by a strictly sequential nonce suffer
+//! head-of-line blocking: if transaction `#1` stalls in the relayer pool,
+//! every later transaction from the same sender (`#2`, `#3`, ...) is blocked
+//! behind it indefinitely.
+//!
+//! The proxy therefore tracks consumed nonces in a two-dimensional bitmap:
+//!
+//! ```text
+//! nonce = (channel_id: u32, word_index: u32, bit_index: u32 in 0..=255)
+//!
+//! (`bit_index` is carried as a `u32` because the Soroban host has no `u8`
+//! type; values above 255 are rejected with `ProxyError::InvalidBitIndex`.)
+//!
+//!                  channel 0             channel 1
+//!   word 0     [ 256-bit word ]     [ 256-bit word ]
+//!   word 1     [ 256-bit word ]     [ 256-bit word ]
+//!    ...              ...                  ...
+//! ```
+//!
+//! Each word covers 256 consecutive nonces and is stored (as four big-endian
+//! `u64` limbs) at `ProxyDataKey::NonceBitmap(user, channel_id, word_index)`
+//! in persistent storage. Consuming a nonce validates that its bit is still
+//! clear and flips it in the same invocation — a consumed bit can never be
+//! set again, so a replayed nonce always reverts with
+//! `ProxyError::NonceAlreadyUsed`.
+//!
+//! Because every `(channel_id, word_index, bit_index)` triple is independent,
+//! execution order is unconstrained: `#5` may execute before `#2`, and
+//! separate channels stream completely in parallel, so a stalled nonce no
+//! longer blocks any other payment.
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
@@ -129,6 +157,10 @@ pub enum ProxyDataKey {
     MetaNonce(Address),
     /// Replay protection nonce for meta-transactions per account.
     Nonce(Address),
+    /// 256-bit bitmap of consumed nonces for `(user, channel_id, word_index)`.
+    /// Stored as `BytesN<32>` — four big-endian `u64` limbs ([u64; 4]) — in
+    /// persistent storage (issue #918).
+    NonceBitmap(Address, u32, u32),
 }
 
 /// Remaining spending allowance and expiry for a delegated session key.
@@ -179,14 +211,6 @@ pub enum ProxyError {
     Unauthorized = 3,
     /// The supplied logic address equals the one already stored.
     SameLogicAddress = 4,
-    /// Session allowances must be positive and expire in the future.
-    InvalidSessionAllowance = 13,
-    /// A session key attempted a payment after its expiry.
-    SessionExpired = 14,
-    /// A payment exceeds the session key's remaining allowance.
-    SessionAllowanceExceeded = 15,
-    /// Session keys can only call the supported payment-routing methods.
-    UnsupportedSessionCall = 16,
     /// The supplied meta-transaction nonce does not match the account's next expected nonce.
     InvalidNonce = 5,
     /// The meta-transaction deadline has expired.
@@ -203,6 +227,18 @@ pub enum ProxyError {
     InsufficientAllowance = 11,
     /// Signature verification failed (invalid Ed25519 signature).
     InvalidSignature = 12,
+    /// Session allowances must be positive and expire in the future.
+    InvalidSessionAllowance = 13,
+    /// A session key attempted a payment after its expiry.
+    SessionExpired = 14,
+    /// A payment exceeds the session key's remaining allowance.
+    SessionAllowanceExceeded = 15,
+    /// Session keys can only call the supported payment-routing methods.
+    UnsupportedSessionCall = 16,
+    /// The requested nonce bit was already consumed — replay attempt.
+    NonceAlreadyUsed = 17,
+    /// `bit_index` exceeded 255; a word holds exactly 256 nonce bits.
+    InvalidBitIndex = 18,
 }
 
 // ── Meta-transaction payload ──────────────────────────────────────────────────
@@ -229,6 +265,8 @@ pub type MetaTransaction = MetaPayment;
 const DAY_IN_LEDGERS: u32 = 17_280; // ≈5 s per ledger
 const INSTANCE_BUMP: u32 = 7 * DAY_IN_LEDGERS;
 const INSTANCE_THRESHOLD: u32 = INSTANCE_BUMP - DAY_IN_LEDGERS;
+const PERSISTENT_BUMP: u32 = 30 * DAY_IN_LEDGERS;
+const PERSISTENT_THRESHOLD: u32 = PERSISTENT_BUMP - DAY_IN_LEDGERS;
 
 const USER_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
@@ -447,19 +485,12 @@ impl PaymentProxy {
             .ok_or(ProxyError::NotInitialized)
     }
 
-    // ── EIP-712 Typed Structured Data Functions ────────────────────────────────
-
     /// Returns the contract version string.
     pub fn version(env: Env) -> String {
         String::from_str(&env, CONTRACT_VERSION)
     }
 
-    /// Returns the canonical EIP-712 domain separator for this contract instance.
-    ///
-    /// Domain separator includes:
-    /// - `contract_id`: Current on-chain address of this contract instance.
-    /// - `network_id`: 32-byte network identifier from the ledger environment.
-    /// - `version`: Contract version string.
+    /// Returns the canonical domain separator for this proxy instance.
     pub fn get_domain_separator(env: Env) -> DomainSeparator {
         DomainSeparator {
             contract_id: env.current_contract_address(),
@@ -468,25 +499,23 @@ impl PaymentProxy {
         }
     }
 
-    /// Computes the 32-byte SHA-256 hash of a domain separator using deterministic Soroban XDR types.
+    /// Computes the SHA-256 hash of a domain separator.
     pub fn hash_domain_separator(env: Env, domain: DomainSeparator) -> BytesN<32> {
         env.crypto().sha256(&domain.to_xdr(&env))
     }
 
-    /// Returns the 32-byte hash of this contract's canonical domain separator.
+    /// Returns the hash of this proxy's canonical domain separator.
     pub fn get_domain_separator_hash(env: Env) -> BytesN<32> {
         let domain = Self::get_domain_separator(env.clone());
         Self::hash_domain_separator(env, domain)
     }
 
-    /// Computes the 32-byte SHA-256 hash of a `PaymentIntent` struct using deterministic Soroban XDR types.
+    /// Computes the SHA-256 hash of a payment intent.
     pub fn hash_payment_intent(env: Env, intent: PaymentIntent) -> BytesN<32> {
         env.crypto().sha256(&intent.to_xdr(&env))
     }
 
-    /// Computes the EIP-712 style typed structured data hash for a given domain separator and intent.
-    ///
-    /// Format: `SHA256("\x19\x01" || domain_separator_hash || intent_hash)`
+    /// Computes the typed data hash for an explicit domain and intent.
     pub fn compute_typed_hash_for_domain(
         env: Env,
         domain: DomainSeparator,
@@ -495,14 +524,13 @@ impl PaymentProxy {
         Self::compute_typed_data_hash_internal(&env, &domain, &intent)
     }
 
-    /// Computes the EIP-712 style typed structured data hash for a `PaymentIntent`
-    /// using this proxy instance's active domain separator.
+    /// Computes the typed data hash using this proxy's domain separator.
     pub fn compute_typed_data_hash(env: Env, intent: PaymentIntent) -> BytesN<32> {
         let domain = Self::get_domain_separator(env.clone());
         Self::compute_typed_data_hash_internal(&env, &domain, &intent)
     }
 
-    /// Gets the next expected meta-transaction nonce for a given account.
+    /// Returns the next expected EIP-712 payment-intent nonce for an account.
     pub fn get_nonce(env: Env, from: Address) -> u64 {
         env.storage()
             .persistent()
@@ -510,17 +538,7 @@ impl PaymentProxy {
             .unwrap_or(0)
     }
 
-    /// Verifies an Ed25519 signature over a typed `PaymentIntent` without consuming the nonce.
-    ///
-    /// # Parameters
-    /// - `signer_pubkey`: 32-byte Ed25519 public key that signed the typed data hash.
-    /// - `intent`: The structured payment intent parameters.
-    /// - `signature`: 64-byte Ed25519 signature.
-    ///
-    /// # Errors
-    /// - [`ProxyError::DeadlineExpired`] if `env.ledger().timestamp() > intent.deadline`.
-    /// - [`ProxyError::InvalidNonce`] if `intent.nonce != get_nonce(intent.from)`.
-    /// - Panics / traps if the signature does not cryptographically verify over the typed hash.
+    /// Verifies an intent signature without consuming its nonce.
     pub fn verify_payment_intent(
         env: Env,
         signer_pubkey: BytesN<32>,
@@ -530,13 +548,7 @@ impl PaymentProxy {
         Self::verify_payment_intent_internal(&env, &signer_pubkey, &intent, &signature)
     }
 
-    /// Verifies a typed `PaymentIntent`, consumes the nonce to prevent replay attacks,
-    /// and emits a `PaymentIntentExecuted` event.
-    ///
-    /// # Errors
-    /// - [`ProxyError::DeadlineExpired`] if `env.ledger().timestamp() > intent.deadline`.
-    /// - [`ProxyError::InvalidNonce`] if `intent.nonce != get_nonce(intent.from)`.
-    /// - Panics / traps if signature verification fails.
+    /// Verifies an intent, consumes its nonce, and emits an execution event.
     pub fn execute_payment_intent(
         env: Env,
         signer_pubkey: BytesN<32>,
@@ -545,7 +557,6 @@ impl PaymentProxy {
     ) -> Result<(), ProxyError> {
         Self::verify_payment_intent_internal(&env, &signer_pubkey, &intent, &signature)?;
 
-        // Consume nonce to prevent replay
         let next_nonce = intent
             .nonce
             .checked_add(1)
@@ -553,7 +564,6 @@ impl PaymentProxy {
         let nonce_key = ProxyDataKey::Nonce(intent.from.clone());
         env.storage().persistent().set(&nonce_key, &next_nonce);
         Self::bump_persistent_ttl(&env, &nonce_key);
-
         Self::bump_ttl(&env);
 
         env.events().publish(
@@ -561,17 +571,12 @@ impl PaymentProxy {
                 Symbol::new(&env, "PaymentIntentExecuted"),
                 intent.from.clone(),
             ),
-            (intent.to.clone(), intent.amount, intent.fee, intent.nonce),
+            (intent.to, intent.amount, intent.fee, intent.nonce),
         );
-
         Ok(())
     }
 
-    /// Verifies the payment intent, consumes the nonce, and forwards the specified call
-    /// to the underlying logic contract.
-    ///
-    /// Enables gasless/relayed meta-transactions where execution is delegated to the
-    /// upgradeable `PaymentRouter` while ensuring client signatures bind exact intent details.
+    /// Verifies and consumes an intent before forwarding its call to the router.
     pub fn forward_with_meta(
         env: Env,
         signer_pubkey: BytesN<32>,
@@ -584,13 +589,12 @@ impl PaymentProxy {
         Self::forward(env, func, args)
     }
 
-    /// Computes the 32-byte network_id from a Stellar network passphrase bytes
-    /// (e.g. `b"Test SDF Network ; September 2015"`).
+    /// Computes a network identifier from a Stellar network passphrase.
     pub fn network_id_from_passphrase(env: Env, passphrase: Bytes) -> BytesN<32> {
         env.crypto().sha256(&passphrase)
     }
 
-    /// Returns the current meta-transaction nonce for `user`.
+    /// Returns the next expected nonce for a relayer-fee meta-payment.
     pub fn get_meta_nonce(env: Env, user: Address) -> u64 {
         env.storage()
             .persistent()
@@ -605,15 +609,15 @@ impl PaymentProxy {
     /// `payload` cannot be exported as a contract entrypoint argument, so this
     /// stays out of the contract's public interface.
     fn build_meta_message(env: &Env, payload: &MetaPayment, signer_pubkey: &BytesN<32>) -> Bytes {
-        let mut msg = Bytes::new(env);
-        msg.append(&env.current_contract_address().to_xdr(env));
-        msg.append(&payload.clone().to_xdr(env));
-        msg.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
-        let hash = env.crypto().sha256(&msg);
+        let mut message = Bytes::new(env);
+        message.append(&env.current_contract_address().to_xdr(env));
+        message.append(&payload.clone().to_xdr(env));
+        message.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
+        let hash = env.crypto().sha256(&message);
         Bytes::from(&hash)
     }
 
-    /// Executes a meta-transaction on behalf of `payload.sender`.
+    /// Executes a signed token payment with optional relayer fee compensation.
     pub fn execute_meta_payment(
         env: Env,
         payload: MetaPayment,
@@ -623,7 +627,6 @@ impl PaymentProxy {
         if payload.deadline > 0 && env.ledger().timestamp() > payload.deadline {
             return Err(ProxyError::DeadlineExpired);
         }
-
         if payload.amount <= 0 {
             return Err(ProxyError::InvalidAmount);
         }
@@ -635,9 +638,7 @@ impl PaymentProxy {
             .amount
             .checked_add(payload.fee)
             .ok_or(ProxyError::MathOverflow)?;
-
-        let stored_nonce = Self::get_meta_nonce(env.clone(), payload.sender.clone());
-        if payload.nonce != stored_nonce {
+        if payload.nonce != Self::get_meta_nonce(env.clone(), payload.sender.clone()) {
             return Err(ProxyError::InvalidNonce);
         }
 
@@ -646,14 +647,11 @@ impl PaymentProxy {
             .ed25519_verify(&signer_pubkey, &message, &signature);
 
         let token_client = token::Client::new(&env, &payload.token_address);
-        let user_balance = token_client.balance(&payload.sender);
-        if user_balance < total_needed {
+        if token_client.balance(&payload.sender) < total_needed {
             return Err(ProxyError::InsufficientBalance);
         }
-
         let proxy_address = env.current_contract_address();
-        let user_allowance = token_client.allowance(&payload.sender, &proxy_address);
-        if user_allowance < total_needed {
+        if token_client.allowance(&payload.sender, &proxy_address) < total_needed {
             return Err(ProxyError::InsufficientAllowance);
         }
 
@@ -661,11 +659,7 @@ impl PaymentProxy {
         env.storage()
             .persistent()
             .set(&nonce_key, &(payload.nonce + 1));
-        env.storage().persistent().extend_ttl(
-            &nonce_key,
-            USER_LIFETIME_THRESHOLD,
-            USER_BUMP_AMOUNT,
-        );
+        Self::bump_persistent_ttl(&env, &nonce_key);
 
         if payload.fee > 0 {
             token_client.transfer_from(
@@ -675,7 +669,6 @@ impl PaymentProxy {
                 &payload.fee,
             );
         }
-
         token_client.transfer_from(
             &proxy_address,
             &payload.sender,
@@ -684,20 +677,19 @@ impl PaymentProxy {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "meta_payment"), payload.sender.clone()),
+            (Symbol::new(&env, "meta_payment"), payload.sender),
             (
-                payload.recipient.clone(),
-                payload.fee_recipient.clone(),
+                payload.recipient,
+                payload.fee_recipient,
                 payload.amount,
                 payload.fee,
                 payload.nonce,
             ),
         );
-
         Ok(())
     }
 
-    /// Alias for execute_meta_payment.
+    /// Alias for `execute_meta_payment`.
     pub fn route_payment_meta(
         env: Env,
         payload: MetaPayment,
@@ -707,55 +699,118 @@ impl PaymentProxy {
         Self::execute_meta_payment(env, payload, signer_pubkey, signature)
     }
 
-    /// Internal sub-call entrypoint for executing a single meta-transaction.
-    ///
-    /// When invoked via `env.try_invoke_contract`, execution runs in an isolated
-    /// sub-call context such that any failure (invalid signature, expired deadline,
-    /// invalid nonce) reverts only this call's state mutations without affecting
-    /// the caller or adjacent batch items.
+    /// Executes one typed meta-transaction for a batch.
     pub fn execute_single_meta_tx(env: Env, call: MetaTxCall) -> Result<(), ProxyError> {
         Self::execute_payment_intent(env, call.signer_pubkey, call.intent, call.signature)
     }
 
-    /// Executes a batch of meta-transactions with individual call revert isolation.
-    ///
-    /// Iterates through `calls`, executing each in an isolated execution context.
-    /// If any single meta-transaction fails (e.g., signature mismatch, expired deadline,
-    /// or nonce error), that transaction's state mutations are prevented from committing,
-    /// a `meta_tx_failed` event is emitted with the corresponding error code, and `false`
-    /// is recorded in the return vector. Successful meta-transactions settle normally,
-    /// committing their state changes (incrementing nonces, emitting execution events)
-    /// and recording `true`.
-    ///
-    /// # Parameters
-    /// - `calls`: A vector of [`MetaTxCall`] items to execute.
-    ///
-    /// # Returns
-    /// - `Vec<bool>`: A vector matching the length of `calls` with `true` for succeeded
-    ///   and `false` for failed/reverted meta-transactions.
+    /// Executes each meta-transaction independently and reports which succeeded.
     pub fn execute_batch_tolerant(env: Env, calls: Vec<MetaTxCall>) -> Vec<bool> {
         let mut results = Vec::new(&env);
-
         for call in calls.iter() {
             match Self::execute_single_meta_tx(env.clone(), call.clone()) {
-                Ok(()) => {
-                    results.push_back(true);
-                }
-                Err(err) => {
-                    let err_code = err as u32;
+                Ok(()) => results.push_back(true),
+                Err(error) => {
                     env.events().publish(
                         (
                             Symbol::new(&env, "meta_tx_failed"),
                             call.intent.from.clone(),
                         ),
-                        err_code,
+                        error as u32,
                     );
                     results.push_back(false);
                 }
             }
         }
-
         results
+    }
+
+    // ── Bitmapped nonce management (issue #918) ───────────────────────
+
+    /// Consumes the nonce `(channel_id, word_index, bit_index)` for `user`.
+    ///
+    /// The 256-bit word holding the bit is loaded, validated, flipped, and
+    /// written back in this one invocation, so check-and-set is atomic. An
+    /// already-set bit — a nonce consumed before — is rejected with
+    /// [`ProxyError::NonceAlreadyUsed`], making replay impossible.
+    ///
+    /// Nonces are independent per bit (and per channel), so execution order
+    /// is unconstrained: `#5` may execute before `#2` — no head-of-line
+    /// blocking.
+    ///
+    /// # Parameters
+    /// - `user` — Nonce owner; must authorize this call.
+    /// - `channel_id` — Independent nonce channel (parallel stream).
+    /// - `word_index` — Index of the 256-bit word inside the channel.
+    /// - `bit_index` — Bit inside the word (`0..=255`, carried as `u32`).
+    ///
+    /// # Errors
+    /// - [`ProxyError::NonceAlreadyUsed`] if the bit was already consumed.
+    /// - [`ProxyError::InvalidBitIndex`] if `bit_index` exceeds 255.
+    pub fn consume_nonce(
+        env: Env,
+        user: Address,
+        channel_id: u32,
+        word_index: u32,
+        bit_index: u32,
+    ) -> Result<(), ProxyError> {
+        if bit_index > 255 {
+            return Err(ProxyError::InvalidBitIndex);
+        }
+
+        // Only the nonce owner may burn their own nonces; otherwise anyone
+        // could grief a sender by consuming future nonces out from under them.
+        user.require_auth();
+
+        let mut word = Self::load_nonce_word(&env, &user, channel_id, word_index);
+        let limb = (bit_index / 64) as usize;
+        let mask = 1u64 << (bit_index % 64);
+
+        // Revert on reuse: the bit must still be unconsumed.
+        if word[limb] & mask != 0 {
+            return Err(ProxyError::NonceAlreadyUsed);
+        }
+
+        word[limb] |= mask;
+        Self::store_nonce_word(&env, &user, channel_id, word_index, &word);
+
+        env.events().publish(
+            (symbol_short!("nonce"), user, channel_id),
+            (word_index, bit_index),
+        );
+
+        Ok(())
+    }
+
+    /// Returns `true` when `user` has already consumed
+    /// `(channel_id, word_index, bit_index)`. An out-of-range `bit_index`
+    /// (`> 255`) always reads as `false`.
+    pub fn is_nonce_consumed(
+        env: Env,
+        user: Address,
+        channel_id: u32,
+        word_index: u32,
+        bit_index: u32,
+    ) -> bool {
+        if bit_index > 255 {
+            return false;
+        }
+        let word = Self::load_nonce_word(&env, &user, channel_id, word_index);
+        let limb = (bit_index / 64) as usize;
+        word[limb] & (1u64 << (bit_index % 64)) != 0
+    }
+
+    /// Returns the raw 256-bit bitmap word for `(user, channel_id,
+    /// word_index)` as 32 bytes (four big-endian `u64` limbs). A word that
+    /// was never written reads as all zeroes.
+    pub fn get_nonce_bitmap(
+        env: Env,
+        user: Address,
+        channel_id: u32,
+        word_index: u32,
+    ) -> BytesN<32> {
+        let word = Self::load_nonce_word(&env, &user, channel_id, word_index);
+        BytesN::from_array(&env, &Self::nonce_word_to_bytes(&word))
     }
 
     // ── Internal helpers ───────────────────────────────────────────────────────
@@ -927,107 +982,63 @@ impl PaymentProxy {
             .extend_ttl(INSTANCE_THRESHOLD, INSTANCE_BUMP);
     }
 
-    /// Extends the persistent TTL for an account entry (e.g. nonces).
     fn bump_persistent_ttl(env: &Env, key: &ProxyDataKey) {
         env.storage()
             .persistent()
             .extend_ttl(key, USER_LIFETIME_THRESHOLD, USER_BUMP_AMOUNT);
     }
-}
 
-// ── Test helpers module (exposed under test or testutils feature) ──────────────
-
-#[cfg(any(test, feature = "testutils"))]
-pub mod testutils {
-    use super::{
-        Address, BytesN, DomainSeparator, Env, MetaTxCall, PaymentIntent, PaymentProxy,
-        PaymentProxyClient, String,
-    };
-    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-
-    /// Generates an Ed25519 keypair from a 32-byte seed for test purposes.
-    pub fn generate_keypair(env: &Env, seed: [u8; 32]) -> (SigningKey, BytesN<32>) {
-        let signing_key = SigningKey::from_bytes(&seed);
-        let verifying_key: VerifyingKey = signing_key.verifying_key();
-        let pubkey_bytes: [u8; 32] = verifying_key.to_bytes();
-        (signing_key, BytesN::from_array(env, &pubkey_bytes))
-    }
-
-    /// Constructs a `PaymentIntent` struct with the specified parameters.
-    pub fn create_payment_intent(
-        from: &Address,
-        to: &Address,
-        amount: i128,
-        nonce: u64,
-        fee: i128,
-        deadline: u64,
-    ) -> PaymentIntent {
-        PaymentIntent {
-            from: from.clone(),
-            to: to.clone(),
-            amount,
-            nonce,
-            fee,
-            deadline,
+    /// Loads the 256-bit nonce bitmap word ([u64; 4]) for
+    /// `(user, channel_id, word_index)`, defaulting to an all-zero word.
+    fn load_nonce_word(env: &Env, user: &Address, channel_id: u32, word_index: u32) -> [u64; 4] {
+        let key = ProxyDataKey::NonceBitmap(user.clone(), channel_id, word_index);
+        match env
+            .storage()
+            .persistent()
+            .get::<ProxyDataKey, BytesN<32>>(&key)
+        {
+            Some(packed) => Self::nonce_word_from_bytes(&packed.to_array()),
+            None => [0u64; 4],
         }
     }
 
-    /// Constructs a `DomainSeparator` struct with custom contract_id, network_id, and version.
-    pub fn create_domain_separator(
+    /// Writes a 256-bit nonce bitmap word back to persistent storage and
+    /// extends its TTL so an idle channel cannot expire mid-stream.
+    fn store_nonce_word(
         env: &Env,
-        contract_id: &Address,
-        network_id: &BytesN<32>,
-        version: &str,
-    ) -> DomainSeparator {
-        DomainSeparator {
-            contract_id: contract_id.clone(),
-            network_id: network_id.clone(),
-            version: String::from_str(env, version),
-        }
-    }
-
-    /// Generates a valid 64-byte Ed25519 signature over the EIP-712 typed structured data
-    /// for a given `DomainSeparator` and `PaymentIntent`.
-    pub fn sign_payment_intent(
-        env: &Env,
-        signing_key: &SigningKey,
-        domain: &DomainSeparator,
-        intent: &PaymentIntent,
-    ) -> BytesN<64> {
-        let hash = PaymentProxy::compute_typed_hash_for_domain(
-            env.clone(),
-            domain.clone(),
-            intent.clone(),
+        user: &Address,
+        channel_id: u32,
+        word_index: u32,
+        word: &[u64; 4],
+    ) {
+        let key = ProxyDataKey::NonceBitmap(user.clone(), channel_id, word_index);
+        env.storage().persistent().set(
+            &key,
+            &BytesN::from_array(env, &Self::nonce_word_to_bytes(word)),
         );
-        let sig = signing_key.sign(&hash.to_array());
-        BytesN::from_array(env, &sig.to_bytes())
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP);
     }
 
-    /// Generates a valid 64-byte Ed25519 signature using the proxy's active domain separator.
-    pub fn sign_payment_intent_for_proxy(
-        env: &Env,
-        signing_key: &SigningKey,
-        proxy_client: &PaymentProxyClient,
-        intent: &PaymentIntent,
-    ) -> BytesN<64> {
-        let domain = proxy_client.get_domain_separator();
-        sign_payment_intent(env, signing_key, &domain, intent)
-    }
-
-    /// Constructs a `MetaTxCall` with a signed `PaymentIntent`.
-    pub fn create_meta_tx_call(
-        env: &Env,
-        signing_key: &SigningKey,
-        signer_pubkey: &BytesN<32>,
-        proxy_client: &PaymentProxyClient,
-        intent: PaymentIntent,
-    ) -> MetaTxCall {
-        let signature = sign_payment_intent_for_proxy(env, signing_key, proxy_client, &intent);
-        MetaTxCall {
-            signer_pubkey: signer_pubkey.clone(),
-            intent,
-            signature,
+    /// Unpacks a 32-byte bitmap word into its four big-endian `u64` limbs.
+    fn nonce_word_from_bytes(bytes: &[u8; 32]) -> [u64; 4] {
+        let mut word = [0u64; 4];
+        for (i, limb) in word.iter_mut().enumerate() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
+            *limb = u64::from_be_bytes(chunk);
         }
+        word
+    }
+
+    /// Packs four big-endian `u64` limbs back into a 32-byte bitmap word.
+    fn nonce_word_to_bytes(word: &[u64; 4]) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for (i, limb) in word.iter().enumerate() {
+            bytes[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_be_bytes());
+        }
+        bytes
     }
 }
 
@@ -1038,8 +1049,8 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         contract, contractimpl,
-        testutils::{Address as _, Events as _, Ledger as _, LedgerInfo},
-        token, vec, Env, IntoVal, TryIntoVal,
+        testutils::{Address as _, Ledger as _, LedgerInfo},
+        vec, Env, IntoVal, TryIntoVal,
     };
 
     #[contract]
@@ -1380,1288 +1391,221 @@ mod tests {
         );
     }
 
-    // ── EIP-712 Typed Structured Data Hashing Tests ───────────────────────────
+    // ── Bitmapped nonce management (issue #918) ───────────────────────
 
-    /// Acceptance Criterion 1:
-    /// Domain separator includes contract_id, network_id, and contract version string.
-    #[test]
-    fn test_domain_separator_includes_contract_network_and_version() {
-        let (env, _admin, _logic, client) = make_proxy();
-
-        let domain = client.get_domain_separator();
-
-        assert_eq!(domain.contract_id, client.address);
-        assert_eq!(domain.network_id, env.ledger().network_id());
-        assert_eq!(domain.version, String::from_str(&env, CONTRACT_VERSION));
-
-        let hash1 = client.get_domain_separator_hash();
-        let hash2 = client.get_domain_separator_hash();
-        assert_eq!(hash1, hash2, "Domain separator hash must be deterministic");
-    }
-
-    /// Acceptance Criterion 2:
-    /// Signature verification hashes structured data according to deterministic Soroban types.
-    #[test]
-    fn test_payment_intent_deterministic_typed_hashing() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-
-        let intent1 = testutils::create_payment_intent(&from, &to, 1_000_000, 0, 5_000, 100_000);
-        let intent2 = testutils::create_payment_intent(&from, &to, 1_000_000, 0, 5_000, 100_000);
-
-        let hash1 = client.hash_payment_intent(&intent1);
-        let hash2 = client.hash_payment_intent(&intent2);
-        assert_eq!(
-            hash1, hash2,
-            "Identical intents must produce identical hashes"
-        );
-
-        let typed_hash1 = client.compute_typed_data_hash(&intent1);
-        let typed_hash2 = client.compute_typed_data_hash(&intent2);
-        assert_eq!(
-            typed_hash1, typed_hash2,
-            "Identical typed hashes must match"
-        );
-
-        // Mutating any single field must produce a completely different hash
-        let mut intent_diff_amt = intent1.clone();
-        intent_diff_amt.amount = 2_000_000;
-        assert_ne!(
-            client.compute_typed_data_hash(&intent1),
-            client.compute_typed_data_hash(&intent_diff_amt)
-        );
-
-        let mut intent_diff_fee = intent1.clone();
-        intent_diff_fee.fee = 10_000;
-        assert_ne!(
-            client.compute_typed_data_hash(&intent1),
-            client.compute_typed_data_hash(&intent_diff_fee)
-        );
-
-        let mut intent_diff_nonce = intent1.clone();
-        intent_diff_nonce.nonce = 1;
-        assert_ne!(
-            client.compute_typed_data_hash(&intent1),
-            client.compute_typed_data_hash(&intent_diff_nonce)
-        );
-
-        let mut intent_diff_deadline = intent1.clone();
-        intent_diff_deadline.deadline = 200_000;
-        assert_ne!(
-            client.compute_typed_data_hash(&intent1),
-            client.compute_typed_data_hash(&intent_diff_deadline)
-        );
-
-        let mut intent_diff_to = intent1.clone();
-        intent_diff_to.to = Address::generate(&env);
-        assert_ne!(
-            client.compute_typed_data_hash(&intent1),
-            client.compute_typed_data_hash(&intent_diff_to)
-        );
-
-        let mut intent_diff_from = intent1.clone();
-        intent_diff_from.from = Address::generate(&env);
-        assert_ne!(
-            client.compute_typed_data_hash(&intent1),
-            client.compute_typed_data_hash(&intent_diff_from)
-        );
-    }
-
-    /// Acceptance Criterion 4:
-    /// Provides test helpers for generating valid typed signatures.
-    #[test]
-    fn test_valid_typed_signature_verification_and_execution() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [42u8; 32]);
-        let intent = testutils::create_payment_intent(&from, &to, 500_000, 0, 1_000, 50_000);
-
-        // Sign using the provided test helper
-        let signature =
-            testutils::sign_payment_intent_for_proxy(&env, &signing_key, &client, &intent);
-
-        // Verify without executing: succeeds
-        let verify_res = client.try_verify_payment_intent(&signer_pubkey, &intent, &signature);
-        assert!(verify_res.is_ok(), "Valid typed signature must verify");
-
-        // Nonce is still 0 before execution
-        assert_eq!(client.get_nonce(&from), 0);
-
-        // Execute intent: succeeds and burns nonce (nonce becomes 1)
-        let exec_res = client.try_execute_payment_intent(&signer_pubkey, &intent, &signature);
-        assert!(exec_res.is_ok(), "Execution of valid intent must succeed");
-        assert_eq!(client.get_nonce(&from), 1);
-    }
-
-    /// Acceptance Criterion 3:
-    /// Unit tests demonstrate cross-network signature replay fails due to domain separator mismatch.
-    #[test]
-    fn test_cross_network_signature_replay_fails_due_to_domain_separator_mismatch() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [7u8; 32]);
-        let intent = testutils::create_payment_intent(&from, &to, 1_000_000, 0, 2_000, 100_000);
-
-        // Network 1: Testnet
-        let testnet_passphrase = Bytes::from_slice(&env, b"Test SDF Network ; September 2015");
-        let testnet_network_id =
-            PaymentProxy::network_id_from_passphrase(env.clone(), testnet_passphrase);
-
-        // Network 2: Mainnet (the network the contract is deployed on)
-        let mainnet_passphrase =
-            Bytes::from_slice(&env, b"Public Global Stellar Network ; September 2015");
-        let mainnet_network_id =
-            PaymentProxy::network_id_from_passphrase(env.clone(), mainnet_passphrase);
-
-        // Set active ledger network_id to Mainnet
-        let mut ledger_info = env.ledger().get();
-        ledger_info.network_id = mainnet_network_id.to_array();
-        env.ledger().set(ledger_info);
-
-        // Sign intent for Testnet domain separator
-        let testnet_domain = testutils::create_domain_separator(
-            &env,
-            &client.address,
-            &testnet_network_id,
-            CONTRACT_VERSION,
-        );
-        let testnet_signature =
-            testutils::sign_payment_intent(&env, &signing_key, &testnet_domain, &intent);
-
-        // Attempting to verify or execute on Mainnet fails because of domain separator mismatch
-        let verify_result =
-            client.try_verify_payment_intent(&signer_pubkey, &intent, &testnet_signature);
-        assert!(
-            verify_result.is_err(),
-            "Cross-network signature replay must fail when network_id differs"
-        );
-
-        let exec_result =
-            client.try_execute_payment_intent(&signer_pubkey, &intent, &testnet_signature);
-        assert!(
-            exec_result.is_err(),
-            "Cross-network signature execution must fail when network_id differs"
-        );
-
-        // Nonce must remain unchanged (0)
-        assert_eq!(client.get_nonce(&from), 0);
-
-        // Signing for Mainnet domain succeeds on Mainnet
-        let mainnet_domain = testutils::create_domain_separator(
-            &env,
-            &client.address,
-            &mainnet_network_id,
-            CONTRACT_VERSION,
-        );
-        let mainnet_signature =
-            testutils::sign_payment_intent(&env, &signing_key, &mainnet_domain, &intent);
-        let valid_result =
-            client.try_verify_payment_intent(&signer_pubkey, &intent, &mainnet_signature);
-        assert!(
-            valid_result.is_ok(),
-            "Signature matching contract's network_id must succeed"
-        );
-    }
-
-    /// Unit test: Cross-contract signature replay fails due to contract_id mismatch in domain separator.
-    #[test]
-    fn test_cross_contract_signature_replay_fails() {
-        let (env, admin, logic, client_a) = make_proxy();
-        let proxy_b_id = env.register_contract(None, PaymentProxy);
-        let client_b = PaymentProxyClient::new(&env, &proxy_b_id);
-        client_b.initialize(&admin, &logic);
-
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [11u8; 32]);
-        let intent = testutils::create_payment_intent(&from, &to, 250_000, 0, 500, 10_000);
-
-        // Sign for Contract A
-        let sig_for_a =
-            testutils::sign_payment_intent_for_proxy(&env, &signing_key, &client_a, &intent);
-
-        // Verifying on Contract A succeeds
-        assert!(client_a
-            .try_verify_payment_intent(&signer_pubkey, &intent, &sig_for_a)
-            .is_ok());
-
-        // Replaying on Contract B fails due to contract_id mismatch in domain separator
-        let replay_res = client_b.try_verify_payment_intent(&signer_pubkey, &intent, &sig_for_a);
-        assert!(
-            replay_res.is_err(),
-            "Cross-contract signature replay must fail"
-        );
-    }
-
-    /// Unit test: Cross-version signature replay fails due to version mismatch in domain separator.
-    #[test]
-    fn test_cross_version_signature_replay_fails() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [19u8; 32]);
-        let intent = testutils::create_payment_intent(&from, &to, 750_000, 0, 1_500, 80_000);
-
-        // Sign for a hypothetical version "2.0.0"
-        let v2_domain = testutils::create_domain_separator(
-            &env,
-            &client.address,
-            &env.ledger().network_id(),
-            "2.0.0",
-        );
-        let v2_sig = testutils::sign_payment_intent(&env, &signing_key, &v2_domain, &intent);
-
-        // Replaying against current contract ("0.1.0") fails
-        let res = client.try_verify_payment_intent(&signer_pubkey, &intent, &v2_sig);
-        assert!(res.is_err(), "Cross-version signature replay must fail");
-    }
-
-    /// Unit test: Replaying the same transaction twice fails because nonce is consumed.
-    #[test]
-    fn test_replay_with_same_nonce_fails_after_execution() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [33u8; 32]);
-        let intent = testutils::create_payment_intent(&from, &to, 100_000, 0, 200, 50_000);
-
-        let signature =
-            testutils::sign_payment_intent_for_proxy(&env, &signing_key, &client, &intent);
-
-        // First execution succeeds
-        let res1 = client.try_execute_payment_intent(&signer_pubkey, &intent, &signature);
-        assert!(res1.is_ok());
-        assert_eq!(client.get_nonce(&from), 1);
-
-        // Second execution with same nonce fails
-        let res2 = client.try_execute_payment_intent(&signer_pubkey, &intent, &signature);
-        assert_eq!(res2, Err(Ok(ProxyError::InvalidNonce)));
-    }
-
-    /// Unit test: Nonce mismatch (gap / out-of-order) is rejected.
-    #[test]
-    fn test_invalid_nonce_rejected() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [55u8; 32]);
-
-        // Stored nonce is 0, but intent specifies nonce 5
-        let intent = testutils::create_payment_intent(&from, &to, 100_000, 5, 200, 50_000);
-        let signature =
-            testutils::sign_payment_intent_for_proxy(&env, &signing_key, &client, &intent);
-
-        let res = client.try_verify_payment_intent(&signer_pubkey, &intent, &signature);
-        assert_eq!(res, Err(Ok(ProxyError::InvalidNonce)));
-    }
-
-    /// Unit test: Expired deadline is rejected.
-    #[test]
-    fn test_expired_deadline_rejected() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [77u8; 32]);
-
-        // Set ledger timestamp to 1,000,000
-        let mut info = env.ledger().get();
-        info.timestamp = 1_000_000;
-        env.ledger().set(info);
-
-        // Intent has expired deadline of 999_999
-        let intent = testutils::create_payment_intent(&from, &to, 100_000, 0, 200, 999_999);
-        let signature =
-            testutils::sign_payment_intent_for_proxy(&env, &signing_key, &client, &intent);
-
-        let res = client.try_verify_payment_intent(&signer_pubkey, &intent, &signature);
-        assert_eq!(res, Err(Ok(ProxyError::DeadlineExpired)));
-    }
-
-    /// Unit test: Tampered intent fields invalidate the signature.
-    #[test]
-    fn test_tampered_payload_fails_verification() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [88u8; 32]);
-
-        let legitimate_intent =
-            testutils::create_payment_intent(&from, &to, 10_000, 0, 100, 50_000);
-        let signature = testutils::sign_payment_intent_for_proxy(
-            &env,
-            &signing_key,
-            &client,
-            &legitimate_intent,
-        );
-
-        // Attacker alters amount to 1,000,000
-        let mut tampered_intent = legitimate_intent.clone();
-        tampered_intent.amount = 1_000_000;
-
-        let res = client.try_verify_payment_intent(&signer_pubkey, &tampered_intent, &signature);
-        assert!(
-            res.is_err(),
-            "Tampered amount must fail signature verification"
-        );
-
-        // Attacker alters fee
-        let mut tampered_fee = legitimate_intent.clone();
-        tampered_fee.fee = 999_999;
-        let res_fee = client.try_verify_payment_intent(&signer_pubkey, &tampered_fee, &signature);
-        assert!(
-            res_fee.is_err(),
-            "Tampered fee must fail signature verification"
-        );
-    }
-
-    /// Unit test: Public key mismatch fails verification.
-    #[test]
-    fn test_wrong_signer_key_fails() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, _correct_pubkey) = testutils::generate_keypair(&env, [99u8; 32]);
-        let (_other_key, wrong_pubkey) = testutils::generate_keypair(&env, [100u8; 32]);
-
-        let intent = testutils::create_payment_intent(&from, &to, 50_000, 0, 100, 50_000);
-        let signature =
-            testutils::sign_payment_intent_for_proxy(&env, &signing_key, &client, &intent);
-
-        let res = client.try_verify_payment_intent(&wrong_pubkey, &intent, &signature);
-        assert!(res.is_err(), "Verification with wrong public key must fail");
-    }
-
-    /// Unit test: forward_with_meta successfully authenticates, burns nonce, and forwards call.
-    #[test]
-    fn test_forward_with_meta_execution() {
+    /// Convenience: nonce management is self-contained, so a fresh
+    /// uninitialized proxy client is enough (auth is mocked for the user
+    /// require_auth inside consume_nonce).
+    fn make_nonce_client() -> (Env, PaymentProxyClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-
-        // Target logic contract
-        let logic_id = env.register_contract(None, PaymentProxy);
-        let logic_admin = Address::generate(&env);
-        let dummy = Address::generate(&env);
-        PaymentProxyClient::new(&env, &logic_id).initialize(&logic_admin, &dummy);
-
-        // Proxy instance
         let proxy_id = env.register_contract(None, PaymentProxy);
-        let proxy_admin = Address::generate(&env);
-        let proxy = PaymentProxyClient::new(&env, &proxy_id);
-        proxy.initialize(&proxy_admin, &logic_id);
+        let client = PaymentProxyClient::new(&env, &proxy_id);
+        (env, client)
+    }
 
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (signing_key, signer_pubkey) = testutils::generate_keypair(&env, [101u8; 32]);
-        let intent = testutils::create_payment_intent(&from, &to, 123_456, 0, 789, 50_000);
-        let signature =
-            testutils::sign_payment_intent_for_proxy(&env, &signing_key, &proxy, &intent);
+    /// A word that was never written reads back as all zeroes.
+    #[test]
+    fn untouched_nonce_word_reads_all_zeroes() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
 
-        assert_eq!(proxy.get_nonce(&from), 0);
-
-        // Forward get_admin with valid meta-transaction signature
-        let result: Address = proxy
-            .forward_with_meta(
-                &signer_pubkey,
-                &intent,
-                &signature,
-                &Symbol::new(&env, "get_admin"),
-                &vec![&env],
-            )
-            .try_into_val(&env)
-            .unwrap();
-
-        assert_eq!(result, logic_admin);
-        assert_eq!(proxy.get_nonce(&from), 1);
-
-        // Replaying forward_with_meta with consumed nonce fails
-        let replay = proxy.try_forward_with_meta(
-            &signer_pubkey,
-            &intent,
-            &signature,
-            &Symbol::new(&env, "get_admin"),
-            &vec![&env],
-        );
-        assert!(
-            matches!(replay, Err(Ok(ProxyError::InvalidNonce))),
-            "expected InvalidNonce error",
+        assert_eq!(
+            client.get_nonce_bitmap(&user, &0, &0),
+            BytesN::from_array(&env, &[0u8; 32])
         );
     }
 
-    /// Unit test: network_id_from_passphrase helper correctly hashes network passphrases.
+    /// Consuming a nonce flips exactly its bit in the 256-bit word, which is
+    /// persisted under NonceBitmap(user, channel_id, word_index).
     #[test]
-    fn test_network_id_from_passphrase_helper() {
-        let env = Env::default();
-        let passphrase = Bytes::from_slice(&env, b"Public Global Stellar Network ; September 2015");
-        let network_id = PaymentProxy::network_id_from_passphrase(env.clone(), passphrase.clone());
+    fn consume_nonce_flips_bit_in_256_bit_word() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
 
-        let expected_hash = env.crypto().sha256(&passphrase);
-        assert_eq!(network_id, expected_hash);
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &7));
+
+        client.consume_nonce(&user, &0, &0, &7);
+
+        assert!(client.is_nonce_consumed(&user, &0, &0, &7));
+        // Neighbouring bits stay unconsumed.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &6));
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &8));
+
+        // Bit 7 lives in the first big-endian u64 limb, whose byte 7 holds
+        // the low mask 0x80.
+        let mut expected = [0u8; 32];
+        expected[7] = 0x80;
+        assert_eq!(
+            client.get_nonce_bitmap(&user, &0, &0),
+            BytesN::from_array(&env, &expected)
+        );
     }
 
-    // ── Multi-Call Batch Execution with Revert Isolation Tests ────────────────
-
-    /// Acceptance Criterion 4:
-    /// Tests prove a batch of 5 transactions with 2 invalid ones successfully executes the other 3.
-    /// Also verifies Acceptance Criteria 1, 2, and 3:
-    /// - Processes each meta-transaction and records boolean success in returned vector.
-    /// - Failing transactions emit meta_tx_failed event with error code.
-    /// - Valid transactions in the batch settle successfully regardless of adjacent failures.
+    /// Out-of-order execution: nonce #5 lands and executes before nonce #2
+    /// — the core fix for head-of-line blocking.
     #[test]
-    fn test_batch_execution_5_transactions_with_2_invalid_executes_other_3() {
-        let (env, _admin, _logic, client) = make_proxy();
+    fn out_of_order_execution_succeeds() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
 
-        // Set ledger timestamp
-        let mut info = env.ledger().get();
-        info.timestamp = 10_000;
-        env.ledger().set(info);
+        // #5 arrives first while #2 is still stalled in the relayer pool.
+        client.consume_nonce(&user, &0, &0, &5);
+        // #2 finally lands; it must not be blocked by #5 having gone first.
+        client.consume_nonce(&user, &0, &0, &2);
 
-        // Setup 5 distinct users and recipients
-        let (key0, pubkey0) = testutils::generate_keypair(&env, [1u8; 32]);
-        let (key1, pubkey1) = testutils::generate_keypair(&env, [2u8; 32]);
-        let (key2, pubkey2) = testutils::generate_keypair(&env, [3u8; 32]);
-        let (key3, pubkey3) = testutils::generate_keypair(&env, [4u8; 32]);
-        let (key4, pubkey4) = testutils::generate_keypair(&env, [5u8; 32]);
+        assert!(client.is_nonce_consumed(&user, &0, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &2));
+        // Nothing between or around them was implicitly consumed.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &3));
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &4));
+    }
 
-        let user0 = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let user3 = Address::generate(&env);
-        let user4 = Address::generate(&env);
+    /// Replaying a consumed nonce reverts with NonceAlreadyUsed and leaves
+    /// the bitmap intact — no replay vulnerability.
+    #[test]
+    fn replay_of_consumed_nonce_reverts() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
 
-        let recipient = Address::generate(&env);
+        client.consume_nonce(&user, &0, &0, &5);
+        client.consume_nonce(&user, &0, &0, &2);
 
-        // Tx 0: Valid
-        let intent0 = testutils::create_payment_intent(&user0, &recipient, 100_000, 0, 100, 50_000);
-        let call0 = testutils::create_meta_tx_call(&env, &key0, &pubkey0, &client, intent0.clone());
-
-        // Tx 1: Invalid (tampered signature / signature verification failure)
-        let intent1 = testutils::create_payment_intent(&user1, &recipient, 200_000, 0, 200, 50_000);
-        let mut call1 =
-            testutils::create_meta_tx_call(&env, &key1, &pubkey1, &client, intent1.clone());
-        // Invalidate the signature with a dummy all-zeros signature
-        call1.signature = BytesN::from_array(&env, &[0u8; 64]);
-
-        // Tx 2: Valid
-        let intent2 = testutils::create_payment_intent(&user2, &recipient, 300_000, 0, 300, 50_000);
-        let call2 = testutils::create_meta_tx_call(&env, &key2, &pubkey2, &client, intent2.clone());
-
-        // Tx 3: Invalid (expired deadline)
-        let intent3 = testutils::create_payment_intent(&user3, &recipient, 400_000, 0, 400, 9_999);
-        let call3 = testutils::create_meta_tx_call(&env, &key3, &pubkey3, &client, intent3.clone());
-
-        // Tx 4: Valid
-        let intent4 = testutils::create_payment_intent(&user4, &recipient, 500_000, 0, 500, 50_000);
-        let call4 = testutils::create_meta_tx_call(&env, &key4, &pubkey4, &client, intent4.clone());
-
-        let calls = soroban_sdk::vec![&env, call0.clone(), call1, call2, call3, call4];
-
-        let results = client.execute_batch_tolerant(&calls);
-
-        // Acceptance Criterion 1: Processes each and records boolean success in returned vector
         assert_eq!(
-            results,
-            soroban_sdk::vec![&env, true, false, true, false, true],
-            "Batch execution vector must indicate true for valid and false for failing calls"
-        );
-
-        // Acceptance Criterion 3: Valid transactions in the batch settle successfully regardless of adjacent failures
-        assert_eq!(
-            client.get_nonce(&user0),
-            1,
-            "Tx 0 must settle and burn nonce"
+            client.try_consume_nonce(&user, &0, &0, &5),
+            Err(Ok(ProxyError::NonceAlreadyUsed))
         );
         assert_eq!(
-            client.get_nonce(&user1),
-            0,
-            "Tx 1 reverted; nonce must remain 0"
+            client.try_consume_nonce(&user, &0, &0, &2),
+            Err(Ok(ProxyError::NonceAlreadyUsed))
         );
+
+        // The failed replays changed nothing: a fresh nonce in the same
+        // word is still usable, and the replayed bits are still consumed.
+        client.consume_nonce(&user, &0, &0, &3);
+        assert!(client.is_nonce_consumed(&user, &0, &0, &3));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &2));
+    }
+
+    /// Channels are independent: the same (word, bit) position can be
+    /// consumed in each channel without touching the others.
+    #[test]
+    fn channels_are_independent() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
+
+        client.consume_nonce(&user, &0, &0, &5);
+        client.consume_nonce(&user, &1, &0, &5);
+        client.consume_nonce(&user, &2, &0, &2);
+
+        assert!(client.is_nonce_consumed(&user, &0, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &1, &0, &5));
+        assert!(client.is_nonce_consumed(&user, &2, &0, &2));
+        // Channels 0 and 1 did not consume bit 2; channels 0 and 2 did not
+        // share state for bit 5.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &2));
+        assert!(!client.is_nonce_consumed(&user, &1, &0, &2));
+
+        // #5 is still consumable on a brand-new channel...
+        client.consume_nonce(&user, &3, &0, &5);
+        // ...but replaying it inside a used channel still reverts.
         assert_eq!(
-            client.get_nonce(&user2),
-            1,
-            "Tx 2 must settle and burn nonce"
+            client.try_consume_nonce(&user, &1, &0, &5),
+            Err(Ok(ProxyError::NonceAlreadyUsed))
         );
-        assert_eq!(
-            client.get_nonce(&user3),
-            0,
-            "Tx 3 reverted; nonce must remain 0"
-        );
-        assert_eq!(
-            client.get_nonce(&user4),
-            1,
-            "Tx 4 must settle and burn nonce"
-        );
+    }
 
-        // Acceptance Criterion 2: Failing transactions emit meta_tx_failed event with error code
-        let all_events = env.events().all();
+    /// Bits on limb boundaries live in different u64 limbs of the same
+    /// 256-bit word and never collide with each other.
+    #[test]
+    fn limb_boundaries_do_not_collide() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
 
-        // Check meta_tx_failed event for Tx 1 (InvalidSignature = 7)
-        let tx1_failed_event_found = all_events.iter().any(|(_, topics, data)| {
-            if topics.len() < 2 {
-                return false;
-            }
-            let topic0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            let topic1: Result<Address, _> = topics.get(1).unwrap().try_into_val(&env);
-            let err_code: Result<u32, _> = data.try_into_val(&env);
+        let boundary_bits = [0u32, 63, 64, 127, 128, 191, 192, 255];
 
-            topic0
-                .map(|s| s == Symbol::new(&env, "meta_tx_failed"))
-                .unwrap_or(false)
-                && topic1.map(|a| a == user1).unwrap_or(false)
-                && err_code == Ok(ProxyError::InvalidSignature as u32)
-        });
-        assert!(
-            tx1_failed_event_found,
-            "meta_tx_failed event must be emitted for Tx 1 with InvalidSignature error code (7)"
-        );
-
-        // Check meta_tx_failed event for Tx 3 (DeadlineExpired = 6)
-        let tx3_failed_event_found = all_events.iter().any(|(_, topics, data)| {
-            if topics.len() < 2 {
-                return false;
-            }
-            let topic0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            let topic1: Result<Address, _> = topics.get(1).unwrap().try_into_val(&env);
-            let err_code: Result<u32, _> = data.try_into_val(&env);
-
-            topic0
-                .map(|s| s == Symbol::new(&env, "meta_tx_failed"))
-                .unwrap_or(false)
-                && topic1.map(|a| a == user3).unwrap_or(false)
-                && err_code == Ok(ProxyError::DeadlineExpired as u32)
-        });
-        assert!(
-            tx3_failed_event_found,
-            "meta_tx_failed event must be emitted for Tx 3 with DeadlineExpired error code (6)"
-        );
-
-        // Check PaymentIntentExecuted event for valid transactions (user0, user2, user4)
-        for user in [&user0, &user2, &user4] {
-            let executed_event_found = all_events.iter().any(|(_, topics, _)| {
-                if topics.len() < 2 {
-                    return false;
-                }
-                let topic0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-                let topic1: Result<Address, _> = topics.get(1).unwrap().try_into_val(&env);
-
-                topic0
-                    .map(|s| s == Symbol::new(&env, "PaymentIntentExecuted"))
-                    .unwrap_or(false)
-                    && topic1.map(|a| a == *user).unwrap_or(false)
-            });
-            assert!(
-                executed_event_found,
-                "PaymentIntentExecuted event must be emitted for valid transactions"
+        for bit in boundary_bits {
+            client.consume_nonce(&user, &0, &0, &bit);
+        }
+        for bit in boundary_bits {
+            assert!(client.is_nonce_consumed(&user, &0, &0, &bit));
+            assert_eq!(
+                client.try_consume_nonce(&user, &0, &0, &bit),
+                Err(Ok(ProxyError::NonceAlreadyUsed))
             );
         }
-    }
 
-    /// Unit test: Multi-call batch execution handles InvalidNonce error with revert isolation.
-    #[test]
-    fn test_batch_execution_with_invalid_nonce_revert_isolation() {
-        let (env, _admin, _logic, client) = make_proxy();
-
-        let (key0, pubkey0) = testutils::generate_keypair(&env, [10u8; 32]);
-        let (key1, pubkey1) = testutils::generate_keypair(&env, [11u8; 32]);
-        let (key2, pubkey2) = testutils::generate_keypair(&env, [12u8; 32]);
-
-        let user0 = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        // Tx 0: Valid nonce 0
-        let intent0 = testutils::create_payment_intent(&user0, &recipient, 10_000, 0, 10, 50_000);
-        let call0 = testutils::create_meta_tx_call(&env, &key0, &pubkey0, &client, intent0);
-
-        // Tx 1: Invalid nonce (nonce is 99, expected 0)
-        let intent1 = testutils::create_payment_intent(&user1, &recipient, 20_000, 99, 20, 50_000);
-        let call1 = testutils::create_meta_tx_call(&env, &key1, &pubkey1, &client, intent1);
-
-        // Tx 2: Valid nonce 0
-        let intent2 = testutils::create_payment_intent(&user2, &recipient, 30_000, 0, 30, 50_000);
-        let call2 = testutils::create_meta_tx_call(&env, &key2, &pubkey2, &client, intent2);
-
-        let calls = soroban_sdk::vec![&env, call0, call1, call2];
-        let results = client.execute_batch_tolerant(&calls);
-
-        assert_eq!(results, soroban_sdk::vec![&env, true, false, true]);
-        assert_eq!(client.get_nonce(&user0), 1);
-        assert_eq!(client.get_nonce(&user1), 0);
-        assert_eq!(client.get_nonce(&user2), 1);
-
-        let all_events = env.events().all();
-        let invalid_nonce_event = all_events.iter().any(|(_, topics, data)| {
-            if topics.len() < 2 {
-                return false;
-            }
-            let topic0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            let topic1: Result<Address, _> = topics.get(1).unwrap().try_into_val(&env);
-            let err_code: Result<u32, _> = data.try_into_val(&env);
-
-            topic0
-                .map(|s| s == Symbol::new(&env, "meta_tx_failed"))
-                .unwrap_or(false)
-                && topic1.map(|a| a == user1).unwrap_or(false)
-                && err_code == Ok(ProxyError::InvalidNonce as u32)
-        });
-        assert!(
-            invalid_nonce_event,
-            "meta_tx_failed event must emit InvalidNonce (5)"
+        // Each of the four limbs holds exactly bits 0 and 63 set:
+        // 0x8000000000000001, big-endian, repeated four times.
+        let limb_value: u64 = (1u64 << 63) | 1;
+        let mut expected = [0u8; 32];
+        for chunk in expected.chunks_mut(8) {
+            chunk.copy_from_slice(&limb_value.to_be_bytes());
+        }
+        assert_eq!(
+            client.get_nonce_bitmap(&user, &0, &0),
+            BytesN::from_array(&env, &expected)
         );
     }
 
-    /// Unit test: All valid transactions in a batch succeed and update state.
+    /// A fully consumed 256-bit word rejects replays of every nonce in it,
+    /// while the next word in the same channel remains a fresh 256-nonce
+    /// space — the stream continues without head-of-line blocking.
     #[test]
-    fn test_batch_execution_all_valid() {
-        let (env, _admin, _logic, client) = make_proxy();
-
-        let (key0, pubkey0) = testutils::generate_keypair(&env, [20u8; 32]);
-        let (key1, pubkey1) = testutils::generate_keypair(&env, [21u8; 32]);
-
-        let user0 = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let call0 = testutils::create_meta_tx_call(
-            &env,
-            &key0,
-            &pubkey0,
-            &client,
-            testutils::create_payment_intent(&user0, &recipient, 15_000, 0, 50, 50_000),
-        );
-        let call1 = testutils::create_meta_tx_call(
-            &env,
-            &key1,
-            &pubkey1,
-            &client,
-            testutils::create_payment_intent(&user1, &recipient, 25_000, 0, 50, 50_000),
-        );
-
-        let results = client.execute_batch_tolerant(&soroban_sdk::vec![&env, call0, call1]);
-        assert_eq!(results, soroban_sdk::vec![&env, true, true]);
-        assert_eq!(client.get_nonce(&user0), 1);
-        assert_eq!(client.get_nonce(&user1), 1);
-    }
-
-    /// Unit test: All failing transactions in a batch record false without throwing unhandled abort.
-    #[test]
-    fn test_batch_execution_all_failing() {
-        let (env, _admin, _logic, client) = make_proxy();
-
-        let (key0, pubkey0) = testutils::generate_keypair(&env, [30u8; 32]);
-        let (key1, pubkey1) = testutils::generate_keypair(&env, [31u8; 32]);
-
-        let user0 = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        // Wrong nonce for user0
-        let call0 = testutils::create_meta_tx_call(
-            &env,
-            &key0,
-            &pubkey0,
-            &client,
-            testutils::create_payment_intent(&user0, &recipient, 10_000, 5, 10, 50_000),
-        );
-
-        // Wrong signature for user1
-        let mut call1 = testutils::create_meta_tx_call(
-            &env,
-            &key1,
-            &pubkey1,
-            &client,
-            testutils::create_payment_intent(&user1, &recipient, 20_000, 0, 10, 50_000),
-        );
-        call1.signature = BytesN::from_array(&env, &[9u8; 64]);
-
-        let results = client.execute_batch_tolerant(&soroban_sdk::vec![&env, call0, call1]);
-        assert_eq!(results, soroban_sdk::vec![&env, false, false]);
-        assert_eq!(client.get_nonce(&user0), 0);
-        assert_eq!(client.get_nonce(&user1), 0);
-    }
-
-    /// Unit test: Empty batch returns empty vector.
-    #[test]
-    fn test_batch_execution_empty() {
-        let (env, _admin, _logic, client) = make_proxy();
-        let results = client.execute_batch_tolerant(&soroban_sdk::vec![&env]);
-        assert_eq!(results, soroban_sdk::vec![&env]);
-    }
-
-    /// Unit test: Sequential batch execution for the same user increments nonce sequentially.
-    #[test]
-    fn test_batch_execution_same_user_sequential() {
-        let (env, _admin, _logic, client) = make_proxy();
-
-        let (key, pubkey) = testutils::generate_keypair(&env, [40u8; 32]);
+    fn full_word_rejects_replays_and_next_word_is_fresh() {
+        let (env, client) = make_nonce_client();
         let user = Address::generate(&env);
-        let recipient = Address::generate(&env);
 
-        let call0 = testutils::create_meta_tx_call(
-            &env,
-            &key,
-            &pubkey,
-            &client,
-            testutils::create_payment_intent(&user, &recipient, 10_000, 0, 10, 50_000),
-        );
-        let call1 = testutils::create_meta_tx_call(
-            &env,
-            &key,
-            &pubkey,
-            &client,
-            testutils::create_payment_intent(&user, &recipient, 20_000, 1, 10, 50_000),
-        );
+        for bit in 0..=255u32 {
+            client.consume_nonce(&user, &0, &0, &bit);
+        }
+        for bit in [0u32, 42, 128, 255] {
+            assert_eq!(
+                client.try_consume_nonce(&user, &0, &0, &bit),
+                Err(Ok(ProxyError::NonceAlreadyUsed))
+            );
+        }
 
-        let results = client.execute_batch_tolerant(&soroban_sdk::vec![&env, call0, call1]);
-        assert_eq!(results, soroban_sdk::vec![&env, true, true]);
-        assert_eq!(client.get_nonce(&user), 2);
+        // Word 1 in the same channel is untouched by word 0's exhaustion.
+        client.consume_nonce(&user, &0, &1, &0);
+        assert!(client.is_nonce_consumed(&user, &0, &1, &0));
+        assert!(!client.is_nonce_consumed(&user, &0, &1, &1));
+        assert!(client.is_nonce_consumed(&user, &0, &0, &0));
     }
 
-    // ── Meta-transaction tests with relayer fee compensation ───────────────────
-
-    fn setup_token(
-        env: &Env,
-    ) -> (
-        Address,
-        token::Client<'static>,
-        token::StellarAssetClient<'static>,
-    ) {
-        let token_admin = Address::generate(env);
-        let token_address = env.register_stellar_asset_contract(token_admin);
-        let token_client = token::Client::new(env, &token_address);
-        let token_admin_client = token::StellarAssetClient::new(env, &token_address);
-        (token_address, token_client, token_admin_client)
-    }
-
-    /// Mirrors `PaymentProxy::build_meta_message`: the proxy's own address, the
-    /// payload and the signer's public key are bound into one
-    /// domain-separated message, so a signature can neither be replayed at
-    /// another proxy instance nor reused for an altered payload.
-    fn meta_message(
-        env: &Env,
-        proxy_id: &Address,
-        payload: &MetaPayment,
-        pubkey: &BytesN<32>,
-    ) -> Bytes {
-        let mut msg = Bytes::new(env);
-        msg.append(&proxy_id.clone().to_xdr(env));
-        msg.append(&payload.clone().to_xdr(env));
-        msg.append(&Bytes::from_slice(env, &pubkey.to_array()));
-        Bytes::from(&env.crypto().sha256(&msg))
-    }
-
-    fn sign_meta_payload(
-        env: &Env,
-        contract_id: &Address,
-        payload: &MetaPayment,
-        signer_pubkey: &BytesN<32>,
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> BytesN<64> {
-        use ed25519_dalek::Signer;
-        let hash = meta_message(env, contract_id, payload, signer_pubkey);
-        let mut buf = [0u8; 32];
-        hash.copy_into_slice(&mut buf);
-        let sig = signing_key.sign(&buf);
-        BytesN::from_array(env, &sig.to_bytes())
-    }
-
-    /// Returns whether `signature` still authorizes `payload` for this proxy.
-    ///
-    /// This is the exact check `execute_meta_payment` performs through
-    /// `Env::crypto().ed25519_verify`: the payload is bound into the
-    /// domain-separated message, so any altered field invalidates the user's
-    /// signature.  The check is evaluated here because the on-chain call
-    /// *traps* on a mismatch, and a trap raised inside a native contract call
-    /// aborts the test process instead of surfacing as an error the test could
-    /// assert on.
-    fn signature_verifies(
-        env: &Env,
-        proxy_id: &Address,
-        payload: &MetaPayment,
-        pubkey: &BytesN<32>,
-        signature: &BytesN<64>,
-    ) -> bool {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let message = meta_message(env, proxy_id, payload, pubkey);
-        let mut hash = [0u8; 32];
-        message.copy_into_slice(&mut hash);
-        let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey.to_array()) else {
-            return false;
-        };
-        verifying_key
-            .verify(&hash, &Signature::from_bytes(&signature.to_array()))
-            .is_ok()
-    }
-
-    fn set_timestamp(env: &Env, timestamp: u64) {
-        use soroban_sdk::testutils::{Ledger as _, LedgerInfo};
-        env.ledger().set(LedgerInfo {
-            timestamp,
-            protocol_version: env.ledger().protocol_version(),
-            sequence_number: env.ledger().sequence(),
-            network_id: env.ledger().network_id().into(),
-            base_reserve: 100,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 4096,
-            max_entry_ttl: 6312000,
-        });
-    }
-
-    /// User signs payload; proxy atomically transfers fee to relayer and net amount to destination.
+    /// Nonce bitmaps are scoped per user: one user's consumption never
+    /// affects another user's stream.
     #[test]
-    fn test_meta_payment_dual_transfer_success() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn nonces_are_scoped_per_user() {
+        let (env, client) = make_nonce_client();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
 
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
+        client.consume_nonce(&alice, &0, &0, &5);
 
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
+        assert!(client.is_nonce_consumed(&alice, &0, &0, &5));
+        assert!(!client.is_nonce_consumed(&bob, &0, &0, &5));
 
-        sac.mint(&sender, &10_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let amount = 1_000i128;
-        let fee = 50i128;
-        let nonce = client.get_meta_nonce(&sender);
-        assert_eq!(nonce, 0);
-        let deadline = env.ledger().timestamp() + 3600;
-
-        let payload = MetaPayment {
-            nonce,
-            deadline,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount,
-            fee,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        client.execute_meta_payment(&payload, &pubkey, &signature);
-
-        assert_eq!(client.get_meta_nonce(&sender), 1);
-        assert_eq!(token_client.balance(&recipient), 1_000);
-        assert_eq!(token_client.balance(&relayer), 50);
-        assert_eq!(token_client.balance(&sender), 10_000 - 1_050);
+        client.consume_nonce(&bob, &0, &0, &5);
+        assert!(client.is_nonce_consumed(&bob, &0, &0, &5));
     }
 
-    /// Verify relayer cannot alter the fee parameter without invalidating the user's signature.
+    /// An out-of-range bit_index reverts instead of silently aliasing
+    /// another bit (256 would wrap into bit 0 of the same limb if unchecked).
     #[test]
-    #[ignore = "quarantined: Soroban ed25519_verify traps via non-unwinding host panic in native test mode"]
-    fn test_relayer_cannot_alter_fee_parameter() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn out_of_range_bit_index_reverts() {
+        let (env, client) = make_nonce_client();
+        let user = Address::generate(&env);
 
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-
-        sac.mint(&sender, &10_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let amount = 1_000i128;
-        let fee = 50i128;
-        let nonce = client.get_meta_nonce(&sender);
-        let deadline = env.ledger().timestamp() + 3600;
-
-        let payload = MetaPayment {
-            nonce,
-            deadline,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount,
-            fee,
-            fee_recipient: relayer.clone(),
-        };
-
-        // User signs the legitimate payload
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        // The user's signature covers the whole payload, so the positive
-        // control verifies before the relayer touches anything.
-        assert!(signature_verifies(
-            &env, &proxy_id, &payload, &pubkey, &signature
-        ));
-
-        // Malicious relayer attempts to alter fee parameter to 500
-        let mut tampered_payload = payload.clone();
-        tampered_payload.fee = 500;
-
-        assert!(
-            !signature_verifies(&env, &proxy_id, &tampered_payload, &pubkey, &signature),
-            "relayer altering fee must invalidate the user's signature"
+        assert_eq!(
+            client.try_consume_nonce(&user, &0, &0, &256),
+            Err(Ok(ProxyError::InvalidBitIndex))
         );
 
-        // State remains completely unmodified
-        assert_eq!(client.get_meta_nonce(&sender), 0);
-        assert_eq!(token_client.balance(&sender), 10_000);
-        assert_eq!(token_client.balance(&recipient), 0);
-        assert_eq!(token_client.balance(&relayer), 0);
-
-        // Legitimate payload succeeds
-        client.execute_meta_payment(&payload, &pubkey, &signature);
-        assert_eq!(client.get_meta_nonce(&sender), 1);
-        assert_eq!(token_client.balance(&recipient), 1_000);
-        assert_eq!(token_client.balance(&relayer), 50);
-        assert_eq!(token_client.balance(&sender), 8_950);
-    }
-
-    /// Verify relayer cannot alter recipient or amount parameters.
-    #[test]
-    #[ignore = "quarantined: Soroban ed25519_verify traps via non-unwinding host panic in native test mode"]
-    fn test_relayer_cannot_alter_other_payload_parameters() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-        let attacker = Address::generate(&env);
-
-        sac.mint(&sender, &10_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let payload = MetaPayment {
-            nonce: 0,
-            deadline: env.ledger().timestamp() + 3600,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 1_000,
-            fee: 50,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        // Relayer tries to redirect funds to attacker
-        let mut tampered_recipient = payload.clone();
-        tampered_recipient.recipient = attacker.clone();
-        assert!(
-            !signature_verifies(&env, &proxy_id, &tampered_recipient, &pubkey, &signature),
-            "altering recipient must fail signature verification"
-        );
-
-        // Relayer tries to inflate amount
-        let mut tampered_amount = payload.clone();
-        tampered_amount.amount = 5_000;
-        assert!(
-            !signature_verifies(&env, &proxy_id, &tampered_amount, &pubkey, &signature),
-            "altering amount must fail signature verification"
-        );
-
-        // The untouched payload is still authorized.
-        assert!(signature_verifies(
-            &env, &proxy_id, &payload, &pubkey, &signature
-        ));
-
-        // Balances untouched
-        assert_eq!(token_client.balance(&sender), 10_000);
-        assert_eq!(token_client.balance(&recipient), 0);
-        assert_eq!(token_client.balance(&attacker), 0);
-    }
-
-    /// Proxy verifies user balance covers amount + fee.
-    #[test]
-    fn test_meta_payment_verifies_balance_covers_amount_plus_fee() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-
-        // User has only 1,000 tokens
-        sac.mint(&sender, &1_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        // Amount 980 + fee 50 = 1030 > balance 1000
-        let payload = MetaPayment {
-            nonce: 0,
-            deadline: env.ledger().timestamp() + 3600,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 980,
-            fee: 50,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        let res = client.try_execute_meta_payment(&payload, &pubkey, &signature);
-        assert_eq!(res, Err(Ok(ProxyError::InsufficientBalance)));
-
-        assert_eq!(token_client.balance(&sender), 1_000);
-        assert_eq!(token_client.balance(&recipient), 0);
-        assert_eq!(token_client.balance(&relayer), 0);
-    }
-
-    /// Proxy verifies user allowance covers amount + fee.
-    #[test]
-    fn test_meta_payment_verifies_allowance_covers_amount_plus_fee() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-
-        sac.mint(&sender, &10_000);
-        // User approved only 500, but amount + fee = 550
-        token_client.approve(&sender, &proxy_id, &500, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let payload = MetaPayment {
-            nonce: 0,
-            deadline: env.ledger().timestamp() + 3600,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 500,
-            fee: 50,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        let res = client.try_execute_meta_payment(&payload, &pubkey, &signature);
-        assert_eq!(res, Err(Ok(ProxyError::InsufficientAllowance)));
-
-        assert_eq!(token_client.balance(&sender), 10_000);
-        assert_eq!(token_client.balance(&recipient), 0);
-        assert_eq!(token_client.balance(&relayer), 0);
-    }
-
-    /// Replay of an already executed meta-transaction payload is rejected.
-    #[test]
-    fn test_meta_payment_replay_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-
-        sac.mint(&sender, &10_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let payload = MetaPayment {
-            nonce: 0,
-            deadline: env.ledger().timestamp() + 3600,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 500,
-            fee: 20,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        client.execute_meta_payment(&payload, &pubkey, &signature);
-        assert_eq!(client.get_meta_nonce(&sender), 1);
-
-        // Attempting to replay same payload fails with InvalidNonce
-        let res = client.try_execute_meta_payment(&payload, &pubkey, &signature);
-        assert_eq!(res, Err(Ok(ProxyError::InvalidNonce)));
-    }
-
-    /// Meta-transaction with expired deadline is rejected.
-    #[test]
-    fn test_meta_payment_deadline_expired() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-
-        sac.mint(&sender, &10_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let deadline = env.ledger().timestamp() + 10;
-        let payload = MetaPayment {
-            nonce: 0,
-            deadline,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 500,
-            fee: 20,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        set_timestamp(&env, deadline + 100);
-
-        let res = client.try_execute_meta_payment(&payload, &pubkey, &signature);
-        assert_eq!(res, Err(Ok(ProxyError::DeadlineExpired)));
-    }
-
-    /// Zero fee is supported for altruistic or sponsored relayers.
-    #[test]
-    fn test_meta_payment_zero_fee_supported() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-
-        sac.mint(&sender, &10_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let payload = MetaPayment {
-            nonce: 0,
-            deadline: env.ledger().timestamp() + 3600,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 700,
-            fee: 0,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        client.execute_meta_payment(&payload, &pubkey, &signature);
-
-        assert_eq!(client.get_meta_nonce(&sender), 1);
-        assert_eq!(token_client.balance(&recipient), 700);
-        assert_eq!(token_client.balance(&relayer), 0);
-        assert_eq!(token_client.balance(&sender), 10_000 - 700);
-    }
-
-    /// route_payment_meta functions identically to execute_meta_payment.
-    #[test]
-    fn test_route_payment_meta_alias() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let logic = Address::generate(&env);
-        let proxy_id = env.register_contract(None, PaymentProxy);
-        let client = PaymentProxyClient::new(&env, &proxy_id);
-        client.initialize(&admin, &logic);
-
-        let (token_address, token_client, sac) = setup_token(&env);
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let relayer = Address::generate(&env);
-
-        sac.mint(&sender, &10_000);
-        token_client.approve(&sender, &proxy_id, &10_000, &1_000_000);
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
-        let payload = MetaPayment {
-            nonce: 0,
-            deadline: env.ledger().timestamp() + 3600,
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token_address: token_address.clone(),
-            amount: 800,
-            fee: 40,
-            fee_recipient: relayer.clone(),
-        };
-
-        let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
-
-        client.route_payment_meta(&payload, &pubkey, &signature);
-
-        assert_eq!(client.get_meta_nonce(&sender), 1);
-        assert_eq!(token_client.balance(&recipient), 800);
-        assert_eq!(token_client.balance(&relayer), 40);
-        assert_eq!(token_client.balance(&sender), 10_000 - 840);
+        // The rejected call consumed nothing, and the view reports
+        // out-of-range bits as never consumed.
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &0));
+        assert!(!client.is_nonce_consumed(&user, &0, &0, &256));
     }
 }

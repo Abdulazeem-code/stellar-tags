@@ -271,7 +271,8 @@ impl PaymentRouter {
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
     }
 
-    /// Resolve a token-pair override, falling back to the global slippage cap.
+    /// Resolve the token-pair override, falling back to the legacy global cap.
+    /// Corrupt or out-of-range persisted overrides fail closed.
     fn pair_max_slippage_bps(
         env: &Env,
         token_in: &Address,
@@ -1098,7 +1099,7 @@ impl PaymentRouter {
 
         env.storage()
             .instance()
-            .set(&DataKey::RateLimitConfig, &max_calls_per_ledger);
+            .set(&RateLimitKey::RateLimitConfig, &max_calls_per_ledger);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1129,7 +1130,7 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        let key = DataKey::RateLimitWhitelist(address.clone());
+        let key = RateLimitKey::RateLimitWhitelist(address.clone());
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(
             &key,
@@ -1164,7 +1165,7 @@ impl PaymentRouter {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::RateLimitWhitelist(address.clone()));
+            .remove(&RateLimitKey::RateLimitWhitelist(address.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "rate_limit_whitelist_removed"), address),
@@ -3058,7 +3059,7 @@ impl PaymentRouter {
     /// Renews the dead man's switch heartbeat on behalf of the configured
     /// heartbeat operator (issue #889).
     ///
-    /// The `operator` address must match the stored `DataKey::HeartbeatOperator`
+    /// The `operator` address must match the stored `HeartbeatKey::HeartbeatOperator`
     /// and must authorize this call.  The operator may **only** reset the
     /// heartbeat timestamp — it cannot modify the backup admin address, the
     /// DMS timeout, or any other contract parameter.
@@ -3143,9 +3144,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        access::require_not_fully_halted(&env)?;
 
         let max_amount: i128 = env
             .storage()
@@ -3225,9 +3224,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        access::require_swaps_not_paused(&env)?;
         if sender == recipient {
             return Err(Error::InvalidRecipient);
         }
@@ -3306,9 +3303,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        access::require_swaps_not_paused(&env)?;
         if sender == recipient {
             return Err(Error::InvalidRecipient);
         }
@@ -4097,7 +4092,8 @@ impl PaymentRouter {
         Self::max_slippage_bps(&env)
     }
 
-    /// Returns a pair-specific slippage cap, or the global cap when unset.
+    /// Returns the configured cap for `(token_in, token_out)`, or the global
+    /// cap when no pair override exists. Invalid stored overrides fail closed.
     pub fn get_pair_max_slippage_bps(
         env: Env,
         token_in: Address,
@@ -4106,8 +4102,8 @@ impl PaymentRouter {
         Self::pair_max_slippage_bps(&env, &token_in, &token_out)
     }
 
-    /// Sets a pair-specific slippage cap. Prefer the timelocked action in
-    /// production configuration.
+    /// Sets a pair-specific slippage cap. Prefer the timelocked
+    /// `SetPairMaxSlippageBps` action for production configuration.
     pub fn set_pair_max_slippage_bps(
         env: Env,
         token_in: Address,

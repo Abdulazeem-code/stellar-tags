@@ -1,4 +1,6 @@
 use super::*;
+use crate::errors::Error;
+use crate::storage::DataKey;
 
 // The crate is `no_std`, but the test harness links std; pull it in so
 // the benchmark can print its GAS REPORT lines.
@@ -5323,6 +5325,7 @@ fn test_operator_cannot_change_backup_admin() {
     let admin = Address::generate(&env);
     let backup = Address::generate(&env);
     let operator = Address::generate(&env);
+
     setup_dms_env(
         &env,
         &client,
@@ -5333,6 +5336,7 @@ fn test_operator_cannot_change_backup_admin() {
     client.set_heartbeat_operator(&operator);
 
     client.renew_heartbeat(&operator);
+
     let (stored_backup, _, _, _) = client.get_dead_mans_switch();
     assert_eq!(
         stored_backup.unwrap(),
