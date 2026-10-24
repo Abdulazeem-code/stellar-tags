@@ -47,6 +47,11 @@ pub enum Error {
     SwapDeadlineExpired = 18,
     /// The supplied role is not one the contract recognises.
     InvalidRole = 20,
+    /// The caller holds a role but is not permitted to perform this action.
+    RoleNotAuthorized = 48,
+    /// The timelock entry or cross-contract upgrade manifest could not be found.
+    /// Retained alongside `TimelockNotFound` so callers referencing either name compile.
+    TimelockNotFoundLegacy = 62,
     /// No backup admin has been armed, so the dead man's switch cannot fire.
     NoBackupAdmin = 43,
     /// The dead man's switch timeout has not elapsed since the last heartbeat.
@@ -114,7 +119,36 @@ pub enum Error {
     /// A reentrant call was detected.
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
-    CyclicSwapPath = 48,
+    CyclicSwapPath = 49,
+    /// No Merkle batch exists for the supplied root or batch id.
+    MerkleBatchNotFound = 50,
+    /// A Merkle batch with this root has already been registered.
+    MerkleBatchAlreadyExists = 51,
+    /// The supplied Merkle inclusion proof does not verify against the root.
+    InvalidMerkleProof = 52,
+    /// The recipient has already claimed their Merkle payment.
+    MerklePaymentAlreadyClaimed = 53,
+    /// The Merkle batch has not expired yet, so unclaimed funds cannot be
+    /// reclaimed by the sender.
+    MerkleBatchNotExpired = 54,
+    /// The Merkle batch has expired and can no longer be claimed against.
+    MerkleBatchExpired = 55,
+    /// The claimed amount does not match the amount committed in the Merkle
+    /// leaf for this recipient.
+    MerkleAmountMismatch = 56,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
-    InvalidSlippageConfig = 49,
+    InvalidSlippageConfig = 57,
+    /// The upgrade manifest is malformed: no target contracts, a different
+    /// number of code hashes than addresses, or a duplicated target.
+    InvalidUpgradeManifest = 58,
+    /// The execution deadline of the prepared upgrade has passed; the upgrade
+    /// must be prepared again.
+    UpgradeManifestExpired = 59,
+    /// A participating contract rejected the manifest during preparation. The
+    /// entire invocation was rolled back, so no contract was registered.
+    UpgradePrepareFailed = 60,
+    /// A participating contract rejected the manifest during the atomic
+    /// commit. The entire invocation was rolled back, so no contract was
+    /// upgraded: the protocol is still fully on its previous version.
+    UpgradeCommitFailed = 61,
 }
