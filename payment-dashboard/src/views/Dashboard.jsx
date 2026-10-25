@@ -1,227 +1,131 @@
-import { useEffect, useRef, useState } from 'react';
-import freighterApi from '@stellar/freighter-api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
 import { Client as PaymentRouterClient, networks } from '@stellar-tags/payment-router';
-import { useLatencyTracker } from '../useLatencyTracker';
-import LatencyGauge from '../LatencyGauge';
-import NetworkBadge from '../NetworkBadge';
-import { useDebounce } from '../useDebounce';
-import ScrollToTop from '../ScrollToTop';
-import MobileNav from './MobileNav';
+import Icon from '../components/Icon';
+import ConnectPrompt from '../components/ConnectPrompt';
 import RecentAddresses from '../components/RecentAddresses';
 import { useRecentAddresses } from '../useRecentAddresses';
+import { signTransaction } from '../lib/wallets';
+import { dailyVolume, fetchAccountPayments, relativeTime } from '../lib/payments';
 import {
   API_BASE,
-  NAV_STORAGE_KEY,
+  DEFAULT_FEDERATION_DOMAIN,
   TOKEN_ADDRESS,
-  formatShortAddress,
-  formatUsername,
-  resolveRecipient,
   apiErrorMessage,
-  useNavState,
-  useWalletMenu,
+  errorMessage,
+  formatShortAddress,
+  fullTag,
+  resolveRecipient,
 } from './shared';
 
-function Dashboard({
-  userPublicKey,
-  onConnectWallet,
-  onDisconnectWallet,
-  balance,
-  isRefreshing,
-  balanceError,
-  onRefreshBalance,
-  onRegisterClick,
-  onAnalyticsClick,
-  onHistoryClick,
-  onHelpClick,
-  onRegistrationStateChange,
-  canRegister,
-}) {
-  const [isNavOpen, setIsNavOpen] = useNavState();
-  const {
-    menuRef,
-    isOpen: isWalletMenuOpen,
-    setIsOpen: setIsWalletMenuOpen,
-  } = useWalletMenu();
-  const closeNav = () => {
-    sessionStorage.setItem(NAV_STORAGE_KEY, "false");
-    setIsNavOpen(false);
+const SOROBAN_RPC = 'https://soroban-testnet.stellar.org';
+const QUICK_AMOUNTS = [10, 50, 100, 250];
+
+function splitBalance(value) {
+  const [whole, fraction = ''] = value.toFixed(7).split('.');
+  return {
+    whole: Number(whole).toLocaleString(),
+    head: fraction.slice(0, 2),
+    tail: fraction.slice(2),
   };
-  const handleNav = (action) => {
-    sessionStorage.setItem(NAV_STORAGE_KEY, 'false')
-    setIsNavOpen(false)
-    action()
+}
+
+function VolumeBars({ rows }) {
+  const buckets = useMemo(() => dailyVolume(rows, 14), [rows]);
+  const max = Math.max(...buckets, 1);
+  const total = buckets.reduce((sum, value) => sum + value, 0);
+  return (
+    <div className="volume">
+      <div className="volume__head">
+        <span className="eyebrow">14-day volume</span>
+        <span className="mono">{total.toLocaleString(undefined, { maximumFractionDigits: 2 })} XLM</span>
+      </div>
+      <div className="volume__bars" role="img" aria-label={`XLM moved per day over 14 days, ${total.toFixed(2)} in total`}>
+        {buckets.map((value, index) => (
+          <span
+            key={index}
+            className={`volume__bar ${index === buckets.length - 1 ? 'blue-fill' : 'dither-blue-50'}`}
+            style={{ height: `${Math.max(4, (value / max) * 100)}%` }}
+            title={`${value.toFixed(2)} XLM`}
+          />
+        ))}
+      </div>
+      <div className="volume__axis mono">
+        <span>-14d</span>
+        <span>today</span>
+      </div>
+    </div>
+  );
+}
+
+function ActivityList({ state, onNavigate }) {
+  if (state.loading) {
+    return (
+      <div className="skeleton-list" aria-busy="true">
+        {[0, 1, 2].map((index) => (
+          <span key={index} className="skeleton dither-12" />
+        ))}
+      </div>
+    );
   }
-  const [nameTag, setNameTag] = useState('')
+  if (state.error) return <p className="muted">{state.error}</p>;
+  if (!state.rows.length) {
+    return <p className="muted">No payments yet. Send one, or share your tag to receive.</p>;
+  }
+  return (
+    <>
+      <ul className="activity">
+        {state.rows.slice(0, 6).map((row) => (
+          <li key={row.id} className="activity__row">
+            <span className={`activity__icon ${row.direction === 'Sent' ? '' : 'is-in'}`} aria-hidden="true">
+              <Icon name={row.direction === 'Sent' ? 'send' : 'receive'} size={14} />
+            </span>
+            <span className="activity__who">
+              <span className="mono">{formatShortAddress(row.counterparty)}</span>
+              <span className="muted small">{relativeTime(row.createdAt)}</span>
+            </span>
+            <span className={`mono activity__amt ${row.direction === 'Sent' ? '' : 'text-blue'}`}>
+              {row.direction === 'Sent' ? '-' : '+'}
+              {row.amount}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <button type="button" className="btn btn--ghost btn--block" onClick={() => onNavigate('history')}>
+        Full history <Icon name="arrow" size={14} />
+      </button>
+    </>
+  );
+}
+
+function SendPanel({ userPublicKey, onRefreshBalance }) {
+  const [recipient, setRecipient] = useState('');
+  const [amount, setAmount] = useState('');
   const [showRecent, setShowRecent] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [message, setMessage] = useState({ tone: '', text: '' });
   const { recentAddresses, saveAddress, clearAddresses } = useRecentAddresses();
   const recipientRef = useRef(null);
-  const debouncedNameTag = useDebounce(nameTag, 300)
-  const [amount, setAmount] = useState('')
-  const [isProcessing, setIsProcessing] = useState(false)
-  const [isSubmitting, setIsSubmitting] = useState(false)
-  const [isReceiving, setIsReceiving] = useState(false)
-  const [activeBalancePanel, setActiveBalancePanel] = useState('transfer')
-  const [showBalance, setShowBalance] = useState(true)
-  const [receiveAddress, setReceiveAddress] = useState('')
-  const [receiveTag, setReceiveTag] = useState('')
-  const [receiveStatus, setReceiveStatus] = useState({
-    text: '',
-    color: '#1F2937',
-    bgColor: '#F3F4F6',
-  })
-  const [status, setStatus] = useState({
-    text: "",
-    color: "#1F2937",
-    bgColor: "#F3F4F6",
-  });
+  const closeRecent = useCallback(() => setShowRecent(false), []);
 
-  // Initialize latency tracker for real-time API monitoring
-  const latencyTracker = useLatencyTracker(API_BASE);
+  const handleSend = async (event) => {
+    event.preventDefault();
+    if (isProcessing) return;
 
-  const walletLabel = userPublicKey
-    ? `Connected: ${userPublicKey.substring(0, 5)}...${userPublicKey.substring(51)}`
-    : "";
-
-  const displayMessage = (text, color, bgColor) => {
-    setStatus({ text, color, bgColor });
-  };
-
-  const displayReceiveMessage = (text, color, bgColor) => {
-    setReceiveStatus({ text, color, bgColor });
-  };
-
-  useEffect(() => {
-    if (!userPublicKey) {
-      Promise.resolve().then(() => onRegistrationStateChange("unknown"));
-      return;
-    }
-
-    const loadReceiveDetails = async () => {
-      setIsReceiving(true);
-      displayReceiveMessage(
-        "Loading your receive details...",
-        "#1F2937",
-        "#F3F4F6",
-      );
-
-      try {
-        const response = await fetch(
-          `${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`,
-        );
-        const rawBody = await response.text();
-        const data = rawBody ? JSON.parse(rawBody) : null;
-
-        if (response.ok && data) {
-          setReceiveAddress(data.address);
-          setReceiveTag(data.username);
-          displayReceiveMessage(
-            "Share your username or wallet address.",
-            "#059669",
-            "#D1FAE5",
-          );
-          onRegistrationStateChange("existing");
-          return;
-        }
-
-        if (response.status === 404) {
-          setReceiveAddress(userPublicKey);
-          setReceiveTag("");
-          displayReceiveMessage(
-            "No username found. Register to claim one.",
-            "#D97706",
-            "#FEF3C7",
-          );
-          // Change "new" to "skipped" to break the infinite redirect loop
-          onRegistrationStateChange("skipped"); 
-          return;
-        }
-
-        throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`))
-      } catch (error){
-        setReceiveAddress(userPublicKey)
-        setReceiveTag('')
-        displayReceiveMessage(error.message || 'Unable to load receive details.', '#DC2626', '#FEE2E2')
-        onRegistrationStateChange('unknown')
-      } finally {
-        setIsReceiving(false);
-      }
-    };
-
-    loadReceiveDetails();
-  }, [userPublicKey, onRegistrationStateChange]);
-
-  useEffect(() => {
-    recipientRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    if (!debouncedNameTag || !userPublicKey) {
-      return;
-    }
-
-    const searchRecipient = async () => {
-      try {
-        const resolved = await resolveRecipient(debouncedNameTag);
-        if (resolved.error) {
-          return;
-        }
-
-        if (resolved.address) {
-          return;
-        }
-
-        if (resolved.tag) {
-          const response = await fetch(
-            `${API_BASE}/federation?q=${encodeURIComponent(resolved.tag)}&type=name`,
-          );
-          const data = response.ok ? await response.json() : null;
-          if (!data?.account_id) {
-            return;
-          }
-        }
-      } catch  {
-        // Silently fail on search errors during typing
-      }
-    };
-
-    searchRecipient();
-  }, [debouncedNameTag, userPublicKey]);
-
-  const handleConnect = async () => {
-    const result = await onConnectWallet();
-    if (!result.ok) {
-      displayMessage(
-        result.error || "Wallet connection failed.",
-        "#DC2626",
-        "#FEE2E2",
-      );
-      return;
-    }
-
-    displayMessage("Wallet connected.", "#059669", "#D1FAE5");
-  };
-
-  const handleLookup = async () => {
-    if (isSubmitting) return;
-    setIsSubmitting(true);
-
-    const recipientInput = nameTag.trim();
+    const recipientInput = recipient.trim();
     const amountValue = parseFloat(amount);
-
     if (!amountValue || Number.isNaN(amountValue) || amountValue <= 0) {
-      toast.error("Please enter a valid amount greater than zero.");
-      setIsSubmitting(false);
+      toast.error('Enter an amount greater than zero.');
       return;
     }
 
     setIsProcessing(true);
-    const toastId = toast.loading("Verifying recipient...");
+    setMessage({ tone: '', text: '' });
+    const toastId = toast.loading('Resolving recipient...');
 
     try {
       const resolved = await resolveRecipient(recipientInput);
-      if (resolved.error)
-        throw new Error(`Resolution error: ${resolved.error}`);
+      if (resolved.error) throw new Error(resolved.error);
 
       let recipientAddress = resolved.address;
       if (!recipientAddress && resolved.tag) {
@@ -229,22 +133,16 @@ function Dashboard({
           `${API_BASE}/federation?q=${encodeURIComponent(resolved.tag)}&type=name`,
         );
         const data = response.ok ? await response.json() : null;
-        if (!data?.account_id)
-          throw new Error(
-            "Recipient address could not be resolved from backend.",
-          );
+        if (!data?.account_id) throw new Error(`No wallet is registered for ${resolved.tag}.`);
         recipientAddress = data.account_id;
       }
 
-      toast.loading("Simulating smart contract execution...", { id: toastId });
+      toast.loading('Simulating the payment_router call...', { id: toastId });
       const amountStroops = BigInt(Math.floor(amountValue * 10000000));
 
       // Build and simulate the payment through the type-safe client generated
       // from the contract ABI (packages/types).
-      const client = new PaymentRouterClient({
-        ...networks.testnet,
-        rpcUrl: "https://soroban-testnet.stellar.org",
-      });
+      const client = new PaymentRouterClient({ ...networks.testnet, rpcUrl: SOROBAN_RPC });
 
       let assembledTransaction;
       try {
@@ -258,479 +156,402 @@ function Dashboard({
         throw new Error(`Simulation failed: ${err.message}`, { cause: err });
       }
 
-      toast.loading("Approve the transaction in your wallet...", { id: toastId });
-      let signedXdrResponse;
+      toast.loading('Approve the transaction in your wallet...', { id: toastId });
+      let signedXdr;
       try {
-        signedXdrResponse = await freighterApi.signTransaction(
-          assembledTransaction.toXDR(),
-          {
-            network: "TESTNET",
-            networkPassphrase: "Test SDF Network ; September 2015",
-          },
-        );
-        if (signedXdrResponse.error) throw new Error(signedXdrResponse.error);
+        signedXdr = await signTransaction(assembledTransaction.toXDR(), userPublicKey);
       } catch (err) {
-        throw new Error(`Wallet signature failed: ${err.message}`, {
-          cause: err,
-        });
+        throw new Error(`Wallet signature failed: ${err?.message || 'rejected'}`, { cause: err });
       }
 
-      toast.loading("Submitting to Stellar Testnet...", { id: toastId });
-      const finalXdr =
-        typeof signedXdrResponse === "string"
-          ? signedXdrResponse
-          : signedXdrResponse.signedTxXdr || signedXdrResponse;
-
-      const rpcResponse = await fetch("https://soroban-testnet.stellar.org", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+      toast.loading('Submitting to Stellar testnet...', { id: toastId });
+      const rpcResponse = await fetch(SOROBAN_RPC, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          jsonrpc: "2.0",
+          jsonrpc: '2.0',
           id: 1,
-          method: "sendTransaction",
-          params: { transaction: finalXdr },
+          method: 'sendTransaction',
+          params: { transaction: signedXdr },
         }),
       });
-
       const rpcData = await rpcResponse.json();
-      if (rpcData.error)
-        throw new Error(`RPC Error: ${rpcData.error.message}`);
+      if (rpcData.error) throw new Error(`RPC error: ${rpcData.error.message}`);
 
       const txStatus = rpcData.result?.status;
-      if (txStatus === "PENDING" || txStatus === "SUCCESS") {
-        const txHash = rpcData.result?.hash;
-        const explorerUrl = txHash
-          ? `https://stellar.expert/explorer/testnet/tx/${txHash}`
-          : null;
-
-        toast.success(
-          (t) => (
-            <span>
-              Payment successful!
-              {explorerUrl && (
-                <>
-                  {' '}
-                  <a
-                    href={explorerUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ color: '#0052FF', fontWeight: 600 }}
-                    onClick={() => toast.dismiss(t.id)}
-                  >
-                    View on Stellar Expert
-                  </a>
-                </>
-              )}
-            </span>
-          ),
-          { id: toastId, duration: 8000 },
-        );
-
-        displayMessage("Payment successful!", "#059669", "#D1FAE5");
-        saveAddress(recipientInput);
-        setAmount("");
-        onRefreshBalance();
-        window.dispatchEvent(new Event("stellar:tx-update"));
-      } else {
-        throw new Error(
-          `Blockchain rejected transaction: ${txStatus || "Unknown"}`,
-        );
+      if (txStatus !== 'PENDING' && txStatus !== 'SUCCESS') {
+        throw new Error(`The network rejected the transaction: ${txStatus || 'unknown'}`);
       }
-    } catch (error) {
-      toast.error(error.message || "Transaction failed.", { id: toastId });
-      displayMessage(
-        error.message || "A critical error occurred.",
-        "#DC2626",
-        "#FEE2E2",
+
+      const txHash = rpcData.result?.hash;
+      const explorerUrl = txHash ? `https://stellar.expert/explorer/testnet/tx/${txHash}` : null;
+      toast.success(
+        (t) => (
+          <span>
+            Sent {amountValue} XLM.
+            {explorerUrl && (
+              <>
+                {' '}
+                <a href={explorerUrl} target="_blank" rel="noopener noreferrer" onClick={() => toast.dismiss(t.id)}>
+                  View on Stellar Expert
+                </a>
+              </>
+            )}
+          </span>
+        ),
+        { id: toastId, duration: 8000 },
       );
+      setMessage({ tone: 'ok', text: `Sent ${amountValue} XLM to ${recipientInput}.` });
+      saveAddress(recipientInput);
+      setAmount('');
+      onRefreshBalance();
+      window.dispatchEvent(new Event('stellar:tx-update'));
+    } catch (error) {
+      toast.error(error.message || 'Transaction failed.', { id: toastId });
+      setMessage({ tone: 'error', text: error.message || 'Transaction failed.' });
     } finally {
       setIsProcessing(false);
-      setIsSubmitting(false);
     }
-  };
-
-  const handleCopy = async (value, label) => {
-    if (!value) {
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(value);
-      displayReceiveMessage(
-        `${label} copied to clipboard.`,
-        "#059669",
-        "#D1FAE5",
-      );
-    } catch {
-      displayReceiveMessage(
-        "Copy failed. Please copy manually.",
-        "#DC2626",
-        "#FEE2E2",
-      );
-    }
-  };
-
-  const handleDisconnect = () => {
-    setIsWalletMenuOpen(false);
-    onDisconnectWallet();
-    displayMessage("Wallet disconnected.", "#1F2937", "#F3F4F6");
   };
 
   return (
-    <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
-      <button
-        type="button"
-        className={`sidebar-scrim ${isNavOpen ? "is-open" : ""}`}
-        onClick={() => setIsNavOpen(false)}
-        aria-label="Close navigation"
-      />
-      <aside className={`sidebar ${isNavOpen ? "is-open" : ""}`}>
-        <div className="brand">
-          <div className="brand-mark">S</div>
-          <h1>Stellar Pay</h1>
-          <span className="brand-badge">Testnet</span>
+    <form className="form" onSubmit={handleSend}>
+      <div className="form__group recipient">
+        <label htmlFor="recipient">Recipient</label>
+        <div className="field">
+          <Icon name="search" size={16} className="field__icon" />
+          <input
+            id="recipient"
+            ref={recipientRef}
+            value={recipient}
+            onChange={(event) => setRecipient(event.target.value)}
+            onFocus={() => setShowRecent(true)}
+            placeholder={`name, name*${DEFAULT_FEDERATION_DOMAIN} or G...`}
+            autoComplete="off"
+            spellCheck="false"
+            required
+          />
         </div>
-        <div className="nav">
-          <button type="button" aria-current="page" onClick={closeNav}>
-            Dashboard
-          </button>
-          <button type="button" onClick={() => handleNav(onHistoryClick)}>
-            History
-          </button>
-          <button type="button" onClick={() => handleNav(onAnalyticsClick)}>
-            Analytics
-          </button>
-          <button type="button" onClick={() => handleNav(onHelpClick)}>
-            Help
-          </button>
-          {canRegister && (
-            <button type="button" onClick={() => handleNav(onRegisterClick)}>
-              Registration
+        <RecentAddresses
+          addresses={recentAddresses}
+          isVisible={showRecent && !recipient}
+          onSelect={(value) => {
+            setRecipient(value);
+            recipientRef.current?.focus();
+          }}
+          onClear={clearAddresses}
+          onClose={closeRecent}
+        />
+      </div>
+
+      <div className="form__group">
+        <label htmlFor="amount">Amount</label>
+        <div className="field field--amount">
+          <input
+            id="amount"
+            type="number"
+            inputMode="decimal"
+            min="0"
+            step="0.0000001"
+            value={amount}
+            onChange={(event) => setAmount(event.target.value)}
+            placeholder="0.00"
+            required
+          />
+          <span className="field__suffix">XLM</span>
+        </div>
+        <div className="chips">
+          {QUICK_AMOUNTS.map((value) => (
+            <button key={value} type="button" className="chip chip--button" onClick={() => setAmount(String(value))}>
+              {value}
             </button>
+          ))}
+        </div>
+      </div>
+
+      <dl className="summary mono">
+        <div>
+          <dt>Route</dt>
+          <dd>payment_router</dd>
+        </div>
+        <div>
+          <dt>Network fee</dt>
+          <dd>~0.00001 XLM</dd>
+        </div>
+        <div>
+          <dt>Settles in</dt>
+          <dd>~5s</dd>
+        </div>
+      </dl>
+
+      <button type="submit" className="btn btn--primary btn--lg btn--block" disabled={isProcessing}>
+        {isProcessing ? (
+          <>
+            <span className="btn__spinner dither-50 spin-steps" aria-hidden="true" /> Processing
+          </>
+        ) : (
+          <>
+            Send payment <Icon name="send" size={16} />
+          </>
+        )}
+      </button>
+      {message.text && (
+        <p className={`notice notice--${message.tone}`} role="status">
+          {message.text}
+        </p>
+      )}
+    </form>
+  );
+}
+
+function ReceivePanel({ receive, onNavigate }) {
+  const [copied, setCopied] = useState('');
+  const tag = fullTag(receive.tag);
+
+  const copy = async (value, label) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(label);
+      toast.success(`${label} copied.`);
+    } catch {
+      toast.error('Copy failed. Select the text and copy it manually.');
+    }
+  };
+
+  if (receive.loading) {
+    return (
+      <div className="skeleton-list" aria-busy="true">
+        <span className="skeleton dither-12" />
+        <span className="skeleton dither-12" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="receive">
+      <div className="receive__qr">
+        <img
+          src={`https://api.qrserver.com/v1/create-qr-code/?size=176x176&margin=8&data=${encodeURIComponent(receive.address)}`}
+          alt="QR code of your wallet address"
+          width="176"
+          height="176"
+        />
+      </div>
+      <div className="receive__fields">
+        {tag ? (
+          <div className="copy-field">
+            <span className="eyebrow">Your tag</span>
+            <div className="copy-field__row">
+              <span className="mono text-paper">{tag}</span>
+              <button type="button" className="icon-button" onClick={() => copy(tag, 'Tag')}>
+                <Icon name={copied === 'Tag' ? 'check' : 'copy'} size={16} label="Copy tag" />
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="notice notice--info">
+            <span>No tag yet. Claim one so people can pay you by name.</span>
+            <button type="button" className="btn btn--ghost btn--sm" onClick={() => onNavigate('register')}>
+              Claim a tag
+            </button>
+          </div>
+        )}
+        <div className="copy-field">
+          <span className="eyebrow">Wallet address</span>
+          <div className="copy-field__row">
+            <span className="mono break">{receive.address}</span>
+            <button type="button" className="icon-button" onClick={() => copy(receive.address, 'Address')}>
+              <Icon name={copied === 'Address' ? 'check' : 'copy'} size={16} label="Copy address" />
+            </button>
+          </div>
+        </div>
+        {receive.error && <p className="notice notice--error">{receive.error}</p>}
+      </div>
+    </div>
+  );
+}
+
+function Dashboard({
+  userPublicKey,
+  onConnectWallet,
+  balance,
+  isRefreshing,
+  balanceError,
+  onRefreshBalance,
+  onNavigate,
+  onRegistrationStateChange,
+}) {
+  const [tab, setTab] = useState('send');
+  const [showBalance, setShowBalance] = useState(true);
+  const [receiveData, setReceiveData] = useState({ key: '', address: '', tag: '', error: '' });
+  const [activityData, setActivityData] = useState({ key: '', rows: [], error: '' });
+  const [activityNonce, setActivityNonce] = useState(0);
+
+  useEffect(() => {
+    if (!userPublicKey) return undefined;
+    let active = true;
+
+    const load = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`);
+        const rawBody = await response.text();
+        const data = rawBody ? JSON.parse(rawBody) : null;
+        if (!active) return;
+
+        if (response.ok && data) {
+          setReceiveData({ key: userPublicKey, address: data.address, tag: data.username, error: '' });
+          onRegistrationStateChange('existing');
+          return;
+        }
+        if (response.status === 404) {
+          setReceiveData({ key: userPublicKey, address: userPublicKey, tag: '', error: '' });
+          // "skipped", not "new", so the app does not keep redirecting to registration.
+          onRegistrationStateChange('skipped');
+          return;
+        }
+        throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`));
+      } catch (error) {
+        if (!active) return;
+        setReceiveData({
+          key: userPublicKey,
+          address: userPublicKey,
+          tag: '',
+          error: errorMessage(error, 'Unable to load receive details.'),
+        });
+        onRegistrationStateChange('unknown');
+      }
+    };
+
+    load();
+    return () => {
+      active = false;
+    };
+  }, [userPublicKey, onRegistrationStateChange]);
+
+  useEffect(() => {
+    if (!userPublicKey) return undefined;
+    const controller = new AbortController();
+    fetchAccountPayments(userPublicKey, { limit: 100, signal: controller.signal })
+      .then((rows) => setActivityData({ key: `${userPublicKey}:${activityNonce}`, rows, error: '' }))
+      .catch((error) => {
+        if (error.name === 'AbortError') return;
+        setActivityData({ key: `${userPublicKey}:${activityNonce}`, rows: [], error: errorMessage(error, 'Unable to load activity.') });
+      });
+    return () => controller.abort();
+  }, [userPublicKey, activityNonce]);
+
+  useEffect(() => {
+    const bump = () => setActivityNonce((value) => value + 1);
+    window.addEventListener('stellar:tx-update', bump);
+    return () => window.removeEventListener('stellar:tx-update', bump);
+  }, []);
+
+  if (!userPublicKey) {
+    return (
+      <ConnectPrompt
+        onConnectWallet={onConnectWallet}
+        title="Connect a wallet to see your balance and send by name."
+        body="Any Stellar wallet works: browser extensions, mobile wallets over WalletConnect, and Ledger or Trezor hardware."
+      />
+    );
+  }
+
+  const receive = { ...receiveData, loading: receiveData.key !== userPublicKey };
+  const activity = {
+    ...activityData,
+    loading: !activityData.key.startsWith(`${userPublicKey}:`),
+  };
+  const parts = balance !== null && balance !== undefined ? splitBalance(balance) : null;
+
+  return (
+    <div className="dash">
+      <section className="card balance-card">
+        <div className="balance-card__head">
+          <span className="eyebrow">Available balance</span>
+          <div className="row-gap">
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => setShowBalance((value) => !value)}
+            >
+              <Icon name={showBalance ? 'eyeOff' : 'eye'} size={16} label={showBalance ? 'Hide balance' : 'Show balance'} />
+            </button>
+            <button
+              type="button"
+              className={`icon-button ${isRefreshing ? 'is-spinning' : ''}`}
+              onClick={onRefreshBalance}
+              disabled={isRefreshing}
+            >
+              <Icon name="refresh" size={16} label="Refresh balance" />
+            </button>
+          </div>
+        </div>
+        <p className="balance" aria-live="polite">
+          {!showBalance ? (
+            <span className="balance__hidden dither-50" aria-label="Balance hidden" />
+          ) : parts ? (
+            <>
+              <span className="balance__whole">{parts.whole}</span>
+              <span className="balance__head">.{parts.head}</span>
+              <span className="balance__tail">{parts.tail}</span>
+              <span className="balance__unit">XLM</span>
+            </>
+          ) : (
+            <span className="balance__whole text-dim">{isRefreshing ? '...' : '--'}</span>
+          )}
+        </p>
+        {balanceError && (
+          <p className="notice notice--error">
+            {balanceError}{' '}
+            {balanceError.includes('not funded') && (
+              <a
+                href={`https://friendbot.stellar.org/?addr=${userPublicKey}`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={() => setTimeout(onRefreshBalance, 4000)}
+              >
+                Fund it with Friendbot
+              </a>
+            )}
+          </p>
+        )}
+        <VolumeBars rows={activity.rows} />
+      </section>
+
+      <section className="card pay-card">
+        <div className="tabs" role="tablist" aria-label="Payment">
+          {['send', 'receive'].map((id) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              id={`tab-${id}`}
+              aria-selected={tab === id}
+              aria-controls={`panel-${id}`}
+              className="tabs__tab"
+              onClick={() => setTab(id)}
+            >
+              <Icon name={id} size={16} />
+              {id === 'send' ? 'Send' : 'Receive'}
+            </button>
+          ))}
+        </div>
+        <div role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`} className="tabs__panel">
+          {tab === 'send' ? (
+            <SendPanel userPublicKey={userPublicKey} onRefreshBalance={onRefreshBalance} />
+          ) : (
+            <ReceivePanel receive={receive} onNavigate={onNavigate} />
           )}
         </div>
-        <div className="sidebar-card">
-          <h3>Network pulse</h3>
-          <p>Testnet status is healthy. Avg confirmation 3.9s.</p>
+      </section>
+
+      <section className="card activity-card">
+        <div className="card__head">
+          <h2 className="h4">Recent activity</h2>
+          <span className="chip">Live</span>
         </div>
-        <div className="sidebar-card">
-          <h3>Support</h3>
-          <p>Need a hand? Open the help panel for quick answers.</p>
-        </div>
-        {userPublicKey && (
-          <button
-            type="button"
-            className="disconnect-button"
-            onClick={handleDisconnect}
-          >
-            Disconnect wallet
-          </button>
-        )}
-      </aside>
-
-      <main className="main">
-        <section className="topbar reveal">
-          <button
-            type="button"
-            className="hamburger"
-            onClick={() => setIsNavOpen((prev) => !prev)}
-            aria-label="Toggle navigation"
-            aria-expanded={isNavOpen}
-          >
-            <span />
-            <span />
-            <span />
-          </button>
-          <div>
-            <h2 className="headline">Frictionless Stellar Finance.</h2>
-            <p className="subtle">
-              Experience frictionless finance with verified identities and
-              real-time smart routing.
-            </p>
-          </div>
-          <div className="topbar-actions">
-            <NetworkBadge />
-            <LatencyGauge 
-              latency={latencyTracker.latency}
-              status={latencyTracker.status}
-            />
-            <div className="wallet-menu" ref={menuRef}>
-              <button
-                type="button"
-                className="connect-pill"
-                onClick={() => {
-                  if (userPublicKey) {
-                    setIsWalletMenuOpen((prev) => !prev);
-                  } else {
-                    handleConnect();
-                  }
-                }}
-                aria-expanded={isWalletMenuOpen}
-              >
-                {userPublicKey
-                  ? `Connected: ${formatShortAddress(userPublicKey)}`
-                  : "Connect wallet"}
-              </button>
-              {userPublicKey && isWalletMenuOpen && (
-                <div className="wallet-dropdown">
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await navigator.clipboard.writeText(userPublicKey);
-                      toast.success("Address copied to clipboard!");
-                      setIsWalletMenuOpen(false);
-                    }}
-                  >
-                    📋 Copy address
-                  </button>
-                  <a
-                    href={`https://stellar.expert/explorer/testnet/account/${userPublicKey}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="wallet-dropdown-link"
-                    onClick={() => setIsWalletMenuOpen(false)}
-                  >
-                    🔍 View on Explorer ↗
-                  </a>
-                  <button type="button" onClick={handleDisconnect} className="disconnect-item">
-                    🔌 Disconnect wallet
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        </section>
-
-        <section className="grid columns-1 balance-grid">
-          <div className="card reveal balance-card">
-            <div className="card-header">
-              <h2>Current balance</h2>
-              <button
-                type="button"
-                className={`refresh-button ${isRefreshing ? "is-loading" : ""}`}
-                onClick={onRefreshBalance}
-                disabled={!userPublicKey || isRefreshing}
-                aria-label="Refresh balance"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M20 12a8 8 0 1 1-2.34-5.66" />
-                  <path d="M20 4v6h-6" />
-                </svg>
-              </button>
-            </div>
-            {balanceError && (
-              <div className="balance-error">{balanceError}</div>
-            )}
-            <div className="metric">
-              {userPublicKey && balance !== null
-                ? showBalance
-                  ? balance.toLocaleString(undefined, {
-                      minimumFractionDigits: 2,
-                      maximumFractionDigits: 2,
-                    })
-                  : "***"
-                : "--"}{" "}
-              <span>XLM</span>
-              <button
-                type="button"
-                className="privacy-toggle"
-                onClick={() => setShowBalance(!showBalance)}
-                aria-label={showBalance ? "Hide balance" : "Show balance"}
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  {showBalance ? (
-                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-7-11-9 0-2.3 1.52-4.58 3.88-6.35M21 9c0 2 0 7-9 7-.71 0-1.4-.07-2.07-.2M21 3l-6 6m6 6l6 6" />
-                  ) : (
-                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 15a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3z" />
-                  )}
-                </svg>
-              </button>
-            </div>
-            <div className="balance-tabs">
-              <button
-                type="button"
-                className={activeBalancePanel === "transfer" ? "is-active" : ""}
-                onClick={() => setActiveBalancePanel("transfer")}
-              >
-                Transfer
-              </button>
-              <button
-                type="button"
-                className={activeBalancePanel === "receive" ? "is-active" : ""}
-                onClick={() => setActiveBalancePanel("receive")}
-              >
-                Receive
-              </button>
-            </div>
-            {activeBalancePanel === "transfer" && (
-              <div className="balance-panel">
-                {!userPublicKey && (
-                  <div className="wallet-status">
-                    Connect your wallet to make a transfer.
-                  </div>
-                )}
-                {walletLabel && (
-                  <div className="wallet-status">{walletLabel}</div>
-                )}
-                <label>Recipient username or address</label>
-                <div style={{ position: 'relative' }}>
-                  <input
-                    ref={recipientRef}
-                    type="text"
-                    value={nameTag}
-                    onChange={(event) => {
-                      setNameTag(event.target.value);
-                      setShowRecent(true);
-                    }}
-                    onFocus={() => setShowRecent(true)}
-                    placeholder="e.g., walzeem or G..."
-                    autoComplete="off"
-                    disabled={!userPublicKey || isProcessing}
-                  />
-                  <RecentAddresses
-                    addresses={recentAddresses}
-                    isVisible={showRecent && recentAddresses.length > 0}
-                    onSelect={(address) => {
-                      setNameTag(address);
-                      setShowRecent(false);
-                      recipientRef.current?.focus();
-                    }}
-                    onClear={clearAddresses}
-                    onClose={() => setShowRecent(false)}
-                  />
-                </div>
-                {nameTag === userPublicKey && (
-                  <span className="field-error">Warning: You are sending funds to your own address.</span>
-                )}
-
-                <label>Amount (XLM)</label>
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  value={amount}
-                  onChange={(event) => {
-                    const raw = event.target.value.replace(/[^0-9.]/g, "");
-                    const parts = raw.split(".");
-                    const cleaned =
-                      parts.length > 2
-                        ? parts[0] + "." + parts.slice(1).join("")
-                        : raw;
-                    setAmount(cleaned);
-                  }}
-                  placeholder="0.00"
-                  disabled={!userPublicKey || isProcessing}
-                />
-
-                <div className="form-actions">
-                <button
-                  type="button"
-                  className="accent-btn"
-                  onClick={handleLookup}
-                  disabled={
-                    !userPublicKey ||
-                    isSubmitting ||
-                    !amount ||
-                    Number(amount) <= 0
-                  }
-                >
-                  {isSubmitting ? "Processing..." : "Transfer"}
-                </button>
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    onClick={() => {
-                      setNameTag("");
-                      setAmount("");
-                    }}
-                    disabled={isProcessing}
-                  >
-                    Clear
-                  </button>
-                </div>
-              </div>
-            )}
-            {activeBalancePanel === "receive" && (
-              <div className="balance-panel">
-                {!userPublicKey && (
-                  <div className="wallet-status">
-                    Connect your wallet to view receive details.
-                  </div>
-                )}
-                {userPublicKey && receiveAddress && (
-                  <div className="receive-panel">
-                    {receiveTag && (
-                      <div className="wallet-status">
-                        Username: {formatUsername(receiveTag)}
-                      </div>
-                    )}
-                    <div className="wallet-status">
-                      Address: {receiveAddress}
-                    </div>
-                    <div className="inline-actions">
-                      {receiveTag && (
-                        <button
-                          type="button"
-                          className="ghost-button"
-                          onClick={() =>
-                            handleCopy(formatUsername(receiveTag), "Username")
-                          }
-                          disabled={isReceiving}
-                        >
-                          Copy username
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        className="ghost-button"
-                        onClick={() => handleCopy(receiveAddress, "Address")}
-                        disabled={isReceiving}
-                      >
-                        Copy address
-                      </button>
-                    </div>
-                    <div className="qr-card">
-                      <img
-                        src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(receiveAddress)}`}
-                        alt="Wallet address QR code"
-                      />
-                    </div>
-                  </div>
-                )}
-                {receiveStatus.text && (
-                  <div
-                    id="receive-status-box"
-                    style={{
-                      color: receiveStatus.color,
-                      backgroundColor: receiveStatus.bgColor,
-                      marginTop: "16px", // Adds a little breathing room below the QR code!
-                    }}
-                  >
-                    {receiveStatus.text}
-                  </div>
-                )}
-              </div>
-            )}
-            {status.text && (
-              <div
-                id="status-box"
-                style={{ color: status.color, backgroundColor: status.bgColor }}
-              >
-                {status.text}
-              </div>
-            )}
-          </div>
-        </section>
-      </main>
-      <MobileNav
-        active="dashboard"
-        onDashboardClick={closeNav}
-        onHistoryClick={() => handleNav(onHistoryClick)}
-        onAnalyticsClick={() => handleNav(onAnalyticsClick)}
-        onHelpClick={() => handleNav(onHelpClick)}
-        onRegisterClick={() => handleNav(onRegisterClick)}
-        canRegister={canRegister}
-      />
-      <ScrollToTop />
+        <ActivityList state={activity} onNavigate={onNavigate} />
+      </section>
     </div>
   );
 }

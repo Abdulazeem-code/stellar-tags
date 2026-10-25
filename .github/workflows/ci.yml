@@ -1,64 +1,110 @@
-name: Production Safety Checks
+name: CI
+
+# Ten required checks. Keep this list short: every job here blocks merging, so
+# a new job should replace an old one rather than pile on.
+#
+#   1. lint                 ESLint for the root workspace and the dashboard
+#   2. frontend-build       Vite production build of the dashboard
+#   3. backend-test         Prisma schema, Jest unit suite with coverage floor
+#   4. backend-integration  Jest against real PostgreSQL and Redis containers
+#   5. contracts-lint       rustfmt and clippy (deny warnings) on all contracts
+#   6. contracts-test       Contract unit tests, gas benchmarks, WASM builds
+#   7. bindings             Generated TypeScript bindings match the contracts
+#   8. fuzz                 Short cargo-fuzz run of the payment router
+#   9. security             TruffleHog secret scan and cargo-audit
+#  10. no-emoji             No emoji or pasted chatbot text in added lines
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  workspace-quality-gates:
-    name: Workspace Quality Gates & Linting
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            payment-dashboard/package-lock.json
 
-      - name: Install Root Dependencies
-        run: npm install
+      - name: Root ESLint
+        run: |
+          npm install
+          npm run lint
 
-      - name: Run Root ESLint
-        run: npm run lint
+      - name: Dashboard ESLint
+        working-directory: ./payment-dashboard
+        run: |
+          npm install --legacy-peer-deps
+          npm run lint
 
-  backend-checks:
-    name: Backend Build & Test
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment-dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ./payment-dashboard/package-lock.json
+
+      - name: Install
+        run: npm install --legacy-peer-deps
+
+      - name: Vite production build
+        run: npm run build
+
+  backend-test:
+    name: Backend tests
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ./stellar-payment-platform
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
 
-      - name: Install Backend Dependencies
+      - name: Install
         run: npm install
 
-      - name: Validate Prisma Schema
+      - name: Validate Prisma schema
         run: npm run prisma:validate
         env:
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/stellar_test?schema=public"
 
-      # Run the full suite with coverage so the thresholds in package.json
-      # fail the build whenever coverage regresses below the floor.
-      - name: Run Backend Tests (with coverage thresholds)
+      # The coverage thresholds in package.json fail the job when coverage drops.
+      - name: Unit tests with coverage
         run: NODE_ENV=test npm run test:coverage
 
-      - name: Upload Coverage Report
-        # Upload even when the thresholds fail, so the drop is visible in the
-        # artifact (see stellar-payment-platform/coverage/lcov-report/).
+      - name: Memory leak tests (#511)
+        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
+        env:
+          MEMORY_TEST_REQUESTS: '200'
+          MEMORY_LEAK_THRESHOLD_MB: '50'
+
+      - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -66,47 +112,33 @@ jobs:
           path: stellar-payment-platform/coverage
           retention-days: 14
 
-      - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
-        env:
-          MEMORY_TEST_REQUESTS: '200'
-          MEMORY_LEAK_THRESHOLD_MB: '50'
-
   backend-integration:
-    name: Backend Integration (Testcontainers)
+    name: Backend integration
     runs-on: ubuntu-latest
-    # Booting PostgreSQL and Redis, applying the migration chain and running the
-    # container-backed suites takes a few minutes; fail loudly rather than hang.
     timeout-minutes: 20
     defaults:
       run:
         working-directory: ./stellar-payment-platform
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: ./stellar-payment-platform/package-lock.json
 
-      - name: Install Backend Dependencies
+      - name: Install
         run: npm install
 
-      # GitHub-hosted runners have a working Docker daemon, so this phase starts
-      # real PostgreSQL 16 and Redis 7 containers (the same versions
-      # docker-compose.yml runs in development) instead of falling back to
-      # TEST_DATABASE_URL / TEST_REDIS_URL. tests/containers/globalSetup.js
-      # applies the Prisma migration chain to the fresh database, so a chain that
-      # is not valid SQL fails the job before a single assertion runs.
-      - name: Run Integration Tests Against Real PostgreSQL and Redis (#686)
+      # Starts real PostgreSQL 16 and Redis 7 containers and applies the Prisma
+      # migration chain before any suite runs (#686).
+      - name: Integration tests
         run: npm run test:integration -- --ci 2>&1 | tee integration-test.log
         env:
           NODE_ENV: test
 
-      - name: Upload Integration Log
+      - name: Upload integration log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -114,28 +146,155 @@ jobs:
           path: stellar-payment-platform/integration-test.log
           retention-days: 7
 
-  frontend-checks:
-    name: Frontend Vercel Build Check
+  contracts-lint:
+    name: Contracts lint
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  contracts-test:
+    name: Contracts test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            ./yield_escrow
+
+      # Covers payment_router (including the test_benchmark_* storage gas
+      # checks from #663), payment_proxy, pausable_token, flash_loan,
+      # timelock_escrow and twap_oracle.
+      - name: Workspace contract tests
+        run: cargo test --workspace --all-features
+
+      - name: yield_escrow tests
+        working-directory: ./yield_escrow
+        run: cargo test
+
+      - name: Build contracts to WASM
+        run: |
+          for crate in payment_router payment_proxy twap_oracle yield_escrow; do
+            echo "::group::$crate"
+            (cd "$crate" && cargo build --target wasm32-unknown-unknown --release)
+            echo "::endgroup::"
+          done
+
+  bindings:
+    name: Bindings up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Download stellar CLI (pinned)
+        run: |
+          curl -sL -o /tmp/stellar-cli.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/stellar-cli.tar.gz -C /tmp
+          chmod +x /tmp/stellar
+          /tmp/stellar --version
+
+      - name: Regenerate contract bindings
+        run: STELLAR_CLI=/tmp/stellar ./scripts/generate-bindings.sh
+
+      - name: Fail if generated bindings drifted
+        run: |
+          if ! git diff --exit-code -- packages/; then
+            echo "::error::packages/types is out of date. Run 'npm run generate:bindings' and commit the result."
+            exit 1
+          fi
+
+  fuzz:
+    name: Fuzz payment router
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./payment-dashboard
+        working-directory: ./payment_router
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: ./payment-dashboard/package-lock.json
-          
-      - name: Install Frontend Dependencies
-        run: npm install --legacy-peer-deps
-        
-      - name: Run ESLint
-        run: npm run lint
+      - uses: actions/checkout@v4
 
-      - name: Verify Vite Build (Catches Vercel Crashes)
-        run: npm run build
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: route_payments
+        run: cargo fuzz run route_payments -- -max_total_time=90
+
+      - name: router_fuzz
+        run: cargo fuzz run router_fuzz -- -max_total_time=90
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event_name == 'push' && 'HEAD~1' || github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --exclude-paths=.github/trufflehog-ignore.txt
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Advisory-only until the ignored advisories below are resolved upstream.
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit --ignore RUSTSEC-2024-0344 --ignore RUSTSEC-2026-0009 --ignore RUSTSEC-2025-0056 --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0097 || true
+
+  no-emoji:
+    name: No emoji
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check added lines for emoji and chatbot boilerplate
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE="HEAD~1"
+          fi
+          python3 scripts/check-emoji.py "$BASE" HEAD

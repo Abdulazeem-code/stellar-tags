@@ -76,6 +76,10 @@ impl Fixture {
     fn set_rate(&self, rate_bps: u32) {
         self.pool.set_yield_rate_bps(&self.token, &rate_bps);
     }
+
+    fn simulate_loss(&self, loss: i128) {
+        self.pool.simulate_loss(&self.token, &loss);
+    }
 }
 
 /// Moves the ledger sequence forward, preserving the rest of the ledger info.
@@ -188,6 +192,22 @@ impl MockLendingPool {
         env.storage()
             .instance()
             .set(&MockLendingKey::Rate(token), &rate_bps);
+    }
+
+    pub fn simulate_loss(env: Env, token: Address, loss: i128) {
+        let p_key = MockLendingKey::Principal(token.clone());
+        let current: i128 = env.storage().instance().get(&p_key).unwrap_or(0);
+        let updated = if loss >= current { 0 } else { current - loss };
+        env.storage().instance().set(&p_key, &updated);
+        let burn_address = Address::generate(&env);
+        let to_transfer = if loss >= current { current } else { loss };
+        if to_transfer > 0 {
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &burn_address,
+                &to_transfer,
+            );
+        }
     }
 }
 
@@ -1265,4 +1285,384 @@ fn active_escrows_restrict_changing_strategy_addresses() {
     f.client.rebalance(&f.token);
     assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 500);
     assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 500);
+}
+
+// ── Emergency Unwind & Circuit Breaker Tests (Issue #924) ────────────────────
+
+#[test]
+fn emergency_unwind_strategy_requires_the_admin_to_authorize() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let adapter = Address::generate(&env);
+    let contract_id = env.register_contract(None, YieldEscrow);
+    let client = YieldEscrowClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &adapter);
+    client.emergency_unwind_strategy(&0);
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "emergency_unwind_strategy must require the admin to authorize"
+    );
+    assert!(client.is_emergency_mode());
+    assert_eq!(client.get_vault_mode(), VaultMode::EmergencyVaultMode);
+}
+
+#[test]
+fn emergency_unwind_strategy_reverts_if_recovered_amount_less_than_min_recovered_amount() {
+    let f = Fixture::new();
+    let amount = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &150_u32,
+        &2_000_u32,
+    );
+
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 1_000);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+
+    // Protocol anomaly: external strategy suffers a 20% loss (200 tokens lost)
+    f.simulate_loss(200);
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 800);
+
+    // Admin attempts emergency unwind with min_recovered_amount = 900 (allowing at most 10% slippage)
+    // Because only 800 tokens can be recovered, it must revert with SlippageExceeded!
+    let res = f.client.try_emergency_unwind_strategy(&900);
+    assert_eq!(res, Err(Ok(Error::SlippageExceeded)));
+
+    // Invariants preserved: contract is NOT in emergency mode, funds remain in pool
+    assert_eq!(f.client.is_emergency_mode(), false);
+    assert_eq!(f.client.get_vault_mode(), VaultMode::Normal);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 800);
+}
+
+#[test]
+fn emergency_unwind_strategy_succeeds_within_slippage_and_switches_to_emergency_vault_mode() {
+    let f = Fixture::new();
+    let amount = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &150_u32,
+        &2_000_u32,
+    );
+
+    // Strategy anomaly: 200 tokens lost
+    f.simulate_loss(200);
+
+    // Admin decides to accept 20% loss: sets min_recovered_amount = 800
+    let recovered = f.client.emergency_unwind_strategy(&800);
+    assert_eq!(recovered, 800);
+
+    // Contract has entered EmergencyVaultMode!
+    assert!(f.client.is_emergency_mode());
+    assert_eq!(f.client.get_vault_mode(), VaultMode::EmergencyVaultMode);
+
+    // Funds are now recovered into raw token vault custody
+    assert_eq!(f.client.get_vault_balance(&f.token), 800);
+    assert_eq!(f.token_client.balance(&f.contract_id), 800);
+    assert_eq!(f.token_client.balance(&f.pool_id), 0);
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 0);
+}
+
+#[test]
+fn emergency_vault_mode_halts_deposits_rebalances_and_config() {
+    let f = Fixture::new();
+    let amount = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &150_u32,
+        &2_000_u32,
+    );
+
+    f.client.emergency_unwind_strategy(&1_000);
+    assert!(f.client.is_emergency_mode());
+
+    // 1. Deposits are halted
+    f.token_admin.mint(&f.payer, &500);
+    assert_eq!(
+        f.client.try_create_escrow(
+            &2_u64,
+            &f.payer,
+            &f.beneficiary,
+            &f.token,
+            &500_i128,
+            &150_u32,
+            &1_000_u32,
+        ),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+
+    // 2. Rebalancing is halted
+    assert_eq!(
+        f.client.try_rebalance(&f.token),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+    assert_eq!(f.client.check_rebalance_needed(&f.token), false);
+
+    // 3. Strategy re-configuration is halted
+    let new_pool = f.env.register_contract(None, MockLendingPool);
+    assert_eq!(
+        f.client.try_set_adapter(&new_pool),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+    assert_eq!(
+        f.client.try_set_rebalance_threshold(&200),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+
+    // 4. Calling unwind again while in emergency mode is rejected
+    assert_eq!(
+        f.client.try_emergency_unwind_strategy(&0),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+}
+
+#[test]
+fn emergency_vault_mode_permits_user_principal_withdrawals() {
+    let f = Fixture::new();
+    let payer2 = Address::generate(&f.env);
+    let beneficiary2 = Address::generate(&f.env);
+
+    f.token_admin.mint(&f.payer, &1_000);
+    f.token_admin.mint(&payer2, &500);
+
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &1_000_i128,
+        &200_u32,
+        &5_000_u32,
+    );
+    f.client.create_escrow(
+        &2_u64,
+        &payer2,
+        &beneficiary2,
+        &f.token,
+        &500_i128,
+        &200_u32,
+        &5_000_u32,
+    );
+    assert_eq!(f.client.get_active_escrows(), 2);
+
+    // Unwind all strategy shares
+    let total_recovered = f.client.emergency_unwind_strategy(&1_500);
+    assert_eq!(total_recovered, 1_500);
+    assert_eq!(f.client.get_vault_balance(&f.token), 1_500);
+
+    // Payer 1 recovers principal using dedicated emergency_withdraw_principal
+    let w1 = f.client.emergency_withdraw_principal(&1_u64);
+    assert_eq!(w1, 1_000);
+    assert_eq!(f.token_client.balance(&f.payer), 1_000);
+    assert_eq!(f.client.get_active_escrows(), 1);
+
+    // Cannot withdraw twice
+    assert_eq!(
+        f.client.try_emergency_withdraw_principal(&1_u64),
+        Err(Ok(Error::EscrowNotActive))
+    );
+
+    // Payer 2 recovers principal using cancel() in emergency mode
+    let outcome = f.client.cancel(&2_u64);
+    assert_eq!(outcome.principal, 500);
+    assert_eq!(outcome.to_payer, 500);
+    assert_eq!(outcome.to_beneficiary, 0);
+    assert_eq!(f.token_client.balance(&payer2), 500);
+    assert_eq!(f.client.get_active_escrows(), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+}
+
+#[test]
+fn emergency_user_withdrawal_permits_cancel_and_release_bypassing_deadlines() {
+    let f = Fixture::new();
+
+    // Escrow 1: future release deadline sequence = 500 (current sequence = 0)
+    f.token_admin.mint(&f.payer, &600);
+    f.client.create_escrow(
+        &10_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &600_i128,
+        &500_u32,
+        &5_000_u32,
+    );
+
+    // Escrow 2: past release deadline sequence = 50 (we will advance sequence to 100)
+    f.token_admin.mint(&f.payer, &400);
+    f.client.create_escrow(
+        &20_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &400_i128,
+        &50_u32,
+        &5_000_u32,
+    );
+
+    // Advance to sequence 100:
+    // Escrow 1 deadline (500) has NOT been reached yet.
+    // Escrow 2 deadline (50) HAS been reached.
+    set_sequence(&f.env, 100);
+
+    // In normal mode:
+    // - Escrow 1 release fails because deadline not reached (NotYetReleasable)
+    assert_eq!(
+        f.client.try_release(&10_u64),
+        Err(Ok(Error::NotYetReleasable))
+    );
+    // - Escrow 2 cancel fails because deadline has passed (StillLocked)
+    assert_eq!(f.client.try_cancel(&20_u64), Err(Ok(Error::StillLocked)));
+
+    // Admin executes emergency unwind
+    f.client.emergency_unwind_strategy(&1_000);
+    assert!(f.client.is_emergency_mode());
+
+    // In EmergencyVaultMode:
+    // - Escrow 1 can be released immediately (bypassing NotYetReleasable) to deliver liquidity to beneficiary!
+    let release_res = f.client.release(&10_u64);
+    assert_eq!(release_res.principal, 600);
+    assert_eq!(release_res.to_beneficiary, 600);
+    assert_eq!(f.token_client.balance(&f.beneficiary), 600);
+
+    // - Escrow 2 can be cancelled immediately (bypassing StillLocked) to refund payer!
+    let cancel_res = f.client.cancel(&20_u64);
+    assert_eq!(cancel_res.principal, 400);
+    assert_eq!(cancel_res.to_payer, 400);
+    assert_eq!(f.token_client.balance(&f.payer), 400);
+
+    assert_eq!(f.client.get_active_escrows(), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+}
+
+#[test]
+fn emergency_unwind_multi_strategy_portfolio_and_haircut_withdrawal() {
+    let f = Fixture::new();
+
+    let pool1_id = f.env.register_contract(None, MockLendingPool);
+    let pool2_id = f.env.register_contract(None, MockLendingPool);
+    let pool3_id = f.env.register_contract(None, MockLendingPool);
+
+    let pool2 = MockLendingPoolClient::new(&f.env, &pool2_id);
+
+    let strats = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 5_000, // 50%
+        },
+        StrategyAllocation {
+            address: pool2_id.clone(),
+            weight_bps: 3_000, // 30%
+        },
+        StrategyAllocation {
+            address: pool3_id.clone(),
+            weight_bps: 2_000, // 20%
+        },
+    ];
+    f.client.set_strategies(&strats);
+
+    let total_principal = 10_000_i128;
+    f.token_admin.mint(&f.payer, &total_principal);
+    f.client.create_escrow(
+        &100_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &total_principal,
+        &300_u32,
+        &5_000_u32,
+    );
+
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 5_000);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 3_000);
+    assert_eq!(f.client.get_strategy_balance(&pool3_id, &f.token), 2_000);
+    assert_eq!(f.client.get_total_strategy_balance(&f.token), 10_000);
+
+    // Pool 2 depegs / loses 50% of its capital (1,500 lost)
+    pool2.simulate_loss(&f.token, &1_500);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 1_500);
+    assert_eq!(f.client.get_total_strategy_balance(&f.token), 8_500);
+
+    // Slippage bound test: requesting 9,000 fails
+    assert_eq!(
+        f.client.try_emergency_unwind_strategy(&9_000),
+        Err(Ok(Error::SlippageExceeded))
+    );
+
+    // Unwind with acceptable bound of 8,500 succeeds
+    let recovered = f.client.emergency_unwind_strategy(&8_500);
+    assert_eq!(recovered, 8_500);
+
+    // All strategies are now drained to 0
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 0);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 0);
+    assert_eq!(f.client.get_strategy_balance(&pool3_id, &f.token), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 8_500);
+
+    // User principal withdrawal receives available liquidity (8,500)
+    let user_payout = f.client.emergency_withdraw(&100_u64);
+    assert_eq!(user_payout, 8_500);
+    assert_eq!(f.token_client.balance(&f.payer), 8_500);
+    assert_eq!(f.client.get_active_escrows(), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+}
+
+#[test]
+fn emergency_unwind_validation_and_invalid_states() {
+    let f = Fixture::new();
+
+    // Calling emergency_withdraw before emergency mode is active fails
+    assert_eq!(
+        f.client.try_emergency_withdraw(&1_u64),
+        Err(Ok(Error::EmergencyModeNotActive))
+    );
+
+    // Negative min_recovered_amount fails
+    assert_eq!(
+        f.client.try_emergency_unwind_strategy(&-10),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // emergency_unwind_token works directly with specific token
+    f.token_admin.mint(&f.payer, &500);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &500_i128,
+        &150_u32,
+        &1_000_u32,
+    );
+
+    let rec = f.client.emergency_unwind_token(&f.token, &500);
+    assert_eq!(rec, 500);
+    assert!(f.client.is_emergency_mode());
+
+    // Non-existent escrow withdrawal fails
+    assert_eq!(
+        f.client.try_emergency_withdraw(&999_u64),
+        Err(Ok(Error::EscrowNotFound))
+    );
 }
