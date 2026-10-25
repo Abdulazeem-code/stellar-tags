@@ -4,7 +4,7 @@ use soroban_sdk::token::TokenInterface;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Bytes, BytesN, Env, String,
+    symbol_short, Address, Bytes, BytesN, Env, String, Vec,
 };
 
 /// Interface implemented by compliance hook contracts.
@@ -33,6 +33,7 @@ pub enum DataKey {
     PermitNonce(Address),
     FrozenUntil(Address),
     ComplianceHook,
+    MaxSupply,
 }
 
 #[contracttype]
@@ -147,6 +148,9 @@ pub enum Error {
     NotRegisteredLiquidator = 15,
     AllowanceExpired = 16,
     ComplianceCheckFailed = 17,
+    SupplyCapExceeded = 18,
+    BatchSizeExceeded = 19,
+    BatchLengthMismatch = 20,
 }
 
 #[contract]
