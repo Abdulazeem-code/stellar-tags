@@ -154,6 +154,8 @@ pub struct PausableToken;
 
 const DAY_IN_LEDGERS: u32 = 17280;
 const MAX_PERMIT_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+pub const DEFAULT_MAX_SUPPLY: i128 = 10_000_000_000_000_000;
+pub const MAX_BATCH_SIZE: u32 = 30;
 
 #[contractimpl]
 impl PausableToken {
@@ -181,6 +183,7 @@ impl PausableToken {
         store.set(&DataKey::Symbol, &symbol);
         store.set(&DataKey::Decimals, &decimals);
         store.set(&DataKey::TotalSupply, &0i128);
+        store.set(&DataKey::MaxSupply, &DEFAULT_MAX_SUPPLY);
         store.set(&DataKey::Paused, &false);
         Self::bump_instance(&env);
 
@@ -433,6 +436,31 @@ impl PausableToken {
             .unwrap_or(0)
     }
 
+    pub fn max_supply(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSupply)
+            .unwrap_or(DEFAULT_MAX_SUPPLY)
+    }
+
+    pub fn set_max_supply(env: Env, new_max_supply: i128) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        if new_max_supply < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let total_supply = Self::total_supply(env.clone());
+        if new_max_supply < total_supply {
+            return Err(Error::SupplyCapExceeded);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxSupply, &new_max_supply);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("set_cap"), admin), new_max_supply);
+        Ok(())
+    }
+
     pub fn transfer_allowed(env: Env, from: Address, to: Address) -> bool {
         Self::assert_settled(&env, &from, &to).is_ok()
             && !Self::is_partition_frozen_internal(&env, &from)
@@ -561,9 +589,63 @@ impl PausableToken {
         Self::assert_movable(&env, &to)?;
 
         let supply = Self::total_supply(env.clone());
+        let max_supply = Self::max_supply(env.clone());
+        let new_supply = supply.checked_add(amount).ok_or(Error::SupplyCapExceeded)?;
+        if new_supply > max_supply {
+            return Err(Error::SupplyCapExceeded);
+        }
+
         Self::credit(env.clone(), &to, amount);
-        Self::set_total_supply(&env, supply + amount);
+        Self::set_total_supply(&env, new_supply);
         env.events().publish((symbol_short!("mint"), to), amount);
+        Ok(())
+    }
+
+    pub fn batch_mint(env: Env, recipients: Vec<Address>, amounts: Vec<i128>) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        if recipients.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+        if recipients.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchSizeExceeded);
+        }
+        if recipients.len() != amounts.len() {
+            return Err(Error::BatchLengthMismatch);
+        }
+
+        let mut total_batch_amount: i128 = 0;
+        for i in 0..recipients.len() {
+            let amount = amounts.get(i).ok_or(Error::BatchLengthMismatch)?;
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let recipient = recipients.get(i).ok_or(Error::BatchLengthMismatch)?;
+            Self::assert_movable(&env, &recipient)?;
+            total_batch_amount = total_batch_amount
+                .checked_add(amount)
+                .ok_or(Error::SupplyCapExceeded)?;
+        }
+
+        let current_supply = Self::total_supply(env.clone());
+        let max_supply = Self::max_supply(env.clone());
+        let new_supply = current_supply
+            .checked_add(total_batch_amount)
+            .ok_or(Error::SupplyCapExceeded)?;
+        if new_supply > max_supply {
+            return Err(Error::SupplyCapExceeded);
+        }
+
+        for i in 0..recipients.len() {
+            let recipient = recipients.get(i).ok_or(Error::BatchLengthMismatch)?;
+            let amount = amounts.get(i).ok_or(Error::BatchLengthMismatch)?;
+            Self::credit(env.clone(), &recipient, amount);
+            env.events()
+                .publish((symbol_short!("mint"), recipient), amount);
+        }
+        Self::set_total_supply(&env, new_supply);
+        env.events()
+            .publish((symbol_short!("batchmint"), admin), total_batch_amount);
+
         Ok(())
     }
 
