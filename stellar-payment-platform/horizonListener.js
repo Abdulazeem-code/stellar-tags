@@ -14,6 +14,7 @@ const {
   createBreaker,
 } = require('./src/services/stellarService');
 const { publishPaymentUpdate } = require('./src/sse');
+const { createPaymentWithOutbox } = require('./src/services/settlementOutbox');
 
 
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
@@ -117,15 +118,13 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
-          prisma.payment.create({
-            data: {
-              transactionHash: payment.transaction_hash,
-              fromAddress: payment.from,
-              toAddress: payment.to,
-              amount: parseFloat(payment.amount),
-              assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
-              status: 'completed'
-            }
+          createPaymentWithOutbox(prisma, {
+            transactionHash: payment.transaction_hash,
+            fromAddress: payment.from,
+            toAddress: payment.to,
+            amount: parseFloat(payment.amount),
+            assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
+            status: 'completed'
           }).then((created) =>
             // Fan the new payment out to connected SSE clients via Redis, so
             // every API process can stream the status update (#730).

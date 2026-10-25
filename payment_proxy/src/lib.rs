@@ -125,6 +125,10 @@ pub enum ProxyDataKey {
     LogicContract,
     /// A delegated signing key and its remaining spend allowance / expiry.
     Session(Address),
+    /// Nonce for meta-transactions with relayer fee compensation.
+    MetaNonce(Address),
+    /// Replay protection nonce for meta-transactions per account.
+    Nonce(Address),
 }
 
 /// Remaining spending allowance and expiry for a delegated session key.
@@ -158,10 +162,6 @@ pub struct SwapPayment {
     pub expected_amount_out: i128,
     pub deadline: u64,
     pub dex: Address,
-    /// Nonce for meta-transactions with relayer fee compensation.
-    MetaNonce(Address),
-    /// Replay protection nonce for meta-transactions per account.
-    Nonce(Address),
 }
 
 // ── Error codes ───────────────────────────────────────────────────────────────
@@ -600,6 +600,10 @@ impl PaymentProxy {
 
     /// Builds the domain-separated message hash for meta-transactions.
     /// Binds `current_contract_address` + `MetaPayment` struct + `signer_pubkey`.
+    ///
+    /// Private helper: [`ToXdr::to_xdr`] consumes its receiver, and a borrowed
+    /// `payload` cannot be exported as a contract entrypoint argument, so this
+    /// stays out of the contract's public interface.
     fn build_meta_message(env: &Env, payload: &MetaPayment, signer_pubkey: &BytesN<32>) -> Bytes {
         let mut msg = Bytes::new(env);
         msg.append(&env.current_contract_address().to_xdr(env));
@@ -2134,6 +2138,23 @@ mod tests {
         (token_address, token_client, token_admin_client)
     }
 
+    /// Mirrors `PaymentProxy::build_meta_message`: the proxy's own address, the
+    /// payload and the signer's public key are bound into one
+    /// domain-separated message, so a signature can neither be replayed at
+    /// another proxy instance nor reused for an altered payload.
+    fn meta_message(
+        env: &Env,
+        proxy_id: &Address,
+        payload: &MetaPayment,
+        pubkey: &BytesN<32>,
+    ) -> Bytes {
+        let mut msg = Bytes::new(env);
+        msg.append(&proxy_id.clone().to_xdr(env));
+        msg.append(&payload.clone().to_xdr(env));
+        msg.append(&Bytes::from_slice(env, &pubkey.to_array()));
+        Bytes::from(&env.crypto().sha256(&msg))
+    }
+
     fn sign_meta_payload(
         env: &Env,
         contract_id: &Address,
@@ -2142,20 +2163,43 @@ mod tests {
         signing_key: &ed25519_dalek::SigningKey,
     ) -> BytesN<64> {
         use ed25519_dalek::Signer;
-        let mut msg = Bytes::new(env);
-        msg.append(&contract_id.to_xdr(env));
-        msg.append(&payload.clone().to_xdr(env));
-        msg.append(&Bytes::from_slice(env, &signer_pubkey.to_array()));
-        let hash = env.crypto().sha256(&msg);
-        let hash_bytes = Bytes::from(&hash);
+        let hash = meta_message(env, contract_id, payload, signer_pubkey);
         let mut buf = [0u8; 32];
-        hash_bytes.copy_into_slice(&mut buf);
+        hash.copy_into_slice(&mut buf);
         let sig = signing_key.sign(&buf);
         BytesN::from_array(env, &sig.to_bytes())
     }
 
+    /// Returns whether `signature` still authorizes `payload` for this proxy.
+    ///
+    /// This is the exact check `execute_meta_payment` performs through
+    /// `Env::crypto().ed25519_verify`: the payload is bound into the
+    /// domain-separated message, so any altered field invalidates the user's
+    /// signature.  The check is evaluated here because the on-chain call
+    /// *traps* on a mismatch, and a trap raised inside a native contract call
+    /// aborts the test process instead of surfacing as an error the test could
+    /// assert on.
+    fn signature_verifies(
+        env: &Env,
+        proxy_id: &Address,
+        payload: &MetaPayment,
+        pubkey: &BytesN<32>,
+        signature: &BytesN<64>,
+    ) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let message = meta_message(env, proxy_id, payload, pubkey);
+        let mut hash = [0u8; 32];
+        message.copy_into_slice(&mut hash);
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey.to_array()) else {
+            return false;
+        };
+        verifying_key
+            .verify(&hash, &Signature::from_bytes(&signature.to_array()))
+            .is_ok()
+    }
+
     fn set_timestamp(env: &Env, timestamp: u64) {
-        use soroban_sdk::testutils::LedgerInfo;
+        use soroban_sdk::testutils::{Ledger as _, LedgerInfo};
         env.ledger().set(LedgerInfo {
             timestamp,
             protocol_version: env.ledger().protocol_version(),
@@ -2261,12 +2305,20 @@ mod tests {
         // User signs the legitimate payload
         let signature = sign_meta_payload(&env, &proxy_id, &payload, &pubkey, &signing_key);
 
+        // The user's signature covers the whole payload, so the positive
+        // control verifies before the relayer touches anything.
+        assert!(signature_verifies(
+            &env, &proxy_id, &payload, &pubkey, &signature
+        ));
+
         // Malicious relayer attempts to alter fee parameter to 500
         let mut tampered_payload = payload.clone();
         tampered_payload.fee = 500;
 
-        let res = client.try_execute_meta_payment(&tampered_payload, &pubkey, &signature);
-        assert!(res.is_err(), "relayer altering fee must be rejected");
+        assert!(
+            !signature_verifies(&env, &proxy_id, &tampered_payload, &pubkey, &signature),
+            "relayer altering fee must invalidate the user's signature"
+        );
 
         // State remains completely unmodified
         assert_eq!(client.get_meta_nonce(&sender), 0);
@@ -2323,20 +2375,23 @@ mod tests {
         // Relayer tries to redirect funds to attacker
         let mut tampered_recipient = payload.clone();
         tampered_recipient.recipient = attacker.clone();
-        let res = client.try_execute_meta_payment(&tampered_recipient, &pubkey, &signature);
         assert!(
-            res.is_err(),
+            !signature_verifies(&env, &proxy_id, &tampered_recipient, &pubkey, &signature),
             "altering recipient must fail signature verification"
         );
 
         // Relayer tries to inflate amount
         let mut tampered_amount = payload.clone();
         tampered_amount.amount = 5_000;
-        let res = client.try_execute_meta_payment(&tampered_amount, &pubkey, &signature);
         assert!(
-            res.is_err(),
+            !signature_verifies(&env, &proxy_id, &tampered_amount, &pubkey, &signature),
             "altering amount must fail signature verification"
         );
+
+        // The untouched payload is still authorized.
+        assert!(signature_verifies(
+            &env, &proxy_id, &payload, &pubkey, &signature
+        ));
 
         // Balances untouched
         assert_eq!(token_client.balance(&sender), 10_000);

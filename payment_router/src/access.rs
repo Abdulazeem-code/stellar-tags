@@ -5,7 +5,6 @@ use crate::storage::{
 };
 use crate::types::ActionType;
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
-
 // ── Role-Based Access Control (RBAC) Helpers ─────────────────────────────────
 
 pub fn set_role_internal(env: &Env, role: Role, account: &Address) {
@@ -113,6 +112,21 @@ pub fn require_role_of(env: &Env, caller: &Address, role: Role) -> Result<(), Er
     Ok(())
 }
 
+pub fn require_security_officer(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::SecurityOfficer)?;
+    Ok(())
+}
+
+pub fn require_fee_manager(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::FeeManager)?;
+    Ok(())
+}
+
+pub fn require_upgrade_manager(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::UpgradeManager)?;
+    Ok(())
+}
+
 pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
     if let Some(gov) = env
         .storage()
@@ -122,7 +136,7 @@ pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
         gov.require_auth();
         Ok(())
     } else {
-        require_role(env, Role::FeeManager)?;
+        require_fee_manager(env)?;
         Ok(())
     }
 }
@@ -160,19 +174,16 @@ pub fn get_pause_level(env: &Env) -> PauseLevel {
 /// Also keeps the legacy `DataKey::Paused` in sync so contracts that still
 /// read the old key see a consistent value.
 pub fn set_pause_level(env: &Env, level: PauseLevel) {
-    env.storage()
-        .instance()
-        .set(&DataKey::PauseLevel, &level);
+    env.storage().instance().set(&DataKey::PauseLevel, &level);
     // Keep legacy key consistent so any external tooling that reads
     // DataKey::Paused still gets a sensible answer.
     let legacy_paused = level != PauseLevel::None;
     env.storage()
         .instance()
         .set(&DataKey::Paused, &legacy_paused);
-    env.storage().instance().extend_ttl(
-        INSTANCE_LIFETIME_THRESHOLD,
-        INSTANCE_BUMP_AMOUNT,
-    );
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
 /// Returns `true` when the contract is at `PauseLevel::FullHalt` **or** the
