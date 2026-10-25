@@ -137,7 +137,13 @@ pub enum Error {
     /// leaf for this recipient.
     MerkleAmountMismatch = 56,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
-    InvalidSlippageConfig = 57,
+    InvalidSlippageConfig = 49,
+    /// A DMS claim is already pending.
+    DmsClaimPending = 55,
+    /// The DMS grace period is still active.
+    DmsGracePeriodActive = 56,
+    /// Caller is not a council signer.
+    NotCouncilSigner = 57,
     /// The upgrade manifest is malformed: no target contracts, a different
     /// number of code hashes than addresses, or a duplicated target.
     InvalidUpgradeManifest = 58,

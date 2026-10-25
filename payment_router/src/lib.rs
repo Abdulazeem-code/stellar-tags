@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)]
 pub mod access;
 mod archival;
 pub mod dead_mans_switch;

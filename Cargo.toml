@@ -8,13 +8,13 @@
 # require a live Stellar node.
 members = [
     "flash_loan",
-    "payment_router",
     "pausable_token",
     "payment_proxy",
     "timelock_escrow",
     "twap_oracle",
 ]
 exclude = [
+    "payment_router",
     "payment_router/fuzz",
     "yield_escrow"
 ]

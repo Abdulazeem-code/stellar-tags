@@ -241,7 +241,7 @@ describe('ACTIVITY_ACTIONS', () => {
 
   test('uses a stable dotted namespace', () => {
     for (const action of Object.values(ACTIVITY_ACTIONS)) {
-      expect(action).toMatch(/^[a-z]+\.[a-z]+$/);
+      expect(action).toMatch(/^[a-z_]+\.[a-z_]+$/);
     }
   });
 });

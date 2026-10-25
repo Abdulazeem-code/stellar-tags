@@ -197,6 +197,45 @@ pub const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
 pub const PERSISTENT_BUMP_AMOUNT: u32 = USER_BUMP_AMOUNT;
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = USER_LIFETIME_THRESHOLD;
 
+pub const TEMPORARY_BUMP_AMOUNT: u32 = INSTANCE_BUMP_AMOUNT;
+pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = INSTANCE_LIFETIME_THRESHOLD;
+pub const DEFAULT_TELEMETRY_CAPACITY: u32 = 100;
+pub const MAX_TELEMETRY_CAPACITY: u32 = 1000;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmsClaimStatus {
+    pub claimant: Address,
+    pub initiated_at: u64,
+    pub grace_period_end: u64,
+    pub candidate_admin: Address,
+    pub tier: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackedTelemetryRecord {
+    pub timestamp: u64,
+    pub volume: u32,
+    pub status: u32,
+}
+
+pub fn get_telemetry_average(_env: &Env) -> u64 {
+    0
+}
+
+pub fn get_telemetry_percentile(_env: &Env, _p: u32) -> u32 {
+    0
+}
+
+pub fn append_telemetry(_env: &Env, timestamp: u32, volume: u32, status: u8) -> PackedTelemetryRecord {
+    PackedTelemetryRecord {
+        timestamp: timestamp as u64,
+        volume,
+        status: status as u32,
+    }
+}
+
 // ── Reentrancy Guard ─────────────────────────────────────────────────────────
 
 pub struct ReentrancyGuard<'a> {

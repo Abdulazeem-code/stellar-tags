@@ -134,10 +134,9 @@ impl TwapOracle {
         let admin = read_admin(&env)?;
         admin.require_auth();
 
-        env.storage().instance().set(
-            &DataKey::Staleness(base, quote),
-            &max_staleness_seconds,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Staleness(base, quote), &max_staleness_seconds);
 
         Ok(())
     }
@@ -248,7 +247,12 @@ impl TwapOracle {
     /// # Panics
     ///
     /// Panics if accessing the stored observations fails.
-    pub fn twap(env: Env, base: Address, quote: Address, window_seconds: u64) -> Result<i128, Error> {
+    pub fn twap(
+        env: Env,
+        base: Address,
+        quote: Address,
+        window_seconds: u64,
+    ) -> Result<i128, Error> {
         if window_seconds == 0 || window_seconds > MAX_WINDOW_SECONDS {
             return Err(Error::InvalidWindow);
         }
