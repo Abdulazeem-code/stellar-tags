@@ -144,10 +144,13 @@ pub enum Error {
     InvalidSignature = 11,
     InvalidNonce = 12,
     PermitDeadlineTooFar = 13,
-    ComplianceCheckFailed = 14,
-    SupplyCapExceeded = 15,
-    BatchSizeExceeded = 16,
-    BatchLengthMismatch = 17,
+    InsufficientTransferable = 14,
+    NotRegisteredLiquidator = 15,
+    AllowanceExpired = 16,
+    ComplianceCheckFailed = 17,
+    SupplyCapExceeded = 18,
+    BatchSizeExceeded = 19,
+    BatchLengthMismatch = 20,
 }
 
 #[contract]
