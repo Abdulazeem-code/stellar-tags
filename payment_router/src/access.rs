@@ -4,7 +4,37 @@ use crate::storage::{
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use crate::types::ActionType;
-use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
+
+// ── Rate Counter Packing Helpers ─────────────────────────────────────────────
+
+/// Packs a `(window, invocations)` pair into an 8-byte big-endian value.
+/// The first 4 bytes hold the window, the last 4 bytes hold the invocation count.
+pub fn pack_rate_counter(env: &Env, window: u32, invocations: u32) -> Bytes {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&window.to_be_bytes());
+    buf[4..8].copy_from_slice(&invocations.to_be_bytes());
+    Bytes::from_array(env, &buf)
+}
+
+/// Unpacks an 8-byte big-endian rate counter into `(window, invocations)`.
+pub fn unpack_rate_counter(packed: &Bytes) -> (u32, u32) {
+    let mut window_bytes = [0u8; 4];
+    let mut invocation_bytes = [0u8; 4];
+    for i in 0..4 {
+        window_bytes[i] = packed.get(i as u32).unwrap_or(0);
+        invocation_bytes[i] = packed.get((i + 4) as u32).unwrap_or(0);
+    }
+    (
+        u32::from_be_bytes(window_bytes),
+        u32::from_be_bytes(invocation_bytes),
+    )
+}
+
+/// Returns the current rate-limit window, derived from the ledger sequence.
+pub fn current_window(env: &Env) -> u32 {
+    env.ledger().sequence()
+}
 
 // ── Role-Based Access Control (RBAC) Helpers ─────────────────────────────────
 
@@ -12,18 +42,20 @@ pub fn set_role_internal(env: &Env, role: Role, account: &Address) {
     if let Some(previous) = env
         .storage()
         .instance()
-        .get::<DataKey, Address>(&DataKey::Role(role))
+        .get::<DataKey, Address>(&DataKey::Role(role.clone()))
     {
         if &previous != account {
             env.storage()
                 .persistent()
-                .set(&DataKey::UserRole(previous, role), &false);
+                .set(&DataKey::UserRole(previous, role.clone()), &false);
         }
     }
-    env.storage().instance().set(&DataKey::Role(role), account);
+    env.storage()
+        .instance()
+        .set(&DataKey::Role(role.clone()), account);
     env.storage()
         .persistent()
-        .set(&DataKey::UserRole(account.clone(), role), &true);
+        .set(&DataKey::UserRole(account.clone(), role.clone()), &true);
     env.storage().persistent().extend_ttl(
         &DataKey::UserRole(account.clone(), role),
         PERSISTENT_LIFETIME_THRESHOLD,
@@ -35,10 +67,12 @@ pub fn remove_role_internal(env: &Env, role: Role, account: &Address) {
     if let Some(current) = env
         .storage()
         .instance()
-        .get::<DataKey, Address>(&DataKey::Role(role))
+        .get::<DataKey, Address>(&DataKey::Role(role.clone()))
     {
         if current == *account {
-            env.storage().instance().remove(&DataKey::Role(role));
+            env.storage()
+                .instance()
+                .remove(&DataKey::Role(role.clone()));
         }
     }
     env.storage()
@@ -47,7 +81,7 @@ pub fn remove_role_internal(env: &Env, role: Role, account: &Address) {
 }
 
 pub fn apply_role_grant(env: &Env, grantee: &Address, role: Role) {
-    set_role_internal(env, role, grantee);
+    set_role_internal(env, role.clone(), grantee);
     env.events().publish(
         (Symbol::new(env, "role_assigned"), role, grantee.clone()),
         env.ledger().timestamp(),
@@ -55,7 +89,7 @@ pub fn apply_role_grant(env: &Env, grantee: &Address, role: Role) {
 }
 
 pub fn apply_role_revoke(env: &Env, grantee: &Address, role: Role) {
-    remove_role_internal(env, role, grantee);
+    remove_role_internal(env, role.clone(), grantee);
     env.events().publish(
         (Symbol::new(env, "role_revoked"), role, grantee.clone()),
         env.ledger().timestamp(),
@@ -66,7 +100,7 @@ pub fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
     let addr = if let Some(role_addr) = env
         .storage()
         .instance()
-        .get::<DataKey, Address>(&DataKey::Role(role))
+        .get::<DataKey, Address>(&DataKey::Role(role.clone()))
     {
         role_addr
     } else {
@@ -87,12 +121,12 @@ pub fn has_role_internal(env: &Env, account: &Address, role: Role) -> bool {
     let granted: bool = env
         .storage()
         .persistent()
-        .get(&DataKey::UserRole(account.clone(), role))
+        .get(&DataKey::UserRole(account.clone(), role.clone()))
         .unwrap_or(false);
     if granted {
         return true;
     }
-    let designated: Option<Address> = env.storage().instance().get(&DataKey::Role(role));
+    let designated: Option<Address> = env.storage().instance().get(&DataKey::Role(role.clone()));
     match designated {
         Some(primary) => &primary == account,
         None => {
@@ -113,6 +147,21 @@ pub fn require_role_of(env: &Env, caller: &Address, role: Role) -> Result<(), Er
     Ok(())
 }
 
+pub fn require_security_officer(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::SecurityOfficer)?;
+    Ok(())
+}
+
+pub fn require_fee_manager(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::FeeManager)?;
+    Ok(())
+}
+
+pub fn require_upgrade_manager(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::UpgradeManager)?;
+    Ok(())
+}
+
 pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
     if let Some(gov) = env
         .storage()
@@ -122,7 +171,7 @@ pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
         gov.require_auth();
         Ok(())
     } else {
-        require_role(env, Role::FeeManager)?;
+        require_fee_manager(env)?;
         Ok(())
     }
 }
@@ -160,19 +209,16 @@ pub fn get_pause_level(env: &Env) -> PauseLevel {
 /// Also keeps the legacy `DataKey::Paused` in sync so contracts that still
 /// read the old key see a consistent value.
 pub fn set_pause_level(env: &Env, level: PauseLevel) {
-    env.storage()
-        .instance()
-        .set(&DataKey::PauseLevel, &level);
+    env.storage().instance().set(&DataKey::PauseLevel, &level);
     // Keep legacy key consistent so any external tooling that reads
     // DataKey::Paused still gets a sensible answer.
     let legacy_paused = level != PauseLevel::None;
     env.storage()
         .instance()
         .set(&DataKey::Paused, &legacy_paused);
-    env.storage().instance().extend_ttl(
-        INSTANCE_LIFETIME_THRESHOLD,
-        INSTANCE_BUMP_AMOUNT,
-    );
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
 /// Returns `true` when the contract is at `PauseLevel::FullHalt` **or** the

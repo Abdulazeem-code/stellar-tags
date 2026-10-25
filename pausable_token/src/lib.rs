@@ -19,6 +19,9 @@ pub enum DataKey {
     TotalSupply,
     Balance(Address),
     Frozen(Address),
+    CollateralLocked(Address),
+    PartitionFrozen(Address),
+    Liquidator,
     Allowance(Address, Address),
     PermitNonce(Address),
     FrozenUntil(Address),
@@ -132,6 +135,8 @@ pub enum Error {
     InvalidSignature = 11,
     InvalidNonce = 12,
     PermitDeadlineTooFar = 13,
+    InsufficientTransferable = 14,
+    NotRegisteredLiquidator = 15,
 }
 
 #[contract]
@@ -323,6 +328,7 @@ impl PausableToken {
 
     pub fn transfer_allowed(env: Env, from: Address, to: Address) -> bool {
         Self::assert_settled(&env, &from, &to).is_ok()
+            && !Self::is_partition_frozen_internal(&env, &from)
     }
 
     /// Returns the nonce consumed by the next successful permit for `owner`.
@@ -394,6 +400,9 @@ impl PausableToken {
             return Err(Error::PermitDeadlineTooFar);
         }
         Self::assert_movable(&env, &owner)?;
+        if Self::is_partition_frozen_internal(&env, &owner) {
+            return Err(Error::AccountFrozen);
+        }
 
         let nonce = Self::permit_nonce(env.clone(), owner.clone());
         let next_nonce = nonce.checked_add(1).ok_or(Error::InvalidNonce)?;
@@ -503,7 +512,7 @@ impl PausableToken {
         while i < STRKEY_LEN {
             let value = match encoded[i] {
                 b'A'..=b'Z' => u32::from(encoded[i] - b'A'),
-                b'2'..=b'7' => u32::from(encoded[i] - b'2' + 26),
+                b'2'..=b'7' => u32::from(encoded[i] - b'2') + 26,
                 _ => return Err(Error::InvalidSignature),
             };
             accumulator = (accumulator << 5) | value;
@@ -554,6 +563,37 @@ impl PausableToken {
         false
     }
 
+    fn is_partition_frozen_internal(env: &Env, account: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PartitionFrozen(account.clone()))
+            .unwrap_or(false)
+    }
+
+    fn read_collateral_locked(env: &Env, account: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CollateralLocked(account.clone()))
+            .unwrap_or(0)
+    }
+
+    fn read_transferable(env: &Env, account: &Address) -> i128 {
+        Self::read_balance(env, account) - Self::read_collateral_locked(env, account)
+    }
+
+    /// Regulatory partition check for user-initiated outflows: the account
+    /// must not be partition-frozen, and the amount must fit in the
+    /// Transferable partition.
+    fn assert_transferable(env: &Env, account: &Address, amount: i128) -> Result<(), Error> {
+        if Self::is_partition_frozen_internal(env, account) {
+            return Err(Error::AccountFrozen);
+        }
+        if Self::read_transferable(env, account) < amount {
+            return Err(Error::InsufficientTransferable);
+        }
+        Ok(())
+    }
+
     fn assert_movable(env: &Env, account: &Address) -> Result<(), Error> {
         if Self::is_paused_internal(env) {
             return Err(Error::Paused);
@@ -597,18 +637,16 @@ impl PausableToken {
     /// Reads the packed allowance for `(from, spender)`.
     ///
     /// An entry whose amount is non-zero but whose expiry has already passed
-    /// reads back as a zeroed amount, preserving the original expiration so a
-    /// later `approve` diff still sees the right baseline.
+    /// is treated as zero and pruned from state.
     fn read_allowance(env: &Env, from: &Address, spender: &Address) -> Allowance {
-        let stored: Option<BytesN<20>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Allowance(from.clone(), spender.clone()));
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let stored: Option<BytesN<20>> = env.storage().persistent().get(&key);
         let (amount, expiration_ledger) = match stored {
             Some(packed) => unpack_allowance(&packed),
             None => (0, 0),
         };
         if amount > 0 && expiration_ledger < env.ledger().sequence() {
+            env.storage().persistent().remove(&key);
             return Allowance {
                 amount: 0,
                 expiration_ledger,
@@ -665,6 +703,9 @@ impl TokenInterface for PausableToken {
         if let Err(err) = Self::assert_movable(&env, &from) {
             panic_with_error!(&env, err);
         }
+        if Self::is_partition_frozen_internal(&env, &from) {
+            panic_with_error!(&env, Error::AccountFrozen);
+        }
         from.require_auth();
         Self::write_allowance(
             &env,
@@ -692,6 +733,9 @@ impl TokenInterface for PausableToken {
         if let Err(err) = Self::assert_settled(&env, &from, &to) {
             panic_with_error!(&env, err);
         }
+        if let Err(err) = Self::assert_transferable(&env, &from, amount) {
+            panic_with_error!(&env, err);
+        }
         from.require_auth();
         if let Err(err) = Self::debit(&env, &from, amount) {
             panic_with_error!(&env, err);
@@ -708,11 +752,18 @@ impl TokenInterface for PausableToken {
         if let Err(err) = Self::assert_settled(&env, &from, &to) {
             panic_with_error!(&env, err);
         }
+        if let Err(err) = Self::assert_transferable(&env, &from, amount) {
+            panic_with_error!(&env, err);
+        }
         if let Err(err) = Self::assert_movable(&env, &spender) {
             panic_with_error!(&env, err);
         }
         spender.require_auth();
         let allowance = Self::read_allowance(&env, &from, &spender);
+        if allowance.expiration_ledger > 0 && env.ledger().sequence() > allowance.expiration_ledger
+        {
+            panic_with_error!(&env, Error::AllowanceExpired);
+        }
         if allowance.amount < amount {
             panic_with_error!(&env, Error::InsufficientAllowance);
         }
@@ -740,6 +791,9 @@ impl TokenInterface for PausableToken {
         if let Err(err) = Self::assert_movable(&env, &from) {
             panic_with_error!(&env, err);
         }
+        if let Err(err) = Self::assert_transferable(&env, &from, amount) {
+            panic_with_error!(&env, err);
+        }
         from.require_auth();
         if let Err(err) = Self::debit(&env, &from, amount) {
             panic_with_error!(&env, err);
@@ -756,11 +810,18 @@ impl TokenInterface for PausableToken {
         if let Err(err) = Self::assert_movable(&env, &from) {
             panic_with_error!(&env, err);
         }
+        if let Err(err) = Self::assert_transferable(&env, &from, amount) {
+            panic_with_error!(&env, err);
+        }
         if let Err(err) = Self::assert_movable(&env, &spender) {
             panic_with_error!(&env, err);
         }
         spender.require_auth();
         let allowance = Self::read_allowance(&env, &from, &spender);
+        if allowance.expiration_ledger > 0 && env.ledger().sequence() > allowance.expiration_ledger
+        {
+            panic_with_error!(&env, Error::AllowanceExpired);
+        }
         if allowance.amount < amount {
             panic_with_error!(&env, Error::InsufficientAllowance);
         }
