@@ -16,7 +16,7 @@
 //! - Removing the operator (by the admin) clears the key entirely.
 
 use crate::errors::Error;
-use crate::storage::{DataKey, HeartbeatKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
+use crate::storage::{DataKey, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
 use soroban_sdk::{Address, Env, Symbol};
 
 // ── Operator storage helpers ─────────────────────────────────────────────────
@@ -28,7 +28,7 @@ use soroban_sdk::{Address, Env, Symbol};
 pub fn set_heartbeat_operator_internal(env: &Env, operator: &Address) {
     env.storage()
         .instance()
-        .set(&HeartbeatKey::HeartbeatOperator, operator);
+        .set(&DataKey::HeartbeatOperator, operator);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -39,9 +39,7 @@ pub fn set_heartbeat_operator_internal(env: &Env, operator: &Address) {
 /// No authorization is performed here — callers must verify admin auth before
 /// calling this function.
 pub fn remove_heartbeat_operator_internal(env: &Env) {
-    env.storage()
-        .instance()
-        .remove(&HeartbeatKey::HeartbeatOperator);
+    env.storage().instance().remove(&DataKey::HeartbeatOperator);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -49,9 +47,7 @@ pub fn remove_heartbeat_operator_internal(env: &Env) {
 
 /// Returns the current heartbeat operator, or `None` if none is configured.
 pub fn get_heartbeat_operator_internal(env: &Env) -> Option<Address> {
-    env.storage()
-        .instance()
-        .get(&HeartbeatKey::HeartbeatOperator)
+    env.storage().instance().get(&DataKey::HeartbeatOperator)
 }
 
 // ── Heartbeat renewal ────────────────────────────────────────────────────────
@@ -79,7 +75,7 @@ pub fn renew_heartbeat(env: &Env, operator: &Address) -> Result<(), Error> {
     let stored_operator: Address = env
         .storage()
         .instance()
-        .get(&HeartbeatKey::HeartbeatOperator)
+        .get(&DataKey::HeartbeatOperator)
         .ok_or(Error::Unauthorized)?;
 
     if *operator != stored_operator {
