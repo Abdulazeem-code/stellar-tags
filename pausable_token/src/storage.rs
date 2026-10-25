@@ -14,6 +14,9 @@ pub enum DataKey {
     Frozen(Address),
     Allowance(Address, Address),
     PermitNonce(Address),
+    PartitionFrozen(Address),
+    CollateralLocked(Address),
+    Liquidator,
 }
 
 /// Packs an allowance amount (i128, 16 bytes) and expiration ledger (u32, 4 bytes)

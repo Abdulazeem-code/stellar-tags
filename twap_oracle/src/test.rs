@@ -63,10 +63,7 @@ fn initialize_sets_admin_and_empty_history() {
     let setup = setup();
 
     assert_eq!(setup.client.admin(), Some(setup.admin.clone()));
-    assert_eq!(
-        setup.client.observation_count(&setup.base, &setup.quote),
-        0
-    );
+    assert_eq!(setup.client.observation_count(&setup.base, &setup.quote), 0);
     assert_eq!(
         setup.client.latest_observation(&setup.base, &setup.quote),
         None
@@ -107,10 +104,7 @@ fn observe_appends_and_derives_cumulative_price() {
 
     let observations = setup.client.observations(&setup.base, &setup.quote);
     assert_eq!(observations.len(), 3);
-    assert_eq!(
-        setup.client.observation_count(&setup.base, &setup.quote),
-        3
-    );
+    assert_eq!(setup.client.observation_count(&setup.base, &setup.quote), 3);
 
     let first = observations.get(0).unwrap();
     assert_eq!(first.timestamp, 1_000);
@@ -275,10 +269,7 @@ fn observe_handles_high_price_elapsed_product_without_overflow() {
     assert_eq!(latest.cumulative_price, expected_cum);
 
     // TWAP calculation over a window within this gap returns MAX_PRICE exactly.
-    assert_eq!(
-        setup.client.twap(&setup.base, &setup.quote, &60),
-        MAX_PRICE
-    );
+    assert_eq!(setup.client.twap(&setup.base, &setup.quote, &60), MAX_PRICE);
 }
 
 // ── Single-Update Deviation Circuit Breaker ─────────────────────────────────
@@ -398,7 +389,6 @@ fn twap_calculates_correctly_across_accumulator_wrap_boundary() {
     assert_eq!(setup.client.twap(&setup.base, &setup.quote, &50), 100);
 }
 
-
 #[test]
 fn twap_averages_over_the_requested_window() {
     let setup = setup();
@@ -487,9 +477,7 @@ fn admin_configures_individual_staleness_thresholds_per_pair() {
 
     // Default staleness
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair1_base, &pair1_quote),
+        setup.client.get_max_staleness(&pair1_base, &pair1_quote),
         DEFAULT_MAX_STALENESS_SECONDS
     );
 
@@ -498,9 +486,7 @@ fn admin_configures_individual_staleness_thresholds_per_pair() {
         .client
         .set_max_staleness(&pair1_base, &pair1_quote, &300);
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair1_base, &pair1_quote),
+        setup.client.get_max_staleness(&pair1_base, &pair1_quote),
         300
     );
 
@@ -509,17 +495,13 @@ fn admin_configures_individual_staleness_thresholds_per_pair() {
         .client
         .set_max_staleness(&pair2_base, &pair2_quote, &600);
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair2_base, &pair2_quote),
+        setup.client.get_max_staleness(&pair2_base, &pair2_quote),
         600
     );
 
     // Ensure pair 1 threshold remains intact
     assert_eq!(
-        setup
-            .client
-            .get_max_staleness(&pair1_base, &pair1_quote),
+        setup.client.get_max_staleness(&pair1_base, &pair1_quote),
         300
     );
 }
@@ -538,10 +520,7 @@ fn consult_returns_error_price_stale_if_older_than_max_staleness() {
 
     // At t = 1_120 + 300 = 1_420, price is within threshold (300s elapsed)
     set_time(&setup.env, 1_420);
-    assert_eq!(
-        setup.client.consult(&setup.base, &setup.quote, &60),
-        200
-    );
+    assert_eq!(setup.client.consult(&setup.base, &setup.quote, &60), 200);
 
     // At t = 1_421 (301s elapsed), price is stale
     set_time(&setup.env, 1_421);
@@ -561,10 +540,7 @@ fn consult_uses_default_staleness_when_not_explicitly_configured() {
     // DEFAULT_MAX_STALENESS_SECONDS = 3600
     // At t = 1_120 + 3600 = 4_720, price is fresh
     set_time(&setup.env, 4_720);
-    assert_eq!(
-        setup.client.consult(&setup.base, &setup.quote, &60),
-        200
-    );
+    assert_eq!(setup.client.consult(&setup.base, &setup.quote, &60), 200);
 
     // At t = 4_721, price is stale
     set_time(&setup.env, 4_721);
@@ -580,11 +556,31 @@ fn concurrent_tracking_of_five_distinct_token_pairs() {
 
     // Setup 5 distinct pairs
     let pairs: [(Address, Address, i128); 5] = [
-        (Address::generate(&setup.env), Address::generate(&setup.env), 100),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 200),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 300),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 400),
-        (Address::generate(&setup.env), Address::generate(&setup.env), 500),
+        (
+            Address::generate(&setup.env),
+            Address::generate(&setup.env),
+            100,
+        ),
+        (
+            Address::generate(&setup.env),
+            Address::generate(&setup.env),
+            200,
+        ),
+        (
+            Address::generate(&setup.env),
+            Address::generate(&setup.env),
+            300,
+        ),
+        (
+            Address::generate(&setup.env),
+            Address::generate(&setup.env),
+            400,
+        ),
+        (
+            Address::generate(&setup.env),
+            Address::generate(&setup.env),
+            500,
+        ),
     ];
 
     // Seed observation 1 for all pairs at t = 1_000
@@ -610,7 +606,10 @@ fn concurrent_tracking_of_five_distinct_token_pairs() {
         let latest = setup.client.latest_observation(base, quote).unwrap();
         assert_eq!(latest.price, initial_price * 2);
         assert_eq!(latest.timestamp, 1_060);
-        assert_eq!(latest.cumulative_price, u256::from((*initial_price * 60) as u128));
+        assert_eq!(
+            latest.cumulative_price,
+            u256::from((*initial_price * 60) as u128)
+        );
 
         // twap over the 60s window should equal initial_price
         let twap = setup.client.twap(base, quote, &60);
