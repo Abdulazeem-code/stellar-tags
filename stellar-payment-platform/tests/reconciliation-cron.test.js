@@ -9,13 +9,9 @@
  * PENDING -> SUCCESS / FAILED transition.
  */
 
-jest.mock(
-  'node-cron',
-  () => ({
-    schedule: jest.fn(),
-  }),
-  { virtual: true },
-);
+jest.mock('node-cron', () => ({
+  schedule: jest.fn(),
+}));
 
 jest.mock('../src/logger', () => ({
   logger: {

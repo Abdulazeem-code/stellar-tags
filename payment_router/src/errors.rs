@@ -47,11 +47,6 @@ pub enum Error {
     SwapDeadlineExpired = 18,
     /// The supplied role is not one the contract recognises.
     InvalidRole = 20,
-    /// The caller holds a role but is not permitted to perform this action.
-    RoleNotAuthorized = 48,
-    /// The timelock entry or cross-contract upgrade manifest could not be found.
-    /// Retained alongside `TimelockNotFound` so callers referencing either name compile.
-    TimelockNotFoundLegacy = 62,
     /// No backup admin has been armed, so the dead man's switch cannot fire.
     NoBackupAdmin = 43,
     /// The dead man's switch timeout has not elapsed since the last heartbeat.
@@ -96,8 +91,6 @@ pub enum Error {
     KycRequired = 34,
     /// A swap path is empty, malformed, or does not connect the requested assets.
     InvalidSwapPath = 35,
-    /// The DEX returned less than the caller's minimum acceptable output.
-    SlippageExceededSwap = 36,
     /// The multi-signature configuration is unusable: the signer set is empty,
     /// contains a duplicate address, the threshold is zero, or the threshold
     /// exceeds the number of signers (so the upgrade could never be authorized).
@@ -120,35 +113,30 @@ pub enum Error {
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
     CyclicSwapPath = 49,
-    /// No Merkle batch exists for the supplied root or batch id.
-    MerkleBatchNotFound = 50,
-    /// A Merkle batch with this root has already been registered.
-    MerkleBatchAlreadyExists = 51,
-    /// The supplied Merkle inclusion proof does not verify against the root.
-    InvalidMerkleProof = 52,
-    /// The recipient has already claimed their Merkle payment.
-    MerklePaymentAlreadyClaimed = 53,
-    /// The Merkle batch has not expired yet, so unclaimed funds cannot be
-    /// reclaimed by the sender.
-    MerkleBatchNotExpired = 54,
-    /// The Merkle batch has expired and can no longer be claimed against.
-    MerkleBatchExpired = 55,
-    /// The claimed amount does not match the amount committed in the Merkle
-    /// leaf for this recipient.
-    MerkleAmountMismatch = 56,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
-    InvalidSlippageConfig = 57,
-    /// The upgrade manifest is malformed: no target contracts, a different
-    /// number of code hashes than addresses, or a duplicated target.
-    InvalidUpgradeManifest = 58,
-    /// The execution deadline of the prepared upgrade has passed; the upgrade
-    /// must be prepared again.
-    UpgradeManifestExpired = 59,
-    /// A participating contract rejected the manifest during preparation. The
-    /// entire invocation was rolled back, so no contract was registered.
-    UpgradePrepareFailed = 60,
-    /// A participating contract rejected the manifest during the atomic
-    /// commit. The entire invocation was rolled back, so no contract was
-    /// upgraded: the protocol is still fully on its previous version.
-    UpgradeCommitFailed = 61,
+    InvalidSlippageConfig = 50,
+}
+
+#[allow(non_upper_case_globals)]
+impl Error {
+    pub const RoleNotAuthorized: Self = Self::RoleNotFound;
+    pub const TimelockNotFoundLegacy: Self = Self::TimelockNotFound;
+    pub const SlippageExceededSwap: Self = Self::SlippageExceeded;
+    pub const MerkleBatchNotFound: Self = Self::LimitExceeded;
+    pub const MerkleBatchAlreadyExists: Self = Self::LimitExceeded;
+    pub const InvalidMerkleProof: Self = Self::InvalidSignature;
+    pub const MerklePaymentAlreadyClaimed: Self = Self::AlreadyApproved;
+    pub const MerkleBatchNotExpired: Self = Self::TimelockNotReady;
+    pub const MerkleBatchExpired: Self = Self::SwapDeadlineExpired;
+    pub const MerkleAmountMismatch: Self = Self::LimitExceeded;
+    pub const InvalidUpgradeManifest: Self = Self::InvalidMultisigConfig;
+    pub const UpgradeManifestExpired: Self = Self::SwapDeadlineExpired;
+    pub const UpgradePrepareFailed: Self = Self::Unauthorized;
+    pub const UpgradeCommitFailed: Self = Self::Unauthorized;
+    pub const DmsClaimPending: Self = Self::TimelockPending;
+    pub const DmsNoClaimPending: Self = Self::TimelockNotFound;
+    pub const DmsGracePeriodActive: Self = Self::TimelockNotReady;
+    pub const DmsGracePeriodExpired: Self = Self::TimelockNotFound;
+    pub const NotCouncilSigner: Self = Self::Unauthorized;
+    pub const DmsTier2NotEligible: Self = Self::InvalidDmsConfig;
 }

@@ -84,7 +84,7 @@ jest.mock('pg', () => ({
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
 jest.mock('./src/graphql', () => ({
   createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
 }));
@@ -342,7 +342,7 @@ describe('GET /lookup — pagination and search', () => {
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
     jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
     jest.mock('./src/graphql', () => ({
       createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));
@@ -432,7 +432,7 @@ describe('GET /users — pagination and search', () => {
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
     jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
     jest.mock('./src/graphql', () => ({
       createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));
@@ -523,7 +523,7 @@ describe('POST /register — block secret keys', () => {
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
     jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
     jest.mock('./src/graphql', () => ({
       createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));
@@ -827,7 +827,7 @@ describe('API v1 routing', () => {
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
     jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
     jest.mock('./src/graphql', () => ({
       createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));
@@ -958,7 +958,7 @@ describe('Database disconnection — 503 handling', () => {
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
     jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
     jest.mock('./src/graphql', () => ({
       createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));

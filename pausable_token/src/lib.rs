@@ -136,6 +136,7 @@ pub enum Error {
     PermitDeadlineTooFar = 13,
     InsufficientTransferable = 14,
     NotRegisteredLiquidator = 15,
+    AllowanceExpired = 16,
 }
 
 #[contract]
