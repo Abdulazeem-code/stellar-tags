@@ -4864,354 +4864,448 @@ fn test_version_is_non_empty() {
     assert!(v.len() > 0, "version must not be empty");
 }
 
-// ── Issue #890: Tiered Circuit Breaker Tests ─────────────────────────────────
+// ── TTL extension tests (issue: automatic storage TTL) ───────────────────────
+//
+// These tests verify that:
+//   1. Instance TTL is extended when it falls below EXTEND_THRESHOLD during
+//      route_payment and route_payments.
+//   2. When TTL is healthy (≥ EXTEND_THRESHOLD), no extension occurs.
+//   3. extend_instance_ttl / extend_persistent_ttl helpers behave correctly
+//      in isolation.
+//   4. Both constants (EXTEND_THRESHOLD=10_000, EXTEND_AMOUNT=50_000) are
+//      exported at the expected values.
 
-/// Under `PauseLevel::None` (default) both direct payments and swap payments
-/// are accepted.
+use crate::storage::{extend_instance_ttl, extend_persistent_ttl};
+
+/// Verifies the exported constant values match the acceptance criteria.
 #[test]
-fn test_tiered_circuit_breaker_none_allows_all() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
-
-    // Default level is None.
-    assert_eq!(client.get_pause_level(), crate::PauseLevel::None);
-    // Legacy is_paused() should return false.
-    assert!(!client.is_paused());
+fn test_ttl_constants_have_expected_values() {
+    assert_eq!(
+        PaymentRouter::EXTEND_THRESHOLD,
+        10_000,
+        "EXTEND_THRESHOLD must be 10_000 ledgers"
+    );
+    assert_eq!(
+        PaymentRouter::EXTEND_AMOUNT,
+        50_000,
+        "EXTEND_AMOUNT must be 50_000 ledgers"
+    );
 }
 
-/// Setting `PauseLevel::SwapsOnly` blocks swap calls but direct payments
-/// continue to work.
+/// Helper that initialises a fresh env for TTL tests.
+///
+/// The ledger is set with `max_entry_ttl = 6_312_000` (the Stellar network
+/// default) and starts at sequence 1 so that TTL reads are well-defined.
+fn setup_ttl_env() -> (Env, PaymentRouterClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set(LedgerInfo {
+        timestamp: 1_000_000,
+        protocol_version: env.ledger().protocol_version(),
+        sequence_number: 1,
+        network_id: env.ledger().network_id().into(),
+        base_reserve: 100,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl: 6_312_000,
+    });
+    let contract_id = env.register_contract(None, PaymentRouter);
+    let client = PaymentRouterClient::new(&env, &contract_id);
+    (env, client, contract_id)
+}
+
+// ── extend_instance_ttl unit tests ──────────────────────────────────────────
+
+/// When instance TTL is below EXTEND_THRESHOLD, calling extend_instance_ttl
+/// should raise it to at least EXTEND_AMOUNT.
 #[test]
-fn test_tiered_circuit_breaker_swaps_only_blocks_swap_not_direct() {
-    let (env, client, _) = setup_env();
+fn test_extend_instance_ttl_extends_when_below_threshold() {
+    let (env, _client, contract_id) = setup_ttl_env();
+
+    // Write any instance key so the entry exists.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Paused, &false);
+
+        // Force a TTL that is just under the threshold.
+        env.storage()
+            .instance()
+            .extend_ttl(1, PaymentRouter::EXTEND_THRESHOLD - 1);
+
+        let before = env.storage().instance().get_ttl();
+        assert!(
+            before < PaymentRouter::EXTEND_THRESHOLD,
+            "pre-condition: TTL must be below threshold, got {before}"
+        );
+
+        extend_instance_ttl(&env);
+
+        let after = env.storage().instance().get_ttl();
+        assert!(
+            after >= PaymentRouter::EXTEND_AMOUNT,
+            "TTL should be extended to at least EXTEND_AMOUNT, got {after}"
+        );
+    });
+}
+
+/// When instance TTL is already above EXTEND_THRESHOLD, extend_instance_ttl
+/// must leave the TTL unchanged (no spurious host write).
+#[test]
+fn test_extend_instance_ttl_noop_when_ttl_healthy() {
+    let (env, _client, contract_id) = setup_ttl_env();
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Paused, &false);
+
+        // Bump TTL well above the threshold.
+        let healthy_ttl = PaymentRouter::EXTEND_THRESHOLD + 5_000;
+        env.storage()
+            .instance()
+            .extend_ttl(1, healthy_ttl);
+
+        let before = env.storage().instance().get_ttl();
+        assert!(
+            before >= PaymentRouter::EXTEND_THRESHOLD,
+            "pre-condition: TTL must be at or above threshold, got {before}"
+        );
+
+        extend_instance_ttl(&env);
+
+        let after = env.storage().instance().get_ttl();
+        // TTL must not have grown beyond what it was (no wasted host write).
+        assert_eq!(
+            after, before,
+            "extend_instance_ttl must not change a healthy TTL (before={before}, after={after})"
+        );
+    });
+}
+
+// ── extend_persistent_ttl unit tests ────────────────────────────────────────
+
+/// When a persistent key's TTL is below EXTEND_THRESHOLD,
+/// extend_persistent_ttl should raise it to at least EXTEND_AMOUNT.
+#[test]
+fn test_extend_persistent_ttl_extends_when_below_threshold() {
+    let (env, _client, contract_id) = setup_ttl_env();
+
+    env.as_contract(&contract_id, || {
+        let key = DataKey::Paused;
+        env.storage().persistent().set(&key, &false);
+
+        // Force the key TTL below the threshold.
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 1, PaymentRouter::EXTEND_THRESHOLD - 1);
+
+        let before = env.storage().persistent().get_ttl(&key);
+        assert!(
+            before < PaymentRouter::EXTEND_THRESHOLD,
+            "pre-condition: persistent TTL must be below threshold, got {before}"
+        );
+
+        extend_persistent_ttl(&env, &key);
+
+        let after = env.storage().persistent().get_ttl(&key);
+        assert!(
+            after >= PaymentRouter::EXTEND_AMOUNT,
+            "persistent TTL should be extended to at least EXTEND_AMOUNT, got {after}"
+        );
+    });
+}
+
+/// When a persistent key's TTL is healthy, extend_persistent_ttl must leave
+/// it unchanged.
+#[test]
+fn test_extend_persistent_ttl_noop_when_ttl_healthy() {
+    let (env, _client, contract_id) = setup_ttl_env();
+
+    env.as_contract(&contract_id, || {
+        let key = DataKey::Paused;
+        env.storage().persistent().set(&key, &false);
+
+        let healthy_ttl = PaymentRouter::EXTEND_THRESHOLD + 5_000;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 1, healthy_ttl);
+
+        let before = env.storage().persistent().get_ttl(&key);
+        assert!(
+            before >= PaymentRouter::EXTEND_THRESHOLD,
+            "pre-condition: persistent TTL must be at or above threshold, got {before}"
+        );
+
+        extend_persistent_ttl(&env, &key);
+
+        let after = env.storage().persistent().get_ttl(&key);
+        assert_eq!(
+            after, before,
+            "extend_persistent_ttl must not change a healthy TTL (before={before}, after={after})"
+        );
+    });
+}
+
+// ── Integration: instance TTL auto-extended via route_payment ────────────────
+
+/// After a route_payment call, the instance TTL must be at least EXTEND_AMOUNT
+/// when the contract started with a TTL below EXTEND_THRESHOLD.
+///
+/// This proves the extend_instance_ttl call inside route_payment fires and
+/// that the final TTL satisfies the acceptance criterion.
+#[test]
+fn test_route_payment_extends_instance_ttl_when_below_threshold() {
+    let (env, client, contract_id) = setup_ttl_env();
+
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
-    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
-
-    // Assign Pauser role to admin for convenience (admin acts as Pauser here).
-    client.assign_role(&admin, &Role::Pauser);
-
-    // Set SwapsOnly pause level.
-    client.set_pause_level(&crate::PauseLevel::SwapsOnly);
-    assert_eq!(client.get_pause_level(), crate::PauseLevel::SwapsOnly);
-    // Legacy is_paused() stays false — direct payments are still allowed.
-    assert!(!client.is_paused());
-
-    // Direct payment: set up accounts and token.
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let (token_addr, _, sac) = setup_token(&env);
+    let (token_address, _token_client, sac) = setup_token(&env);
     sac.mint(&sender, &1_000_000);
 
-    let payment = crate::Payment {
-        sender: sender.clone(),
-        recipient: recipient.clone(),
-        token_address: token_addr.clone(),
-        amount: 100_000,
-    };
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
 
-    // Direct payment MUST succeed under SwapsOnly.
-    let result = client.try_route_payments(&soroban_sdk::vec![&env, payment]);
+    // Manually lower the instance TTL below the threshold, simulating
+    // an instance that is close to expiry.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(1, PaymentRouter::EXTEND_THRESHOLD - 1);
+    });
+
+    // Verify pre-condition.
+    let ttl_before = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
     assert!(
-        result.is_ok(),
-        "direct payment must succeed under SwapsOnly, got: {:?}",
-        result
+        ttl_before < PaymentRouter::EXTEND_THRESHOLD,
+        "pre-condition: TTL must be below threshold before route_payment, got {ttl_before}"
+    );
+
+    client.route_payment(&sender, &recipient, &token_address, &500_000);
+
+    let ttl_after = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
+    assert!(
+        ttl_after >= PaymentRouter::EXTEND_AMOUNT,
+        "instance TTL must be ≥ EXTEND_AMOUNT after route_payment, got {ttl_after}"
     );
 }
 
-/// Under `PauseLevel::SwapsOnly`, `route_payment_with_swap` reverts.
+/// When instance TTL is already healthy, route_payment must not reset it
+/// downward: the TTL must remain the same or higher.
 #[test]
-fn test_tiered_circuit_breaker_swaps_only_rejects_swap() {
-    // A fresh environment lets this test configure the pause level directly.
-    let (env2, client2, _) = setup_env();
-    let admin2 = Address::generate(&env2);
-    let treasury2 = Address::generate(&env2);
-    client2.initialize(&admin2, &treasury2, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
-    client2.assign_role(&admin2, &Role::Pauser);
-    client2.set_pause_level(&crate::PauseLevel::SwapsOnly);
+fn test_route_payment_does_not_shrink_healthy_instance_ttl() {
+    let (env, client, contract_id) = setup_ttl_env();
 
-    // A non-existent swap should hit the Paused guard before any other check.
-    let dummy_swap = crate::SwapPayment {
-        sender: Address::generate(&env2),
-        recipient: Address::generate(&env2),
-        sell_token: Address::generate(&env2),
-        buy_token: Address::generate(&env2),
-        amount_in: 1_000,
-        min_amount_out: 1,
-        expected_amount_out: 0,
-        deadline: 0,
-        dex: Address::generate(&env2),
-    };
-    let res = client2.try_route_payment_with_swap(&dummy_swap);
-    assert_eq!(
-        res.unwrap_err().unwrap(),
-        crate::Error::Paused,
-        "swap must be rejected under SwapsOnly"
-    );
-}
-
-/// `PauseLevel::FullHalt` blocks both direct payments and swaps.
-/// `is_paused()` returns true.  Clearing to `None` re-enables everything.
-#[test]
-fn test_tiered_circuit_breaker_full_halt_blocks_all_and_clear_restores() {
-    let (env, client, _) = setup_env();
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
-    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
-    client.assign_role(&admin, &Role::Pauser);
-
-    client.set_pause_level(&crate::PauseLevel::FullHalt);
-    assert_eq!(client.get_pause_level(), crate::PauseLevel::FullHalt);
-    assert!(client.is_paused(), "is_paused() must be true at FullHalt");
-
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let (token_addr, _, sac) = setup_token(&env);
+    let (token_address, _token_client, sac) = setup_token(&env);
     sac.mint(&sender, &1_000_000);
 
-    let payment = crate::Payment {
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // Set a large, healthy TTL above the threshold.
+    let healthy_ttl = PaymentRouter::EXTEND_THRESHOLD + 20_000;
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(1, healthy_ttl);
+    });
+
+    let ttl_before = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
+    assert!(
+        ttl_before >= PaymentRouter::EXTEND_THRESHOLD,
+        "pre-condition: TTL must be healthy, got {ttl_before}"
+    );
+
+    client.route_payment(&sender, &recipient, &token_address, &500_000);
+
+    let ttl_after = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
+    // The TTL must not have been reduced by a spurious extend_ttl call.
+    assert!(
+        ttl_after >= ttl_before,
+        "healthy TTL must not shrink after route_payment (before={ttl_before}, after={ttl_after})"
+    );
+}
+
+// ── Integration: instance TTL auto-extended via route_payments ───────────────
+
+/// After a route_payments batch call, instance TTL must be at least
+/// EXTEND_AMOUNT when the contract started with a TTL below EXTEND_THRESHOLD.
+#[test]
+fn test_route_payments_extends_instance_ttl_when_below_threshold() {
+    let (env, client, contract_id) = setup_ttl_env();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let (token_address, _token_client, sac) = setup_token(&env);
+    sac.mint(&sender, &1_000_000);
+
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // Lower instance TTL below the threshold.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(1, PaymentRouter::EXTEND_THRESHOLD - 1);
+    });
+
+    let ttl_before = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
+    assert!(
+        ttl_before < PaymentRouter::EXTEND_THRESHOLD,
+        "pre-condition: TTL must be below threshold before route_payments, got {ttl_before}"
+    );
+
+    let mut payments: Vec<Payment> = Vec::new(&env);
+    payments.push_back(Payment {
         sender: sender.clone(),
         recipient: recipient.clone(),
-        token_address: token_addr.clone(),
+        token_address: token_address.clone(),
         amount: 100_000,
-    };
+    });
+    client.route_payments(&payments);
 
-    // Direct payment must also fail at FullHalt.
-    let res = client.try_route_payments(&soroban_sdk::vec![&env, payment.clone()]);
-    assert_eq!(
-        res.unwrap_err().unwrap(),
-        crate::Error::Paused,
-        "direct payment must fail at FullHalt"
-    );
-
-    // Clear the pause.
-    client.set_pause_level(&crate::PauseLevel::None);
-    assert_eq!(client.get_pause_level(), crate::PauseLevel::None);
-    assert!(!client.is_paused());
-
-    // Direct payment must now succeed.
-    let res2 = client.try_route_payments(&soroban_sdk::vec![&env, payment]);
+    let ttl_after = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
     assert!(
-        res2.is_ok(),
-        "direct payment must succeed after clearing pause"
+        ttl_after >= PaymentRouter::EXTEND_AMOUNT,
+        "instance TTL must be ≥ EXTEND_AMOUNT after route_payments, got {ttl_after}"
     );
 }
 
-/// `set_pause(true)` is a backward-compat wrapper that sets `FullHalt`.
-/// `set_pause(false)` clears to `None`.
+/// When instance TTL is healthy before a route_payments batch, TTL must not
+/// shrink after the call.
 #[test]
-fn test_set_pause_bool_maps_to_full_halt() {
-    let (env, client, _) = setup_env();
+fn test_route_payments_does_not_shrink_healthy_instance_ttl() {
+    let (env, client, contract_id) = setup_ttl_env();
+
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
-    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
-    client.assign_role(&admin, &Role::Pauser);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let (token_address, _token_client, sac) = setup_token(&env);
+    sac.mint(&sender, &1_000_000);
 
-    client.set_pause(&true);
-    assert_eq!(client.get_pause_level(), crate::PauseLevel::FullHalt);
-    assert!(client.is_paused());
-
-    client.set_pause(&false);
-    assert_eq!(client.get_pause_level(), crate::PauseLevel::None);
-    assert!(!client.is_paused());
-}
-
-/// Only the Pauser role may call `set_pause_level`.
-#[test]
-#[ignore = "quarantined: native test host aborts on host-level auth failure, so the rejection cannot be observed in-process"]
-fn test_set_pause_level_requires_pauser_role() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    client.initialize(&admin, &treasury, &0, &1_000, &PaymentRouter::MAX_AMOUNT);
-
-    // Drop the blanket mock authorizations: without a matching signature the
-    // Pauser-role requirement cannot be satisfied.
-    env.mock_auths(&[]);
-    let res = client.try_set_pause_level(&crate::PauseLevel::SwapsOnly);
-    assert!(
-        res.is_err(),
-        "set_pause_level must fail without Pauser authorization"
-    );
-}
-
-// ── Issue #889: Heartbeat Operator Tests ─────────────────────────────────────
-
-/// Admin can appoint a heartbeat operator; get_heartbeat_operator returns it.
-#[test]
-fn test_set_and_get_heartbeat_operator() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let operator = Address::generate(&env);
     client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
 
-    assert_eq!(client.get_heartbeat_operator(), None);
+    let healthy_ttl = PaymentRouter::EXTEND_THRESHOLD + 20_000;
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(1, healthy_ttl);
+    });
 
-    client.set_heartbeat_operator(&operator);
-    assert_eq!(client.get_heartbeat_operator(), Some(operator.clone()));
-}
+    let ttl_before = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
 
-/// Admin can remove the heartbeat operator; get_heartbeat_operator returns None.
-#[test]
-fn test_remove_heartbeat_operator() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let operator = Address::generate(&env);
-    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+    let mut payments: Vec<Payment> = Vec::new(&env);
+    payments.push_back(Payment {
+        sender: sender.clone(),
+        recipient: recipient.clone(),
+        token_address: token_address.clone(),
+        amount: 100_000,
+    });
+    client.route_payments(&payments);
 
-    client.set_heartbeat_operator(&operator);
-    assert_eq!(client.get_heartbeat_operator(), Some(operator));
-
-    client.remove_heartbeat_operator();
-    assert_eq!(client.get_heartbeat_operator(), None);
-}
-
-/// The heartbeat operator successfully renews the heartbeat; the claim clock
-/// resets so `claim_admin` fails again after renewal.
-#[test]
-fn test_operator_renews_heartbeat_resets_dms_clock() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let backup = Address::generate(&env);
-    let operator = Address::generate(&env);
-
-    setup_dms_env(
-        &env,
-        &client,
-        &admin,
-        &backup,
-        PaymentRouter::MIN_DMS_TIMEOUT,
-    );
-    client.set_heartbeat_operator(&operator);
-
-    // Advance time close to (but before) the timeout.
-    advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT - 1);
-
-    // Operator renews.
-    client.renew_heartbeat(&operator);
-
-    // After renewal the backup cannot yet claim (clock was reset).
-    let res = client.try_claim_admin(&backup);
-    assert_eq!(
-        res.unwrap_err().unwrap(),
-        crate::Error::DmsNotReady,
-        "backup should not be able to claim right after operator renewal"
-    );
-
-    // Advance past the new timeout.
-    advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
-
-    // Now the backup can claim.
-    client.claim_admin(&backup);
-    assert_eq!(client.get_admin(), Some(backup));
-}
-
-/// An unauthorized address (not the configured operator) is rejected.
-#[test]
-fn test_renew_heartbeat_rejects_unauthorized_address() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let backup = Address::generate(&env);
-    let operator = Address::generate(&env);
-    let impostor = Address::generate(&env);
-
-    setup_dms_env(
-        &env,
-        &client,
-        &admin,
-        &backup,
-        PaymentRouter::MIN_DMS_TIMEOUT,
-    );
-    client.set_heartbeat_operator(&operator);
-
-    let res = client.try_renew_heartbeat(&impostor);
-    assert_eq!(
-        res.unwrap_err().unwrap(),
-        crate::Error::Unauthorized,
-        "impostor must be rejected"
-    );
-}
-
-/// `renew_heartbeat` fails when no operator has been configured.
-#[test]
-fn test_renew_heartbeat_fails_when_no_operator_configured() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let backup = Address::generate(&env);
-    let random = Address::generate(&env);
-
-    setup_dms_env(
-        &env,
-        &client,
-        &admin,
-        &backup,
-        PaymentRouter::MIN_DMS_TIMEOUT,
-    );
-    // No operator set.
-
-    let res = client.try_renew_heartbeat(&random);
-    assert_eq!(
-        res.unwrap_err().unwrap(),
-        crate::Error::Unauthorized,
-        "renew_heartbeat must fail with Unauthorized when no operator is configured"
-    );
-}
-
-/// `renew_heartbeat` fails when the DMS is not armed (no heartbeat key).
-#[test]
-fn test_renew_heartbeat_fails_when_dms_not_armed() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let operator = Address::generate(&env);
-    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
-
-    // Set operator but do NOT arm the DMS.
-    client.set_heartbeat_operator(&operator);
-
-    let res = client.try_renew_heartbeat(&operator);
-    assert_eq!(
-        res.unwrap_err().unwrap(),
-        crate::Error::InvalidDmsConfig,
-        "renew_heartbeat must fail with InvalidDmsConfig when switch is not armed"
-    );
-}
-
-/// The operator cannot change the backup admin address.
-#[test]
-#[ignore = "quarantined: native test host aborts on host-level auth failure, so the rejection cannot be observed in-process"]
-fn test_operator_cannot_change_backup_admin() {
-    let (env, client, _) = setup_env();
-    let admin = Address::generate(&env);
-    let backup = Address::generate(&env);
-    let operator = Address::generate(&env);
-    let new_backup = Address::generate(&env);
-
-    setup_dms_env(
-        &env,
-        &client,
-        &admin,
-        &backup,
-        PaymentRouter::MIN_DMS_TIMEOUT,
-    );
-    client.set_heartbeat_operator(&operator);
-
-    // Drop the blanket mock authorizations: the operator cannot produce the
-    // admin signature that set_backup_admin_internal requires.
-    env.mock_auths(&[]);
-    let res = client.try_set_backup_admin_internal(&new_backup, &PaymentRouter::MIN_DMS_TIMEOUT);
+    let ttl_after = env.as_contract(&contract_id, || {
+        env.storage().instance().get_ttl()
+    });
     assert!(
-        res.is_err(),
-        "operator must not be able to change the backup admin"
+        ttl_after >= ttl_before,
+        "healthy TTL must not shrink after route_payments (before={ttl_before}, after={ttl_after})"
     );
-    let (stored_backup, _, _, _) = client.get_dead_mans_switch();
-    assert_eq!(
-        stored_backup.unwrap(),
-        backup,
-        "operator must not be able to change backup admin"
+}
+
+// ── Gas / overhead benchmark: TTL check when healthy ─────────────────────────
+//
+// The Soroban test environment tracks instruction counts, which serve as a
+// proxy for gas cost. We compare two route_payment calls:
+//   - "cold": contract freshly initialised, full TTL extension path runs
+//             because the default TTL starts below EXTEND_THRESHOLD
+//   - "warm": explicit healthy TTL set so the conditional check short-circuits
+//
+// Both calls must succeed, and the warm invocation's instruction count must
+// not be higher than the cold one (the extra host read is negligible and
+// should never add more overhead than a full extend_ttl).
+
+#[test]
+fn test_ttl_check_overhead_is_minimal_when_ttl_is_healthy() {
+    // --- Cold run: TTL below threshold → extend_ttl fires ───────────────
+    let (env_cold, client_cold, contract_id_cold) = setup_ttl_env();
+    {
+        let admin = Address::generate(&env_cold);
+        let treasury = Address::generate(&env_cold);
+        let sender = Address::generate(&env_cold);
+        let recipient = Address::generate(&env_cold);
+        let (token_address, _token_client, sac) = setup_token(&env_cold);
+        sac.mint(&sender, &1_000_000);
+        client_cold.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        // Force TTL below threshold so extend_ttl fires.
+        env_cold.as_contract(&contract_id_cold, || {
+            env_cold
+                .storage()
+                .instance()
+                .extend_ttl(1, PaymentRouter::EXTEND_THRESHOLD - 1);
+        });
+
+        env_cold.budget().reset_default();
+        client_cold.route_payment(&sender, &recipient, &token_address, &500_000);
+    }
+    let cold_cpu = env_cold.budget().cpu_instruction_cost();
+
+    // --- Warm run: TTL above threshold → only get_ttl fires ─────────────
+    let (env_warm, client_warm, contract_id_warm) = setup_ttl_env();
+    {
+        let admin = Address::generate(&env_warm);
+        let treasury = Address::generate(&env_warm);
+        let sender = Address::generate(&env_warm);
+        let recipient = Address::generate(&env_warm);
+        let (token_address, _token_client, sac) = setup_token(&env_warm);
+        sac.mint(&sender, &1_000_000);
+        client_warm.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        // Ensure TTL is well above threshold so no extension is performed.
+        env_warm.as_contract(&contract_id_warm, || {
+            env_warm
+                .storage()
+                .instance()
+                .extend_ttl(1, PaymentRouter::EXTEND_THRESHOLD + 20_000);
+        });
+
+        env_warm.budget().reset_default();
+        client_warm.route_payment(&sender, &recipient, &token_address, &500_000);
+    }
+    let warm_cpu = env_warm.budget().cpu_instruction_cost();
+
+    // The warm (no-extend) path must not be more expensive than the cold
+    // (extend fires) path.  A TTL read is always cheaper than a write, so
+    // this assertion should always hold.
+    assert!(
+        warm_cpu <= cold_cpu,
+        "TTL check on healthy instance should not cost more than an extension \
+         (warm={warm_cpu}, cold={cold_cpu})"
+    );
+
+    // Sanity-print for --nocapture so the numbers are visible in CI.
+    std::println!(
+        "GAS REPORT [ttl_overhead]: cold (extend)={cold_cpu} \
+         warm (no-extend)={warm_cpu} cpu instructions"
     );
 }

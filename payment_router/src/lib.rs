@@ -52,6 +52,8 @@ impl PaymentRouter {
     pub const USER_LIFETIME_THRESHOLD: u32 = storage::USER_LIFETIME_THRESHOLD;
     pub const PERSISTENT_BUMP_AMOUNT: u32 = storage::PERSISTENT_BUMP_AMOUNT;
     pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = storage::PERSISTENT_LIFETIME_THRESHOLD;
+    pub const EXTEND_THRESHOLD: u32 = storage::EXTEND_THRESHOLD;
+    pub const EXTEND_AMOUNT: u32 = storage::EXTEND_AMOUNT;
 
     // ── Delegated Domain Helpers ─────────────────────────────────────────────
 
@@ -2650,6 +2652,7 @@ impl PaymentRouter {
         amount: i128,
     ) -> Result<(), Error> {
         let _guard = ReentrancyGuard::new(&env)?;
+        extend_instance_ttl(&env);
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
@@ -2816,6 +2819,7 @@ impl PaymentRouter {
     /// a token transfer to `platform_treasury` fails.
     pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
         let _guard = ReentrancyGuard::new(&env)?;
+        extend_instance_ttl(&env);
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
