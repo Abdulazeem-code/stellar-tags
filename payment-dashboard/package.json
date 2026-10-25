@@ -11,9 +11,10 @@
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^1.7.5",
-    "@stellar/freighter-api": "^6.0.1",
-    "@stellar/stellar-sdk": "^16.0.0",
     "@stellar-tags/payment-router": "file:../packages/types",
+    "@stellar/freighter-api": "^6.0.1",
+    "@stellar/stellar-base": "^12.1.1",
+    "@stellar/stellar-sdk": "^16.0.0",
     "date-fns": "^4.4.0",
     "pino": "^9.0.0",
     "react": "^19.2.5",
@@ -31,5 +32,8 @@
     "globals": "^17.5.0",
     "vite": "^8.0.10",
     "vite-plugin-node-polyfills": "^0.28.0"
+  },
+  "overrides": {
+    "@ledgerhq/devices": "8.15.0"
   }
 }

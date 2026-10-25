@@ -1,404 +1,348 @@
 import { useEffect, useState } from 'react';
-import { API_BASE, apiErrorMessage, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
+import toast from 'react-hot-toast';
+import Icon from '../components/Icon';
+import { useDebounce } from '../useDebounce';
+import { checkTag, validateTag, TAG_MAX } from '../lib/tags';
+import { signMessage, walletName, connectedWalletId } from '../lib/wallets';
+import {
+  API_BASE,
+  DEFAULT_FEDERATION_DOMAIN,
+  apiErrorMessage,
+  formatShortAddress,
+  fullTag,
+} from './shared';
 
-const USERNAME_REGEX = /^[a-zA-Z0-9]/;
+const MEMO_PLACEHOLDER = {
+  text: 'Up to 28 characters',
+  id: '64-bit unsigned integer',
+  hash: '64-character hex string',
+};
 
-function RegistrationPage({
-  userPublicKey,
-  setUserPublicKey,
-  onBack,
-  onRegistered,
-}) {
-  const [username, setUsername] = useState("");
-  const [usernameError, setUsernameError] = useState("");
-  const [memoType, setMemoType] = useState("");
-  const [memo, setMemo] = useState("");
-  const [memoError, setMemoError] = useState("");
-  const [status, setStatus] = useState({
-    text: "Connect a wallet to begin your registration.",
-    tone: "neutral",
-  });
-  const [isConnecting, setIsConnecting] = useState(false);
+// Wallets return the signature as a base64 string, a Buffer-like object or a
+// Uint8Array depending on the wallet. The API wants base64.
+function normaliseSignature(result) {
+  if (result && result.error) throw new Error(result.error.message || result.error);
+  const raw = typeof result === 'string' ? result : result?.signedMessage || result?.signature;
+  if (!raw || typeof raw !== 'object') return raw;
+
+  let bytes;
+  if (raw.type === 'Buffer' && Array.isArray(raw.data)) {
+    bytes = new Uint8Array(raw.data);
+  } else if (raw instanceof Uint8Array) {
+    bytes = raw;
+  } else if (raw.buffer instanceof ArrayBuffer) {
+    bytes = new Uint8Array(raw.buffer);
+  } else {
+    bytes = new Uint8Array(Object.values(raw));
+  }
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  // Some wallets hand back the ASCII bytes of an already base64 signature.
+  if (binary.length >= 80 && binary.length <= 90 && /^[a-zA-Z0-9+/]+={0,2}$/.test(binary)) {
+    return binary;
+  }
+  return btoa(binary);
+}
+
+function validateMemo(memoType, memo) {
+  if (memoType && !memo) return 'Enter a memo value, or set the type back to None.';
+  if (!memoType && memo) return 'Pick a memo type.';
+  if (memoType === 'text' && memo.length > 28) return 'Text memos are at most 28 characters.';
+  if (memoType === 'id' && !/^\d+$/.test(memo)) return 'ID memos are whole numbers.';
+  if (memoType === 'hash' && !/^[0-9a-fA-F]{64}$/.test(memo)) return 'Hash memos are 64 hex characters.';
+  return '';
+}
+
+function ExistingTag({ tag, address, onDone }) {
+  const full = fullTag(tag);
+  return (
+    <section className="card claimed">
+      <div className="claimed__bands" aria-hidden="true">
+        <span className="dither-blue-12" />
+        <span className="dither-blue-25" />
+        <span className="dither-blue-50" />
+      </div>
+      <p className="eyebrow eyebrow--blue">
+        <Icon name="check" size={14} /> Registered
+      </p>
+      <h2 className="claimed__tag mono">{full}</h2>
+      <p className="muted">
+        Resolves to <span className="mono text-paper">{formatShortAddress(address)}</span>. Anyone can pay
+        you with this name from any app that supports Stellar federation.
+      </p>
+      <div className="row-gap">
+        <button
+          type="button"
+          className="btn btn--primary"
+          onClick={async () => {
+            await navigator.clipboard.writeText(full);
+            toast.success('Tag copied.');
+          }}
+        >
+          <Icon name="copy" size={16} /> Copy tag
+        </button>
+        <button type="button" className="btn btn--ghost" onClick={onDone}>
+          Go to dashboard <Icon name="arrow" size={16} />
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone }) {
+  const [username, setUsername] = useState('');
+  const debounced = useDebounce(username, 350);
+  const [availability, setAvailability] = useState({ state: 'idle', text: 'Type a name to check' });
+  const [memoType, setMemoType] = useState('');
+  const [memo, setMemo] = useState('');
+  const [memoError, setMemoError] = useState('');
+  const [status, setStatus] = useState({ tone: '', text: '' });
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const walletLabel = userPublicKey
-    ? `Connected: ${userPublicKey.substring(0, 5)}...${userPublicKey.substring(51)}`
-    : "No wallet connected";
-
-  const setStatusMessage = (text, tone = "neutral") => {
-    setStatus({ text, tone });
-  };
+  const [existing, setExisting] = useState({ key: '', tag: '' });
 
   useEffect(() => {
-    if (!userPublicKey) {
-      return;
-    }
-
-    const checkExisting = async () => {
-      try {
-        const response = await fetch(
-          `${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`,
-        );
-        const rawBody = await response.text();
-        const data = rawBody ? JSON.parse(rawBody) : null;
-
-        if (response.ok && data?.username) {
-          onRegistered();
-        }
-      } catch {
-        // Ignore lookup errors in registration view.
-      }
+    if (!userPublicKey) return undefined;
+    let active = true;
+    fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`)
+      .then(async (response) => {
+        const data = response.ok ? await response.json().catch(() => null) : null;
+        if (active) setExisting({ key: userPublicKey, tag: data?.username || '' });
+      })
+      .catch(() => active && setExisting({ key: userPublicKey, tag: '' }));
+    return () => {
+      active = false;
     };
+  }, [userPublicKey]);
 
-    checkExisting();
-  }, [userPublicKey, onRegistered]);
+  useEffect(() => {
+    const controller = new AbortController();
+    checkTag(debounced, { signal: controller.signal })
+      .then((next) => setAvailability({ ...next, for: debounced }))
+      .catch(() => {});
+    return () => controller.abort();
+  }, [debounced]);
 
-  // 2. Updated to use the universal walletKit modal instead of Freighter specifically
-  const handleConnect = async () => {
-    setIsConnecting(true);
-    try {
-      await walletKit.openModal({
-        onWalletSelected: async (option) => {
-          walletKit.setWallet(option.id);
-          const addressResponse = await walletKit.getAddress();
-          
-          const publicKey = typeof addressResponse === 'string' 
-            ? addressResponse 
-            : addressResponse.address;
-          
-          setUserPublicKey(publicKey);
-          setStatusMessage(`Wallet connected. Pick your username.`, "success");
-        }
-      });
-    } catch {
-      setStatusMessage("Wallet connection cancelled or failed.", "error");
-    } finally {
-      setIsConnecting(false);
-    }
-  };
+  const cleaned = username.trim();
+  const ruleError = validateTag(cleaned);
+  // Still typing, or the request for the latest name has not answered yet
+  // (the API can take a while to wake up).
+  const checking = Boolean(cleaned) && (cleaned !== debounced.trim() || availability.for !== debounced);
+  const shown = checking ? { state: 'checking', text: 'Checking...' } : availability;
+  const full = `${(cleaned || 'yourname').toLowerCase()}*${DEFAULT_FEDERATION_DOMAIN}`;
 
   const handleSubmit = async (event) => {
-    if (isSubmitting) return;
-    
     event.preventDefault();
-    const cleaned = username.trim();
+    if (isSubmitting) return;
 
-    if (!userPublicKey) {
-      setStatusMessage("Connect a wallet before registering.", "error");
-      return;
-    }
-
-    if (cleaned.length < 3) {
-      setStatusMessage("Username must be at least 3 characters.", "error");
-      return;
+    let address = userPublicKey;
+    if (!address) {
+      const result = await onConnectWallet();
+      if (!result?.ok) return;
+      address = result.address;
     }
 
-    if (!USERNAME_REGEX.test(cleaned)) {
-      setStatusMessage(
-        "Username may only contain letters, numbers, hyphens, and underscores.",
-        "error",
-      );
+    if (!cleaned || ruleError) {
+      setStatus({ tone: 'error', text: ruleError || 'Pick a username first.' });
       return;
     }
-
-    // Validate memo fields before signing
-    if (memoType && !memo) {
-      setMemoError("Memo value is required when a memo type is selected.");
+    if (checking) {
+      setStatus({ tone: 'error', text: 'Still checking that name. Try again in a moment.' });
       return;
     }
-    if (!memoType && memo) {
-      setMemoError("Please select a memo type.");
+    if (availability.state === 'taken') {
+      setStatus({ tone: 'error', text: `${full} is already taken.` });
       return;
     }
-    if (memoType === "text" && memo.length > 28) {
-      setMemoError("Text memo must not exceed 28 characters.");
-      return;
-    }
-    setMemoError("");
+    const memoProblem = validateMemo(memoType, memo);
+    setMemoError(memoProblem);
+    if (memoProblem) return;
 
     setIsSubmitting(true);
-    // 3. Removed the hardcoded Freighter text
-    setStatusMessage(
-      "Approve the signature request in your wallet...", 
-      "neutral",
-    );
+    setStatus({ tone: '', text: `Approve the signature request in ${walletName(connectedWalletId())}...` });
 
     let signature;
-    let signerAddress;
     try {
-      const message = `register:${cleaned.toLowerCase()}:${userPublicKey}`;
-      
-      // 4. Use walletKit to sign the data dynamically based on the selected wallet
-      // Note: Some wallet kit versions wrap this differently. If signBlob is unavailable, 
-      // check your specific @creit.tech/stellar-wallets-kit version docs for message signing.
-      const result = await walletKit.signBlob 
-        ? await walletKit.signBlob(message) 
-        : await walletKit.signMessage(message, { address: userPublicKey });
-      
-      if (result && result.error) throw new Error(result.error);
-      
-      let rawSignature = typeof result === 'string' ? result : (result.signedMessage || result.signature);
-      
-      // walletKit might return a Uint8Array or Buffer object. Convert to base64 string.
-      if (typeof rawSignature === 'object' && rawSignature !== null) {
-        let uint8;
-        if (rawSignature.type === 'Buffer' && Array.isArray(rawSignature.data)) {
-          uint8 = new Uint8Array(rawSignature.data);
-        } else if (rawSignature instanceof Uint8Array) {
-          uint8 = rawSignature;
-        } else if (rawSignature.buffer instanceof ArrayBuffer) {
-          uint8 = new Uint8Array(rawSignature.buffer);
-        } else {
-          uint8 = new Uint8Array(Object.values(rawSignature));
-        }
-        let binary = '';
-        for (let i = 0; i < uint8.length; i++) {
-          binary += String.fromCharCode(uint8[i]);
-        }
-        // If the walletKit accidentally returned the ASCII bytes of the base64 string,
-        // 'binary' will just be the base64 string itself. We shouldn't double-encode it.
-        if (binary.length >= 80 && binary.length <= 90 && /^[a-zA-Z0-9+/]+={0,2}$/.test(binary)) {
-          signature = binary;
-        } else {
-          signature = btoa(binary);
-        }
-      } else {
-        signature = rawSignature;
-      }
-      
-      if (!signature) {
-        throw new Error("Failed to capture signature from wallet.");
-      }
-
-      signerAddress = userPublicKey; 
-      
+      const message = `register:${cleaned.toLowerCase()}:${address}`;
+      signature = normaliseSignature(await signMessage(message, address));
+      if (!signature) throw new Error('The wallet did not return a signature.');
     } catch (err) {
-      // Check if it's the specific LOBSTR unsupported error
-      if (err.message && err.message.includes("signMessage")) {
-        setStatusMessage(
-          "LOBSTR does not support registration signatures. Please click 'Back to dashboard' to skip this step, or connect with Freighter.", 
-          "error"
-        );
-      } else {
-        // Handle all other normal errors
-        setStatusMessage(err.message || "Signature request cancelled.", "error");
-      }
+      const text = String(err?.message || '');
+      setStatus({
+        tone: 'error',
+        text:
+          text.includes('signMessage') || text.toLowerCase().includes('not supported')
+            ? `${walletName(connectedWalletId())} cannot sign messages yet. Connect Freighter, xBull, Albedo, Hana or Rabet to claim a tag.`
+            : text || 'Signature request cancelled.',
+      });
       setIsSubmitting(false);
       return;
     }
 
-    setStatusMessage("Submitting your registration...", "neutral");
-
+    setStatus({ tone: '', text: 'Saving your tag...' });
     try {
-      fetch(`${API_BASE}/register`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+      const response = await fetch(`${API_BASE}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           username: cleaned.toLowerCase(),
-          address: userPublicKey,
+          address,
           signature,
-          signerAddress,
+          signerAddress: address,
           ...(memoType && memo && { memo_type: memoType, memo }),
         }),
-      })
-        .then(async (response) => {
-          const data = await response.json().catch(() => null);
-          if (!response.ok) {
-            throw new Error(
-              apiErrorMessage(data, "Registration failed."),
-            );
-          }
-          return data;
-        })
-        .then(() => {
-          setStatusMessage("Username reserved and saved.", "success");
-          
-          setTimeout(() => {
-            if (typeof onRegistered === 'function') {
-              onRegistered();
-            }
-          }, 1500);
-        })
-        .catch((error) => {
-          setStatusMessage(error.message || "Registration failed.", "error");
-        })
-        .finally(() => {
-          setIsSubmitting(false);
-        });
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(apiErrorMessage(data, 'Registration failed.'));
+
+      setStatus({ tone: 'ok', text: `${full} is yours.` });
+      toast.success(`${full} is yours.`);
+      setExisting({ key: address, tag: cleaned.toLowerCase() });
+      onRegistered?.();
     } catch (error) {
-      setStatusMessage(error.message || "Registration failed.", "error");
+      setStatus({ tone: 'error', text: error.message || 'Registration failed.' });
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  if (userPublicKey && existing.key === userPublicKey && existing.tag) {
+    return <ExistingTag tag={existing.tag} address={userPublicKey} onDone={onDone} />;
+  }
+
   return (
-    <div className="registration">
-      <section className="hero-panel">
-        <div className="brand">
-          <div className="brand-mark">S</div>
-          <div>
-            <p className="brand-eyebrow">Stellar Pay</p>
-            <h1>Claim your on-chain identity.</h1>
-          </div>
+    <div className="register">
+      <form className="card form register__form" onSubmit={handleSubmit} noValidate>
+        <div>
+          <p className="eyebrow eyebrow--blue">Step 2 of 3</p>
+          <h2 className="h3">Claim a name people can pay.</h2>
+          <p className="muted">
+            Letters and numbers, 3 to {TAG_MAX} characters. Your wallet signs a message to prove the
+            address is yours. No fee, no transaction.
+          </p>
         </div>
-        <p className="hero-copy">
-          Register a username that follows your wallet across apps, tips, and
-          payments. Secure, memorable, and ready for the Stellar network.
-        </p>
-        <div className="pill-row">
-          <span>Instant wallet link</span>
-          <span>Unique username</span>
-          <span>Testnet ready</span>
-        </div>
-        <div className="hero-card">
-          <div>
-            <p className="card-label">Wallet status</p>
-            <p className="card-value">{walletLabel}</p>
-          </div>
-          <button
-            type="button"
-            className="ghost-button"
-            onClick={handleConnect}
-          >
-            {isConnecting ? "Connecting..." : "Connect wallet"}
-          </button>
-        </div>
-        <div className="hero-grid">
-          <div>
-            <h3>Own your name</h3>
-            <p>Secure a username that resolves to your wallet instantly.</p>
-          </div>
-          <div>
-            {/* 5. Removed hardcoded Freighter marketing copy */}
-            <h3>Seamless onboarding</h3>
-            <p>Connect your preferred wallet with a single approval.</p>
-          </div>
-          <div>
-            <h3>Verified presence</h3>
-            <p>Show a trusted badge to customers and collaborators.</p>
-          </div>
-        </div>
-      </section>
 
-      <section className="form-panel">
-        <div className="form-header">
-          <h2>Registration</h2>
-          <p>Choose a name that your community will recognize.</p>
-        </div>
-        <form className="registration-form" onSubmit={handleSubmit}>
-          <label className="form-field">
-            Desired username
+        <div className="form__group">
+          <label htmlFor="username">Username</label>
+          <div className={`field field--joined ${ruleError ? 'is-invalid' : ''}`}>
             <input
-              type="text"
-              placeholder="stellarname"
+              id="username"
               value={username}
-              onChange={(event) => {
-                const val = event.target.value;
-                setUsername(val);
-                if (val && !USERNAME_REGEX.test(val)) {
-                  setUsernameError(
-                    "Only letters, numbers, hyphens, and underscores are allowed.",
-                  );
-                } else {
-                  setUsernameError("");
-                }
-              }}
-              aria-describedby={usernameError ? "username-error" : undefined}
-              aria-invalid={!!usernameError}
+              onChange={(event) => setUsername(event.target.value.replace(/\s/g, ''))}
+              placeholder="yourname"
+              autoComplete="off"
+              spellCheck="false"
+              maxLength={TAG_MAX}
+              aria-describedby="username-status"
+              aria-invalid={Boolean(ruleError)}
             />
-            {usernameError && (
-              <span id="username-error" className="field-error" role="alert">
-                {usernameError}
-              </span>
-            )}
-          </label>
-          <div className="helper-row">
-            <span>3-18 characters, letters and numbers recommended.</span>
-            <span
-              className={`char-counter${username.length >= 30 ? " char-counter--limit" : ""}`}
-            >
-              {username.length} / 30
-            </span>
+            <span className="field__suffix">*{DEFAULT_FEDERATION_DOMAIN}</span>
           </div>
+          <p id="username-status" className={`tag-check__status tag-check__status--${shown.state}`} aria-live="polite">
+            <span className="dot" aria-hidden="true" />
+            {shown.text}
+          </p>
+        </div>
 
-          <label className="form-field">
-            Memo type <span className="optional-label">(optional)</span>
-            <select
-              value={memoType}
-              onChange={(event) => {
-                setMemoType(event.target.value);
-                setMemo("");
-                setMemoError("");
-              }}
-            >
-              <option value="">None</option>
-              <option value="text">Text</option>
-              <option value="id">ID</option>
-              <option value="hash">Hash</option>
-            </select>
-          </label>
-
-          {memoType && (
-            <label className="form-field">
-              Memo value
-              <input
-                type="text"
-                placeholder={
-                  memoType === "text"
-                    ? "Up to 28 characters"
-                    : memoType === "id"
-                    ? "64-bit unsigned integer"
-                    : "64-character hex string"
-                }
-                value={memo}
-                maxLength={memoType === "text" ? 28 : undefined}
+        <details className="disclosure">
+          <summary>
+            Default memo <span className="muted">(optional, for exchanges)</span>
+          </summary>
+          <div className="form__row">
+            <div className="form__group">
+              <label htmlFor="memo-type">Memo type</label>
+              <select
+                id="memo-type"
+                className="select"
+                value={memoType}
                 onChange={(event) => {
-                  setMemo(event.target.value);
-                  setMemoError("");
+                  setMemoType(event.target.value);
+                  setMemo('');
+                  setMemoError('');
                 }}
-                aria-describedby={memoError ? "memo-error" : undefined}
-                aria-invalid={!!memoError}
-              />
-              {memoType === "text" && (
-                <span
-                  className={`char-counter${memo.length >= 28 ? " char-counter--limit" : ""}`}
-                >
-                  {memo.length} / 28
-                </span>
-              )}
-              {memoError && (
-                <span id="memo-error" className="field-error" role="alert">
-                  {memoError}
-                </span>
-              )}
-            </label>
-          )}
-          <button
-            className="primary-button"
-            type="submit"
-            disabled={isSubmitting || !!usernameError}
-          >
-            {isSubmitting ? "Processing..." : "Reserve username"}
-          </button>
-        </form>
-        <div className={`status-card ${status.tone}`}>
-          <p>{status.text}</p>
-        </div>
-        <div className="form-footer">
-          <button type="button" className="ghost-button" onClick={onBack}>
-            Back to dashboard
-          </button>
-          <p>Wallet required to finalize registration.</p>
-          {/* 6. Removed hardcoded Freighter badge */}
-          <div className="badge-row">
-            <span>Stellar Testnet</span>
-            <span>Secure</span>
+              >
+                <option value="">None</option>
+                <option value="text">Text</option>
+                <option value="id">ID</option>
+                <option value="hash">Hash</option>
+              </select>
+            </div>
+            {memoType && (
+              <div className="form__group">
+                <label htmlFor="memo-value">
+                  Memo value
+                  {memoType === 'text' && <span className="muted mono"> {memo.length}/28</span>}
+                </label>
+                <div className="field">
+                  <input
+                    id="memo-value"
+                    value={memo}
+                    maxLength={memoType === 'text' ? 28 : undefined}
+                    placeholder={MEMO_PLACEHOLDER[memoType]}
+                    onChange={(event) => {
+                      setMemo(event.target.value);
+                      setMemoError('');
+                    }}
+                    aria-invalid={Boolean(memoError)}
+                  />
+                </div>
+              </div>
+            )}
           </div>
+          {memoError && <p className="notice notice--error" role="alert">{memoError}</p>}
+        </details>
+
+        <button
+          type="submit"
+          className="btn btn--primary btn--lg btn--block"
+          disabled={isSubmitting || (Boolean(userPublicKey) && (Boolean(ruleError) || availability.state === 'taken'))}
+        >
+          {isSubmitting ? (
+            <>
+              <span className="btn__spinner dither-50 spin-steps" aria-hidden="true" /> Waiting for wallet
+            </>
+          ) : userPublicKey ? (
+            <>
+              Sign and claim <Icon name="arrow" size={16} />
+            </>
+          ) : (
+            <>
+              <Icon name="wallet" size={16} /> Connect wallet to claim
+            </>
+          )}
+        </button>
+        {status.text && (
+          <p className={`notice notice--${status.tone || 'info'}`} role="status">
+            {status.text}
+          </p>
+        )}
+      </form>
+
+      <aside className="card preview">
+        <span className="eyebrow">Preview</span>
+        <div className="preview__card dither-frame">
+          <span className="mono text-dim">STELLAR/TAGS</span>
+          <strong className="preview__tag mono">{full}</strong>
+          <span className="mono text-blue">
+            {userPublicKey ? formatShortAddress(userPublicKey) : 'G... your wallet'}
+          </span>
         </div>
-      </section>
+        <ol className="preview__steps">
+          <li className={userPublicKey ? 'is-done' : ''}>
+            <span className="mono">01</span> Connect wallet
+            {userPublicKey && <Icon name="check" size={14} className="text-blue" />}
+          </li>
+          <li className={cleaned && !ruleError ? 'is-done' : ''}>
+            <span className="mono">02</span> Pick a name
+          </li>
+          <li>
+            <span className="mono">03</span> Sign once to prove ownership
+          </li>
+        </ol>
+        <p className="muted small">
+          Tags resolve through SEP-0002 federation, so wallets and exchanges that support it can pay
+          you by name too.
+        </p>
+      </aside>
     </div>
   );
 }

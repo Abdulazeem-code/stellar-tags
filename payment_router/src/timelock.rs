@@ -125,7 +125,11 @@ pub fn execute_action(env: &Env, nonce: u64) -> Result<(), Error> {
 ///   before executing the first action.
 /// - Atomic rollback if any action in the batch fails execution.
 /// - Emits `batch_actions_executed` event with the list of nonces.
-#[allow(clippy::missing_panics_doc)]
+///
+/// # Panics
+///
+/// Panics only if a batch index is out of bounds while iterating `nonces`;
+/// the loop bounds make that unreachable.
 pub fn execute_batch_actions(env: &Env, nonces: Vec<u64>) -> Result<(), Error> {
     if is_frozen_internal(env) {
         return Err(Error::ContractFrozen);

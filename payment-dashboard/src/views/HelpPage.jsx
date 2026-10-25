@@ -1,194 +1,179 @@
-import { useState } from 'react';
-import ScrollToTop from '../ScrollToTop';
-import MobileNav from './MobileNav';
-import { NAV_STORAGE_KEY, useNavState } from './shared';
+import { useMemo, useState } from 'react';
+import Icon from '../components/Icon';
+import { DEFAULT_FEDERATION_DOMAIN } from './shared';
 
-function HelpPage({
-  userPublicKey,
-  onDisconnectWallet,
-  onDashboardClick,
-  onAnalyticsClick,
-  onHistoryClick,
-  onRegisterClick,
-  canRegister,
-}) {
-  const [isNavOpen, setIsNavOpen] = useNavState();
-  const [activeHelpAction, setActiveHelpAction] = useState("");
-  const closeNav = () => {
-    sessionStorage.setItem(NAV_STORAGE_KEY, "false");
-    setIsNavOpen(false);
-  };
-  const handleNav = (action) => {
-    sessionStorage.setItem(NAV_STORAGE_KEY, "false");
-    setIsNavOpen(false);
-    action();
-  };
+const TOPICS = [
+  { id: 'all', label: 'All' },
+  { id: 'tags', label: 'Tags' },
+  { id: 'wallets', label: 'Wallets' },
+  { id: 'payments', label: 'Payments' },
+  { id: 'trouble', label: 'Troubleshooting' },
+];
 
-  const helpContent = {
-    identity: (
-      <div className="help-action-content">
-        <p>
-          Our platform uses a Federation Server. This acts as a decentralized
-          phonebook that maps your easy-to-read name tag directly to your
-          cryptographic public key.
-        </p>
-        <div className="help-action-block">
-          <strong>The Process:</strong>
-          <ol>
-            <li>Navigate to the Profile page.</li>
-            <li>Connect your Freighter Wallet to verify ownership.</li>
-            <li>Enter your desired username and click Claim.</li>
-          </ol>
-        </div>
-        <p className="help-action-note">
-          Note: Once claimed, your name tag is permanent and can be shared with
-          anyone on the network to receive instant payments.
-        </p>
-      </div>
-    ),
-    troubleshooting: (
-      <div className="help-action-content">
-        <p>
-          <strong>Simulation Failed:</strong> If the dashboard says "Simulation
-          Failed," it usually means the smart contract rejected the logic.
-          Ensure you aren't trying to send more XLM than you actually have in
-          your balance (including the 0.4% fee, capped at 30 XLM).
-        </p>
-        <p>
-          <strong>Wallet Locked:</strong> If the Freighter popup doesn't appear,
-          check the extension icon in your browser. If it has a red dot or says
-          "Locked," you must re-enter your password before the dashboard can
-          request a signature.
-        </p>
-      </div>
-    ),
-  };
+const FAQ = [
+  {
+    topic: 'tags',
+    q: 'What is a tag?',
+    a: `A short name like you*${DEFAULT_FEDERATION_DOMAIN} that points at your Stellar address. It is served over SEP-0002 federation, so any wallet that supports federation can resolve it.`,
+  },
+  {
+    topic: 'tags',
+    q: 'How do I claim one?',
+    a: 'Open My tag, connect a wallet, pick a name of 3 to 20 letters or numbers and sign the message your wallet shows you. Signing proves you own the address. It costs nothing and sends no transaction.',
+  },
+  {
+    topic: 'tags',
+    q: 'Can I change my tag later?',
+    a: 'Not yet. A tag is bound to one address once claimed, so choose one you are happy to share.',
+  },
+  {
+    topic: 'wallets',
+    q: 'Which wallets work?',
+    a: 'Freighter, xBull, LOBSTR, Albedo, Rabet, Hana, HOT Wallet, Ledger and Trezor hardware wallets, and any wallet that speaks WalletConnect. Installed browser extensions show up under Detected in the connect window.',
+  },
+  {
+    topic: 'wallets',
+    q: 'Why does my wallet say it cannot sign the registration?',
+    a: 'Claiming a tag needs a signed message. A few wallets, LOBSTR among them, cannot sign arbitrary messages yet. Claim your tag with Freighter, xBull, Albedo, Hana or Rabet, then use any wallet to send and receive.',
+  },
+  {
+    topic: 'wallets',
+    q: 'Do you hold my keys?',
+    a: 'No. Stellar Tags only ever asks your wallet for your public key and for signatures you approve one by one.',
+  },
+  {
+    topic: 'payments',
+    q: 'How does a payment by name work?',
+    a: 'The app resolves the tag to an address through federation, simulates a route_payment call on the Soroban payment_router contract, asks your wallet to sign it and submits it to the network. A ledger closes about every five seconds.',
+  },
+  {
+    topic: 'payments',
+    q: 'What does it cost?',
+    a: 'The Stellar network fee, about 0.00001 XLM, plus the router fee of 0.4 percent capped at 30 XLM.',
+  },
+  {
+    topic: 'trouble',
+    q: 'The dashboard says simulation failed',
+    a: 'The contract rejected the payment before it was signed. Usually the amount plus the router fee is more than your balance, or the recipient account does not exist on testnet yet.',
+  },
+  {
+    topic: 'trouble',
+    q: 'My account says it is not funded',
+    a: 'New testnet accounts need XLM before they exist on the ledger. Use the Friendbot link on the dashboard to fund it with test XLM.',
+  },
+  {
+    topic: 'trouble',
+    q: 'The wallet window never opened',
+    a: 'Check the extension icon in your browser. A locked wallet will not show a signing window until you unlock it. Pop-up blockers can also stop Albedo and WalletConnect.',
+  },
+];
+
+function HelpPage({ onNavigate }) {
+  const [query, setQuery] = useState('');
+  const [topic, setTopic] = useState('all');
+  const [open, setOpen] = useState(0);
+
+  const items = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return FAQ.filter(
+      (item) =>
+        (topic === 'all' || item.topic === topic) &&
+        (!needle || `${item.q} ${item.a}`.toLowerCase().includes(needle)),
+    );
+  }, [query, topic]);
+
   return (
-    <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
-      <button
-        type="button"
-        className={`sidebar-scrim ${isNavOpen ? "is-open" : ""}`}
-        onClick={() => setIsNavOpen(false)}
-        aria-label="Close navigation"
-      />
-      <aside className={`sidebar ${isNavOpen ? "is-open" : ""}`}>
-        <div className="brand">
-          <div className="brand-mark">S</div>
-          <h1>Stellar Pay</h1>
-          <span className="brand-badge">Testnet</span>
+    <div className="help">
+      <section className="help__hero card">
+        <div className="help__bands" aria-hidden="true">
+          <span className="dither-blue-12" />
+          <span className="dither-blue-25" />
         </div>
-        <div className="nav">
-          <button type="button" onClick={() => handleNav(onDashboardClick)}>
-            Dashboard
-          </button>
-          <button type="button" onClick={() => handleNav(onHistoryClick)}>
-            History
-          </button>
-          <button type="button" onClick={() => handleNav(onAnalyticsClick)}>
-            Analytics
-          </button>
-          <button type="button" aria-current="page" onClick={closeNav}>
-            Help
-          </button>
-          {canRegister && (
-            <button type="button" onClick={() => handleNav(onRegisterClick)}>
-              Registration
-            </button>
-          )}
+        <h2 className="h3">How can we help?</h2>
+        <div className="field field--search field--lg" role="search">
+          <Icon name="search" size={18} className="field__icon" />
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search tags, wallets, payments"
+            aria-label="Search the help center"
+          />
         </div>
-        <div className="sidebar-card">
-          <h3>Support hours</h3>
-          <p>Live help is active Mon-Fri, 09:00-18:00 UTC.</p>
-        </div>
-        <div className="sidebar-card">
-          <h3>Contact</h3>
-          <p>Need a real person? Open a ticket from your wallet settings.</p>
-        </div>
-        {userPublicKey && (
-          <button
-            type="button"
-            className="disconnect-button"
-            onClick={onDisconnectWallet}
-          >
-            Disconnect wallet
-          </button>
-        )}
-      </aside>
-
-      <main className="main">
-        <section className="help-hero">
-          <button
-            type="button"
-            className="hamburger"
-            onClick={() => setIsNavOpen((prev) => !prev)}
-            aria-label="Toggle navigation"
-            aria-expanded={isNavOpen}
-          >
-            <span />
-            <span />
-            <span />
-          </button>
-          <div className="help-hero-content">
-            <p className="help-eyebrow">Help Center</p>
-            <h2 className="help-title">System Clarity</h2>
-            <div className="help-search" role="search">
-              <input
-                type="search"
-                placeholder="Search identities, routing, or transactions"
-                aria-label="Search the help center"
-              />
-              <div className="help-search-glow" aria-hidden="true" />
-            </div>
-            <div className="help-actions">
-              <button
-                type="button"
-                className={activeHelpAction === "identity" ? "is-active" : ""}
-                onClick={() =>
-                  setActiveHelpAction((prev) =>
-                    prev === "identity" ? "" : "identity",
-                  )
-                }
-              >
-                Claim Identity
-              </button>
-              <button type="button">Smart Routing</button>
-              <button
-                type="button"
-                className={
-                  activeHelpAction === "troubleshooting" ? "is-active" : ""
-                }
-                onClick={() =>
-                  setActiveHelpAction((prev) =>
-                    prev === "troubleshooting" ? "" : "troubleshooting",
-                  )
-                }
-              >
-                Troubleshooting
-              </button>
-            </div>
-            <div
-              className={`help-action-panel ${activeHelpAction ? "is-visible" : ""}`}
-              aria-live="polite"
+        <div className="segmented" role="group" aria-label="Topic">
+          {TOPICS.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              aria-pressed={topic === item.id}
+              onClick={() => {
+                setTopic(item.id);
+                setOpen(-1);
+              }}
             >
-              {helpContent[activeHelpAction] ?? null}
-            </div>
-            <div className="help-status">
-              <span className="status-dot" aria-hidden="true" />
-              Stellar Testnet: Operational
+              {item.label}
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <div className="help__body">
+        <section className="faq" aria-label="Questions">
+          {items.length === 0 && <p className="muted">No answers match that search.</p>}
+          {items.map((item, index) => {
+            const isOpen = open === index;
+            return (
+              <div key={item.q} className={`faq__item ${isOpen ? 'is-open' : ''}`}>
+                <h3>
+                  <button
+                    type="button"
+                    aria-expanded={isOpen}
+                    aria-controls={`faq-${index}`}
+                    onClick={() => setOpen(isOpen ? -1 : index)}
+                  >
+                    <span>{item.q}</span>
+                    <Icon name={isOpen ? 'minus' : 'plus'} size={16} />
+                  </button>
+                </h3>
+                {isOpen && (
+                  <p id={`faq-${index}`} className="faq__answer">
+                    {item.a}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </section>
+
+        <aside className="stack">
+          <div className="card">
+            <span className="eyebrow">Quick actions</span>
+            <div className="link-list">
+              <button type="button" onClick={() => onNavigate('register')}>
+                <Icon name="tag" size={16} /> Claim a tag <Icon name="arrow" size={14} />
+              </button>
+              <button type="button" onClick={() => onNavigate('dashboard')}>
+                <Icon name="send" size={16} /> Send a payment <Icon name="arrow" size={14} />
+              </button>
+              <button type="button" onClick={() => onNavigate('analytics')}>
+                <Icon name="chart" size={16} /> Network status <Icon name="arrow" size={14} />
+              </button>
             </div>
           </div>
-        </section>
-      </main>
-      <MobileNav
-        active="help"
-        onDashboardClick={() => handleNav(onDashboardClick)}
-        onHistoryClick={() => handleNav(onHistoryClick)}
-        onAnalyticsClick={() => handleNav(onAnalyticsClick)}
-        onHelpClick={closeNav}
-        onRegisterClick={() => handleNav(onRegisterClick)}
-        canRegister={canRegister}
-      />
-      <ScrollToTop />
+          <div className="card">
+            <span className="eyebrow">Still stuck?</span>
+            <p className="muted">Open an issue with what you tried and the transaction hash if there is one.</p>
+            <a
+              className="btn btn--ghost btn--block"
+              href="https://github.com/ALIPHATICHYD/stellar-tags/issues/new"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <Icon name="github" size={16} /> Report an issue
+            </a>
+          </div>
+        </aside>
+      </div>
     </div>
   );
 }
