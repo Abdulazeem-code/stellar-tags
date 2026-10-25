@@ -243,6 +243,29 @@ describe('webhook BullMQ delivery', () => {
     );
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
   });
+
+  test('halts active delivery queueing when destination domain circuit breaker is OPEN', async () => {
+    const { handleDeliveryFailure, resetCircuitBreaker } = require('../src/services/webhookService');
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-cb-1' }) };
+    const failingWebhook = {
+      id: 'wh-cb-failing',
+      username: 'merchant-cb',
+      url: 'https://tripped-host.com/hook',
+      secret: 'sec',
+    };
+
+    // Trip circuit breaker with 5 consecutive failures
+    for (let i = 0; i < 5; i += 1) {
+      await handleDeliveryFailure(null, 'tripped-host.com', new Error('HTTP 500'));
+    }
+
+    const result = await enqueueWebhookDelivery(failingWebhook, payload, queue);
+    expect(result).toBeNull();
+    expect(queue.add).not.toHaveBeenCalled();
+
+    // Clean up
+    await resetCircuitBreaker(null, 'tripped-host.com');
+  });
 });
 
 

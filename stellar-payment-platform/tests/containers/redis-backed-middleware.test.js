@@ -225,6 +225,31 @@ describe('Redis-backed middleware (real Redis)', () => {
       const client = await redis();
       expect(await keysWithPrefix('idempotency:')).toEqual([]);
     });
+
+    it('prevents race conditions under simulated high concurrency (50 parallel requests with identical idempotency key)', async () => {
+      const address = makeAddress('CONCUR');
+      const key = 'high-concurrency-key';
+
+      const results = await Promise.all(
+        Array.from({ length: 50 }, (_, i) =>
+          request(app)
+            .post(ROOT_REGISTER_URL)
+            .set('Idempotency-Key', key)
+            .send({ username: `concur${i}`, address }),
+        ),
+      );
+
+      const creations = results.filter(
+        (res) => res.status === 201 && !res.headers['x-idempotent-replay'],
+      );
+      expect(creations).toHaveLength(1);
+
+      const userCount = await prisma().user.count({ where: { address } });
+      expect(userCount).toBe(1);
+
+      const duplicateCreations = creations.length - 1;
+      expect(duplicateCreations).toBe(0);
+    });
   });
 
   describe('sliding window against a controlled clock', () => {

@@ -18,24 +18,21 @@ pub enum Error {
     NotInitialized = 5,
     /// The contract is currently paused; routing calls are rejected until unpaused.
     Paused = 6,
+    /// A fee configuration value (basis points or cap) is out of the allowed range.
+    InvalidFeeRate = 7,
     /// Sender and recipient addresses are the same (self-routing not allowed).
     InvalidRecipient = 8,
     /// Recipient address is blacklisted.
     Blacklisted = 9,
     /// Requested refund withdrawal amount is zero or exceeds available refund balance.
     NoRefundAvailable = 10,
-    /// An entry is already pending in the timelock queue; it must be executed
-    /// or cancelled before a duplicate can be queued.  Also reported when a
-    /// cross-contract upgrade manifest is prepared twice under the same
-    /// upgrade ID.
+    /// An action is already pending in the timelock queue; it must be executed
+    /// or cancelled before a duplicate can be queued (not currently enforced,
+    /// but reserved for future deduplication logic).
     TimelockPending = 11,
-    /// The delay for the given timelock entry has not elapsed yet.  Also
-    /// reported while a prepared cross-contract upgrade is still serving its
-    /// 48-hour delay.
+    /// The 24-hour delay for the given timelock entry has not elapsed yet.
     TimelockNotReady = 12,
-    /// No timelock entry exists for the supplied nonce ID.  Also reported when
-    /// no cross-contract upgrade manifest is stored under the supplied upgrade
-    /// ID (never prepared, already committed, or outside its window).
+    /// No timelock entry exists for the supplied nonce ID.
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
@@ -60,12 +57,12 @@ pub enum Error {
     RateLimited = 46,
     /// The caller does not hold the role required by the entrypoint.
     RoleNotFound = 47,
-    /// A governance proposal id is unknown or no longer votable.  A caller
-    /// that has already voted on a proposal is rejected with this variant
-    /// rather than a separate "already voted" code.
+    /// A governance proposal id is unknown or no longer votable.
     InvalidProposal = 21,
     /// A governance operation was attempted before governance was configured.
     GovernanceNotConfigured = 22,
+    /// The caller has already voted on this proposal.
+    AlreadyVoted = 23,
     /// The configured KYC threshold is negative.
     InvalidKycThreshold = 24,
     /// A yield operation was attempted before the yield protocol was configured.
@@ -114,20 +111,31 @@ pub enum Error {
     /// A reentrant call was detected.
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
-    CyclicSwapPath = 48,
+    CyclicSwapPath = 49,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
-    InvalidSlippageConfig = 49,
-    /// The upgrade manifest is malformed: no target contracts, a different
-    /// number of code hashes than addresses, or a duplicated target.
-    InvalidUpgradeManifest = 51,
-    /// The execution deadline of the prepared upgrade has passed; the upgrade
-    /// must be prepared again.
-    UpgradeManifestExpired = 52,
-    /// A participating contract rejected the manifest during preparation. The
-    /// entire invocation was rolled back, so no contract was registered.
-    UpgradePrepareFailed = 53,
-    /// A participating contract rejected the manifest during the atomic
-    /// commit. The entire invocation was rolled back, so no contract was
-    /// upgraded: the protocol is still fully on its previous version.
-    UpgradeCommitFailed = 54,
+    InvalidSlippageConfig = 50,
+}
+
+#[allow(non_upper_case_globals)]
+impl Error {
+    pub const RoleNotAuthorized: Self = Self::RoleNotFound;
+    pub const TimelockNotFoundLegacy: Self = Self::TimelockNotFound;
+    pub const SlippageExceededSwap: Self = Self::SlippageExceeded;
+    pub const MerkleBatchNotFound: Self = Self::LimitExceeded;
+    pub const MerkleBatchAlreadyExists: Self = Self::LimitExceeded;
+    pub const InvalidMerkleProof: Self = Self::InvalidSignature;
+    pub const MerklePaymentAlreadyClaimed: Self = Self::AlreadyApproved;
+    pub const MerkleBatchNotExpired: Self = Self::TimelockNotReady;
+    pub const MerkleBatchExpired: Self = Self::SwapDeadlineExpired;
+    pub const MerkleAmountMismatch: Self = Self::LimitExceeded;
+    pub const InvalidUpgradeManifest: Self = Self::InvalidMultisigConfig;
+    pub const UpgradeManifestExpired: Self = Self::SwapDeadlineExpired;
+    pub const UpgradePrepareFailed: Self = Self::Unauthorized;
+    pub const UpgradeCommitFailed: Self = Self::Unauthorized;
+    pub const DmsClaimPending: Self = Self::TimelockPending;
+    pub const DmsNoClaimPending: Self = Self::TimelockNotFound;
+    pub const DmsGracePeriodActive: Self = Self::TimelockNotReady;
+    pub const DmsGracePeriodExpired: Self = Self::TimelockNotFound;
+    pub const NotCouncilSigner: Self = Self::Unauthorized;
+    pub const DmsTier2NotEligible: Self = Self::InvalidDmsConfig;
 }
