@@ -1,457 +1,270 @@
-import { Fragment, useCallback, useEffect, useState } from 'react';
-import NetworkBadge from '../NetworkBadge';
-import ScrollToTop from '../ScrollToTop';
-import MobileNav from './MobileNav';
-import { HORIZON_BASE, NAV_STORAGE_KEY, formatShortAddress, useNavState, useWalletMenu } from './shared';
+import { Fragment, useEffect, useMemo, useState } from 'react';
+import Icon from '../components/Icon';
+import ConnectPrompt from '../components/ConnectPrompt';
+import { fetchAccountPayments, relativeTime, toCsv } from '../lib/payments';
+import { errorMessage, formatShortAddress } from './shared';
 
-function HistoryPage({
-  userPublicKey,
-  setUserPublicKey,
-  onConnectWallet,
-  onDisconnectWallet,
-  onRefreshBalance,
-  onDashboardClick,
-  onAnalyticsClick,
-  onHelpClick,
-  onRegisterClick,
-  canRegister,
-}) {
-  const [isNavOpen, setIsNavOpen] = useNavState();
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [historyError, setHistoryError] = useState("");
-  const [history, setHistory] = useState([]);
-  const [expandedId, setExpandedId] = useState(null);
+const FILTERS = ['All', 'Sent', 'Received', 'Failed'];
+
+const TYPE_LABEL = {
+  payment: 'Payment',
+  path_payment_strict_receive: 'Path payment',
+  path_payment_strict_send: 'Path payment',
+  create_account: 'Account created',
+  account_merge: 'Account merge',
+  invoke_host_function: 'Contract call',
+};
+
+function downloadCsv(rows) {
+  const blob = new Blob([toCsv(rows)], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `stellar-tags-history-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function HistoryPage({ userPublicKey, onConnectWallet, onRefreshBalance }) {
+  const [result, setResult] = useState({ key: '', rows: [], error: '' });
   const [refreshIndex, setRefreshIndex] = useState(0);
-  const {
-    menuRef,
-    isOpen: isWalletMenuOpen,
-    setIsOpen: setIsWalletMenuOpen,
-  } = useWalletMenu();
-  const closeNav = () => {
-    sessionStorage.setItem(NAV_STORAGE_KEY, "false");
-    setIsNavOpen(false);
-  };
-  const handleNav = (action) => {
-    sessionStorage.setItem(NAV_STORAGE_KEY, "false");
-    setIsNavOpen(false);
-    action();
-  };
+  const [filter, setFilter] = useState('All');
+  const [query, setQuery] = useState('');
+  const [expandedId, setExpandedId] = useState(null);
+  const requestKey = `${userPublicKey}:${refreshIndex}`;
 
-  const handleConnect = async () => {
-    setIsConnecting(true);
-    try {
-      const result = await onConnectWallet();
-      if (result?.address) {
-        setUserPublicKey(result.address);
-      }
-    } finally {
-      setIsConnecting(false);
-    }
-  };
-  const handleDisconnect = () => {
-    onDisconnectWallet();
-  };
-
-  const loadHistory = useCallback(
-    async (signal) => {
-      if (!userPublicKey) {
-        return;
-      }
-
-      await Promise.resolve();
-      setIsLoading(true);
-      setHistoryError("");
-      try {
-        const response = await fetch(
-          `${HORIZON_BASE}/accounts/${userPublicKey}/payments?order=desc&limit=25`,
-          { signal, cache: "no-store" },
-        );
-        if (!response.ok) {
-          throw new Error(`Horizon error (${response.status}).`);
-        }
-
-        const data = await response.json();
-        const records = data?._embedded?.records ?? [];
-        const filtered = records.filter((record) =>
-          [
-            "payment",
-            "path_payment_strict_receive",
-            "path_payment_strict_send",
-            "create_account",
-            "account_merge",
-            "invoke_host_function",
-          ].includes(record.type),
-        );
-        const formatted = filtered
-          .flatMap((record) => {
-            if (
-              record.type === "invoke_host_function" &&
-              record.asset_balance_changes?.length
-            ) {
-              const changes = record.asset_balance_changes
-                .filter((change) => change.asset_type === "native")
-                .filter(
-                  (change) =>
-                    change.from === userPublicKey ||
-                    change.to === userPublicKey,
-                );
-
-              return changes.map((change, index) => {
-                const direction =
-                  change.from === userPublicKey ? "Sent" : "Received";
-                const counterparty =
-                  change.from === userPublicKey ? change.to : change.from;
-                const amount = `${change.amount} XLM`;
-                const status =
-                  record.transaction_successful === false
-                    ? "Failed"
-                    : "Success";
-                const explorerLink = record.transaction_hash
-                  ? `https://stellar.expert/explorer/testnet/tx/${record.transaction_hash}`
-                  : "";
-
-                return {
-                  id: `${record.id}-${index}`,
-                  counterparty: counterparty || "Unknown",
-                  direction,
-                  amount,
-                  status,
-                  type: record.type,
-                  createdAt: record.created_at,
-                  transactionHash: record.transaction_hash,
-                  asset: "XLM",
-                  explorerLink,
-                };
-              });
-            }
-
-            const isSender =
-              record.from === userPublicKey || record.account === userPublicKey;
-            const isReceiver =
-              record.to === userPublicKey || record.into === userPublicKey;
-            const direction =
-              isSender && !isReceiver
-                ? "Sent"
-                : isReceiver
-                  ? "Received"
-                  : "Sent";
-            const counterparty =
-              direction === "Sent"
-                ? record.to || record.into || record.account || "Unknown"
-                : record.from || record.funder || record.account || "Unknown";
-
-            const asset =
-              record.asset_type === "native"
-                ? "XLM"
-                : record.asset_code || "Asset";
-            const rawAmount = record.amount || record.starting_balance || "";
-            const amount = rawAmount ? `${rawAmount} ${asset}` : "-";
-            const status =
-              record.transaction_successful === false ? "Failed" : "Success";
-            const explorerLink = record.transaction_hash
-              ? `https://stellar.expert/explorer/testnet/tx/${record.transaction_hash}`
-              : "";
-
-            return [
-              {
-                id: String(record.id),
-                counterparty,
-                direction,
-                amount,
-                status,
-                type: record.type,
-                createdAt: record.created_at,
-                transactionHash: record.transaction_hash,
-                asset,
-                explorerLink,
-              },
-            ];
-          })
-          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-        const latest = formatted[0];
-        if (latest?.status === "Success") {
-          const lastSeen = sessionStorage.getItem("stellar-last-tx");
+  useEffect(() => {
+    if (!userPublicKey) return undefined;
+    const controller = new AbortController();
+    fetchAccountPayments(userPublicKey, { limit: 100, signal: controller.signal })
+      .then((rows) => {
+        // Refresh the balance once when a new successful payment shows up.
+        const latest = rows[0];
+        if (latest?.status === 'Success') {
           const latestKey = `${latest.transactionHash || latest.id}-${latest.amount}`;
-          if (latestKey !== lastSeen) {
-            sessionStorage.setItem("stellar-last-tx", latestKey);
+          if (latestKey !== sessionStorage.getItem('stellar-last-tx')) {
+            sessionStorage.setItem('stellar-last-tx', latestKey);
             onRefreshBalance();
           }
         }
+        setResult({ key: `${userPublicKey}:${refreshIndex}`, rows, error: '' });
+      })
+      .catch((error) => {
+        if (error.name === 'AbortError') return;
+        setResult({
+          key: `${userPublicKey}:${refreshIndex}`,
+          rows: [],
+          error: errorMessage(error, 'Unable to load transaction history.'),
+        });
+      });
+    return () => controller.abort();
+  }, [userPublicKey, refreshIndex, onRefreshBalance]);
 
-        setHistory(formatted);
-      } catch (error) {
-        if (error.name !== "AbortError") {
-          setHistoryError(
-            error.message || "Unable to load transaction history.",
-          );
-        }
-      } finally {
-        setIsLoading(false);
-      }
+  useEffect(() => {
+    const handleUpdate = () => setRefreshIndex((value) => value + 1);
+    window.addEventListener('stellar:tx-update', handleUpdate);
+    return () => window.removeEventListener('stellar:tx-update', handleUpdate);
+  }, []);
+
+  const rows = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return result.rows.filter((row) => {
+      if (filter === 'Failed' && row.status !== 'Failed') return false;
+      if ((filter === 'Sent' || filter === 'Received') && row.direction !== filter) return false;
+      if (!needle) return true;
+      return [row.counterparty, row.transactionHash, row.amount, row.type]
+        .join(' ')
+        .toLowerCase()
+        .includes(needle);
+    });
+  }, [result.rows, filter, query]);
+
+  if (!userPublicKey) {
+    return (
+      <ConnectPrompt
+        onConnectWallet={onConnectWallet}
+        title="Connect a wallet to read its ledger."
+        body="History comes straight from Horizon, so it covers payments made from any app, not only this one."
+      />
+    );
+  }
+
+  const isLoading = result.key !== requestKey;
+  const totals = result.rows.reduce(
+    (acc, row) => {
+      if (row.asset !== 'XLM' || row.status !== 'Success') return acc;
+      if (row.direction === 'Sent') acc.out += row.amountValue;
+      else acc.in += row.amountValue;
+      return acc;
     },
-    [onRefreshBalance, userPublicKey],
+    { in: 0, out: 0 },
   );
 
-  useEffect(() => {
-    const controller = new AbortController();
-    const run = async () => {
-      await loadHistory(controller.signal);
-    };
-    run();
-    return () => controller.abort();
-  }, [loadHistory, refreshIndex, userPublicKey]);
-
-  useEffect(() => {
-    const handleUpdate = () => {
-      setRefreshIndex((value) => value + 1);
-    };
-
-    window.addEventListener("stellar:tx-update", handleUpdate);
-    return () => window.removeEventListener("stellar:tx-update", handleUpdate);
-  }, []);
   return (
-    <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
-      <button
-        type="button"
-        className={`sidebar-scrim ${isNavOpen ? "is-open" : ""}`}
-        onClick={() => setIsNavOpen(false)}
-        aria-label="Close navigation"
-      />
-      <aside className={`sidebar ${isNavOpen ? "is-open" : ""}`}>
-        <div className="brand">
-          <div className="brand-mark">S</div>
-          <h1>Stellar Pay</h1>
-          <span className="brand-badge">Testnet</span>
+    <div className="stack">
+      <section className="stat-row">
+        <div className="stat">
+          <span className="eyebrow">Received</span>
+          <strong className="mono text-blue">+{totals.in.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong>
+          <span className="muted small">XLM, last 100 operations</span>
         </div>
-        <div className="nav">
-          <button type="button" onClick={() => handleNav(onDashboardClick)}>
-            Dashboard
-          </button>
-          <button type="button" aria-current="page" onClick={closeNav}>
-            History
-          </button>
-          <button type="button" onClick={() => handleNav(onAnalyticsClick)}>
-            Analytics
-          </button>
-          <button type="button" onClick={() => handleNav(onHelpClick)}>
-            Help
-          </button>
-          {canRegister && (
-            <button type="button" onClick={() => handleNav(onRegisterClick)}>
-              Registration
-            </button>
-          )}
+        <div className="stat">
+          <span className="eyebrow">Sent</span>
+          <strong className="mono">-{totals.out.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong>
+          <span className="muted small">XLM, last 100 operations</span>
         </div>
-        <div className="sidebar-card">
-          <h3>Timeline</h3>
-          <p>Payments are archived for 90 days.</p>
+        <div className="stat">
+          <span className="eyebrow">Operations</span>
+          <strong className="mono">{result.rows.length}</strong>
+          <span className="muted small">{result.rows.filter((row) => row.status === 'Failed').length} failed</span>
         </div>
-        <div className="sidebar-card">
-          <h3>Filters</h3>
-          <p>Sort by status, amount, or corridor.</p>
-        </div>
-        {userPublicKey && (
-          <button
-            type="button"
-            className="disconnect-button"
-            onClick={onDisconnectWallet}
-          >
-            Disconnect wallet
-          </button>
-        )}
-      </aside>
+      </section>
 
-      <main className="main">
-        <section className="topbar reveal">
-          <button
-            type="button"
-            className="hamburger"
-            onClick={() => setIsNavOpen((prev) => !prev)}
-            aria-label="Toggle navigation"
-            aria-expanded={isNavOpen}
-          >
-            <span />
-            <span />
-            <span />
-          </button>
-          <div>
-            <h2 className="headline">Transaction history</h2>
-            <p className="subtle">
-              Connect your wallet to review recent transactions.
+      <section className="card">
+        <div className="toolbar">
+          <div className="segmented" role="group" aria-label="Filter">
+            {FILTERS.map((name) => (
+              <button
+                key={name}
+                type="button"
+                aria-pressed={filter === name}
+                onClick={() => setFilter(name)}
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+          <div className="field field--search">
+            <Icon name="search" size={16} className="field__icon" />
+            <input
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search address, hash, amount"
+              aria-label="Search history"
+            />
+          </div>
+          <div className="row-gap">
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => setRefreshIndex((value) => value + 1)}
+              disabled={isLoading}
+            >
+              <Icon name="refresh" size={16} label="Refresh" className={isLoading ? 'spin' : ''} />
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              onClick={() => downloadCsv(rows)}
+              disabled={!rows.length}
+            >
+              <Icon name="download" size={14} /> CSV
+            </button>
+          </div>
+        </div>
+
+        {result.error && <p className="notice notice--error">{result.error}</p>}
+
+        {isLoading && !result.rows.length ? (
+          <div className="skeleton-list" aria-busy="true">
+            {[0, 1, 2, 3, 4].map((index) => (
+              <span key={index} className="skeleton dither-12" />
+            ))}
+          </div>
+        ) : rows.length === 0 ? (
+          <div className="empty-inline">
+            <span className="empty-inline__art dither-12" aria-hidden="true" />
+            <p className="muted">
+              {result.rows.length ? 'Nothing matches that filter.' : 'No payments on this account yet.'}
             </p>
           </div>
-          <div className="topbar-actions">
-            <span className="chip">Last 24 hours</span>
-            <NetworkBadge />
-            <div className="wallet-menu" ref={menuRef}>
-              <button
-                type="button"
-                className="connect-pill"
-                onClick={() => {
-                  if (userPublicKey) {
-                    setIsWalletMenuOpen((prev) => !prev);
-                  } else {
-                    handleConnect();
-                  }
-                }}
-                disabled={isConnecting}
-                aria-expanded={isWalletMenuOpen}
-              >
-                {userPublicKey
-                  ? `Connected: ${formatShortAddress(userPublicKey)}`
-                  : isConnecting
-                    ? "Connecting..."
-                    : "Connect wallet"}
-              </button>
-              {userPublicKey && isWalletMenuOpen && (
-                <div className="wallet-dropdown">
-                  <button type="button" onClick={handleDisconnect}>
-                    Disconnect wallet
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        </section>
-
-        <section className="card reveal">
-          <div className="card-header">
-            <h2>Recent transactions</h2>
-            <div className="history-actions">
-              <span className="chip">Latest</span>
-              <button
-                type="button"
-                className={`refresh-button ${isLoading ? "is-loading" : ""}`}
-                onClick={() => setRefreshIndex((value) => value + 1)}
-                disabled={!userPublicKey || isLoading}
-                aria-label="Refresh history"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M20 12a8 8 0 1 1-2.34-5.66" />
-                  <path d="M20 4v6h-6" />
-                </svg>
-              </button>
-            </div>
-          </div>
-          {!userPublicKey && (
-            <div className="wallet-status">
-              Connect your wallet to view your transaction history.
-              <button
-                type="button"
-                onClick={handleConnect}
-                disabled={isConnecting}
-              >
-                {isConnecting ? "Connecting..." : "Connect wallet"}
-              </button>
-            </div>
-          )}
-          {userPublicKey && isLoading && (
-            <div className="wallet-status">Loading transactions...</div>
-          )}
-          {userPublicKey && historyError && (
-            <div className="wallet-status">{historyError}</div>
-          )}
-          {userPublicKey &&
-            !isLoading &&
-            !historyError &&
-            history.length === 0 && (
-              <div className="wallet-status">
-                No transactions found for this wallet.
-              </div>
-            )}
-          {userPublicKey &&
-            !isLoading &&
-            !historyError &&
-            history.length > 0 && (
-              <table className="history-table">
-                <thead>
-                  <tr>
-                    <th>Counterparty</th>
-                    <th>Direction</th>
-                    <th>Amount</th>
-                    <th>Status</th>
-                    <th>Details</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {history.map((entry) => (
-                    <Fragment key={entry.id}>
-                      <tr>
-                        <td>{formatShortAddress(entry.counterparty)}</td>
-                        <td>{entry.direction}</td>
-                        <td>{entry.amount}</td>
-                        <td>{entry.status}</td>
+        ) : (
+          <div className="table-wrap">
+            <table className="ledger">
+              <thead>
+                <tr>
+                  <th scope="col">Direction</th>
+                  <th scope="col">Counterparty</th>
+                  <th scope="col" className="hide-sm">Type</th>
+                  <th scope="col" className="num">Amount</th>
+                  <th scope="col" className="hide-sm">Status</th>
+                  <th scope="col" className="hide-sm">When</th>
+                  <th scope="col"><span className="sr-only">Details</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => {
+                  const open = expandedId === row.id;
+                  return (
+                    <Fragment key={row.id}>
+                      <tr className={open ? 'is-open' : ''}>
                         <td>
+                          <span className={`dir ${row.direction === 'Sent' ? '' : 'dir--in'}`}>
+                            <Icon name={row.direction === 'Sent' ? 'send' : 'receive'} size={14} />
+                            {row.direction}
+                          </span>
+                        </td>
+                        <td className="mono">{formatShortAddress(row.counterparty)}</td>
+                        <td className="hide-sm muted">{TYPE_LABEL[row.type] || row.type}</td>
+                        <td className={`num mono ${row.direction === 'Sent' ? '' : 'text-blue'}`}>
+                          {row.direction === 'Sent' ? '-' : '+'}
+                          {row.amount}
+                        </td>
+                        <td className="hide-sm">
+                          <span className={`status status--${row.status.toLowerCase()}`}>{row.status}</span>
+                        </td>
+                        <td className="hide-sm muted">{relativeTime(row.createdAt)}</td>
+                        <td className="num">
                           <button
                             type="button"
-                            className="details-button"
-                            onClick={() =>
-                              setExpandedId((current) =>
-                                current === entry.id ? null : entry.id,
-                              )
-                            }
+                            className="icon-button icon-button--sm"
+                            aria-expanded={open}
+                            onClick={() => setExpandedId(open ? null : row.id)}
                           >
-                            {expandedId === entry.id ? "Hide" : "View"}
+                            <Icon name={open ? 'minus' : 'plus'} size={14} label={open ? 'Hide details' : 'Show details'} />
                           </button>
                         </td>
                       </tr>
-                      {expandedId === entry.id && (
-                        <tr className="details-row">
-                          <td colSpan={5}>
-                            <div className="details-panel">
+                      {open && (
+                        <tr className="ledger__detail">
+                          <td colSpan={7}>
+                            <dl className="detail-grid">
                               <div>
-                                <strong>Type:</strong> {entry.type}
+                                <dt>Counterparty</dt>
+                                <dd className="mono break">{row.counterparty}</dd>
                               </div>
                               <div>
-                                <strong>Counterparty:</strong>{" "}
-                                {entry.counterparty}
+                                <dt>Transaction</dt>
+                                <dd className="mono break">{row.transactionHash || '-'}</dd>
                               </div>
                               <div>
-                                <strong>Asset:</strong> {entry.asset}
+                                <dt>Time</dt>
+                                <dd>{new Date(row.createdAt).toLocaleString()}</dd>
                               </div>
                               <div>
-                                <strong>Time:</strong>{" "}
-                                {new Date(entry.createdAt).toLocaleString()}
+                                <dt>Status</dt>
+                                <dd>
+                                  <span className={`status status--${row.status.toLowerCase()}`}>{row.status}</span>
+                                </dd>
                               </div>
-                              <div>
-                                <strong>Hash:</strong>{" "}
-                                {entry.transactionHash || "Unavailable"}
-                              </div>
-                              {entry.explorerLink && (
-                                <div>
-                                  <a
-                                    className="details-link"
-                                    href={entry.explorerLink}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                  >
-                                    View on Stellar Expert
-                                  </a>
-                                </div>
-                              )}
-                            </div>
+                            </dl>
+                            {row.explorerLink && (
+                              <a className="btn btn--ghost btn--sm" href={row.explorerLink} target="_blank" rel="noopener noreferrer">
+                                View on Stellar Expert <Icon name="external" size={14} />
+                              </a>
+                            )}
                           </td>
                         </tr>
                       )}
                     </Fragment>
-                  ))}
-                </tbody>
-              </table>
-            )}
-        </section>
-      </main>
-      <MobileNav
-        active="history"
-        onDashboardClick={() => handleNav(onDashboardClick)}
-        onHistoryClick={closeNav}
-        onAnalyticsClick={() => handleNav(onAnalyticsClick)}
-        onHelpClick={() => handleNav(onHelpClick)}
-        onRegisterClick={() => handleNav(onRegisterClick)}
-        canRegister={canRegister}
-      />
-      <ScrollToTop />
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

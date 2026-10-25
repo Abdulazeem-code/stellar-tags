@@ -69,6 +69,19 @@ pub enum DataKey {
     Escrow(u64),
     /// Cumulative time-weighted yield index and active principal for a token.
     YieldState(Address),
+    /// Monitored tokens used in escrows or strategy unwinding.
+    Tokens,
+    /// Circuit breaker flag indicating emergency vault custody mode.
+    EmergencyVaultMode,
+}
+
+/// Contract operating mode.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum VaultMode {
+    Normal = 0,
+    EmergencyVaultMode = 1,
 }
 
 /// Strategy allocation entry defining a verified lending protocol and target weight in bps.
@@ -178,6 +191,14 @@ pub enum Error {
     StrategyNotFound = 20,
     MaxStrategiesExceeded = 21,
     InvalidThreshold = 22,
+    /// Recovered amount fell below minimum slippage tolerance bound.
+    SlippageExceeded = 23,
+    /// Operation halted because emergency vault mode is active.
+    EmergencyModeActive = 24,
+    /// Operation requires emergency vault mode to be active.
+    EmergencyModeNotActive = 25,
+    /// Available liquidity in the vault is insufficient for payout.
+    InsufficientLiquidity = 26,
 }
 
 // ── Lending protocol adapter ─────────────────────────────────────────────────
@@ -234,6 +255,11 @@ impl YieldEscrow {
         env.storage()
             .instance()
             .set(&DataKey::ActiveEscrows, &0_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyVaultMode, &false);
+        let tokens = Vec::<Address>::new(&env);
+        env.storage().instance().set(&DataKey::Tokens, &tokens);
         Self::bump_instance(&env);
 
         env.events()
@@ -251,6 +277,9 @@ impl YieldEscrow {
     /// `Error::ActiveEscrowsRemain` while any escrow is still active.
     pub fn set_adapter(env: Env, adapter: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
         if Self::active_escrows(&env) != 0 {
             return Err(Error::ActiveEscrowsRemain);
         }
@@ -285,6 +314,9 @@ impl YieldEscrow {
     /// and `Error::ActiveEscrowsRemain` if changing strategy addresses while escrows are open.
     pub fn set_strategies(env: Env, strategies: Vec<StrategyAllocation>) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
         if Self::active_escrows(&env) != 0 {
             let current = Self::get_strategies(env.clone());
             if !Self::same_strategy_addresses(&current, &strategies) {
@@ -311,6 +343,9 @@ impl YieldEscrow {
     /// Registers or updates a strategy in the portfolio with a target weight. Admin only.
     pub fn register_strategy(env: Env, strategy: Address, weight_bps: u32) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
         if weight_bps == 0 || weight_bps > (BPS_DENOMINATOR as u32) {
             return Err(Error::InvalidWeights);
         }
@@ -384,6 +419,9 @@ impl YieldEscrow {
     /// Sets the rebalance threshold in basis points. Admin only.
     pub fn set_rebalance_threshold(env: Env, threshold_bps: u32) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
         if threshold_bps > (BPS_DENOMINATOR as u32) {
             return Err(Error::InvalidThreshold);
         }
@@ -408,6 +446,9 @@ impl YieldEscrow {
     /// by more than the configured rebalance threshold.
     pub fn check_rebalance_needed(env: Env, token: Address) -> Result<bool, Error> {
         Self::require_initialized(&env)?;
+        if Self::is_emergency_mode(env.clone()) {
+            return Ok(false);
+        }
         let strategies = Self::get_strategies(env.clone());
         if strategies.len() <= 1 {
             return Ok(false);
@@ -449,6 +490,9 @@ impl YieldEscrow {
     /// withdrawals from excess strategies followed by deposits into deficit strategies.
     pub fn rebalance(env: Env, token: Address) -> Result<(), Error> {
         Self::require_initialized(&env)?;
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
         let strategies = Self::get_strategies(env.clone());
         let num_strats = strategies.len();
         if num_strats <= 1 {
@@ -570,6 +614,9 @@ impl YieldEscrow {
         beneficiary_interest_bps: u32,
     ) -> Result<(), Error> {
         Self::require_initialized(&env)?;
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -589,6 +636,7 @@ impl YieldEscrow {
         let contract = env.current_contract_address();
         let strategies = Self::get_strategies(env.clone());
         let mut yield_state = Self::update_yield_state(&env, &token)?;
+        Self::record_token(&env, &token);
 
         // Move the principal into this contract, then supply across strategies
         token::Client::new(&env, &token).transfer(&payer, &contract, &amount);
@@ -699,8 +747,39 @@ impl YieldEscrow {
         if !record.is_active() {
             return Err(Error::EscrowNotActive);
         }
-        if env.ledger().sequence() < record.release_ledger {
+
+        let is_emergency = Self::is_emergency_mode(env.clone());
+        if !is_emergency && env.ledger().sequence() < record.release_ledger {
             return Err(Error::NotYetReleasable);
+        }
+
+        if is_emergency {
+            let contract = env.current_contract_address();
+            let token_client = token::Client::new(&env, &record.token);
+            let vault_bal = token_client.balance(&contract);
+            let payout = core::cmp::min(vault_bal, record.principal);
+            if payout > 0 {
+                token_client.transfer(&contract, &record.beneficiary, &payout);
+            }
+
+            record.released = true;
+            Self::remove_active_principal_internal(&env, &record.token, record.principal, true)?;
+            env.storage().persistent().set(&key, &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, ESCROW_THRESHOLD, ESCROW_BUMP);
+            Self::sub_active(&env)?;
+
+            env.events().publish(
+                (symbol_short!("released"), escrow_id),
+                (payout, 0_i128, payout, 0_i128),
+            );
+            return Ok(ReleaseOutcome {
+                principal: payout,
+                interest: 0,
+                to_beneficiary: payout,
+                to_payer: 0,
+            });
         }
 
         let yield_state = Self::update_yield_state(&env, &record.token)?;
@@ -741,15 +820,15 @@ impl YieldEscrow {
         })
     }
 
-    /// Refunds an escrow to its payer before the release deadline. Payer only.
+    /// Refunds an escrow to its payer. Payer only.
     ///
-    /// Any interest accrued up to this point is refunded with the principal,
-    /// since the payer carried the position risk.
+    /// In normal mode, only callable before the release deadline.
+    /// In `EmergencyVaultMode`, callable anytime to recover available principal liquidity.
     ///
     /// # Errors
     /// Returns `Error::EscrowNotFound` for an unknown id,
     /// `Error::EscrowNotActive` when the position was already settled and
-    /// `Error::StillLocked` once the deadline has passed.
+    /// `Error::StillLocked` once the deadline has passed (in normal mode).
     pub fn cancel(env: Env, escrow_id: u64) -> Result<ReleaseOutcome, Error> {
         Self::require_initialized(&env)?;
         let key = DataKey::Escrow(escrow_id);
@@ -761,10 +840,41 @@ impl YieldEscrow {
         if !record.is_active() {
             return Err(Error::EscrowNotActive);
         }
-        if env.ledger().sequence() >= record.release_ledger {
+
+        let is_emergency = Self::is_emergency_mode(env.clone());
+        if !is_emergency && env.ledger().sequence() >= record.release_ledger {
             return Err(Error::StillLocked);
         }
         record.payer.require_auth();
+
+        if is_emergency {
+            let contract = env.current_contract_address();
+            let token_client = token::Client::new(&env, &record.token);
+            let vault_bal = token_client.balance(&contract);
+            let refund = core::cmp::min(vault_bal, record.principal);
+            if refund > 0 {
+                token_client.transfer(&contract, &record.payer, &refund);
+            }
+
+            record.cancelled = true;
+            Self::remove_active_principal_internal(&env, &record.token, record.principal, true)?;
+            env.storage().persistent().set(&key, &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, ESCROW_THRESHOLD, ESCROW_BUMP);
+            Self::sub_active(&env)?;
+
+            env.events().publish(
+                (symbol_short!("cancelled"), escrow_id),
+                (refund, 0_i128, refund),
+            );
+            return Ok(ReleaseOutcome {
+                principal: refund,
+                interest: 0,
+                to_beneficiary: 0,
+                to_payer: refund,
+            });
+        }
 
         let yield_state = Self::update_yield_state(&env, &record.token)?;
         let (principal, harvested) = Self::redeem_position(&env, &record)?;
@@ -799,6 +909,168 @@ impl YieldEscrow {
             to_beneficiary: 0,
             to_payer: refund,
         })
+    }
+
+    // ── Emergency Circuit Breaker ────────────────────────────────────────
+
+    /// Unwinds strategy shares from external yield protocols back into contract vault custody.
+    ///
+    /// Multi-sig admin authorization required.
+    /// Reverts if recovered token amount is less than `min_recovered_amount` (slippage bound).
+    /// Switches contract mode to `EmergencyVaultMode` permitting user withdrawals of available liquidity,
+    /// and halts further deposits.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` before initialization,
+    /// `Error::InvalidAmount` if `min_recovered_amount < 0`,
+    /// `Error::EmergencyModeActive` if already in emergency mode,
+    /// and `Error::SlippageExceeded` if total recovered token amount is less than `min_recovered_amount`.
+    pub fn emergency_unwind_strategy(env: Env, min_recovered_amount: i128) -> Result<i128, Error> {
+        Self::require_initialized(&env)?;
+        let admin = Self::require_admin(&env)?;
+        if min_recovered_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
+
+        let strategies = Self::get_strategies(env.clone());
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Tokens)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total_recovered: i128 = 0;
+        for token in tokens.iter() {
+            let recovered = Self::unwind_token_from_strategies(&env, &token, &strategies)?;
+            total_recovered = total_recovered
+                .checked_add(recovered)
+                .ok_or(Error::MathOverflow)?;
+        }
+
+        if total_recovered < min_recovered_amount {
+            return Err(Error::SlippageExceeded);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyVaultMode, &true);
+
+        for token in tokens.iter() {
+            if let Some(mut state) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, YieldState>(&DataKey::YieldState(token.clone()))
+            {
+                state.rate_bps = 0;
+                state.updated_at = env.ledger().timestamp();
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::YieldState(token.clone()), &state);
+            }
+        }
+
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("unwind"), admin),
+            (total_recovered, min_recovered_amount),
+        );
+        Ok(total_recovered)
+    }
+
+    /// Unwinds strategy shares for a specific token into raw token vault custody with slippage bounds.
+    /// Admin authorization required.
+    pub fn emergency_unwind_token(
+        env: Env,
+        token: Address,
+        min_recovered_amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_initialized(&env)?;
+        let admin = Self::require_admin(&env)?;
+        if min_recovered_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeActive);
+        }
+
+        Self::record_token(&env, &token);
+        let strategies = Self::get_strategies(env.clone());
+        let recovered = Self::unwind_token_from_strategies(&env, &token, &strategies)?;
+
+        if recovered < min_recovered_amount {
+            return Err(Error::SlippageExceeded);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyVaultMode, &true);
+
+        if let Some(mut state) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, YieldState>(&DataKey::YieldState(token.clone()))
+        {
+            state.rate_bps = 0;
+            state.updated_at = env.ledger().timestamp();
+            env.storage()
+                .persistent()
+                .set(&DataKey::YieldState(token.clone()), &state);
+        }
+
+        Self::bump_instance(&env);
+        env.events().publish(
+            (symbol_short!("unwind"), admin),
+            (recovered, min_recovered_amount),
+        );
+        Ok(recovered)
+    }
+
+    /// Permits a user (payer) to withdraw their principal from the available vault liquidity
+    /// while the contract is in `EmergencyVaultMode`.
+    pub fn emergency_withdraw_principal(env: Env, escrow_id: u64) -> Result<i128, Error> {
+        Self::require_initialized(&env)?;
+        if !Self::is_emergency_mode(env.clone()) {
+            return Err(Error::EmergencyModeNotActive);
+        }
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EscrowNotFound)?;
+        if !record.is_active() {
+            return Err(Error::EscrowNotActive);
+        }
+        record.payer.require_auth();
+
+        let contract = env.current_contract_address();
+        let token_client = token::Client::new(&env, &record.token);
+        let vault_bal = token_client.balance(&contract);
+        let payout = core::cmp::min(vault_bal, record.principal);
+        if payout <= 0 {
+            return Err(Error::InsufficientLiquidity);
+        }
+
+        token_client.transfer(&contract, &record.payer, &payout);
+        record.cancelled = true;
+        Self::remove_active_principal_internal(&env, &record.token, record.principal, true)?;
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_THRESHOLD, ESCROW_BUMP);
+        Self::sub_active(&env)?;
+
+        env.events()
+            .publish((symbol_short!("em_wdr"), escrow_id), (record.payer, payout));
+        Ok(payout)
+    }
+
+    /// Alias for `emergency_withdraw_principal`.
+    pub fn emergency_withdraw(env: Env, escrow_id: u64) -> Result<i128, Error> {
+        Self::emergency_withdraw_principal(env, escrow_id)
     }
 
     // ── Views ────────────────────────────────────────────────────────────
@@ -839,6 +1111,28 @@ impl YieldEscrow {
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         VERSION
+    }
+
+    /// Returns true if the contract is in `EmergencyVaultMode`.
+    pub fn is_emergency_mode(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyVaultMode)
+            .unwrap_or(false)
+    }
+
+    /// Returns the current operating mode of the contract.
+    pub fn get_vault_mode(env: Env) -> VaultMode {
+        if Self::is_emergency_mode(env) {
+            VaultMode::EmergencyVaultMode
+        } else {
+            VaultMode::Normal
+        }
+    }
+
+    /// Returns the raw token balance held directly in the contract vault.
+    pub fn get_vault_balance(env: Env, token: Address) -> i128 {
+        token::Client::new(&env, &token).balance(&env.current_contract_address())
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -1039,7 +1333,60 @@ impl YieldEscrow {
             .ok_or(Error::MathOverflow)
     }
 
+    fn record_token(env: &Env, token: &Address) {
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Tokens)
+            .unwrap_or_else(|| Vec::new(env));
+        for t in tokens.iter() {
+            if t == *token {
+                return;
+            }
+        }
+        tokens.push_back(token.clone());
+        env.storage().instance().set(&DataKey::Tokens, &tokens);
+    }
+
+    fn unwind_token_from_strategies(
+        env: &Env,
+        token: &Address,
+        strategies: &Vec<StrategyAllocation>,
+    ) -> Result<i128, Error> {
+        let contract = env.current_contract_address();
+        let token_client = token::Client::new(env, token);
+        let before_bal = token_client.balance(&contract);
+
+        for strat in strategies.iter() {
+            let bal = LendingProtocolClient::new(env, &strat.address).get_balance(token);
+            if bal > 0 {
+                LendingProtocolClient::new(env, &strat.address).withdraw(&contract, token, &bal);
+            }
+            let _ = LendingProtocolClient::new(env, &strat.address).harvest(&contract, token);
+        }
+
+        let after_bal = token_client.balance(&contract);
+        let recovered = after_bal
+            .checked_sub(before_bal)
+            .ok_or(Error::MathOverflow)?;
+        Ok(recovered)
+    }
+
     fn remove_active_principal(env: &Env, token: &Address, principal: i128) -> Result<(), Error> {
+        Self::remove_active_principal_internal(
+            env,
+            token,
+            principal,
+            Self::is_emergency_mode(env.clone()),
+        )
+    }
+
+    fn remove_active_principal_internal(
+        env: &Env,
+        token: &Address,
+        principal: i128,
+        is_emergency: bool,
+    ) -> Result<(), Error> {
         let key = DataKey::YieldState(token.clone());
         let mut state: YieldState = env
             .storage()
@@ -1050,9 +1397,13 @@ impl YieldEscrow {
             .total_principal
             .checked_sub(principal)
             .ok_or(Error::MathOverflow)?;
-        state.rate_bps = Self::get_weighted_yield_rate(env, token)?;
-        if state.rate_bps > 100_000 {
-            return Err(Error::InvalidYieldRate);
+        if is_emergency {
+            state.rate_bps = 0;
+        } else {
+            state.rate_bps = Self::get_weighted_yield_rate(env, token)?;
+            if state.rate_bps > 100_000 {
+                return Err(Error::InvalidYieldRate);
+            }
         }
         env.storage().persistent().set(&key, &state);
         env.storage()

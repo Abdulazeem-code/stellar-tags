@@ -15,23 +15,14 @@ change when the oracle evolves.
 | --- | --- |
 | `initialize(admin)` | One-time setup. Records the admin allowed to write observations. Requires `admin` authorization. |
 | `admin()` | Returns the configured admin, if initialized. |
-| `observe(price, timestamp)` | Appends an observation and returns the retained count. Admin-only. |
-| `observation_count()` | Number of retained observations. |
-| `latest_observation()` | Most recent observation, if any. |
-| `observations()` | All retained observations, oldest first. |
-| `twap(window_seconds)` | Time-weighted average price over the window ending at the latest observation. |
-| `set_secondary_oracle(address)` | Registers secondary oracle price feed address in persistent storage. Admin-only. |
-| `secondary_oracle()` | Returns the secondary oracle address, if registered. |
-| `set_max_divergence_bps(bps)` | Sets divergence threshold (e.g. 500 bps = 5%). Admin-only. |
-| `max_divergence_bps()` | Returns current max divergence threshold (default: 500 bps). |
-| `set_staleness_threshold(secs)` | Sets observation staleness threshold in seconds. Admin-only. |
-| `staleness_threshold()` | Returns observation staleness limit (default: 3,600s). |
-| `set_consensus_weights(w1, w2)` | Sets weighted consensus weights for primary and secondary feeds. Admin-only. |
-| `consensus_weights()` | Returns consensus weights (default: 5000 / 5000). |
-| `is_circuit_breaker_tripped()` | Returns whether discrepancy circuit breaker is currently tripped. |
-| `trip_circuit_breaker()` | Manually trips circuit breaker to freeze swaps. Admin-only. |
-| `reset_circuit_breaker()` | Resets tripped circuit breaker. Admin-only. |
-| `consult(window_seconds)` | Dual-source oracle consensus query with dynamic discrepancy circuit breaker and fallback. |
+| `set_max_staleness(base, quote, max_staleness_seconds)` | Configures max staleness threshold for a specific token pair. Admin-only. |
+| `get_max_staleness(base, quote)` | Returns configured max staleness for a pair, defaulting to 3600 seconds. |
+| `observe(base, quote, price, timestamp)` | Appends an observation for a pair and returns the retained count. Admin-only. |
+| `observation_count(base, quote)` | Number of retained observations for a pair. |
+| `latest_observation(base, quote)` | Most recent observation for a pair, if any. |
+| `observations(base, quote)` | All retained observations for a pair, oldest first. |
+| `twap(base, quote, window_seconds)` | Time-weighted average price for a pair over the window ending at the latest observation. |
+| `consult(base, quote, window_seconds)` | TWAP price for a pair over the window, enforcing heartbeat freshness check (`Error::PriceStale`). |
 
 Prices are `i128` in whatever unit the caller uses (for example, stroops of a
 reference asset). No scaling is applied by the contract.
@@ -67,16 +58,6 @@ twap = (cumulative_at_latest - cumulative_at_target) / window
 where `target = latest.timestamp - window`, and `cumulative_at_target` is
 interpolated inside the segment that contains `target`. The result is truncated
 toward zero (integer division).
-
-## Dual-Source Consensus & Circuit Breaker
-
-The oracle provides a dual-source consensus engine to protect downstream contracts (e.g. `payment_router`) if the primary on-chain AMM pool halts or prices go stale:
-
-* **Secondary Oracle Registration.** The admin registers a secondary price feed contract address stored persistently on-chain.
-* **Dual-Feed Staleness Checks.** `consult(window_seconds)` checks timestamps against `staleness_threshold` (default 3,600s).
-* **Consensus Pricing.** If both primary and secondary feeds are fresh and within `max_divergence_bps` (default 500 bps = 5%), `consult` returns the weighted average (default 50/50, configurable via `set_consensus_weights`).
-* **Fallback Switchover.** If the primary feed exceeds the staleness threshold, `consult` falls back to the secondary feed and emits an `(oracle, fallback)` warning event.
-* **Dynamic Discrepancy Circuit Breaker.** If price discrepancy exceeds `max_divergence_bps` (500 bps), `consult` rejects the call with `Error::CircuitBreakerTripped` instead of serving a price. A rejected invocation is rolled back in full, so the trip itself cannot be persisted from that call: to freeze pricing until an admin resets it, trip the breaker in its own transaction with `trip_circuit_breaker`, and clear it with `reset_circuit_breaker`.
 
 ## Building and testing
 

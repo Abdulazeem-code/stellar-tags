@@ -19,6 +19,7 @@ const ACTIVITY_ACTIONS = {
   USER_RESTORED: 'user.restored',
   WEBHOOK_CREATED: 'webhook.created',
   WEBHOOK_DELETED: 'webhook.deleted',
+  WEBHOOK_CIRCUIT_BREAKER_OPEN: 'webhook.circuit_breaker_open',
 };
 
 const MAX_METADATA_BYTES = 2 * 1024;
