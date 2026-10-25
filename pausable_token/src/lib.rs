@@ -24,6 +24,7 @@ pub enum DataKey {
     Liquidator,
     Allowance(Address, Address),
     PermitNonce(Address),
+    FrozenUntil(Address),
 }
 
 #[contracttype]
@@ -237,6 +238,9 @@ impl PausableToken {
             env.storage()
                 .persistent()
                 .remove(&DataKey::Frozen(account.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::FrozenUntil(account.clone()));
         }
         let topic = if frozen {
             symbol_short!("frozen")
@@ -256,140 +260,64 @@ impl PausableToken {
         Self::set_frozen(env, account, false)
     }
 
-    /// Returns true when the account's Transferable partition is under
-    /// regulatory freeze. CollateralLocked funds remain reachable by the
-    /// registered liquidator.
-    pub fn is_partition_frozen(env: Env, account: Address) -> bool {
-        Self::is_partition_frozen_internal(&env, &account)
-    }
-
-    /// Regulatory freeze: locks the account's Transferable partition.
-    ///
-    /// User-initiated movement (transfer, transfer_from, burn, burn_from,
-    /// approve, permit, lock_collateral) is blocked; the registered
-    /// liquidator can still unwind the CollateralLocked partition.
-    pub fn freeze_partition(env: Env, account: Address) -> Result<(), Error> {
-        Self::set_partition_frozen(env, account, true)
-    }
-
-    pub fn unfreeze_partition(env: Env, account: Address) -> Result<(), Error> {
-        Self::set_partition_frozen(env, account, false)
-    }
-
-    fn set_partition_frozen(env: Env, account: Address, frozen: bool) -> Result<(), Error> {
+    pub fn freeze_account_until(
+        env: Env,
+        account: Address,
+        until_timestamp: u64,
+    ) -> Result<(), Error> {
         let admin = Self::require_admin_auth(&env)?;
-        if frozen {
-            let key = DataKey::PartitionFrozen(account.clone());
-            env.storage().persistent().set(&key, &true);
-            Self::bump_user(&env, &key);
-        } else {
+        if until_timestamp <= env.ledger().timestamp() {
             env.storage()
                 .persistent()
-                .remove(&DataKey::PartitionFrozen(account.clone()));
-        }
-        let topic = if frozen {
-            symbol_short!("frzpart")
+                .remove(&DataKey::FrozenUntil(account.clone()));
+            env.events().publish(
+                (symbol_short!("unfreeze"), admin, account),
+                env.ledger().sequence(),
+            );
         } else {
-            symbol_short!("unfrzpart")
-        };
-        env.events()
-            .publish((topic, admin, account), env.ledger().sequence());
+            let key = DataKey::FrozenUntil(account.clone());
+            env.storage().persistent().set(&key, &until_timestamp);
+            Self::bump_user(&env, &key);
+            env.events().publish(
+                (symbol_short!("frz_until"), admin, account),
+                until_timestamp,
+            );
+        }
         Ok(())
     }
 
-    /// Amount of the account's balance held in the CollateralLocked
-    /// partition.
-    pub fn collateral_locked(env: Env, account: Address) -> i128 {
-        Self::read_collateral_locked(&env, &account)
-    }
-
-    /// Balance minus collateral locked — the part a partition-frozen account
-    /// may not move.
-    pub fn transferable_balance(env: Env, account: Address) -> i128 {
-        Self::read_transferable(&env, &account)
-    }
-
-    /// Moves `amount` from the Transferable partition into CollateralLocked.
-    ///
-    /// Requires the account's own authorization, and is blocked while the
-    /// Transferable partition is frozen so a sanctioned account cannot keep
-    /// reshuffling funds.
-    pub fn lock_collateral(env: Env, account: Address, amount: i128) -> Result<(), Error> {
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        account.require_auth();
-        if Self::is_paused_internal(&env) {
-            return Err(Error::Paused);
-        }
-        if Self::is_partition_frozen_internal(&env, &account) {
-            return Err(Error::AccountFrozen);
-        }
-        if Self::read_transferable(&env, &account) < amount {
-            return Err(Error::InsufficientTransferable);
-        }
-        let key = DataKey::CollateralLocked(account.clone());
-        let current = Self::read_collateral_locked(&env, &account);
-        env.storage().persistent().set(&key, &(current + amount));
-        Self::bump_user(&env, &key);
-        env.events()
-            .publish((symbol_short!("lockcol"), account), amount);
-        Ok(())
-    }
-
-    /// Admin: register the settlement/liquidation contract allowed to unwind
-    /// locked collateral regardless of pause or freeze state.
-    pub fn set_liquidator(env: Env, liquidator: Address) -> Result<(), Error> {
+    pub fn cancel_freeze(env: Env, account: Address) -> Result<(), Error> {
         let admin = Self::require_admin_auth(&env)?;
         env.storage()
-            .instance()
-            .set(&DataKey::Liquidator, &liquidator);
-        Self::bump_instance(&env);
+            .persistent()
+            .remove(&DataKey::Frozen(account.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FrozenUntil(account.clone()));
         env.events().publish(
-            (symbol_short!("liquidatr"), admin, liquidator),
+            (symbol_short!("unfreeze"), admin, account),
             env.ledger().sequence(),
         );
         Ok(())
     }
 
-    /// Settlement hook: debits `amount` of `from`'s CollateralLocked
-    /// partition and credits it to `to`.
-    ///
-    /// Deliberately bypasses the pause and both freeze flags so
-    /// collateralized positions can always be unwound.
-    pub fn liquidate(
-        env: Env,
-        liquidator: Address,
-        from: Address,
-        to: Address,
-        amount: i128,
-    ) -> Result<(), Error> {
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        let registered: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Liquidator)
-            .ok_or(Error::NotRegisteredLiquidator)?;
-        if registered != liquidator {
-            return Err(Error::NotRegisteredLiquidator);
-        }
-        liquidator.require_auth();
-        if Self::read_collateral_locked(&env, &from) < amount {
-            return Err(Error::InsufficientBalance);
-        }
-        // Debit the total balance and the locked partition by the same
-        // amount so the ledger supply stays balanced after the move to `to`.
-        Self::debit(&env, &from, amount)?;
-        let key = DataKey::CollateralLocked(from.clone());
-        let locked = Self::read_collateral_locked(&env, &from);
-        env.storage().persistent().set(&key, &(locked - amount));
-        Self::bump_user(&env, &key);
-        Self::credit(env.clone(), &to, amount);
-        env.events()
-            .publish((symbol_short!("liquidate"), from, to), amount);
+    pub fn cancel_freeze_until(env: Env, account: Address) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FrozenUntil(account.clone()));
+        env.events().publish(
+            (symbol_short!("unfreeze"), admin, account),
+            env.ledger().sequence(),
+        );
         Ok(())
+    }
+
+    pub fn frozen_until(env: Env, account: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FrozenUntil(account))
+            .unwrap_or(0)
     }
 
     pub fn total_supply(env: Env) -> i128 {
@@ -616,10 +544,24 @@ impl PausableToken {
     }
 
     fn is_frozen_internal(env: &Env, account: &Address) -> bool {
-        env.storage()
+        if env
+            .storage()
             .persistent()
             .get(&DataKey::Frozen(account.clone()))
             .unwrap_or(false)
+        {
+            return true;
+        }
+
+        if let Some(frozen_until) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::FrozenUntil(account.clone()))
+        {
+            return env.ledger().timestamp() < frozen_until;
+        }
+
+        false
     }
 
     fn is_partition_frozen_internal(env: &Env, account: &Address) -> bool {
