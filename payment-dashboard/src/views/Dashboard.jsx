@@ -6,6 +6,7 @@ import ConnectPrompt from '../components/ConnectPrompt';
 import RecentAddresses from '../components/RecentAddresses';
 import { useRecentAddresses } from '../useRecentAddresses';
 import { signTransaction } from '../lib/wallets';
+import { SOROBAN_RPC, submitAndWait } from '../lib/soroban';
 import { dailyVolume, fetchAccountPayments, relativeTime } from '../lib/payments';
 import {
   API_BASE,
@@ -18,7 +19,6 @@ import {
   resolveRecipient,
 } from './shared';
 
-const SOROBAN_RPC = 'https://soroban-testnet.stellar.org';
 const QUICK_AMOUNTS = [10, 50, 100, 250];
 
 function splitBalance(value) {
@@ -141,8 +141,14 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
       const amountStroops = BigInt(Math.floor(amountValue * 10000000));
 
       // Build and simulate the payment through the type-safe client generated
-      // from the contract ABI (packages/types).
-      const client = new PaymentRouterClient({ ...networks.testnet, rpcUrl: SOROBAN_RPC });
+      // from the contract ABI (packages/types). The sender has to be the
+      // transaction source: without publicKey the SDK builds the transaction
+      // from a placeholder account and the network rejects it.
+      const client = new PaymentRouterClient({
+        ...networks.testnet,
+        rpcUrl: SOROBAN_RPC,
+        publicKey: userPublicKey,
+      });
 
       let assembledTransaction;
       try {
@@ -153,7 +159,14 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
           amount: amountStroops,
         });
       } catch (err) {
+        if (/account not found/i.test(err?.message || '')) {
+          throw new Error('Your account does not exist on testnet yet. Fund it with Friendbot first.', { cause: err });
+        }
         throw new Error(`Simulation failed: ${err.message}`, { cause: err });
+      }
+      if (assembledTransaction.result?.isErr?.()) {
+        const reason = assembledTransaction.result.unwrapErr()?.message;
+        throw new Error(`The payment_router contract refused this payment${reason ? `: ${reason}` : '.'}`);
       }
 
       toast.loading('Approve the transaction in your wallet...', { id: toastId });
@@ -164,26 +177,9 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
         throw new Error(`Wallet signature failed: ${err?.message || 'rejected'}`, { cause: err });
       }
 
-      toast.loading('Submitting to Stellar testnet...', { id: toastId });
-      const rpcResponse = await fetch(SOROBAN_RPC, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'sendTransaction',
-          params: { transaction: signedXdr },
-        }),
-      });
-      const rpcData = await rpcResponse.json();
-      if (rpcData.error) throw new Error(`RPC error: ${rpcData.error.message}`);
+      toast.loading('Waiting for the ledger to confirm...', { id: toastId });
+      const txHash = await submitAndWait(signedXdr, networks.testnet.networkPassphrase);
 
-      const txStatus = rpcData.result?.status;
-      if (txStatus !== 'PENDING' && txStatus !== 'SUCCESS') {
-        throw new Error(`The network rejected the transaction: ${txStatus || 'unknown'}`);
-      }
-
-      const txHash = rpcData.result?.hash;
       const explorerUrl = txHash ? `https://stellar.expert/explorer/testnet/tx/${txHash}` : null;
       toast.success(
         (t) => (

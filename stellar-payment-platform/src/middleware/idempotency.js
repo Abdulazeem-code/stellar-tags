@@ -157,7 +157,9 @@ async function acquireRedlock(clients, lockKey, lockValue, ttlMs, options = {}) 
           if (parsed.state === 'complete') {
             return { acquired: false, existing: parsed };
           }
-        } catch (_) {}
+        } catch (_err) {
+          // Ignore invalid JSON payload in pending lock check
+        }
       }
 
       const jitter = Math.floor(Math.random() * retryJitter);
@@ -175,7 +177,9 @@ async function acquireRedlock(clients, lockKey, lockValue, ttlMs, options = {}) 
   if (stored) {
     try {
       existing = JSON.parse(stored);
-    } catch (_) {}
+    } catch (_err) {
+      // Ignore unparseable stored value
+    }
   }
 
   return { acquired: false, existing };

@@ -50,12 +50,18 @@ pub enum Role {
     /// from the broader compliance role so the ability to halt routing can be
     /// delegated narrowly.
     Pauser = 5,
+    /// Security officer with authority over security policies and freeze operations.
+    SecurityOfficer = 6,
+    /// Upgrade manager with authority over contract code upgrades and migrations.
+    UpgradeManager = 7,
 }
 
 /// Storage keys for all contract instance and persistent data.
 #[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// The designated primary address holding a given role.
+    Role(Role),
     /// The current admin address.
     Admin,
     /// Governance contract address; if set, it takes over fee-authority from the admin.

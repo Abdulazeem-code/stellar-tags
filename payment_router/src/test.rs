@@ -5105,9 +5105,7 @@ fn test_operator_renews_heartbeat_resets_dms_clock() {
     // Advance past the new timeout.
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
 
-    // Now the backup can initiate a claim, then finalize it after the grace period.
-    client.claim_admin(&backup);
-    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
+    // Now the backup can claim.
     client.claim_admin(&backup);
     assert_eq!(client.get_admin(), Some(backup));
 }
