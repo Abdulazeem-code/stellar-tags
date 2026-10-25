@@ -143,7 +143,10 @@ pub enum Error {
     InvalidSignature = 11,
     InvalidNonce = 12,
     PermitDeadlineTooFar = 13,
-    ComplianceCheckFailed = 14,
+    InsufficientTransferable = 14,
+    NotRegisteredLiquidator = 15,
+    AllowanceExpired = 16,
+    ComplianceCheckFailed = 17,
 }
 
 #[contract]
