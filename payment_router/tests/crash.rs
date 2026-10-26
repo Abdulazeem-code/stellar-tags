@@ -1,5 +1,5 @@
 #![cfg(all(test, feature = "testutils"))]
-use payment_router::{Payment, PaymentRouter, PaymentRouterClient};
+use payment_router::{Memo, Payment, PaymentRouter, PaymentRouterClient};
 use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
 #[test]

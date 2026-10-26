@@ -5016,6 +5016,7 @@ fn test_tiered_circuit_breaker_swaps_only_blocks_swap_not_direct() {
         recipient: recipient.clone(),
         token_address: token_addr.clone(),
         amount: 100_000,
+        memo: Memo::None,
     };
 
     // Direct payment MUST succeed under SwapsOnly.
@@ -5082,6 +5083,7 @@ fn test_tiered_circuit_breaker_full_halt_blocks_all_and_clear_restores() {
         recipient: recipient.clone(),
         token_address: token_addr.clone(),
         amount: 100_000,
+        memo: Memo::None,
     };
 
     // Direct payment must also fail at FullHalt.
