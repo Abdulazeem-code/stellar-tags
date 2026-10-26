@@ -123,7 +123,7 @@ fn short_repayment_reverts_every_transfer() {
     let (env, provider_id, provider, borrower, token, asset) = setup();
     let initiator = Address::generate(&env);
     asset.mint(&provider_id, &100_000);
-    asset.mint(&borrower, &5);
+    asset.mint(&borrower, &6);
 
     let result = provider.try_flash_loan(
         &initiator,
@@ -135,7 +135,7 @@ fn short_repayment_reverts_every_transfer() {
 
     assert!(result.is_err());
     assert_eq!(token.balance(&provider_id), 100_000);
-    assert_eq!(token.balance(&borrower), 5);
+    assert_eq!(token.balance(&borrower), 6);
 
     // A failed invocation rolls back its lock, so a later valid loan can run.
     provider.flash_loan(
@@ -145,7 +145,7 @@ fn short_repayment_reverts_every_transfer() {
         &10_000,
         &Bytes::new(&env),
     );
-    assert_eq!(token.balance(&provider_id), 100_005);
+    assert_eq!(token.balance(&provider_id), 100_006);
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn recursive_flash_loan_is_rejected_and_outer_loan_completes() {
     let initiator = Address::generate(&env);
 
     asset.mint(&provider_id, &100_000);
-    asset.mint(&borrower_id, &5);
+    asset.mint(&borrower_id, &6);
 
     provider.flash_loan(
         &initiator,
@@ -174,7 +174,7 @@ fn recursive_flash_loan_is_rejected_and_outer_loan_completes() {
     );
 
     assert!(borrower.reentrancy_rejected());
-    assert_eq!(token.balance(&provider_id), 100_005);
+    assert_eq!(token.balance(&provider_id), 100_006);
     assert_eq!(token.balance(&borrower_id), 0);
 }
 

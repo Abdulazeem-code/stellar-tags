@@ -72,7 +72,6 @@ impl FlashLoanProvider {
 
         initiator.require_auth();
 
-        let fee = Self::calculate_fee(amount)?;
         let provider = env.current_contract_address();
         let token_client = token::Client::new(&env, &token_address);
         env.storage()
