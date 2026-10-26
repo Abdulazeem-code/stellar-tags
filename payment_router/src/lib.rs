@@ -269,7 +269,7 @@ impl PaymentRouter {
     }
 
     /// Returns the configured swap slippage ceiling in basis points.
-    pub(crate) fn max_slippage_bps(env: &Env) -> i128 {
+    fn max_slippage_bps(env: &Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::MaxSlippageBps)
@@ -3260,9 +3260,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
