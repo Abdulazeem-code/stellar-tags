@@ -7,6 +7,15 @@ const { context, propagation, trace } = require('@opentelemetry/api');
 const { internalFetch } = require('./utils/internalClient');
 const { routeToDlq, isDlqAvailable, DLQ_QUEUE_NAME } = require('./dlq');
 const { prisma } = require('../prismaClient');
+const {
+  getDestinationDomain,
+  canQueueDelivery,
+  acquireProbeSlot,
+  handleDeliverySuccess,
+  handleDeliveryFailure,
+  consumeToken,
+  calculateExponentialBackoff,
+} = require('./services/webhookService');
 
 /** Reads a positive integer env var, falling back when unset or malformed. */
 const parseEnvInt = (value, fallback) => {
@@ -208,11 +217,26 @@ const markWebhookFailure = async (prisma, webhookId, now) => {
 const processWebhookJobImpl = async (job, { prisma }) => {
   const { webhook, payload } = job.data;
   const now = new Date();
-  const attemptNumber = job.attemptsMade + 1;
+const attemptNumber = (job.attemptsMade || 0) + 1;
+  const domain = getDestinationDomain(webhook?.url);
+  const redisClient = workerConnection || queueConnection;
 
+  const rateLimit = await consumeToken(redisClient, domain);
+  if (!rateLimit.allowed) {
+    const backoff = calculateExponentialBackoff(job.attemptsMade || 0);
+    const delayMs = Math.min(rateLimit.retryAfterMs || 1000, backoff);
+    logger.warn(
+      `[webhook-worker] Rate limit exceeded for domain=${domain}; applying backpressure delay=${delayMs}ms`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  const startTime = Date.now();
   let result;
   try {
     result = await sendWebhook(webhook.url, payload, webhook.secret, webhook.id, webhook.username);
+    const latencyMs = Date.now() - startTime;
+
     await markWebhookSuccess(prisma, webhook.id, now);
     await recordWebhookDelivery({
       webhookId: webhook.id,
@@ -222,11 +246,36 @@ const processWebhookJobImpl = async (job, { prisma }) => {
       payload,
       status: 'success',
       responseCode: 200,
-      responseBody: result.responseBody,
+      responseBody: result?.responseBody,
       attemptNumber,
     });
+
+    await handleDeliverySuccess(redisClient, domain, latencyMs, {
+      prisma,
+      merchantUsername: webhook.username,
+    });
   } catch (error) {
-    await markWebhookFailure(prisma, webhook.id, now);
+    const latencyMs = Date.now() - startTime;
+
+    try {
+      await handleDeliveryFailure(redisClient, domain, error, latencyMs, {
+        prisma,
+        merchantUsername: webhook.username,
+      });
+    } catch (cbErr) {
+      logger.error(
+        `[webhook-worker] Failed to record circuit breaker failure for domain ${domain}: ${cbErr.message}`,
+      );
+    }
+
+    try {
+      await markWebhookFailure(prisma, webhook.id, now);
+    } catch (databaseError) {
+      logger.error(
+        `[webhook-worker] Failed to mark failure for webhook ${webhook.id}: ${databaseError.message}`,
+      );
+    }
+
     await recordWebhookDelivery({
       webhookId: webhook.id,
       username: webhook.username,
@@ -234,11 +283,12 @@ const processWebhookJobImpl = async (job, { prisma }) => {
       eventId: payload.event_id,
       payload,
       status: 'failed',
-      responseCode: error.responseCode,
+      responseCode: error.responseCode || 500,
       responseBody: error.responseBody,
       errorMessage: error.message,
       attemptNumber,
     });
+  } main
     throw error;
   }
 
@@ -342,7 +392,30 @@ const buildJobId = (webhookId, eventId) => {
   return crypto.createHash('sha256').update(`${webhookId}:${eventId}`).digest('hex');
 };
 
-const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
+const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue(), { isProbe = false, redis } = {}) => {
+  const domain = getDestinationDomain(webhook?.url);
+  const redisClient = redis || queueConnection;
+
+  if (!isProbe) {
+    const queueCheck = await canQueueDelivery(redisClient, domain);
+    if (!queueCheck.allowed) {
+      if (queueCheck.canProbe) {
+        const wonProbe = await acquireProbeSlot(redisClient, domain);
+        if (!wonProbe) {
+          logger.warn(
+            `[webhook-queue] Delivery queueing halted for webhook=${webhook.id} domain=${domain}: ${queueCheck.reason}`,
+          );
+          return null;
+        }
+      } else {
+        logger.warn(
+          `[webhook-queue] Delivery queueing halted for webhook=${webhook.id} domain=${domain}: ${queueCheck.reason}`,
+        );
+        return null;
+      }
+    }
+  }
+
   const otelContext = {};
   propagation.inject(context.active(), otelContext);
   return withRedisRetry(
