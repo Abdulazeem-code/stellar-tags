@@ -19,6 +19,7 @@ const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
 const { scheduleReconciliationJob, scheduleLedgerReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
+const { scheduleReceiptNotarizationJob } = require("./src/receipt-notarization-cron");
 const { correlationId } = require("./middleware/correlation");
 const dotenv = require("dotenv");
 const timeout = require("connect-timeout");
@@ -32,6 +33,7 @@ const {
   setDlqDepthSource,
 } = require("./src/metrics");
 const { closeDlqQueue, getDlqDepth, hasOpenDlqQueues } = require("./src/dlq");
+const { startDlqWorker, closeDlqWorker } = require("./src/dlqWorker");
 const {
   buildErrorHandler,
   notFoundHandler,
@@ -275,7 +277,8 @@ const isPrimitive = (v) =>
 const rejectNestedObjects = (req, res, next) => {
   // GraphQL variables are intentionally nested; field-level schema validation
   // replaces the flat-input guard used by the REST API.
-  if (req.path === "/graphql") return next();
+  // The receipt verification endpoint also needs to accept nested structures.
+  if (req.path === "/graphql" || req.path === "/v1/receipts/verify" || req.path === "/api/v1/receipts/verify") return next();
 
   const sources = [req.query, req.body];
   for (const source of sources) {
@@ -283,7 +286,7 @@ const rejectNestedObjects = (req, res, next) => {
       for (const val of Object.values(source)) {
         if (!isPrimitive(val)) {
           // Responds directly rather than delegating, so the middleware stays
-          // usable on its own ΓÇö the same way validateSchema behaves.
+          // usable on its own — the same way validateSchema behaves.
           return res
             .status(400)
             .json(
@@ -309,9 +312,14 @@ app.use("/graphql", graphQLMiddleware);
 scheduleCleanupJob(prisma);
 scheduleSoftDeletePurgeJob(prisma);
 scheduleReconciliationJob(prisma);
+// Background job initializations
+scheduleReceiptNotarizationJob(prisma);
+
 // Event-driven ledger reconciliation of stale PENDING payments (issue #933)
 scheduleLedgerReconciliationJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
+
+startDlqWorker();
 
 // RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
 
@@ -503,6 +511,11 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
         } catch (err) {
           logger.error(err, "Error closing the DLQ queues during shutdown:");
         }
+      }
+      try {
+        await closeDlqWorker();
+      } catch (err) {
+        logger.error(err, "Error closing the DLQ worker during shutdown:");
       }
       process.exit(0);
     });

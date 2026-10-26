@@ -8,7 +8,7 @@ const mockRedisQuit = jest.fn().mockResolvedValue(undefined);
 let mockWorkerProcessor;
 let mockWorkerOptions;
 
-jest.mock('bullmq', () => ({
+jest.mock("bullmq", () => ({
   Queue: jest.fn().mockImplementation(() => ({
     add: mockQueueAdd,
     on: mockQueueOn,
@@ -24,41 +24,44 @@ jest.mock('bullmq', () => ({
   }),
 }));
 
-jest.mock('../src/config/redis', () => ({
+jest.mock("../src/config/redis", () => ({
   createRedisConnection: jest.fn(() => ({ quit: mockRedisQuit })),
   // Real retry behaviour is covered in tests/redis-failover.test.js; the
   // passthrough here keeps the enqueue assertions focused on the BullMQ shape.
   withRedisRetry: jest.fn((operation) => operation()),
 }));
 
-const { Queue, Worker } = require('bullmq');
-const { withRedisRetry } = require('../src/config/redis');
+const { Queue, Worker } = require("bullmq");
+const { withRedisRetry } = require("../src/config/redis");
 const {
   dispatchPaymentWebhooks,
   enqueueWebhookDelivery,
   startWebhookWorker,
   closeWebhookQueue,
   processWebhookJob,
+  getWebhookConcurrencyLimit,
+  acquireWebhookSemaphore,
+  releaseWebhookSemaphore,
   MAX_WEBHOOK_ATTEMPTS,
   WEBHOOK_BACKOFF_DELAY_MS,
   WEBHOOK_QUEUE_NAME,
-} = require('../src/webhookWorker');
+} = require("../src/webhookWorker");
 
 const webhook = {
-  id: 'webhook-1',
-  username: 'merchant',
-  url: 'https://merchant.example/webhooks',
-  secret: 'secret',
+  id: "webhook-1",
+  username: "merchant",
+  url: "https://merchant.example/webhooks",
+  secret: "secret",
 };
 
 const payload = {
-  event: 'payment.received',
-  event_id: 'transaction-1-payment-1',
-  timestamp: '2026-08-25T12:00:00.000Z',
-  data: { amount: '10.00' },
+  event: "payment.received",
+  event_id: "transaction-1-payment-1",
+  timestamp: "2026-08-25T12:00:00.000Z",
+  data: { amount: "10.00" },
 };
 
-describe('webhook BullMQ delivery', () => {
+describe("webhook BullMQ delivery", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     global.fetch = jest.fn();
@@ -69,13 +72,13 @@ describe('webhook BullMQ delivery', () => {
     delete global.fetch;
   });
 
-  test('enqueues deliveries with five attempts and exponential backoff', async () => {
-    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+  test("enqueues deliveries with five attempts and exponential backoff", async () => {
+    const queue = { add: jest.fn().mockResolvedValue({ id: "job-1" }) };
 
     await enqueueWebhookDelivery(webhook, payload, queue);
 
     expect(queue.add).toHaveBeenCalledWith(
-      'deliver',
+      "deliver",
       expect.objectContaining({
         webhook,
         payload,
@@ -84,7 +87,7 @@ describe('webhook BullMQ delivery', () => {
       expect.objectContaining({
         attempts: MAX_WEBHOOK_ATTEMPTS,
         backoff: {
-          type: 'exponential',
+          type: "exponential",
           delay: WEBHOOK_BACKOFF_DELAY_MS,
         },
         jobId: expect.any(String),
@@ -93,7 +96,7 @@ describe('webhook BullMQ delivery', () => {
     expect(MAX_WEBHOOK_ATTEMPTS).toBe(5);
   });
 
-  test('worker throws failed deliveries so BullMQ retries them', async () => {
+  test("worker throws failed deliveries so BullMQ retries them", async () => {
     global.fetch.mockResolvedValue({ ok: false, status: 503 });
     const prisma = {
       webhook: {
@@ -102,18 +105,22 @@ describe('webhook BullMQ delivery', () => {
       },
     };
 
-    await expect(processWebhookJob(
-      { data: { webhook, payload }, attemptsMade: 0 },
-      { prisma,  },
-    )).rejects.toThrow('HTTP 503');
+    await expect(
+      processWebhookJob(
+        { data: { webhook, payload }, attemptsMade: 0 },
+        { prisma },
+      ),
+    ).rejects.toThrow("HTTP 503");
 
-    expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: webhook.id },
-      data: expect.objectContaining({ failingSince: expect.any(Date) }),
-    }));
+    expect(prisma.webhook.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: webhook.id },
+        data: expect.objectContaining({ failingSince: expect.any(Date) }),
+      }),
+    );
   });
 
-  test('worker marks a recovered webhook as successful', async () => {
+  test("worker marks a recovered webhook as successful", async () => {
     global.fetch.mockResolvedValue({ ok: true, status: 200 });
     const prisma = {
       webhook: {
@@ -123,17 +130,19 @@ describe('webhook BullMQ delivery', () => {
 
     await processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 2 },
-      { prisma,  },
+      { prisma },
     );
 
-    expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: webhook.id },
-      data: expect.objectContaining({ failingSince: null }),
-    }));
+    expect(prisma.webhook.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: webhook.id },
+        data: expect.objectContaining({ failingSince: null }),
+      }),
+    );
   });
 
-  test('delivery includes timestamp-bound Stellar headers alongside legacy ones', async () => {
-    const crypto = require('crypto');
+  test("delivery includes timestamp-bound Stellar headers alongside legacy ones", async () => {
+    const crypto = require("crypto");
     global.fetch.mockResolvedValue({ ok: true, status: 200 });
     const prisma = {
       webhook: {
@@ -143,31 +152,33 @@ describe('webhook BullMQ delivery', () => {
 
     await processWebhookJob(
       { data: { webhook, payload }, attemptsMade: 0 },
-      { prisma,  },
+      { prisma },
     );
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
     const [, options] = global.fetch.mock.calls[0];
     const rawBody = JSON.stringify(payload);
-    const expectedLegacy = crypto.createHmac('sha256', webhook.secret).update(rawBody).digest('hex');
+    const expectedLegacy = crypto
+      .createHmac("sha256", webhook.secret)
+      .update(rawBody)
+      .digest("hex");
     const expectedBound = crypto
-      .createHmac('sha256', webhook.secret)
+      .createHmac("sha256", webhook.secret)
       .update(`${payload.timestamp}.${rawBody}`)
-      .digest('hex');
+      .digest("hex");
 
     expect(options.headers).toMatchObject({
-      'X-Webhook-Signature': expectedLegacy,
-      'X-Stellar-Tags-Signature': expectedLegacy,
-      'X-Webhook-Timestamp': payload.timestamp,
-      'Stellar-Signature': expectedBound,
-      'Stellar-Timestamp': payload.timestamp,
+      "X-Webhook-Signature": expectedLegacy,
+      "X-Stellar-Tags-Signature": expectedLegacy,
+      "X-Webhook-Timestamp": payload.timestamp,
+      "Stellar-Signature": expectedBound,
+      "Stellar-Timestamp": payload.timestamp,
     });
   });
 
-  test('configures and starts a BullMQ webhook worker', () => {
+  test("configures and starts a BullMQ webhook worker", () => {
     const dependencies = {
       prisma: { webhook: {} },
-      
     };
 
     startWebhookWorker(dependencies);
@@ -177,63 +188,74 @@ describe('webhook BullMQ delivery', () => {
       expect.any(Function),
       expect.objectContaining({ concurrency: 5 }),
     );
-    expect(mockWorkerOptions.connection).toEqual(expect.objectContaining({ quit: mockRedisQuit }));
+    expect(mockWorkerOptions.connection).toEqual(
+      expect.objectContaining({ quit: mockRedisQuit }),
+    );
     expect(mockWorkerProcessor).toEqual(expect.any(Function));
   });
 
-  test('queues a payment event for every registered webhook', async () => {
+  test("queues a payment event for every registered webhook", async () => {
     const queue = { add: jest.fn().mockResolvedValue({}) };
     const prisma = {
       webhook: {
-        findMany: jest.fn().mockResolvedValue([
-          webhook,
-          { ...webhook, id: 'webhook-2', url: 'https://second.example/webhooks' },
-        ]),
+        findMany: jest
+          .fn()
+          .mockResolvedValue([
+            webhook,
+            {
+              ...webhook,
+              id: "webhook-2",
+              url: "https://second.example/webhooks",
+            },
+          ]),
       },
     };
 
     await dispatchPaymentWebhooks({
       prisma,
-      
+
       queue,
       payment: {
-        id: 'payment-1',
-        type: 'payment',
-        transaction_hash: 'transaction-1',
-        to: 'GDESTINATION',
-        from: 'GSOURCE',
-        amount: '10.00',
-        asset_type: 'native',
+        id: "payment-1",
+        type: "payment",
+        transaction_hash: "transaction-1",
+        to: "GDESTINATION",
+        from: "GSOURCE",
+        amount: "10.00",
+        asset_type: "native",
       },
     });
 
     expect(queue.add).toHaveBeenCalledTimes(2);
     expect(queue.add).toHaveBeenCalledWith(
-      'deliver',
+      "deliver",
       expect.objectContaining({
         payload: expect.objectContaining({
-          event: 'payment.received',
-          event_id: 'transaction-1-payment-1',
+          event: "payment.received",
+          event_id: "transaction-1-payment-1",
         }),
       }),
       expect.objectContaining({ attempts: 5 }),
     );
   });
 
-  test('routes enqueues through the Redis failover retry helper', async () => {
-    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+  test("routes enqueues through the Redis failover retry helper", async () => {
+    const queue = { add: jest.fn().mockResolvedValue({ id: "job-1" }) };
 
     await enqueueWebhookDelivery(webhook, payload, queue);
 
     expect(withRedisRetry).toHaveBeenCalledTimes(1);
     expect(withRedisRetry.mock.calls[0][0]).toEqual(expect.any(Function));
     expect(withRedisRetry.mock.calls[0][1]).toEqual(
-      expect.objectContaining({ attempts: expect.any(Number), baseDelayMs: expect.any(Number) }),
+      expect.objectContaining({
+        attempts: expect.any(Number),
+        baseDelayMs: expect.any(Number),
+      }),
     );
   });
 
-  test('creates a lazy queue when no queue is injected', async () => {
-    mockQueueAdd.mockResolvedValue({ id: 'job-1' });
+  test("creates a lazy queue when no queue is injected", async () => {
+    mockQueueAdd.mockResolvedValue({ id: "job-1" });
 
     await enqueueWebhookDelivery(webhook, payload);
 
@@ -243,8 +265,7 @@ describe('webhook BullMQ delivery', () => {
     );
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
   });
-
-  test('halts active delivery queueing when destination domain circuit breaker is OPEN', async () => {
+test('halts active delivery queueing when destination domain circuit breaker is OPEN', async () => {
     const { handleDeliveryFailure, resetCircuitBreaker } = require('../src/services/webhookService');
     const queue = { add: jest.fn().mockResolvedValue({ id: 'job-cb-1' }) };
     const failingWebhook = {
@@ -266,6 +287,37 @@ describe('webhook BullMQ delivery', () => {
     // Clean up
     await resetCircuitBreaker(null, 'tripped-host.com');
   });
+});main
+
+  test("uses a per-webhook concurrency limit and releases the semaphore after delivery", async () => {
+    const redis = {
+      incr: jest.fn().mockResolvedValue(1),
+      decr: jest.fn().mockResolvedValue(0),
+      expire: jest.fn().mockResolvedValue(1),
+    };
+
+    expect(getWebhookConcurrencyLimit({ concurrencyLimit: 3 })).toBe(3);
+    expect(getWebhookConcurrencyLimit({ maxConcurrent: 2 })).toBe(2);
+    expect(getWebhookConcurrencyLimit({})).toBe(10);
+
+    const slot = await acquireWebhookSemaphore(redis, { id: "webhook-42" }, 2);
+    expect(slot).toEqual(
+      expect.objectContaining({
+        acquired: true,
+        key: expect.stringContaining("webhook-42"),
+      }),
+    );
+    expect(redis.incr).toHaveBeenCalledWith(
+      expect.stringContaining("webhook-42"),
+    );
+    expect(redis.expire).toHaveBeenCalledWith(
+      expect.stringContaining("webhook-42"),
+      expect.any(Number),
+    );
+
+    await releaseWebhookSemaphore(redis, { id: "webhook-42" });
+    expect(redis.decr).toHaveBeenCalledWith(
+      expect.stringContaining("webhook-42"),
+    );
+  });
 });
-
-

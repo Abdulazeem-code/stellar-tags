@@ -152,6 +152,33 @@ model WebhookDLQ {
   @@map("webhook_dlq")
 }
 
+// WebhookDelivery: tracks all webhook delivery attempts (success and failure)
+// for time-travel replay functionality. Records the full payload, response,
+// and metadata needed to replay historical events.
+model WebhookDelivery {
+  id            String    @id @default(uuid())
+  webhookId     String    @map("webhook_id")
+  username      String
+  eventType     String    @map("event_type")
+  eventId       String    @map("event_id")
+  payload       Json      // Full payload sent to the webhook
+  status        String    // 'success' | 'failed' | 'replayed'
+  responseCode  Int?      @map("response_code")
+  responseBody  String?   @map("response_body")
+  errorMessage  String?   @map("error_message")
+  attemptNumber Int       @default(1) @map("attempt_number")
+  sentAt        DateTime  @default(now()) @map("sent_at")
+  replayedAt    DateTime? @map("replayed_at")
+  replayId      String?   @map("replay_id") // Groups replays from the same replay request
+
+  @@index([username])
+  @@index([webhookId])
+  @@index([eventId])
+  @@index([sentAt])
+  @@index([status])
+  @@map("webhook_deliveries")
+}
+
 // API keys for backend consumers. Only the SHA-256 hash of the secret is
 // stored; the raw key is shown once at creation time.
 model ApiKey {
@@ -404,6 +431,45 @@ model WebAuthnChallenge {
   @@index([expiresAt])
   @@index([userId, type])
   @@map("webauthn_challenges")
+}
+
+// PaymentReceipt: stores cryptographic Merkle inclusion proofs for completed payments
+model PaymentReceipt {
+  id              String    @id @default(uuid())
+  paymentId       String    @unique @map("payment_id")
+  merkleRoot      String    @map("merkle_root")
+  leafIndex       Int       @map("leaf_index")
+  proof           Json      // Array of { position: 'left'|'right', hash: string }
+  anchorTxHash    String?   @map("anchor_tx_hash") // Stellar transaction hash anchoring the Merkle root
+  anchorStatus    String    @default("pending") @map("anchor_status") // pending | confirmed | failed
+  batchId         String    @map("batch_id")
+  batchTimestamp  BigInt    @map("batch_timestamp") // Unix milliseconds
+  createdAt       DateTime  @default(now()) @map("created_at")
+  confirmedAt     DateTime? @map("confirmed_at")
+
+  @@index([anchorTxHash])
+  @@index([batchId])
+  @@index([createdAt])
+  @@map("payment_receipts")
+}
+
+// ReceiptAnchor: records each hourly Merkle root anchoring to Stellar ledger
+model ReceiptAnchor {
+  id              String    @id @default(uuid())
+  merkleRoot      String    @unique @map("merkle_root")
+  anchorTxHash    String    @unique @map("anchor_tx_hash")
+  batchId         String    @unique @map("batch_id")
+  batchTimestamp  BigInt    @map("batch_timestamp")
+  leafCount       Int       @map("leaf_count")
+  status          String    @default("pending") // pending | confirmed | failed
+  attempts        Int       @default(0)
+  lastError       String?   @map("last_error")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  confirmedAt     DateTime? @map("confirmed_at")
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("receipt_anchors")
 }
 
 // #929 — durable notifications written in the same transaction as payment state.

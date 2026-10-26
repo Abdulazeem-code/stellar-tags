@@ -31,6 +31,12 @@ jest.mock('../src/dlq', () => ({
   replayDlqMessage: (...args) => mockReplayDlqMessage(...args),
   replayDlqMessages: (...args) => mockReplayDlqMessages(...args),
   discardDlqMessage: (...args) => mockDiscardDlqMessage(...args),
+  isDlqAvailable: jest.fn(() => true),
+}));
+
+jest.mock('../src/dlqWorker', () => ({
+  startDlqWorker: jest.fn(),
+  closeDlqWorker: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../prismaClient', () => ({
