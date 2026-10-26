@@ -5,7 +5,6 @@ use crate::storage::{
 };
 use crate::types::ActionType;
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
-
 // ── Role-Based Access Control (RBAC) Helpers ─────────────────────────────────
 
 pub fn set_role_internal(env: &Env, role: Role, account: &Address) {
@@ -113,6 +112,21 @@ pub fn require_role_of(env: &Env, caller: &Address, role: Role) -> Result<(), Er
     Ok(())
 }
 
+pub fn require_security_officer(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::SecurityOfficer)?;
+    Ok(())
+}
+
+pub fn require_fee_manager(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::FeeManager)?;
+    Ok(())
+}
+
+pub fn require_upgrade_manager(env: &Env) -> Result<(), Error> {
+    require_role(env, Role::UpgradeManager)?;
+    Ok(())
+}
+
 pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
     if let Some(gov) = env
         .storage()
@@ -122,7 +136,7 @@ pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
         gov.require_auth();
         Ok(())
     } else {
-        require_role(env, Role::FeeManager)?;
+        require_fee_manager(env)?;
         Ok(())
     }
 }

@@ -41,4 +41,9 @@ fn advance_time(env: &Env, duration_secs: u64) {
         min_persistent_entry_ttl: 4096,
         max_entry_ttl: 6312000,
     });
+client.grant_role(&admin, &second, &Role::Pauser);
+
+    assert!(!client.has_role(&first, &Role::Pauser));
+    assert!(client.has_role(&second, &Role::Pauser));
+    assert_eq!(client.get_role_member(&Role::Pauser), Some(second));
 }

@@ -85,7 +85,7 @@ export interface PriceData {
 }
 
 /**
- * The result of a DEX-routed swap quote, returned by [`PaymentRouter::quote_swap`].
+ * The result of a DEX quote, returned by [`PaymentRouter::quote_swap`].
  */
 export interface SwapQuote {
   /**
@@ -93,10 +93,11 @@ export interface SwapQuote {
    */
   amount_out: i128;
   /**
-   * Configured maximum slippage, in basis points, that produced
+* Configured maximum slippage, in basis points, that produced
    * `min_amount_out`.
    */
   max_slippage_bps: i128;
+  /**
   /**
    * Tightest `min_amount_out` that still respects the contract's
    * `max_slippage_bps` for this quote.
@@ -147,6 +148,7 @@ export interface FeeProposal {
   yes_votes: i128;
 }
 
+/**
 /**
  * A batch of payments committed by a 32-byte Merkle root.
  */
@@ -222,183 +224,11 @@ export interface SwapSimulationReport {
   projected_amount_out: i128;
   read_only: Array<string>;
   read_write: Array<string>;
-}
-
+}main
 /**
  * Contract-level errors returned instead of panicking.
  */
 export const Errors = {
-  1: { message: "Unauthorized" },
-  2: { message: "InsufficientBalance" },
-  3: { message: "LimitExceeded" },
-  4: { message: "AlreadyInitialized" },
-  5: { message: "NotInitialized" },
-  6: { message: "Paused" },
-  8: { message: "InvalidRecipient" },
-  9: { message: "Blacklisted" },
-  10: { message: "NoRefundAvailable" },
-  11: { message: "TimelockPending" },
-  12: { message: "TimelockNotReady" },
-  13: { message: "TimelockNotFound" },
-  14: { message: "ContractFrozen" },
-  15: { message: "DexNotRegistered" },
-  16: { message: "SwapFailed" },
-  17: { message: "SlippageExceeded" },
-  18: { message: "SwapDeadlineExpired" },
-  19: { message: "InvalidSwapParams" },
-  20: { message: "InvalidRole" },
-  21: { message: "InvalidProposal" },
-  22: { message: "GovernanceNotConfigured" },
-  24: { message: "InvalidKycThreshold" },
-  25: { message: "YieldProtocolNotConfigured" },
-  26: { message: "InvalidYieldAmount" },
-  27: { message: "OracleNotConfigured" },
-  28: { message: "OracleCallFailed" },
-  29: { message: "OraclePriceStale" },
-  30: { message: "OraclePriceInvalid" },
-  31: { message: "DeadlineExpired" },
-  32: { message: "InvalidNonce" },
-  33: { message: "InvalidSignature" },
-  34: { message: "KycRequired" },
-  35: { message: "InvalidSwapPath" },
-  37: { message: "InvalidMultisigConfig" },
-  38: { message: "NotMultisigSigner" },
-  39: { message: "InsufficientApprovals" },
-  40: { message: "MultisigNotInitialized" },
-  41: { message: "AlreadyApproved" },
-  42: { message: "ReentrantCall" },
-  43: { message: "NoBackupAdmin" },
-  44: { message: "DmsNotReady" },
-  45: { message: "InvalidDmsConfig" },
-  46: { message: "RateLimited" },
-  47: { message: "RoleNotFound" },
-  48: { message: "CyclicSwapPath" },
-  49: { message: "InvalidSlippageConfig" },
-  51: { message: "InvalidUpgradeManifest" },
-  52: { message: "UpgradeManifestExpired" },
-  53: { message: "UpgradePrepareFailed" },
-  54: { message: "UpgradeCommitFailed" }
-};
-
-/**
- * Role definitions for the Role-Based Access Control (RBAC) system.
- */
-export enum Role {
-  SuperAdmin = 1,
-  TreasuryManager = 2,
-  ComplianceOfficer = 3,
-  FeeManager = 4,
-  Pauser = 5,
-}
-
-/**
- * Storage keys for all contract instance and persistent data.
- */
-export type DataKey = 
-  | { tag: "Admin"; values: void } 
-  | { tag: "Governance"; values: void } 
-  | { tag: "PlatformTreasury"; values: void } 
-  | { tag: "FeeBps"; values: void } 
-  | { tag: "FeeCap"; values: void } 
-  | { tag: "MinLimit"; values: void } 
-  | { tag: "Paused"; values: void } 
-  | { tag: "PauseLevel"; values: void } 
-  | { tag: "MaxAmount"; values: void } 
-  | { tag: "UserRecord"; values: readonly [string] } 
-  | { tag: "UserSpending"; values: readonly [string] } 
-  | { tag: "UserVolume"; values: readonly [string] } 
-  | { tag: "Blacklist"; values: readonly [string] } 
-  | { tag: "RefundBalance"; values: readonly [string, string] } 
-  | { tag: "TimelockNonce"; values: void } 
-  | { tag: "TimelockEntry"; values: readonly [u64] } 
-  | { tag: "Frozen"; values: void } 
-  | { tag: "UserRole"; values: readonly [string, Role] } 
-  | { tag: "Role"; values: readonly [Role] } 
-  | { tag: "MetaNonce"; values: readonly [string] } 
-  | { tag: "KycOracle"; values: void } 
-  | { tag: "KycThreshold"; values: void } 
-  | { tag: "BackupAdmin"; values: void } 
-  | { tag: "LastHeartbeat"; values: void } 
-  | { tag: "DmsTimeout"; values: void } 
-  | { tag: "RateLimitConfig"; values: void } 
-  | { tag: "RateLimitCounter"; values: readonly [string] } 
-  | { tag: "RateLimitWhitelist"; values: readonly [string] } 
-  | { tag: "OracleAddress"; values: void } 
-  | { tag: "StalenessThreshold"; values: void } 
-  | { tag: "FallbackPrice"; values: readonly [string, string] } 
-  | { tag: "GovernanceToken"; values: void } 
-  | { tag: "GovernanceQuorum"; values: void } 
-  | { tag: "GovernanceNonce"; values: void } 
-  | { tag: "GovernanceProposal"; values: readonly [u64] } 
-  | { tag: "GovernanceVote"; values: readonly [u64, string] } 
-  | { tag: "ArchiveEpoch"; values: void } 
-  | { tag: "ArchiveRoot"; values: readonly [u64] } 
-  | { tag: "ArchiveMeta"; values: readonly [u64] } 
-  | { tag: "YieldProtocol"; values: void } 
-  | { tag: "YieldPrincipal"; values: readonly [string] } 
-  | { tag: "RegisteredDex"; values: readonly [string] } 
-  | { tag: "MaxSlippageBps"; values: void } 
-  | { tag: "PairSlippage"; values: readonly [string, string] } 
-  | { tag: "MultisigSigners"; values: void } 
-  | { tag: "MultisigThreshold"; values: void } 
-  | { tag: "UpgradeApproval"; values: readonly [Buffer] } 
-  | { tag: "ReentrancyGuard"; values: void } 
-  | { tag: "MerkleClaimedBits"; values: readonly [u64] } 
-  | { tag: "TwoPhaseCommit"; values: readonly [Buffer] };
-
-/**
- * Tiered pause levels for the emergency circuit breaker.
- */
-export enum PauseLevel {
-  None = 0,
-  SwapsOnly = 1,
-  FullHalt = 2,
-}
-
-/**
- * Dedicated key type for the heartbeat operator.
- */
-export type HeartbeatKey = { tag: "HeartbeatOperator"; values: void };
-
-/**
- * Packed record describing a registered Merkle distribution batch.
- */
-export interface MerkleBatchRecord {
-  claimed_amount: i128;
-  expiration: u64;
-  merkle_root: Buffer;
-  sender: string;
-  token: string;
-  total_amount: i128;
-}
-
-/**
- * A single archive leaf descriptor passed into `commit_archive_root`.
- */
-export interface ArchiveLeaf {
-  primary_key: string;
-  record_type: ArchiveRecordType;
-  secondary_key: string;
-}
-
-/**
- * Metadata stored alongside each archive root.
- */
-export interface ArchiveMetadata {
-  committed_at: u64;
-  description: string;
-  record_count: u32;
-}
-
-/**
- * Record types supported by the archival system.
- */
-export enum ArchiveRecordType {
-  UserVolume = 1,
-  UserSpending = 2,
-  RefundBalance = 3,
-}
-
 /**
  * A prepared cross-contract upgrade waiting for its 48-hour timelock.
  */
@@ -411,14 +241,184 @@ export interface TwoPhaseCommit {
 }
 
 export interface Client {
+  /**
+   * Construct and simulate a ping transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Routes a payment from a sender to a recipient, deducting a platform fee.
+   *
+   * # Parameters
+   * - `sender`: Address the funds are debited from; must authorize the call.
+   * - `recipient`: Address to receive the funds (minus the platform fee).
+   * - `token_address`: Contract ID of the token being transferred.
+   * - `amount`: Amount to route, in the token's smallest unit. Must be
+   * positive and within the configured min/max and daily-limit bounds.
+   *
+   * This is the primary way for the admin to reset the timer without
+   * changing any contract state. Routing a payment also bumps the
+   * heartbeat automatically. A no-op when no backup admin is configured.
+   *
+   * Admin authorization is required. Works even while the contract is
+   * frozen so the legitimate admin can keep the switch alive.
+   */
   ping: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+
+  /**
+   * Construct and simulate a get_fee transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the current protocol fee percentage in basis points.
+   *
+   * # Returns
+   * The configured `fee_bps`, or `0` if the contract has not been
+   * initialized.
+   *
+   * # Panics
+   * Does not panic.
+   */
   get_fee: (options?: MethodOptions) => Promise<AssembledTransaction<i128>>;
-  upgrade: ({ new_wasm_hash }: { new_wasm_hash: Buffer }, options?:MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+
+  /**
+   * Construct and simulate a upgrade transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Replaces this contract's WASM with a previously uploaded version, once
+   * the multi-signature group has authorized that exact hash.
+   *
+   * # Parameters
+   * - `new_wasm_hash`: Hash of a WASM blob previously uploaded to the
+   * network. Must match a hash with at least `threshold` approvals.
+   *
+   * # Returns
+   * `Ok(())` on success, `Err(Error::MultisigNotInitialized)` if no group
+   * is configured, or `Err(Error::InsufficientApprovals)` if fewer than
+   * `threshold` members have approved this hash.
+   *
+   * # Panics
+   * Panics if `new_wasm_hash` does not reference an uploaded WASM blob.
+   */
+  upgrade: ({ new_wasm_hash }: { new_wasm_hash: Buffer }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+
+  /**
+   * Construct and simulate a version transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the contract version.
+   *
+   * This is a read-only view function: it does not write to ledger storage
+   * and costs only the base invocation fee.  The UI calls this before
+   * submitting transactions to confirm it is compatible with the deployed
+   * contract.
+   *
+   * # Returns
+   * A [`String`] in the form `"MAJOR.MINOR.PATCH"` (e.g. `"1.0.0"`).
+   */
   version: (options?: MethodOptions) => Promise<AssembledTransaction<string>>;
+
+  /**
+   * Construct and simulate a has_role transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Queries whether a given account holds an active role assignment.
+   *
+   * Read-only and authorization-free.  Reports effective authority: the
+   * account is granted the role directly, is the role's designated holder,
+   * or is the root admin standing in for a role that has not been delegated.
+   *
+   * # Parameters
+   * - `account`: Address to query.
+   * - `role`: Role variant to check.
+   *
+   * # Returns
+   * `true` if the account can exercise `role`, `false` otherwise.
+   */
   has_role: ({ account, role }: { account: string; role: Role }, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>;
+
+  /**
+   * Construct and simulate a unfreeze transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Removes the frozen state, restoring normal contract operation.
+   *
+   * Like `emergency_freeze`, this takes effect immediately and does not
+   * go through the timelock.
+   *
+   * SuperAdmin authorization is required.
+   */
   unfreeze: (options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+
+  /**
+   * Construct and simulate a get_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns the current admin address.
+   *
+   * # Returns
+   * `Some(admin)` if the contract is initialized, otherwise `None`.
+   *
+   * # Panics
+   * Does not panic.
+   */
   get_admin: (options?: MethodOptions) => Promise<AssembledTransaction<Option<string>>>;
+
+  /**
+   * Construct and simulate a get_price transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Fetches the current exchange rate for a `(base_asset, quote_asset)`
+   * pair from the configured price-feed oracle, validates it, and returns
+   * the result.
+   *
+   * Every failure path below first attempts to serve an admin-configured
+   * fallback price for the pair; the oracle error is only surfaced when no
+   * fallback exists.
+   *
+   * ## Validation flow
+   *
+   * 1. **Oracle configured?** - Otherwise `Err(Error::OracleNotConfigured)`.
+   * 2. **Call oracle** - Invoke the oracle's `get_price`; a trapped or
+   * unavailable contract yields `Err(Error::OracleCallFailed)`.
+   * 3. **Staleness check** - Reject a `price_data.timestamp` older than the
+   * configured threshold (default 3 600 s) with
+   * `Err(Error::OraclePriceStale)`. A threshold of `0` disables this check.
+   * 4. **Validity check** - A price <= 0 is invalid
+   * (`Err(Error::OraclePriceInvalid)`).
+   * 5. **Return** - The validated `PriceData` is returned to the caller.
+   *
+   * `base_asset` is typically the XLM native contract and `quote_asset` the
+   * USDC contract.
+   */
   get_price: ({ base_asset, quote_asset }: { base_asset: string; quote_asset: string }, options?: MethodOptions) => Promise<AssembledTransaction<Result<PriceData>>>;
+
+  /**
+   * Construct and simulate a is_frozen transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns whether the contract is currently frozen.
+   */
   is_frozen: (options?: MethodOptions) => Promise<AssembledTransaction<boolean>>;
+
+  /**
+   * Construct and simulate a is_paused transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns whether the contract is currently paused.
+   *
+   * Returns `true` only when the pause level is `FullHalt`.  Under
+   * `SwapsOnly`, direct payments still work so this returns `false` to
+   * preserve backward compatibility for callers that only need to know
+   * whether core transfers are allowed.
+   *
+   * # Returns
+   * `true` if fully halted, `false` otherwise.
+   *
+   * # Panics
+   * Does not panic.
+   */
   is_paused: (options?: MethodOptions) => Promise<AssembledTransaction<boolean>>;
+
+  set_admin: ({ new_admin }: { new_admin: string }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  set_pause: ({ paused }: { paused: boolean }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  grant_role: ({ admin, grantee, role }: { admin: string; grantee: string; role: Role }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  initialize: ({ admin, platform_treasury, fee_bps, fee_cap, max_amount }: { admin: string; platform_treasury: string; fee_bps: i128; fee_cap: i128; max_amount: i128 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  quote_swap: ({ dex, sell_token, buy_token, amount_in }: { dex: string; sell_token: string; buy_token: string; amount_in: i128 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<SwapQuote>>>;
+  set_paused: ({ paused }: { paused: boolean }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  assign_role: ({ account, role }: { account: string; role: Role }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  claim_admin: ({ claimant }: { claimant: string }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  revoke_role: ({ admin, grantee, role }: { admin: string; grantee: string; role: Role }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  set_fee_bps: ({ new_fee_bps }: { new_fee_bps: i128 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  queue_action: ({ action }: { action: ActionType }, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>;
+  register_dex: ({ dex }: { dex: string }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  cancel_action: ({ nonce }: { nonce: u64 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  harvest_yield: ({ token }: { token: string }, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>;
+  route_payment: ({ sender, recipient, token_address, amount }: { sender: string; recipient: string; token_address: string; amount: i128 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  set_min_limit: ({ min_limit }: { min_limit: i128 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  cancel_upgrade: ({ new_wasm_hash }: { new_wasm_hash: Buffer }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  deregister_dex: ({ dex }: { dex: string }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  execute_action: ({ nonce }: { nonce: u64 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
+  get_meta_nonce: ({ user }: { user: string }, options?: MethodOptions) => Promise<AssembledTransaction<u64>>;
+  get_rate_limit: (options?: MethodOptions) => Promise<AssembledTransaction<u32>>;
+  get_role_admin: ({ _role }: { _role: Role }, options?: MethodOptions) => Promise<AssembledTransaction<Role>>;
+  is_blacklisted: ({ address }: { address: string }, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>;
+  recover_tokens: ({ token, amount }: { token: string; amount: i128 }, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>;
 }
