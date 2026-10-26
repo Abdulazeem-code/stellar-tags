@@ -4,7 +4,9 @@ use crate::storage::{
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use crate::types::ActionType;
-use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
+use core::cmp::Ordering;
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
 // ── Role-Based Access Control (RBAC) Helpers ─────────────────────────────────
 
 pub fn set_role_internal(env: &Env, role: Role, account: &Address) {

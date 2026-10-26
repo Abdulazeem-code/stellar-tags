@@ -114,6 +114,10 @@ pub enum Error {
     CyclicSwapPath = 49,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
     InvalidSlippageConfig = 50,
+    /// The multisig approval threshold is outside the valid signer range.
+    InvalidThreshold = 51,
+    /// A multisig signer set contains the same address more than once.
+    DuplicateSigner = 52,
 }
 
 #[allow(non_upper_case_globals)]

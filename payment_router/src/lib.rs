@@ -968,7 +968,7 @@ impl PaymentRouter {
                 Self::apply_upgrade(&env, &new_wasm_hash);
             }
             ActionType::SetMultisigConfig(signers, threshold) => {
-                Self::store_multisig_config(&env, signers, threshold);
+                Self::store_multisig_config(&env, signers, threshold)?;
             }
             ActionType::RegisterDex(dex) => {
                 let key = DataKey::RegisteredDex(dex.clone());

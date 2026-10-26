@@ -476,7 +476,15 @@ export const Errors = {
   /**
    * A pair-specific slippage cap is negative or exceeds the 500 bps limit.
    */
-  50: {message:"InvalidSlippageConfig"}
+  50: {message:"InvalidSlippageConfig"},
+  /**
+   * The multisig approval threshold is outside the valid signer range.
+   */
+  51: {message:"InvalidThreshold"},
+  /**
+   * A multisig signer set contains the same address more than once.
+   */
+  52: {message:"DuplicateSigner"}
 }
 
 /**

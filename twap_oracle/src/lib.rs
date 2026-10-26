@@ -24,7 +24,11 @@
 //!   retained history to cover it, so a caller cannot average over a single
 //!   freshly written observation.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use core::cmp::Ordering;
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+};
 
 /// A Soroban-compatible 256-bit unsigned integer type backed by high and low 128-bit words.
 #[contracttype]
@@ -176,7 +180,9 @@ pub const DEFAULT_MAX_SINGLE_UPDATE_DEVIATION_BPS: u32 = 1_000;
 /// Divisor for basis points calculations.
 pub const BPS_DIVISOR: i128 = 10_000;
 const Q64: i128 = 1i128 << 64;
+#[allow(dead_code)]
 const Q63: u128 = 1u128 << 63;
+#[allow(dead_code)]
 const OUTLIER_BPS: i128 = 1_500;
 
 /// Upper bound for a single observation price. Keeps `price * elapsed` well
@@ -240,6 +246,7 @@ pub enum DataKey {
     Staleness(Address, Address),
     CircuitBreakerTripped,
     MaxSingleUpdateDeviationBps,
+    CumulativeLogs(Address, Address),
 }
 
 /// Oracle errors surfaced to callers.
@@ -260,6 +267,7 @@ pub enum Error {
     PriceStale = 11,
     CircuitBreakerTripped = 12,
     InvalidConfig = 13,
+    OracleUnavailable = 14,
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -278,10 +286,12 @@ fn read_observations(env: &Env, base: &Address, quote: &Address) -> Vec<Observat
 
 fn read_cumulative_logs(
     env: &Env,
+    base: &Address,
+    quote: &Address,
     observations: &Vec<Observation>,
 ) -> Result<Vec<LogObservation>, Error> {
-    let stored: Option<Vec<LogObservation>> =
-        env.storage().instance().get(&DataKey::CumulativeLogs);
+    let key = DataKey::CumulativeLogs(base.clone(), quote.clone());
+    let stored: Option<Vec<LogObservation>> = env.storage().instance().get(&key);
     if let Some(logs) = stored {
         if logs.len() == observations.len() {
             return Ok(logs);
@@ -350,6 +360,7 @@ fn log2_q64(value: i128) -> Result<i128, Error> {
         .ok_or(Error::PriceOverflow)
 }
 
+#[allow(dead_code)]
 fn exp2_q64(value: i128) -> Result<i128, Error> {
     const ROOTS_Q63: [u128; 32] = [
         13043817825332782212,
@@ -425,6 +436,7 @@ fn exp2_q64(value: i128) -> Result<i128, Error> {
 }
 
 #[allow(unused_mut)]
+#[allow(dead_code)]
 fn median(mut prices: Vec<i128>) -> Result<i128, Error> {
     if prices.is_empty() {
         return Err(Error::OracleUnavailable);
@@ -450,6 +462,7 @@ fn median(mut prices: Vec<i128>) -> Result<i128, Error> {
     }
 }
 
+#[allow(dead_code)]
 fn oracle_price_digest(
     env: &Env,
     base: &Symbol,
@@ -553,8 +566,10 @@ impl TwapOracle {
         }
 
         let mut observations = read_observations(&env, &base, &quote);
+        let mut log_observations = read_cumulative_logs(&env, &base, &quote, &observations)?;
 
         let mut cumulative_price = u256::ZERO;
+        let mut cumulative_log_price = 0;
         if !observations.is_empty() {
             let previous = observations.get(observations.len() - 1).unwrap();
 
@@ -593,6 +608,15 @@ impl TwapOracle {
             let elapsed = u256::from(timestamp - previous.timestamp);
             let increment = u256::from(previous.price.cast_unsigned()).wrapping_mul(elapsed);
             cumulative_price = previous.cumulative_price.wrapping_add(increment);
+
+            let previous_log = log_observations.get(log_observations.len() - 1).unwrap();
+            let log_increment = log2_q64(previous.price)?
+                .checked_mul(i128::from(timestamp - previous.timestamp))
+                .ok_or(Error::PriceOverflow)?;
+            cumulative_log_price = previous_log
+                .cumulative_log_price
+                .checked_add(log_increment)
+                .ok_or(Error::PriceOverflow)?;
         }
 
         observations.push_back(Observation {
@@ -627,7 +651,10 @@ impl TwapOracle {
         let count = observations.len();
         env.storage()
             .instance()
-            .set(&DataKey::Pair(base, quote), &observations);
+            .set(&DataKey::Pair(base.clone(), quote.clone()), &observations);
+        env.storage()
+            .instance()
+            .set(&DataKey::CumulativeLogs(base, quote), &log_observations);
 
         Ok(count)
     }

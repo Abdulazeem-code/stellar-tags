@@ -178,6 +178,8 @@ pub enum DataKey {
     /// without possessing full admin privileges (issue #889).
     /// Stored as `Address` in instance storage.
     HeartbeatOperator,
+    /// Signer approvals collected for a specific multisig configuration.
+    MultisigConfigApproval(BytesN<32>),
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
