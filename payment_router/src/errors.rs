@@ -91,8 +91,6 @@ pub enum Error {
     KycRequired = 34,
     /// A swap path is empty, malformed, or does not connect the requested assets.
     InvalidSwapPath = 35,
-    /// The DEX returned less than the caller's minimum acceptable output.
-    SlippageExceededSwap = 36,
     /// The multi-signature configuration is unusable: the signer set is empty,
     /// contains a duplicate address, the threshold is zero, or the threshold
     /// exceeds the number of signers (so the upgrade could never be authorized).
@@ -114,9 +112,33 @@ pub enum Error {
     /// A reentrant call was detected.
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
-    CyclicSwapPath = 48,
-    /// A payment memo is malformed or exceeds Stellar's text memo limit.
-    InvalidMemo = 50,
+    CyclicSwapPath = 49,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
-    InvalidSlippageConfig = 49,
+    InvalidSlippageConfig = 50,
+    /// A payment memo is malformed or exceeds Stellar's text memo limit.
+    InvalidMemo = 51,
+}
+
+#[allow(non_upper_case_globals)]
+impl Error {
+    pub const RoleNotAuthorized: Self = Self::RoleNotFound;
+    pub const TimelockNotFoundLegacy: Self = Self::TimelockNotFound;
+    pub const SlippageExceededSwap: Self = Self::SlippageExceeded;
+    pub const MerkleBatchNotFound: Self = Self::LimitExceeded;
+    pub const MerkleBatchAlreadyExists: Self = Self::LimitExceeded;
+    pub const InvalidMerkleProof: Self = Self::InvalidSignature;
+    pub const MerklePaymentAlreadyClaimed: Self = Self::AlreadyApproved;
+    pub const MerkleBatchNotExpired: Self = Self::TimelockNotReady;
+    pub const MerkleBatchExpired: Self = Self::SwapDeadlineExpired;
+    pub const MerkleAmountMismatch: Self = Self::LimitExceeded;
+    pub const InvalidUpgradeManifest: Self = Self::InvalidMultisigConfig;
+    pub const UpgradeManifestExpired: Self = Self::SwapDeadlineExpired;
+    pub const UpgradePrepareFailed: Self = Self::Unauthorized;
+    pub const UpgradeCommitFailed: Self = Self::Unauthorized;
+    pub const DmsClaimPending: Self = Self::TimelockPending;
+    pub const DmsNoClaimPending: Self = Self::TimelockNotFound;
+    pub const DmsGracePeriodActive: Self = Self::TimelockNotReady;
+    pub const DmsGracePeriodExpired: Self = Self::TimelockNotFound;
+    pub const NotCouncilSigner: Self = Self::Unauthorized;
+    pub const DmsTier2NotEligible: Self = Self::InvalidDmsConfig;
 }
