@@ -1,4 +1,10 @@
 #![cfg(test)]
+#![allow(
+    clippy::bool_assert_comparison,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::too_many_lines
+)]
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger as _, LedgerInfo};
@@ -70,6 +76,10 @@ impl Fixture {
     fn set_rate(&self, rate_bps: u32) {
         self.pool.set_yield_rate_bps(&self.token, &rate_bps);
     }
+
+    fn simulate_loss(&self, loss: i128) {
+        self.pool.simulate_loss(&self.token, &loss);
+    }
 }
 
 /// Moves the ledger sequence forward, preserving the rest of the ledger info.
@@ -127,11 +137,19 @@ impl MockLendingPool {
     }
 
     pub fn withdraw(env: Env, to: Address, token: Address, amount: i128) {
-        let key = MockLendingKey::Principal(token.clone());
-        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-        assert!(current >= amount);
+        let p_key = MockLendingKey::Principal(token.clone());
+        let y_key = MockLendingKey::Yield(token.clone());
+        let principal: i128 = env.storage().instance().get(&p_key).unwrap_or(0);
+        let accrued: i128 = env.storage().instance().get(&y_key).unwrap_or(0);
+        assert!(principal + accrued >= amount);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
-        env.storage().instance().set(&key, &(current - amount));
+        if amount <= principal {
+            env.storage().instance().set(&p_key, &(principal - amount));
+        } else {
+            env.storage().instance().set(&p_key, &0_i128);
+            let rem = amount - principal;
+            env.storage().instance().set(&y_key, &(accrued - rem));
+        }
     }
 
     pub fn harvest(env: Env, to: Address, token: Address) -> i128 {
@@ -146,6 +164,14 @@ impl MockLendingPool {
             env.storage().instance().remove(&key);
         }
         amount
+    }
+
+    pub fn get_balance(env: Env, token: Address) -> i128 {
+        let p_key = MockLendingKey::Principal(token.clone());
+        let y_key = MockLendingKey::Yield(token);
+        let principal: i128 = env.storage().instance().get(&p_key).unwrap_or(0);
+        let accrued: i128 = env.storage().instance().get(&y_key).unwrap_or(0);
+        principal + accrued
     }
 
     /// Test helper: records interest the pool will pay on the next `harvest`.
@@ -166,6 +192,22 @@ impl MockLendingPool {
         env.storage()
             .instance()
             .set(&MockLendingKey::Rate(token), &rate_bps);
+    }
+
+    pub fn simulate_loss(env: Env, token: Address, loss: i128) {
+        let p_key = MockLendingKey::Principal(token.clone());
+        let current: i128 = env.storage().instance().get(&p_key).unwrap_or(0);
+        let updated = if loss >= current { 0 } else { current - loss };
+        env.storage().instance().set(&p_key, &updated);
+        let burn_address = Address::generate(&env);
+        let to_transfer = if loss >= current { current } else { loss };
+        if to_transfer > 0 {
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &burn_address,
+                &to_transfer,
+            );
+        }
     }
 }
 
@@ -656,4 +698,971 @@ fn set_adapter_requires_the_admin_to_authorize() {
     );
 
     assert_eq!(client.get_adapter(), replacement);
+}
+
+// ── Multi-Strategy Allocation & Rebalancing Tests ─────────────────────────────
+
+#[test]
+fn strategy_registration_up_to_4_and_max_limit() {
+    let f = Fixture::new();
+
+    let pool1 = Address::generate(&f.env);
+    let pool2 = Address::generate(&f.env);
+    let pool3 = Address::generate(&f.env);
+    let pool4 = Address::generate(&f.env);
+    let pool5 = Address::generate(&f.env);
+
+    // Initial state after initialize: 1 default strategy with 10,000 bps
+    assert_eq!(f.client.get_strategy_count(), 1);
+    let init_strats = f.client.get_strategies();
+    assert_eq!(init_strats.len(), 1);
+    assert_eq!(init_strats.get(0).unwrap().address, f.pool_id);
+    assert_eq!(init_strats.get(0).unwrap().weight_bps, 10_000);
+
+    // 1 strategy: 10,000 bps
+    let s1 = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 10_000,
+        },
+    ];
+    f.client.set_strategies(&s1);
+    assert_eq!(f.client.get_strategy_count(), 1);
+
+    // 2 strategies: 6,000 + 4,000 bps
+    let s2 = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 6_000,
+        },
+        StrategyAllocation {
+            address: pool2.clone(),
+            weight_bps: 4_000,
+        },
+    ];
+    f.client.set_strategies(&s2);
+    assert_eq!(f.client.get_strategy_count(), 2);
+
+    // 3 strategies: 3,334 + 3,333 + 3,333 bps
+    let s3 = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 3_334,
+        },
+        StrategyAllocation {
+            address: pool2.clone(),
+            weight_bps: 3_333,
+        },
+        StrategyAllocation {
+            address: pool3.clone(),
+            weight_bps: 3_333,
+        },
+    ];
+    f.client.set_strategies(&s3);
+    assert_eq!(f.client.get_strategy_count(), 3);
+
+    // 4 strategies: 2,500 + 2,500 + 2,500 + 2,500 bps
+    let s4 = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 2_500,
+        },
+        StrategyAllocation {
+            address: pool2.clone(),
+            weight_bps: 2_500,
+        },
+        StrategyAllocation {
+            address: pool3.clone(),
+            weight_bps: 2_500,
+        },
+        StrategyAllocation {
+            address: pool4.clone(),
+            weight_bps: 2_500,
+        },
+    ];
+    f.client.set_strategies(&s4);
+    assert_eq!(f.client.get_strategy_count(), 4);
+
+    // 5 strategies: exceeds max of 4
+    let s5 = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 2_000,
+        },
+        StrategyAllocation {
+            address: pool2.clone(),
+            weight_bps: 2_000,
+        },
+        StrategyAllocation {
+            address: pool3.clone(),
+            weight_bps: 2_000,
+        },
+        StrategyAllocation {
+            address: pool4.clone(),
+            weight_bps: 2_000,
+        },
+        StrategyAllocation {
+            address: pool5.clone(),
+            weight_bps: 2_000,
+        },
+    ];
+    assert_eq!(
+        f.client.try_set_strategies(&s5),
+        Err(Ok(Error::MaxStrategiesExceeded))
+    );
+
+    // 0 strategies: empty portfolio rejected
+    let empty_strats: soroban_sdk::Vec<StrategyAllocation> = soroban_sdk::Vec::new(&f.env);
+    assert_eq!(
+        f.client.try_set_strategies(&empty_strats),
+        Err(Ok(Error::InvalidStrategyCount))
+    );
+}
+
+#[test]
+fn strategy_allocation_weights_validation() {
+    let f = Fixture::new();
+
+    let pool1 = Address::generate(&f.env);
+    let pool2 = Address::generate(&f.env);
+    let pool3 = Address::generate(&f.env);
+
+    // Sum is 9,999 (less than 10,000)
+    let s_under = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 5_000,
+        },
+        StrategyAllocation {
+            address: pool2.clone(),
+            weight_bps: 4_999,
+        },
+    ];
+    assert_eq!(
+        f.client.try_set_strategies(&s_under),
+        Err(Ok(Error::InvalidWeights))
+    );
+
+    // Sum is 10,001 (greater than 10,000)
+    let s_over = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 5_000,
+        },
+        StrategyAllocation {
+            address: pool2.clone(),
+            weight_bps: 5_001,
+        },
+    ];
+    assert_eq!(
+        f.client.try_set_strategies(&s_over),
+        Err(Ok(Error::InvalidWeights))
+    );
+
+    // Weight of 0 is rejected
+    let s_zero = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 10_000,
+        },
+        StrategyAllocation {
+            address: pool2.clone(),
+            weight_bps: 0,
+        },
+    ];
+    assert_eq!(
+        f.client.try_set_strategies(&s_zero),
+        Err(Ok(Error::InvalidWeights))
+    );
+
+    // Duplicate strategy address is rejected
+    let s_dup = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 5_000,
+        },
+        StrategyAllocation {
+            address: pool1.clone(),
+            weight_bps: 5_000,
+        },
+    ];
+    assert_eq!(
+        f.client.try_set_strategies(&s_dup),
+        Err(Ok(Error::DuplicateStrategy))
+    );
+
+    // Registering a strategy with invalid weights
+    assert_eq!(
+        f.client.try_register_strategy(&pool3, &0),
+        Err(Ok(Error::InvalidWeights))
+    );
+    assert_eq!(
+        f.client.try_register_strategy(&pool3, &10_001),
+        Err(Ok(Error::InvalidWeights))
+    );
+}
+
+#[test]
+fn three_way_capital_allocation_and_rebalancing_following_uneven_yield_accrual() {
+    let f = Fixture::new();
+
+    // Register 3 separate mock lending pools
+    let pool1_id = f.env.register_contract(None, MockLendingPool);
+    let pool2_id = f.env.register_contract(None, MockLendingPool);
+    let pool3_id = f.env.register_contract(None, MockLendingPool);
+
+    let pool1 = MockLendingPoolClient::new(&f.env, &pool1_id);
+
+    // Configure 3 strategies with balanced weights: 3,334 + 3,333 + 3,333 = 10,000 bps
+    let strategies = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 3_334,
+        },
+        StrategyAllocation {
+            address: pool2_id.clone(),
+            weight_bps: 3_333,
+        },
+        StrategyAllocation {
+            address: pool3_id.clone(),
+            weight_bps: 3_333,
+        },
+    ];
+    f.client.set_strategies(&strategies);
+    assert_eq!(f.client.get_strategy_count(), 3);
+
+    // Fund the payer with 3,000 tokens
+    let total_principal = 3_000_i128;
+    f.token_admin.mint(&f.payer, &total_principal);
+
+    // Create escrow position
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &total_principal,
+        &100_u32,
+        &5_000_u32, // 50% interest split
+    );
+
+    // Verify 3-way capital allocation across all 3 pools
+    // 3,000 * 3334 / 10000 = 1000 (+1 remainder) = 1001 or 1000
+    let bal1_initial = f.client.get_strategy_balance(&pool1_id, &f.token);
+    let bal2_initial = f.client.get_strategy_balance(&pool2_id, &f.token);
+    let bal3_initial = f.client.get_strategy_balance(&pool3_id, &f.token);
+
+    assert_eq!(bal1_initial + bal2_initial + bal3_initial, total_principal);
+    assert_eq!(bal1_initial, 1_001);
+    assert_eq!(bal2_initial, 1_000);
+    assert_eq!(bal3_initial, 999);
+
+    // Initial state is balanced within threshold
+    assert_eq!(f.client.check_rebalance_needed(&f.token), false);
+
+    // Simulate uneven yield accrual:
+    // Pool 1 generates 600 tokens of yield!
+    // Pool 2 and Pool 3 generate 0 tokens of yield.
+    let yield_amount = 600_i128;
+    f.token_admin.mint(&pool1_id, &yield_amount);
+    pool1.accrue_yield(&f.token, &yield_amount);
+
+    // Balances before rebalance:
+    let bal1_before = f.client.get_strategy_balance(&pool1_id, &f.token);
+    let bal2_before = f.client.get_strategy_balance(&pool2_id, &f.token);
+    let bal3_before = f.client.get_strategy_balance(&pool3_id, &f.token);
+    let total_capital_before = f.client.get_total_strategy_balance(&f.token);
+
+    assert_eq!(bal1_before, 1_601); // 1001 + 600
+    assert_eq!(bal2_before, 1_000);
+    assert_eq!(bal3_before, 999);
+    assert_eq!(total_capital_before, 3_600);
+
+    // Pool 1 now holds ~44.47% of total capital (vs target 33.34%) -> drift ~11.13% = 1113 bps
+    // Default rebalance threshold is 100 bps (1.00%), so check_rebalance_needed must be true!
+    assert_eq!(f.client.check_rebalance_needed(&f.token), true);
+
+    // Execute automated rebalance
+    f.client.rebalance(&f.token);
+
+    // Verify balances after rebalance:
+    // Total capital = 3,600
+    // Target 1: 3,600 * 3334 / 10000 = 1200 + 1 (remainder) = 1201
+    // Target 2: 3,600 * 3333 / 10000 = 1199 + 1 (remainder) = 1200
+    // Target 3: 3,600 * 3333 / 10000 = 1199
+    let bal1_after = f.client.get_strategy_balance(&pool1_id, &f.token);
+    let bal2_after = f.client.get_strategy_balance(&pool2_id, &f.token);
+    let bal3_after = f.client.get_strategy_balance(&pool3_id, &f.token);
+    let total_capital_after = f.client.get_total_strategy_balance(&f.token);
+
+    assert_eq!(total_capital_after, 3_600);
+    assert_eq!(bal1_after, 1_201);
+    assert_eq!(bal2_after, 1_200);
+    assert_eq!(bal3_after, 1_199);
+
+    // Excess capital from Pool 1 (1601 - 1201 = 400) was successfully shifted:
+    // 200 deposited into Pool 2 (1000 + 200 = 1200)
+    // 200 deposited into Pool 3 (999 + 200 = 1199)
+    assert_eq!(bal1_after + bal2_after + bal3_after, 3_600);
+
+    // After rebalance, portfolio is balanced and check_rebalance_needed is false
+    assert_eq!(f.client.check_rebalance_needed(&f.token), false);
+}
+
+#[test]
+fn three_way_allocation_with_asymmetric_weights_and_rebalancing() {
+    let f = Fixture::new();
+
+    let pool1_id = f.env.register_contract(None, MockLendingPool);
+    let pool2_id = f.env.register_contract(None, MockLendingPool);
+    let pool3_id = f.env.register_contract(None, MockLendingPool);
+
+    let pool3 = MockLendingPoolClient::new(&f.env, &pool3_id);
+
+    // Asymmetric weights: 50% (5,000 bps), 30% (3,000 bps), 20% (2,000 bps)
+    let strategies = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 5_000,
+        },
+        StrategyAllocation {
+            address: pool2_id.clone(),
+            weight_bps: 3_000,
+        },
+        StrategyAllocation {
+            address: pool3_id.clone(),
+            weight_bps: 2_000,
+        },
+    ];
+    f.client.set_strategies(&strategies);
+
+    let deposit_amount = 10_000_i128;
+    f.token_admin.mint(&f.payer, &deposit_amount);
+
+    f.client.create_escrow(
+        &2_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &deposit_amount,
+        &100_u32,
+        &5_000_u32,
+    );
+
+    // Check initial 3-way asymmetric allocation
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 5_000);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 3_000);
+    assert_eq!(f.client.get_strategy_balance(&pool3_id, &f.token), 2_000);
+
+    // Accrue 2,000 uneven yield on Pool 3
+    let yield_amount = 2_000_i128;
+    f.token_admin.mint(&pool3_id, &yield_amount);
+    pool3.accrue_yield(&f.token, &yield_amount);
+
+    // Total capital is now 12,000
+    // Pool 3 has 4,000 (33.33% vs target 20%) -> drift 13.33% = 1333 bps
+    assert_eq!(f.client.get_strategy_balance(&pool3_id, &f.token), 4_000);
+    assert_eq!(f.client.check_rebalance_needed(&f.token), true);
+
+    // Rebalance
+    f.client.rebalance(&f.token);
+
+    // Target balances for 12,000 capital:
+    // Pool 1 (50%): 6,000
+    // Pool 2 (30%): 3,600
+    // Pool 3 (20%): 2,400
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 6_000);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 3_600);
+    assert_eq!(f.client.get_strategy_balance(&pool3_id, &f.token), 2_400);
+    assert_eq!(f.client.get_total_strategy_balance(&f.token), 12_000);
+    assert_eq!(f.client.check_rebalance_needed(&f.token), false);
+}
+
+#[test]
+fn settlement_and_cancel_after_multi_strategy_allocation() {
+    let f = Fixture::new();
+
+    let pool1_id = f.env.register_contract(None, MockLendingPool);
+    let pool2_id = f.env.register_contract(None, MockLendingPool);
+
+    let pool1 = MockLendingPoolClient::new(&f.env, &pool1_id);
+    let pool2 = MockLendingPoolClient::new(&f.env, &pool2_id);
+
+    // 2-way 50/50 allocation
+    let strategies = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 5_000,
+        },
+        StrategyAllocation {
+            address: pool2_id.clone(),
+            weight_bps: 5_000,
+        },
+    ];
+    f.client.set_strategies(&strategies);
+
+    let amount = 2_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+
+    f.client.create_escrow(
+        &3_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &100_u32,
+        &5_000_u32, // 50% split
+    );
+
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 1_000);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 1_000);
+
+    // Cancel before deadline refunds payer full principal
+    let outcome = f.client.cancel(&3_u64);
+    assert_eq!(outcome.principal, 2_000);
+    assert_eq!(outcome.to_payer, 2_000);
+    assert_eq!(outcome.to_beneficiary, 0);
+
+    assert_eq!(f.token_client.balance(&f.payer), 2_000);
+    assert_eq!(f.client.get_active_escrows(), 0);
+
+    // Now test release with yield across multi-strategies
+    pool1.set_yield_rate_bps(&f.token, &1_000);
+    pool2.set_yield_rate_bps(&f.token, &1_000);
+
+    let amount2 = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount2);
+
+    f.client.create_escrow(
+        &4_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount2,
+        &100_u32,
+        &5_000_u32,
+    );
+
+    // Both pools accrue yield (50 each = 100 total)
+    f.token_admin.mint(&pool1_id, &50);
+    pool1.accrue_yield(&f.token, &50);
+    f.token_admin.mint(&pool2_id, &50);
+    pool2.accrue_yield(&f.token, &50);
+
+    set_timestamp(&f.env, SECONDS_PER_YEAR as u64);
+    set_sequence(&f.env, 100);
+    let release_outcome = f.client.release(&4_u64);
+    assert_eq!(release_outcome.principal, 1_000);
+    assert_eq!(release_outcome.interest, 100);
+    assert_eq!(release_outcome.to_beneficiary, 1_050); // principal + 50% of 100
+    assert_eq!(release_outcome.to_payer, 50); // remainder 50% of 100
+
+    assert_eq!(f.token_client.balance(&f.beneficiary), 1_050);
+}
+
+#[test]
+fn rebalance_edge_cases_and_threshold_configuration() {
+    let f = Fixture::new();
+
+    // Default threshold is 100 bps (1%)
+    assert_eq!(f.client.get_rebalance_threshold(), 100);
+
+    // Admin sets new threshold to 250 bps (2.5%)
+    f.client.set_rebalance_threshold(&250);
+    assert_eq!(f.client.get_rebalance_threshold(), 250);
+
+    // Setting threshold > 10,000 bps fails
+    assert_eq!(
+        f.client.try_set_rebalance_threshold(&10_001),
+        Err(Ok(Error::InvalidThreshold))
+    );
+
+    // Rebalance on a single strategy portfolio is a clean no-op
+    f.client.rebalance(&f.token);
+
+    // check_rebalance_needed on single strategy returns false
+    assert_eq!(f.client.check_rebalance_needed(&f.token), false);
+
+    // Zero balance portfolio returns false and rebalances cleanly
+    let p1 = f.env.register_contract(None, MockLendingPool);
+    let p2 = f.env.register_contract(None, MockLendingPool);
+    let strats = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: p1.clone(),
+            weight_bps: 5_000,
+        },
+        StrategyAllocation {
+            address: p2.clone(),
+            weight_bps: 5_000,
+        },
+    ];
+    f.client.set_strategies(&strats);
+    assert_eq!(f.client.check_rebalance_needed(&f.token), false);
+}
+
+#[test]
+fn active_escrows_restrict_changing_strategy_addresses() {
+    let f = Fixture::new();
+
+    let pool1_id = f.env.register_contract(None, MockLendingPool);
+    let pool2_id = f.env.register_contract(None, MockLendingPool);
+    let pool3_id = f.env.register_contract(None, MockLendingPool);
+
+    let strats = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 6_000,
+        },
+        StrategyAllocation {
+            address: pool2_id.clone(),
+            weight_bps: 4_000,
+        },
+    ];
+    f.client.set_strategies(&strats);
+
+    // Lock funds
+    let amount = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+    f.client.create_escrow(
+        &5_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &100_u32,
+        &1_000_u32,
+    );
+    assert_eq!(f.client.get_active_escrows(), 1);
+
+    // Attempting to change to a new strategy address while active escrows exist must fail
+    let strats_new_addr = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 6_000,
+        },
+        StrategyAllocation {
+            address: pool3_id.clone(),
+            weight_bps: 4_000,
+        },
+    ];
+    assert_eq!(
+        f.client.try_set_strategies(&strats_new_addr),
+        Err(Ok(Error::ActiveEscrowsRemain))
+    );
+
+    // Updating weights for the EXACT SAME strategies while active escrows exist is allowed!
+    let strats_reweighted = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 5_000,
+        },
+        StrategyAllocation {
+            address: pool2_id.clone(),
+            weight_bps: 5_000,
+        },
+    ];
+    f.client.set_strategies(&strats_reweighted);
+    assert_eq!(f.client.get_strategies().get(0).unwrap().weight_bps, 5_000);
+    assert_eq!(f.client.get_strategies().get(1).unwrap().weight_bps, 5_000);
+
+    // Rebalancing shifts funds to the new target weights
+    f.client.rebalance(&f.token);
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 500);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 500);
+}
+
+// ── Emergency Unwind & Circuit Breaker Tests (Issue #924) ────────────────────
+
+#[test]
+fn emergency_unwind_strategy_requires_the_admin_to_authorize() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let adapter = Address::generate(&env);
+    let contract_id = env.register_contract(None, YieldEscrow);
+    let client = YieldEscrowClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &adapter);
+    client.emergency_unwind_strategy(&0);
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "emergency_unwind_strategy must require the admin to authorize"
+    );
+    assert!(client.is_emergency_mode());
+    assert_eq!(client.get_vault_mode(), VaultMode::EmergencyVaultMode);
+}
+
+#[test]
+fn emergency_unwind_strategy_reverts_if_recovered_amount_less_than_min_recovered_amount() {
+    let f = Fixture::new();
+    let amount = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &150_u32,
+        &2_000_u32,
+    );
+
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 1_000);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+
+    // Protocol anomaly: external strategy suffers a 20% loss (200 tokens lost)
+    f.simulate_loss(200);
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 800);
+
+    // Admin attempts emergency unwind with min_recovered_amount = 900 (allowing at most 10% slippage)
+    // Because only 800 tokens can be recovered, it must revert with SlippageExceeded!
+    let res = f.client.try_emergency_unwind_strategy(&900);
+    assert_eq!(res, Err(Ok(Error::SlippageExceeded)));
+
+    // Invariants preserved: contract is NOT in emergency mode, funds remain in pool
+    assert_eq!(f.client.is_emergency_mode(), false);
+    assert_eq!(f.client.get_vault_mode(), VaultMode::Normal);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 800);
+}
+
+#[test]
+fn emergency_unwind_strategy_succeeds_within_slippage_and_switches_to_emergency_vault_mode() {
+    let f = Fixture::new();
+    let amount = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &150_u32,
+        &2_000_u32,
+    );
+
+    // Strategy anomaly: 200 tokens lost
+    f.simulate_loss(200);
+
+    // Admin decides to accept 20% loss: sets min_recovered_amount = 800
+    let recovered = f.client.emergency_unwind_strategy(&800);
+    assert_eq!(recovered, 800);
+
+    // Contract has entered EmergencyVaultMode!
+    assert!(f.client.is_emergency_mode());
+    assert_eq!(f.client.get_vault_mode(), VaultMode::EmergencyVaultMode);
+
+    // Funds are now recovered into raw token vault custody
+    assert_eq!(f.client.get_vault_balance(&f.token), 800);
+    assert_eq!(f.token_client.balance(&f.contract_id), 800);
+    assert_eq!(f.token_client.balance(&f.pool_id), 0);
+    assert_eq!(f.client.get_strategy_balance(&f.pool_id, &f.token), 0);
+}
+
+#[test]
+fn emergency_vault_mode_halts_deposits_rebalances_and_config() {
+    let f = Fixture::new();
+    let amount = 1_000_i128;
+    f.token_admin.mint(&f.payer, &amount);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &amount,
+        &150_u32,
+        &2_000_u32,
+    );
+
+    f.client.emergency_unwind_strategy(&1_000);
+    assert!(f.client.is_emergency_mode());
+
+    // 1. Deposits are halted
+    f.token_admin.mint(&f.payer, &500);
+    assert_eq!(
+        f.client.try_create_escrow(
+            &2_u64,
+            &f.payer,
+            &f.beneficiary,
+            &f.token,
+            &500_i128,
+            &150_u32,
+            &1_000_u32,
+        ),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+
+    // 2. Rebalancing is halted
+    assert_eq!(
+        f.client.try_rebalance(&f.token),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+    assert_eq!(f.client.check_rebalance_needed(&f.token), false);
+
+    // 3. Strategy re-configuration is halted
+    let new_pool = f.env.register_contract(None, MockLendingPool);
+    assert_eq!(
+        f.client.try_set_adapter(&new_pool),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+    assert_eq!(
+        f.client.try_set_rebalance_threshold(&200),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+
+    // 4. Calling unwind again while in emergency mode is rejected
+    assert_eq!(
+        f.client.try_emergency_unwind_strategy(&0),
+        Err(Ok(Error::EmergencyModeActive))
+    );
+}
+
+#[test]
+fn emergency_vault_mode_permits_user_principal_withdrawals() {
+    let f = Fixture::new();
+    let payer2 = Address::generate(&f.env);
+    let beneficiary2 = Address::generate(&f.env);
+
+    f.token_admin.mint(&f.payer, &1_000);
+    f.token_admin.mint(&payer2, &500);
+
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &1_000_i128,
+        &200_u32,
+        &5_000_u32,
+    );
+    f.client.create_escrow(
+        &2_u64,
+        &payer2,
+        &beneficiary2,
+        &f.token,
+        &500_i128,
+        &200_u32,
+        &5_000_u32,
+    );
+    assert_eq!(f.client.get_active_escrows(), 2);
+
+    // Unwind all strategy shares
+    let total_recovered = f.client.emergency_unwind_strategy(&1_500);
+    assert_eq!(total_recovered, 1_500);
+    assert_eq!(f.client.get_vault_balance(&f.token), 1_500);
+
+    // Payer 1 recovers principal using dedicated emergency_withdraw_principal
+    let w1 = f.client.emergency_withdraw_principal(&1_u64);
+    assert_eq!(w1, 1_000);
+    assert_eq!(f.token_client.balance(&f.payer), 1_000);
+    assert_eq!(f.client.get_active_escrows(), 1);
+
+    // Cannot withdraw twice
+    assert_eq!(
+        f.client.try_emergency_withdraw_principal(&1_u64),
+        Err(Ok(Error::EscrowNotActive))
+    );
+
+    // Payer 2 recovers principal using cancel() in emergency mode
+    let outcome = f.client.cancel(&2_u64);
+    assert_eq!(outcome.principal, 500);
+    assert_eq!(outcome.to_payer, 500);
+    assert_eq!(outcome.to_beneficiary, 0);
+    assert_eq!(f.token_client.balance(&payer2), 500);
+    assert_eq!(f.client.get_active_escrows(), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+}
+
+#[test]
+fn emergency_user_withdrawal_permits_cancel_and_release_bypassing_deadlines() {
+    let f = Fixture::new();
+
+    // Escrow 1: future release deadline sequence = 500 (current sequence = 0)
+    f.token_admin.mint(&f.payer, &600);
+    f.client.create_escrow(
+        &10_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &600_i128,
+        &500_u32,
+        &5_000_u32,
+    );
+
+    // Escrow 2: past release deadline sequence = 50 (we will advance sequence to 100)
+    f.token_admin.mint(&f.payer, &400);
+    f.client.create_escrow(
+        &20_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &400_i128,
+        &50_u32,
+        &5_000_u32,
+    );
+
+    // Advance to sequence 100:
+    // Escrow 1 deadline (500) has NOT been reached yet.
+    // Escrow 2 deadline (50) HAS been reached.
+    set_sequence(&f.env, 100);
+
+    // In normal mode:
+    // - Escrow 1 release fails because deadline not reached (NotYetReleasable)
+    assert_eq!(
+        f.client.try_release(&10_u64),
+        Err(Ok(Error::NotYetReleasable))
+    );
+    // - Escrow 2 cancel fails because deadline has passed (StillLocked)
+    assert_eq!(f.client.try_cancel(&20_u64), Err(Ok(Error::StillLocked)));
+
+    // Admin executes emergency unwind
+    f.client.emergency_unwind_strategy(&1_000);
+    assert!(f.client.is_emergency_mode());
+
+    // In EmergencyVaultMode:
+    // - Escrow 1 can be released immediately (bypassing NotYetReleasable) to deliver liquidity to beneficiary!
+    let release_res = f.client.release(&10_u64);
+    assert_eq!(release_res.principal, 600);
+    assert_eq!(release_res.to_beneficiary, 600);
+    assert_eq!(f.token_client.balance(&f.beneficiary), 600);
+
+    // - Escrow 2 can be cancelled immediately (bypassing StillLocked) to refund payer!
+    let cancel_res = f.client.cancel(&20_u64);
+    assert_eq!(cancel_res.principal, 400);
+    assert_eq!(cancel_res.to_payer, 400);
+    assert_eq!(f.token_client.balance(&f.payer), 400);
+
+    assert_eq!(f.client.get_active_escrows(), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+}
+
+#[test]
+fn emergency_unwind_multi_strategy_portfolio_and_haircut_withdrawal() {
+    let f = Fixture::new();
+
+    let pool1_id = f.env.register_contract(None, MockLendingPool);
+    let pool2_id = f.env.register_contract(None, MockLendingPool);
+    let pool3_id = f.env.register_contract(None, MockLendingPool);
+
+    let pool2 = MockLendingPoolClient::new(&f.env, &pool2_id);
+
+    let strats = soroban_sdk::vec![
+        &f.env,
+        StrategyAllocation {
+            address: pool1_id.clone(),
+            weight_bps: 5_000, // 50%
+        },
+        StrategyAllocation {
+            address: pool2_id.clone(),
+            weight_bps: 3_000, // 30%
+        },
+        StrategyAllocation {
+            address: pool3_id.clone(),
+            weight_bps: 2_000, // 20%
+        },
+    ];
+    f.client.set_strategies(&strats);
+
+    let total_principal = 10_000_i128;
+    f.token_admin.mint(&f.payer, &total_principal);
+    f.client.create_escrow(
+        &100_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &total_principal,
+        &300_u32,
+        &5_000_u32,
+    );
+
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 5_000);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 3_000);
+    assert_eq!(f.client.get_strategy_balance(&pool3_id, &f.token), 2_000);
+    assert_eq!(f.client.get_total_strategy_balance(&f.token), 10_000);
+
+    // Pool 2 depegs / loses 50% of its capital (1,500 lost)
+    pool2.simulate_loss(&f.token, &1_500);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 1_500);
+    assert_eq!(f.client.get_total_strategy_balance(&f.token), 8_500);
+
+    // Slippage bound test: requesting 9,000 fails
+    assert_eq!(
+        f.client.try_emergency_unwind_strategy(&9_000),
+        Err(Ok(Error::SlippageExceeded))
+    );
+
+    // Unwind with acceptable bound of 8,500 succeeds
+    let recovered = f.client.emergency_unwind_strategy(&8_500);
+    assert_eq!(recovered, 8_500);
+
+    // All strategies are now drained to 0
+    assert_eq!(f.client.get_strategy_balance(&pool1_id, &f.token), 0);
+    assert_eq!(f.client.get_strategy_balance(&pool2_id, &f.token), 0);
+    assert_eq!(f.client.get_strategy_balance(&pool3_id, &f.token), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 8_500);
+
+    // User principal withdrawal receives available liquidity (8,500)
+    let user_payout = f.client.emergency_withdraw(&100_u64);
+    assert_eq!(user_payout, 8_500);
+    assert_eq!(f.token_client.balance(&f.payer), 8_500);
+    assert_eq!(f.client.get_active_escrows(), 0);
+    assert_eq!(f.client.get_vault_balance(&f.token), 0);
+}
+
+#[test]
+fn emergency_unwind_validation_and_invalid_states() {
+    let f = Fixture::new();
+
+    // Calling emergency_withdraw before emergency mode is active fails
+    assert_eq!(
+        f.client.try_emergency_withdraw(&1_u64),
+        Err(Ok(Error::EmergencyModeNotActive))
+    );
+
+    // Negative min_recovered_amount fails
+    assert_eq!(
+        f.client.try_emergency_unwind_strategy(&-10),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // emergency_unwind_token works directly with specific token
+    f.token_admin.mint(&f.payer, &500);
+    f.client.create_escrow(
+        &1_u64,
+        &f.payer,
+        &f.beneficiary,
+        &f.token,
+        &500_i128,
+        &150_u32,
+        &1_000_u32,
+    );
+
+    let rec = f.client.emergency_unwind_token(&f.token, &500);
+    assert_eq!(rec, 500);
+    assert!(f.client.is_emergency_mode());
+
+    // Non-existent escrow withdrawal fails
+    assert_eq!(
+        f.client.try_emergency_withdraw(&999_u64),
+        Err(Ok(Error::EscrowNotFound))
+    );
 }

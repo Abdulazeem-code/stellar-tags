@@ -1,6 +1,30 @@
 use crate::errors::Error;
 use soroban_sdk::{contracttype, Address, BytesN, Env};
 
+// ── Tiered Circuit Breaker ───────────────────────────────────────────────────
+
+/// Tiered pause levels for the emergency circuit breaker (issue #890).
+///
+/// - `None` (0): Contract is fully operational — both direct payments and
+///   swap-routed payments are accepted.
+/// - `SwapsOnly` (1): Only DEX swap operations (`route_payment_with_swap` and
+///   `route_payments_with_swap`) are halted.  Direct `route_payments` calls
+///   continue to function normally, so core merchant payment flows remain
+///   unaffected during an isolated DEX exploit.
+/// - `FullHalt` (2): All routing operations are halted.  Equivalent to the
+///   legacy `Paused = true` behaviour.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PauseLevel {
+    /// Contract fully operational.
+    None = 0,
+    /// DEX swaps halted; direct payments continue.
+    SwapsOnly = 1,
+    /// All routing halted.
+    FullHalt = 2,
+}
+
 /// Role definitions for the Role-Based Access Control (RBAC) system.
 ///
 /// Segregates operational privileges across dedicated role boundaries:
@@ -26,12 +50,18 @@ pub enum Role {
     /// from the broader compliance role so the ability to halt routing can be
     /// delegated narrowly.
     Pauser = 5,
+    /// Security officer with authority over security policies and freeze operations.
+    SecurityOfficer = 6,
+    /// Upgrade manager with authority over contract code upgrades and migrations.
+    UpgradeManager = 7,
 }
 
 /// Storage keys for all contract instance and persistent data.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// The designated primary address holding a given role.
+    Role(Role),
     /// The current admin address.
     Admin,
     /// Governance contract address; if set, it takes over fee-authority from the admin.
@@ -77,8 +107,6 @@ pub enum DataKey {
     Frozen,
     /// Whether an address holds a given role.
     UserRole(Address, Role),
-    /// The primary address currently holding a role.
-    Role(Role),
     /// Monotonic nonce for meta-transaction replay protection.
     MetaNonce(Address),
     /// Trusted issuer/oracle queried for high-value payment senders.
@@ -141,6 +169,15 @@ pub enum DataKey {
     UpgradeApproval(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
+    /// Tiered pause level for the emergency circuit breaker (issue #890).
+    /// Stored as `PauseLevel` in instance storage. Supersedes the legacy
+    /// `DataKey::Paused` boolean; both keys are honoured during migration so
+    /// existing paused state is preserved.
+    PauseLevel,
+    /// The operator address authorized to renew the dead man's switch heartbeat
+    /// without possessing full admin privileges (issue #889).
+    /// Stored as `Address` in instance storage.
+    HeartbeatOperator,
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

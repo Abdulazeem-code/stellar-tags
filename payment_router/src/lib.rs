@@ -1,6 +1,7 @@
 #![no_std]
 pub mod access;
 mod archival;
+pub mod dead_mans_switch;
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
@@ -10,11 +11,11 @@ pub mod types;
 
 pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
+pub use dead_mans_switch::*;
 pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
 pub use storage::*;
-pub use timelock::*;
 pub use types::*;
 
 use soroban_sdk::xdr::ToXdr;
@@ -89,6 +90,21 @@ impl PaymentRouter {
     #[inline]
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
         access::require_fee_authority(env)
+    }
+    #[allow(dead_code)]
+    #[inline]
+    fn require_fee_manager(env: &Env) -> Result<Address, Error> {
+        access::require_role(env, Role::FeeManager)
+    }
+    #[allow(dead_code)]
+    #[inline]
+    fn require_security_officer(env: &Env) -> Result<Address, Error> {
+        access::require_role(env, Role::SecurityOfficer)
+    }
+    #[allow(dead_code)]
+    #[inline]
+    fn require_upgrade_manager(env: &Env) -> Result<Address, Error> {
+        access::require_role(env, Role::UpgradeManager)
     }
     #[inline]
     fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
@@ -169,6 +185,22 @@ impl PaymentRouter {
     #[inline]
     fn require_circuit_closed(env: &Env) -> Result<(), Error> {
         access::require_circuit_closed(env)
+    }
+    #[inline]
+    fn get_pause_level_internal(env: &Env) -> PauseLevel {
+        access::get_pause_level(env)
+    }
+    #[inline]
+    fn set_pause_level_internal(env: &Env, level: PauseLevel) {
+        access::set_pause_level(env, level);
+    }
+    #[inline]
+    fn require_not_fully_halted(env: &Env) -> Result<(), Error> {
+        access::require_not_fully_halted(env)
+    }
+    #[inline]
+    fn require_swaps_not_paused(env: &Env) -> Result<(), Error> {
+        access::require_swaps_not_paused(env)
     }
     #[inline]
     fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
@@ -861,20 +893,118 @@ impl PaymentRouter {
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
-        timelock::execute_action(&env, nonce)
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        // Circuit breaker: applying a queued parameter change is a
+        // non-essential state change and is blocked while paused.
+        Self::require_circuit_closed(&env)?;
+
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::TimelockEntry(nonce);
+        let entry: TimelockEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now < entry.queued_at + Self::SECONDS_IN_24H {
+            return Err(Error::TimelockNotReady);
+        }
+
+        // Validate the action before touching storage so that a rejected entry
+        // stays in the queue for the admin to retry or cancel.  Upgrades are
+        // gated on the M-of-N threshold here as well as in `upgrade`, so
+        // routing an upgrade through the timelock is not a way around it.
+        access::validate_queued_action(&env, &entry.action)?;
+
+        // Remove the entry before applying the action (checks-effects-interactions).
+        env.storage().persistent().remove(&key);
+
+        // Apply the action.
+        match entry.action {
+            ActionType::SetPlatformTreasury(new_treasury) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PlatformTreasury, &new_treasury);
+            }
+            ActionType::SetFeeConfig(fee_bps, fee_cap) => {
+                env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+                env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
+            }
+            ActionType::SetFeeBps(new_fee_bps) => {
+                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+            }
+            ActionType::SetGovernance(gov) => {
+                env.storage().instance().set(&DataKey::Governance, &gov);
+            }
+            ActionType::SetMinLimit(min_limit) => {
+                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
+            }
+            ActionType::TransferAdmin(new_admin) => {
+                env.storage().instance().set(&DataKey::Admin, &new_admin);
+                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
+            }
+            ActionType::SetBackupAdmin(backup, timeout_seconds) => {
+                Self::apply_set_backup_admin(&env, backup, timeout_seconds)?;
+            }
+            ActionType::Upgrade(new_wasm_hash) => {
+                Self::apply_upgrade(&env, &new_wasm_hash);
+            }
+            ActionType::SetMultisigConfig(signers, threshold) => {
+                Self::store_multisig_config(&env, signers, threshold);
+            }
+            ActionType::RegisterDex(dex) => {
+                let key = DataKey::RegisteredDex(dex.clone());
+                env.storage().persistent().set(&key, &true);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+            ActionType::DeregisterDex(dex) => {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::RegisteredDex(dex.clone()));
+            }
+            ActionType::SetMaxSlippageBps(max_slippage_bps) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MaxSlippageBps, &max_slippage_bps);
+            }
+            ActionType::SetPairMaxSlippageBps(token_in, token_out, bps) => {
+                let key = DataKey::PairSlippage(token_in, token_out);
+                env.storage().persistent().set(&key, &bps);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+        }
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
+
+        log!(&env, "Timelock action executed for nonce {}", nonce);
+        Ok(())
     }
 
-    /// Executes a batch of previously queued timelock actions sequentially within
-    /// a single atomic invocation.
+    /// Executes a batch of previously queued timelock actions identified by
+    /// `nonces`, in order.
     ///
-    /// Requirements:
-    /// - The contract must not be frozen.
-    /// - Circuit breaker must be closed.
-    /// - The admin must authorize.
-    /// - All nonces in the batch must be verified ready and valid BEFORE any action is executed.
-    /// - All actions execute sequentially. If any action fails execution,
-    ///   the entire invocation reverts atomically.
-    /// - Emits `batch_actions_executed` event with the list of nonces.
+    /// Each nonce is applied exactly as [`Self::execute_action`] would apply
+    /// it; the first failure aborts the whole batch, reverting every action
+    /// already applied in the same transaction.
     pub fn execute_batch_actions(env: Env, nonces: Vec<u64>) -> Result<(), Error> {
         timelock::execute_batch_actions(&env, nonces)
     }
@@ -1390,11 +1520,14 @@ impl PaymentRouter {
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         Self::require_role(&env, Role::Pauser)?;
 
-        env.storage().instance().set(&DataKey::Paused, &paused);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
+        // Convert the boolean to a tiered level for backward compatibility.
+        // `true` → `FullHalt`, `false` → `None`.
+        let level = if paused {
+            PauseLevel::FullHalt
+        } else {
+            PauseLevel::None
+        };
+        Self::set_pause_level_internal(&env, level);
 
         env.events().publish((symbol_short!("pause"),), (paused,));
 
@@ -1415,10 +1548,52 @@ impl PaymentRouter {
         Self::set_pause(env, paused)
     }
 
-    /// Returns whether the contract is currently paused.
+    /// Sets the tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `PauseLevel::None` (0) — all routing enabled.
+    /// - `PauseLevel::SwapsOnly` (1) — DEX swap calls blocked; direct payments continue.
+    /// - `PauseLevel::FullHalt` (2) — all routing blocked (equivalent to `set_pause(true)`).
+    ///
+    /// Pauser role is required. This call is NOT timelocked so the Pauser can
+    /// react immediately to an exploit.
+    ///
+    /// # Panics
+    /// Panics if the current Pauser does not authorize the call.
+    pub fn set_pause_level(env: Env, level: PauseLevel) -> Result<(), Error> {
+        Self::require_role(&env, Role::Pauser)?;
+
+        Self::set_pause_level_internal(&env, level);
+
+        env.events()
+            .publish((Symbol::new(&env, "pause_level"),), (level as u32,));
+
+        Ok(())
+    }
+
+    /// Returns the current tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `0` = None (fully operational)
+    /// - `1` = SwapsOnly (swaps halted, direct payments active)
+    /// - `2` = FullHalt (all routing halted)
     ///
     /// # Returns
-    /// `true` if paused, `false` if unpaused or not yet initialized.
+    /// The active [`PauseLevel`].
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_pause_level(env: Env) -> PauseLevel {
+        Self::get_pause_level_internal(&env)
+    }
+
+    /// Returns whether the contract is currently paused.
+    ///
+    /// Returns `true` only when the pause level is `FullHalt`.  Under
+    /// `SwapsOnly`, direct payments still work so this returns `false` to
+    /// preserve backward compatibility for callers that only need to know
+    /// whether core transfers are allowed.
+    ///
+    /// # Returns
+    /// `true` if fully halted, `false` otherwise.
     ///
     /// # Panics
     /// Does not panic.
@@ -1702,7 +1877,7 @@ impl PaymentRouter {
     /// configuration, stores the backup admin and timeout, and starts the
     /// claim clock. Performs NO authorization; callers must do that first
     /// (direct admin call or timelock execution).
-    pub(crate) fn apply_set_backup_admin(
+    fn apply_set_backup_admin(
         env: &Env,
         backup: Address,
         timeout_seconds: u64,
@@ -2315,6 +2490,108 @@ impl PaymentRouter {
         env.ledger().timestamp().saturating_sub(last) >= timeout
     }
 
+    // ── Dead Man's Switch — Operator Heartbeat (issue #889) ──────────────────
+
+    /// Appoints `operator` as the designated heartbeat renewal address.
+    ///
+    /// The operator can call `renew_heartbeat` to reset the DMS clock without
+    /// holding any other admin privileges.  This avoids exposing cold-storage
+    /// admin keys for routine monthly renewals.
+    ///
+    /// Only one operator may be designated at a time; calling this again
+    /// overwrites the previous designation.
+    ///
+    /// # Parameters
+    /// - `operator`: Address to designate as the heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    /// - `Error::Unauthorized` — caller is not the admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn set_heartbeat_operator(env: Env, operator: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::set_heartbeat_operator_internal(&env, &operator);
+
+        env.events()
+            .publish((Symbol::new(&env, "hb_operator_set"), admin), operator);
+
+        log!(&env, "Heartbeat operator set");
+        Ok(())
+    }
+
+    /// Removes the designated heartbeat operator.
+    ///
+    /// After removal, only the primary admin (`ping`) or a routed payment can
+    /// reset the DMS clock.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn remove_heartbeat_operator(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::remove_heartbeat_operator_internal(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "hb_operator_rm"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Heartbeat operator removed");
+        Ok(())
+    }
+
+    /// Returns the currently designated heartbeat operator, if any.
+    ///
+    /// # Returns
+    /// `Some(operator)` if one is configured, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_heartbeat_operator(env: Env) -> Option<Address> {
+        dead_mans_switch::get_heartbeat_operator_internal(&env)
+    }
+
+    /// Renews the dead man's switch heartbeat on behalf of the configured
+    /// heartbeat operator (issue #889).
+    ///
+    /// The `operator` address must match the stored `DataKey::HeartbeatOperator`
+    /// and must authorize this call.  The operator may **only** reset the
+    /// heartbeat timestamp — it cannot modify the backup admin address, the
+    /// DMS timeout, or any other contract parameter.
+    ///
+    /// # Parameters
+    /// - `operator`: The address claiming operator privileges.  Must match the
+    ///   configured heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::Unauthorized` — `operator` does not match the stored operator
+    ///   or no operator has been configured.
+    /// - `Error::InvalidDmsConfig` — the dead man's switch is not currently
+    ///   armed (no heartbeat timestamp exists).
+    ///
+    /// # Panics
+    /// Panics if `operator` does not authorize the call.
+    pub fn renew_heartbeat(env: Env, operator: Address) -> Result<(), Error> {
+        dead_mans_switch::renew_heartbeat(&env, &operator)
+    }
+
     /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
     ///
     /// # Parameters
@@ -2521,164 +2798,6 @@ impl PaymentRouter {
         )
     }
 
-    /// Routes a payment through two to four consecutive DEX swaps. `path`
-    /// contains the input asset followed by every intermediate asset and the
-    /// output asset. `min_amounts_out[i]` is the required output for hop `i`.
-    /// Any input dust returned by a hop is refunded to `sender` in that hop's
-    /// input asset. All swaps and settlement are atomic.
-    pub fn route_multihop_swap(
-        env: Env,
-        sender: Address,
-        recipient: Address,
-        dex_router: Address,
-        amount_in: i128,
-        path: Vec<Address>,
-        min_amounts_out: Vec<i128>,
-    ) -> Result<i128, Error> {
-        let _guard = ReentrancyGuard::new(&env)?;
-        if Self::is_frozen_internal(&env) {
-            return Err(Error::ContractFrozen);
-        }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
-        if sender == recipient {
-            return Err(Error::InvalidRecipient);
-        }
-        if Self::is_blacklisted(env.clone(), recipient.clone()) {
-            return Err(Error::Blacklisted);
-        }
-
-        let hop_count = path.len().saturating_sub(1);
-        if !(2..=4).contains(&hop_count) || min_amounts_out.len() != hop_count {
-            return Err(Error::InvalidSwapPath);
-        }
-        // Paths are intentionally short (at most five assets), so checking
-        // every pair keeps the cycle guard simple and bounded.
-        for i in 0..path.len() {
-            let asset = path.get(i).ok_or(Error::InvalidSwapPath)?;
-            for j in (i + 1)..path.len() {
-                if path.get(j).as_ref() == Some(&asset) {
-                    return Err(Error::CyclicSwapPath);
-                }
-            }
-        }
-        for floor in min_amounts_out.iter() {
-            if floor <= 0 {
-                return Err(Error::InvalidSwapParams);
-            }
-        }
-        if !Self::is_dex_registered_internal(&env, &dex_router) {
-            return Err(Error::DexNotRegistered);
-        }
-
-        let max_amount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxAmount)
-            .unwrap_or(Self::MAX_AMOUNT);
-        let min_limit: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinLimit)
-            .unwrap_or(0);
-        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
-            return Err(Error::LimitExceeded);
-        }
-        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
-        sender.require_auth();
-        Self::check_rate_limit(&env, &sender)?;
-
-        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
-        let user_volume = Self::accrue_user_record(&env, &sender, amount_in)?;
-        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
-            fee_bps / 2
-        } else {
-            fee_bps
-        };
-        let contract_address = env.current_contract_address();
-        let first_token = path.get(0).ok_or(Error::InvalidSwapPath)?;
-        let input_client = token::Client::new(&env, &first_token);
-        if input_client.balance(&sender) < amount_in {
-            return Err(Error::InsufficientBalance);
-        }
-        input_client.transfer(&sender, &contract_address, &amount_in);
-
-        let mut current_amount = amount_in;
-        for i in 0..hop_count {
-            let token_in = path.get(i).ok_or(Error::InvalidSwapPath)?;
-            let token_out = path.get(i + 1).ok_or(Error::InvalidSwapPath)?;
-            let floor = min_amounts_out.get(i).ok_or(Error::InvalidSwapPath)?;
-            let token_in_client = token::Client::new(&env, &token_in);
-            let token_out_client = token::Client::new(&env, &token_out);
-            let input_before = token_in_client.balance(&contract_address);
-            let output_before = token_out_client.balance(&contract_address);
-            token_in_client.transfer(&contract_address, &dex_router, &current_amount);
-            let hop_path = vec![&env, token_in.clone(), token_out.clone()];
-            let result = DexRouterClient::new(&env, &dex_router).swap_exact_tokens_for_tokens(
-                &token_in,
-                &token_out,
-                &current_amount,
-                &floor,
-                &hop_path,
-                &contract_address,
-            );
-            if result.len() != 2 {
-                return Err(Error::InvalidSwapPath);
-            }
-            let reported_out: i128 = result.get(0).ok_or(Error::SwapFailed)?;
-            let reported_unused: i128 = result.get(1).ok_or(Error::SwapFailed)?;
-            let input_after = token_in_client.balance(&contract_address);
-            let output_after = token_out_client.balance(&contract_address);
-            let actual_unused = input_after - (input_before - current_amount);
-            let actual_out = output_after - output_before;
-            if reported_unused < 0
-                || reported_unused > current_amount
-                || actual_unused != reported_unused
-                || reported_out != actual_out
-                || actual_out < floor
-                || actual_out <= 0
-            {
-                return Err(Error::SlippageExceeded);
-            }
-            if actual_unused > 0 {
-                // The path cannot revisit an asset, so this hop's unused input
-                // is no longer needed by a later hop.
-                token_in_client.transfer(&contract_address, &sender, &actual_unused);
-            }
-            env.events().publish(
-                (
-                    Symbol::new(&env, "swap_hop"),
-                    dex_router.clone(),
-                    token_in,
-                    token_out,
-                ),
-                (current_amount, actual_out, actual_unused, floor),
-            );
-            current_amount = actual_out;
-        }
-
-        let final_token = path.get(path.len() - 1).ok_or(Error::InvalidSwapPath)?;
-        let output_client = token::Client::new(&env, &final_token);
-        let (fee_amount, remainder) =
-            Self::calculate_fee(current_amount, effective_fee_bps, fee_cap);
-        if fee_amount > 0 {
-            output_client.transfer(&contract_address, &platform_treasury, &fee_amount);
-        }
-        if remainder > 0 {
-            match output_client.try_transfer(&contract_address, &recipient, &remainder) {
-                Ok(Ok(())) => {}
-                _ => Self::credit_refund_balance(&env, &sender, &final_token, remainder),
-            }
-        }
-        env.events().publish(
-            (symbol_short!("routed"), sender.clone(), recipient.clone()),
-            remainder,
-        );
-        Self::bump_heartbeat(&env);
-        Ok(remainder)
-    }
-
     /// Routes multiple payments in a single transaction. If any payment fails,
     /// the entire batch is reverted atomically.
     ///
@@ -2700,9 +2819,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): direct payments are only
+        // blocked at FullHalt.  SwapsOnly leaves them unaffected.
+        Self::require_not_fully_halted(&env)?;
 
         // Pre-validate the whole batch before authorizing or moving any
         // funds, so a rejected payment never triggers an auth rollback.
@@ -3102,9 +3221,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3132,9 +3251,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3198,6 +3317,161 @@ impl PaymentRouter {
             min_amount_out: Self::slippage_floor(amount_out, max_slippage_bps),
             max_slippage_bps,
         })
+    }
+
+    /// Routes a payment through a multi-hop swap path on a registered DEX.
+    ///
+    /// `path` must begin with `token_in` and end with `token_out`; `floors`
+    /// supplies the per-hop `min_amount_out` floors. The DEX is invoked once
+    /// per hop, and the final delivered amount is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_multihop_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        floors: Vec<i128>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+
+        let hop_count = path.len().saturating_sub(1);
+        if !(2..=4).contains(&hop_count) || floors.len() != hop_count {
+            return Err(Error::InvalidSwapPath);
+        }
+        for i in 0..path.len() {
+            let asset = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            for j in (i + 1)..path.len() {
+                if path.get(j).as_ref() == Some(&asset) {
+                    return Err(Error::CyclicSwapPath);
+                }
+            }
+        }
+        for floor in floors.iter() {
+            if floor <= 0 {
+                return Err(Error::InvalidSwapParams);
+            }
+        }
+        if !Self::is_dex_registered_internal(&env, &dex) {
+            return Err(Error::DexNotRegistered);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+        Self::check_rate_limit(&env, &sender)?;
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let user_volume = Self::accrue_user_record(&env, &sender, amount_in)?;
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+        let contract_address = env.current_contract_address();
+        let first_token = path.get(0).ok_or(Error::InvalidSwapPath)?;
+        let input_client = token::Client::new(&env, &first_token);
+        if input_client.balance(&sender) < amount_in {
+            return Err(Error::InsufficientBalance);
+        }
+        input_client.transfer(&sender, &contract_address, &amount_in);
+
+        let mut current_amount = amount_in;
+        for i in 0..hop_count {
+            let token_in = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_out = path.get(i + 1).ok_or(Error::InvalidSwapPath)?;
+            let floor = floors.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_in_client = token::Client::new(&env, &token_in);
+            let token_out_client = token::Client::new(&env, &token_out);
+            let input_before = token_in_client.balance(&contract_address);
+            let output_before = token_out_client.balance(&contract_address);
+            token_in_client.transfer(&contract_address, &dex, &current_amount);
+            let hop_path = vec![&env, token_in.clone(), token_out.clone()];
+            let result = DexRouterClient::new(&env, &dex).swap_exact_tokens_for_tokens(
+                &token_in,
+                &token_out,
+                &current_amount,
+                &floor,
+                &hop_path,
+                &contract_address,
+            );
+            if result.len() != 2 {
+                return Err(Error::InvalidSwapPath);
+            }
+            let reported_out: i128 = result.get(0).ok_or(Error::SwapFailed)?;
+            let reported_unused: i128 = result.get(1).ok_or(Error::SwapFailed)?;
+            let input_after = token_in_client.balance(&contract_address);
+            let output_after = token_out_client.balance(&contract_address);
+            let actual_unused = input_after - (input_before - current_amount);
+            let actual_out = output_after - output_before;
+            if reported_unused < 0
+                || reported_unused > current_amount
+                || actual_unused != reported_unused
+                || reported_out != actual_out
+                || actual_out < floor
+                || actual_out <= 0
+            {
+                return Err(Error::SlippageExceeded);
+            }
+            if actual_unused > 0 {
+                token_in_client.transfer(&contract_address, &sender, &actual_unused);
+            }
+            env.events().publish(
+                (
+                    Symbol::new(&env, "swap_hop"),
+                    dex.clone(),
+                    token_in,
+                    token_out,
+                ),
+                (current_amount, actual_out, actual_unused, floor),
+            );
+            current_amount = actual_out;
+        }
+
+        let final_token = path.get(path.len() - 1).ok_or(Error::InvalidSwapPath)?;
+        let output_client = token::Client::new(&env, &final_token);
+        let (fee_amount, remainder) =
+            Self::calculate_fee(current_amount, effective_fee_bps, fee_cap);
+        if fee_amount > 0 {
+            output_client.transfer(&contract_address, &platform_treasury, &fee_amount);
+        }
+        if remainder > 0 {
+            match output_client.try_transfer(&contract_address, &recipient, &remainder) {
+                Ok(Ok(())) => {}
+                _ => Self::credit_refund_balance(&env, &sender, &final_token, remainder),
+            }
+        }
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            remainder,
+        );
+        Self::bump_heartbeat(&env);
+        Ok(remainder)
     }
 
     // ── Swap configuration (sensitive; timelock-gated) ──────────────────────
