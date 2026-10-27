@@ -4,8 +4,8 @@ use crate::access::{
 };
 use crate::errors::Error;
 use crate::storage::{
-    DataKey, ExtraKey, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, SECONDS_IN_24H,
+    DataKey, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD, SECONDS_IN_24H,
 };
 use crate::types::{ActionType, TimelockEntry};
 use crate::PaymentRouter;

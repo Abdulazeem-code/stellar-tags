@@ -99,15 +99,16 @@ pub fn process_split_payment_with_swap(
     sell_token_client.transfer(sender, &contract_address, &amount_in);
 
     let mut total_out: i128 = 0;
-    let num_splits = splits.len();
+    let mut splits_remaining = splits.len();
     let mut allocated_in: i128 = 0;
 
-    for (idx, split) in splits.iter().enumerate() {
-        let is_last = (idx as u32) == num_splits - 1;
+    for split in splits.iter() {
+        let is_last = splits_remaining == 1;
+        splits_remaining -= 1;
         let split_amount_in = if is_last {
             amount_in - allocated_in
         } else {
-            (amount_in * (split.weight_bps as i128)) / (TOTAL_WEIGHT_BPS as i128)
+            (amount_in * i128::from(split.weight_bps)) / i128::from(TOTAL_WEIGHT_BPS)
         };
         allocated_in += split_amount_in;
 
