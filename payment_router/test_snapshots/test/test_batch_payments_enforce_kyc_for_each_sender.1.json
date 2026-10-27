@@ -1435,6 +1435,18 @@
                     },
                     {
                       "key": {
+                        "symbol": "memo"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "symbol": "None"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "recipient"
                       },
                       "val": {
@@ -1605,6 +1617,18 @@
                                   "hi": 0,
                                   "lo": 2000
                                 }
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "memo"
+                              },
+                              "val": {
+                                "vec": [
+                                  {
+                                    "symbol": "None"
+                                  }
+                                ]
                               }
                             },
                             {

@@ -115,6 +115,8 @@ pub enum Error {
     CyclicSwapPath = 49,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
     InvalidSlippageConfig = 50,
+    /// A payment memo is malformed or exceeds Stellar's text memo limit.
+    InvalidMemo = 51,
 }
 
 #[allow(non_upper_case_globals)]

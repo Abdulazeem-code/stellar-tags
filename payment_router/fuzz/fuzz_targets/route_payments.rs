@@ -79,6 +79,7 @@ fuzz_target!(|input: FuzzInput| {
             recipient: recipient.clone(),
             token_address: token_address.clone(),
             amount: fuzz_payment.amount,
+            memo: Memo::None,
         });
     }
 
@@ -86,4 +87,3 @@ fuzz_target!(|input: FuzzInput| {
     // rejection, which is the behavior this fuzz target verifies.
     let _ = client.try_route_payments(&payments);
 });
-
