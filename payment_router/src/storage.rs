@@ -1,5 +1,5 @@
 use crate::errors::Error;
-use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 // ── Tiered Circuit Breaker ───────────────────────────────────────────────────
 
@@ -50,14 +50,10 @@ pub enum Role {
     /// from the broader compliance role so the ability to halt routing can be
     /// delegated narrowly.
     Pauser = 5,
-}
-
-/// Dedicated key type for the heartbeat operator, kept separate to stay within
-/// Soroban's generated enum size limit for `DataKey`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeartbeatKey {
-    HeartbeatOperator,
+    /// Security officer with authority over security policies and freeze operations.
+    SecurityOfficer = 6,
+    /// Upgrade manager with authority over contract code upgrades and migrations.
+    UpgradeManager = 7,
 }
 
 /// Storage keys for the most recently added upgrade and batch features. Kept
@@ -75,9 +71,11 @@ pub enum ExtraKey {
 }
 
 /// Storage keys for all contract instance and persistent data.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// The designated primary address holding a given role.
+    Role(Role),
     /// The current admin address.
     Admin,
     /// Governance contract address; if set, it takes over fee-authority from the admin.
@@ -92,8 +90,6 @@ pub enum DataKey {
     MinLimit,
     /// Whether routing is currently paused.
     Paused,
-    /// Tiered circuit-breaker pause level.
-    PauseLevel,
     /// Maximum amount accepted by a single payment.
     MaxAmount,
     /// Cumulative lifetime amount routed by a given sender.
@@ -125,8 +121,6 @@ pub enum DataKey {
     Frozen,
     /// Whether an address holds a given role.
     UserRole(Address, Role),
-    /// The primary address currently holding a role.
-    Role(Role),
     /// Monotonic nonce for meta-transaction replay protection.
     MetaNonce(Address),
     /// Whether a maker quote identified by its quote ID has been settled.
@@ -144,14 +138,6 @@ pub enum DataKey {
     /// Inactivity window (seconds) after which the backup admin may claim.
     /// Stored as `u64` in instance storage.
     DmsTimeout,
-    /// Tier 2 council signers for multi-sig succession.
-    DmsTier2Council,
-    /// Tier 2 configuration tuple (threshold: u32, timeout_seconds: u64).
-    DmsTier2Config,
-    /// Pending in-flight dead man's switch claim (DmsClaimStatus) during grace period.
-    DmsPendingClaim,
-    /// List of council signers who approved the pending Tier 2 claim.
-    DmsCouncilApprovals,
     /// Per-address payment invocation cap per ledger sequence.
     /// Stored as `u32` in instance storage (`0` disables rate limiting).
     RateLimitConfig,
@@ -193,6 +179,21 @@ pub enum DataKey {
     PairSlippage(Address, Address),
     /// The N addresses of the multi-signature admin group for upgrades.
     MultisigSigners,
+    /// The M signers threshold of the multi-signature admin group.
+    MultisigThreshold,
+    /// Signer approvals collected for a specific upgrade WASM hash.
+    UpgradeApproval(BytesN<32>),
+    /// Guard against cross-contract reentrancy attacks.
+    ReentrancyGuard,
+    /// Tiered pause level for the emergency circuit breaker (issue #890).
+    /// Stored as `PauseLevel` in instance storage. Supersedes the legacy
+    /// `DataKey::Paused` boolean; both keys are honoured during migration so
+    /// existing paused state is preserved.
+    PauseLevel,
+    /// The operator address authorized to renew the dead man's switch heartbeat
+    /// without possessing full admin privileges (issue #889).
+    /// Stored as `Address` in instance storage.
+    HeartbeatOperator,
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -204,7 +205,6 @@ pub const DAILY_MAX_LIMIT: i128 = 1_000_000 * XLM_DECIMALS; // 1M tokens limit
 pub const VOLUME_THRESHOLD: i128 = 10_000 * XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
 pub const SECONDS_IN_24H: u64 = 24 * 3600;
 pub const MIN_DMS_TIMEOUT: u64 = 7 * 24 * 3600;
-pub const DMS_GRACE_PERIOD: u64 = 72 * 3600;
 pub const DEFAULT_RATE_LIMIT: u32 = 10;
 pub const MAX_RATE_LIMIT: u32 = 1_000_000;
 pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = 1_000;
@@ -218,12 +218,6 @@ pub const USER_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 pub const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
 pub const PERSISTENT_BUMP_AMOUNT: u32 = USER_BUMP_AMOUNT;
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = USER_LIFETIME_THRESHOLD;
-pub const TEMPORARY_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
-pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = TEMPORARY_BUMP_AMOUNT - DAY_IN_LEDGERS;
-pub const DEFAULT_TELEMETRY_CAPACITY: u32 = 64;
-pub const MAX_TELEMETRY_CAPACITY: u32 = 256;
-/// Number of bits packed into each `u64` word of a Merkle claimed bitset.
-pub const MERKLE_BITS_PER_WORD: u32 = 64;
 
 // ── Reentrancy Guard ─────────────────────────────────────────────────────────
 
@@ -400,446 +394,4 @@ pub fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i
     }
 
     Ok(volume)
-}
-
-// ── Merkle Batch Helpers ─────────────────────────────────────────────────────
-
-/// Packed record describing a registered Merkle distribution batch.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MerkleBatchRecord {
-    /// Address that funded the batch and may reclaim unclaimed funds.
-    pub sender: Address,
-    /// Token contract used for disbursement.
-    pub token: Address,
-    /// Total amount deposited for the batch.
-    pub total_amount: i128,
-    /// Committed 32-byte Merkle root over (recipient, amount) leaves.
-    pub merkle_root: BytesN<32>,
-    /// Unix timestamp after which unclaimed funds may be reclaimed.
-    pub expiration: u64,
-    /// Total amount already claimed from this batch.
-    pub claimed_amount: i128,
-}
-
-/// Returns the number of `u64` words required to store `leaf_count` bits.
-pub fn merkle_bitset_words(leaf_count: u32) -> u32 {
-    if leaf_count == 0 {
-        return 0;
-    }
-    leaf_count.div_ceil(MERKLE_BITS_PER_WORD)
-}
-
-/// Reads the packed claimed bitset for a batch, returning an empty vector when
-/// no claims have been recorded yet.
-pub fn load_merkle_bits(env: &Env, batch_id: u64) -> Vec<u64> {
-    env.storage()
-        .persistent()
-        .get(&ExtraKey::MerkleClaimedBits(batch_id))
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-/// Persists the packed claimed bitset for a batch with an extended TTL.
-pub fn store_merkle_bits(env: &Env, batch_id: u64, bits: &Vec<u64>) {
-    let key = ExtraKey::MerkleClaimedBits(batch_id);
-    env.storage().persistent().set(&key, bits);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
-}
-
-/// Returns `true` when the bit at `index` is set in the packed bitset.
-pub fn merkle_bit_get(bits: &Vec<u64>, index: u32) -> bool {
-    let word = index / MERKLE_BITS_PER_WORD;
-    let offset = index % MERKLE_BITS_PER_WORD;
-    match bits.get(word) {
-        Some(w) => (w >> offset) & 1 == 1,
-        None => false,
-    }
-}
-
-/// Sets the bit at `index` in the packed bitset, growing it as needed.
-pub fn merkle_bit_set(env: &Env, bits: &mut Vec<u64>, index: u32) {
-    let word = index / MERKLE_BITS_PER_WORD;
-    let offset = index % MERKLE_BITS_PER_WORD;
-    while bits.len() <= word {
-        bits.push_back(0u64);
-    }
-    let current = bits.get(word).unwrap_or(0);
-    bits.set(word, current | (1u64 << offset));
-    let _ = env;
-}
-
-// ── Circular Telemetry Ring Buffer ───────────────────────────────────────────
-
-/// A bit-packed 64-bit telemetry record for payment router operations.
-///
-/// Bit layout (64 bits total):
-/// - Timestamp: 32 bits (bits 32..63)
-/// - Volume:    24 bits (bits 8..31, max 16,777,215)
-/// - Status:     8 bits (bits 0..7, max 255)
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub struct PackedTelemetryRecord {
-    pub raw: u64,
-}
-
-impl PackedTelemetryRecord {
-    pub const MAX_VOLUME: u32 = 0x00FF_FFFF;
-
-    #[inline]
-    pub fn new(timestamp: u32, volume: u32, status: u8) -> Self {
-        let volume = volume.min(Self::MAX_VOLUME);
-        let raw = (u64::from(timestamp) << 32)
-            | ((u64::from(volume) & u64::from(Self::MAX_VOLUME)) << 8)
-            | u64::from(status);
-        Self { raw }
-    }
-
-    #[inline]
-    pub fn from_raw(raw: u64) -> Self {
-        Self { raw }
-    }
-
-    #[inline]
-    pub fn raw(&self) -> u64 {
-        self.raw
-    }
-
-    #[inline]
-    pub fn to_u64(&self) -> u64 {
-        self.raw
-    }
-
-    #[inline]
-    pub fn from_u128(value: u128) -> Self {
-        Self {
-            raw: u64::try_from(value).unwrap_or(u64::MAX),
-        }
-    }
-
-    #[inline]
-    pub fn to_u128(&self) -> u128 {
-        u128::from(self.raw)
-    }
-
-    #[inline]
-    pub fn timestamp(&self) -> u32 {
-        (self.raw >> 32) as u32
-    }
-
-    #[inline]
-    pub fn volume(&self) -> u32 {
-        u32::try_from((self.raw >> 8) & u64::from(Self::MAX_VOLUME)).unwrap_or(Self::MAX_VOLUME)
-    }
-
-    #[inline]
-    pub fn status(&self) -> u8 {
-        (self.raw & 0xFF) as u8
-    }
-
-    #[inline]
-    pub fn unpack(&self) -> (u32, u32, u8) {
-        (self.timestamp(), self.volume(), self.status())
-    }
-}
-
-impl From<u64> for PackedTelemetryRecord {
-    #[inline]
-    fn from(raw: u64) -> Self {
-        Self { raw }
-    }
-}
-
-impl From<PackedTelemetryRecord> for u64 {
-    #[inline]
-    fn from(record: PackedTelemetryRecord) -> Self {
-        record.raw
-    }
-}
-
-impl From<u128> for PackedTelemetryRecord {
-    #[inline]
-    fn from(value: u128) -> Self {
-        Self::from_u128(value)
-    }
-}
-
-impl From<PackedTelemetryRecord> for u128 {
-    #[inline]
-    fn from(record: PackedTelemetryRecord) -> Self {
-        record.to_u128()
-    }
-}
-
-/// Header state for the circular telemetry ring buffer stored in temporary storage.
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct TelemetryHeader {
-    pub head: u32,
-    pub count: u32,
-    pub capacity: u32,
-    pub running_sum: u64,
-}
-
-/// A zero-allocation circular ring buffer backed by temporary ledger storage.
-pub struct TelemetryRingBuffer<'a> {
-    env: &'a Env,
-    header: TelemetryHeader,
-}
-
-impl<'a> TelemetryRingBuffer<'a> {
-    pub fn new(env: &'a Env, capacity: u32) -> Self {
-        let capacity = match capacity {
-            0 => DEFAULT_TELEMETRY_CAPACITY,
-            value => value.min(MAX_TELEMETRY_CAPACITY),
-        };
-        let buffer = Self {
-            env,
-            header: TelemetryHeader {
-                head: 0,
-                count: 0,
-                capacity,
-                running_sum: 0,
-            },
-        };
-        buffer.save_header();
-        buffer
-    }
-
-    pub fn load_or_create(env: &'a Env, capacity: u32) -> Self {
-        if let Some(header) = env
-            .storage()
-            .temporary()
-            .get::<ExtraKey, TelemetryHeader>(&ExtraKey::TelemetryHeader)
-        {
-            Self { env, header }
-        } else {
-            Self::new(env, capacity)
-        }
-    }
-
-    pub fn load(env: &'a Env) -> Option<Self> {
-        env.storage()
-            .temporary()
-            .get::<ExtraKey, TelemetryHeader>(&ExtraKey::TelemetryHeader)
-            .map(|header| Self { env, header })
-    }
-
-    #[inline]
-    pub fn save_header(&self) {
-        self.env
-            .storage()
-            .temporary()
-            .set(&ExtraKey::TelemetryHeader, &self.header);
-        self.env.storage().temporary().extend_ttl(
-            &ExtraKey::TelemetryHeader,
-            TEMPORARY_LIFETIME_THRESHOLD,
-            TEMPORARY_BUMP_AMOUNT,
-        );
-    }
-
-    pub fn append(&mut self, record: PackedTelemetryRecord) {
-        let capacity = self.header.capacity;
-        if capacity == 0 {
-            return;
-        }
-
-        let slot_index = self.header.head;
-        let slot_key = ExtraKey::TelemetrySlot(slot_index);
-        let new_volume = u64::from(record.volume());
-
-        if self.header.count >= capacity {
-            let old_volume = self
-                .env
-                .storage()
-                .temporary()
-                .get::<ExtraKey, PackedTelemetryRecord>(&slot_key)
-                .map(|stored| u64::from(stored.volume()))
-                .unwrap_or(0);
-            self.header.running_sum = self
-                .header
-                .running_sum
-                .saturating_sub(old_volume)
-                .saturating_add(new_volume);
-            self.header.count = capacity;
-        } else {
-            self.header.running_sum = self.header.running_sum.saturating_add(new_volume);
-            self.header.count += 1;
-        }
-
-        self.env.storage().temporary().set(&slot_key, &record);
-        self.env.storage().temporary().extend_ttl(
-            &slot_key,
-            TEMPORARY_LIFETIME_THRESHOLD,
-            TEMPORARY_BUMP_AMOUNT,
-        );
-        self.header.head = (slot_index + 1) % capacity;
-        self.save_header();
-    }
-
-    #[inline]
-    pub fn append_raw(&mut self, timestamp: u32, volume: u32, status: u8) -> PackedTelemetryRecord {
-        let record = PackedTelemetryRecord::new(timestamp, volume, status);
-        self.append(record);
-        record
-    }
-
-    #[inline]
-    pub fn rolling_average(&self) -> u64 {
-        if self.header.count == 0 {
-            0
-        } else {
-            self.header.running_sum / u64::from(self.header.count)
-        }
-    }
-
-    pub fn percentile(&self, percentile: u32) -> u32 {
-        let count = self.header.count as usize;
-        if count == 0 {
-            return 0;
-        }
-
-        let percentile = percentile.min(100);
-        let mut values = [0u32; MAX_TELEMETRY_CAPACITY as usize];
-        let bound = count.min(MAX_TELEMETRY_CAPACITY as usize);
-        for (index, value) in values.iter_mut().enumerate().take(bound) {
-            let slot = u32::try_from(index).unwrap_or(u32::MAX);
-            *value = self
-                .env
-                .storage()
-                .temporary()
-                .get::<ExtraKey, PackedTelemetryRecord>(&ExtraKey::TelemetrySlot(slot))
-                .map(|record| record.volume())
-                .unwrap_or(0);
-        }
-
-        for index in 1..bound {
-            let value = values[index];
-            let mut cursor = index;
-            while cursor > 0 && values[cursor - 1] > value {
-                values[cursor] = values[cursor - 1];
-                cursor -= 1;
-            }
-            values[cursor] = value;
-        }
-
-        if percentile == 0 {
-            return values[0];
-        }
-        if percentile == 100 {
-            return values[bound - 1];
-        }
-        let rank = (percentile as usize * (bound - 1) + 50) / 100;
-        values[rank]
-    }
-
-    #[inline]
-    pub fn p50(&self) -> u32 {
-        self.percentile(50)
-    }
-
-    #[inline]
-    pub fn p90(&self) -> u32 {
-        self.percentile(90)
-    }
-
-    #[inline]
-    pub fn p95(&self) -> u32 {
-        self.percentile(95)
-    }
-
-    #[inline]
-    pub fn p99(&self) -> u32 {
-        self.percentile(99)
-    }
-
-    #[inline]
-    pub fn min_volume(&self) -> u32 {
-        self.percentile(0)
-    }
-
-    #[inline]
-    pub fn max_volume(&self) -> u32 {
-        self.percentile(100)
-    }
-
-    pub fn get_slot(&self, index: u32) -> Option<PackedTelemetryRecord> {
-        if index >= self.header.capacity || index >= self.header.count {
-            None
-        } else {
-            self.env
-                .storage()
-                .temporary()
-                .get::<ExtraKey, PackedTelemetryRecord>(&ExtraKey::TelemetrySlot(index))
-        }
-    }
-
-    #[inline]
-    pub fn count(&self) -> u32 {
-        self.header.count
-    }
-
-    #[inline]
-    pub fn capacity(&self) -> u32 {
-        self.header.capacity
-    }
-
-    #[inline]
-    pub fn head(&self) -> u32 {
-        self.header.head
-    }
-
-    #[inline]
-    pub fn running_sum(&self) -> u64 {
-        self.header.running_sum
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.header.count == 0
-    }
-
-    #[inline]
-    pub fn is_full(&self) -> bool {
-        self.header.count >= self.header.capacity
-    }
-
-    #[inline]
-    pub fn header(&self) -> TelemetryHeader {
-        self.header
-    }
-}
-
-pub fn append_telemetry(
-    env: &Env,
-    timestamp: u32,
-    volume: u32,
-    status: u8,
-) -> PackedTelemetryRecord {
-    let mut buffer = TelemetryRingBuffer::load_or_create(env, DEFAULT_TELEMETRY_CAPACITY);
-    buffer.append_raw(timestamp, volume, status)
-}
-
-pub fn append_telemetry_record(env: &Env, record: PackedTelemetryRecord) {
-    let mut buffer = TelemetryRingBuffer::load_or_create(env, DEFAULT_TELEMETRY_CAPACITY);
-    buffer.append(record);
-}
-
-pub fn get_telemetry_average(env: &Env) -> u64 {
-    let buffer = TelemetryRingBuffer::load_or_create(env, DEFAULT_TELEMETRY_CAPACITY);
-    buffer.rolling_average()
-}
-
-pub fn get_telemetry_percentile(env: &Env, percentile: u32) -> u32 {
-    let buffer = TelemetryRingBuffer::load_or_create(env, DEFAULT_TELEMETRY_CAPACITY);
-    buffer.percentile(percentile)
-}
-
-pub fn load_telemetry_header(env: &Env) -> Option<TelemetryHeader> {
-    env.storage()
-        .temporary()
-        .get::<ExtraKey, TelemetryHeader>(&ExtraKey::TelemetryHeader)
 }

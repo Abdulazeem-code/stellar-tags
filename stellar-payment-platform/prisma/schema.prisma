@@ -405,3 +405,28 @@ model WebAuthnChallenge {
   @@index([userId, type])
   @@map("webauthn_challenges")
 }
+
+// #929 — durable notifications written in the same transaction as payment state.
+enum OutboxStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+model OutboxMessage {
+  id            String       @id @default(uuid())
+  eventType     String       @map("event_type")
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  retries       Int          @default(0)
+  nextAttemptAt DateTime     @default(now()) @map("next_attempt_at")
+  lockedUntil   DateTime?    @map("locked_until")
+  lockOwner     String?      @map("lock_owner")
+  lastError     String?      @map("last_error")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  processedAt   DateTime?    @map("processed_at")
+
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([lockedUntil])
+  @@map("outbox_messages")
+}

@@ -57,6 +57,18 @@ pub struct MetaPayment {
     pub amount: i128,
 }
 
+/// A single leg in a split swap route.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitRoute {
+    /// DEX contract address for this split.
+    pub dex_address: Address,
+    /// Basis points weight allocated to this split (out of 10,000 total).
+    pub weight_bps: u32,
+    /// Minimum acceptable output tokens from this split swap.
+    pub min_amount_out: i128,
+}
+
 /// A single swap-routed transfer instruction for use with
 /// [`PaymentRouter::route_payment_with_swap`] and
 /// [`PaymentRouter::route_payments_with_swap`].
@@ -88,34 +100,7 @@ pub struct SwapPayment {
     pub dex: Address,
 }
 
-/// The result of a DEX-routed swap simulation, returned by
-/// [`PaymentRouter::simulate_swap_execution`].
-///
-/// The report is produced entirely read-only: it inspects the pool storage
-/// keys along the route, estimates the dynamic CPU / memory cost of the
-/// execution, projects slippage across the pool curves, and returns the
-/// exact Soroban ledger footprint declarations required for the call.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SwapSimulationReport {
-    /// Estimated CPU instructions the route will consume.
-    pub estimated_cpu_instructions: u64,
-    /// Estimated memory bytes the route will consume.
-    pub estimated_memory_bytes: u64,
-    /// Projected amount of the final buy token delivered by the route.
-    pub projected_amount_out: i128,
-    /// Projected price impact of the route, in basis points.
-    pub price_impact_bps: i128,
-    /// Read-only ledger keys the route will touch.
-    pub read_only: Vec<Address>,
-    /// Read-write ledger keys the route will touch.
-    pub read_write: Vec<Address>,
-    /// True when the route exceeds the Soroban transaction footprint limit
-    /// of 40 read-write keys.
-    pub exceeds_footprint_limit: bool,
-}
-
-/// The result of a DEX-routed swap quote, returned by [`PaymentRouter::quote_swap`].
+/// The result of a DEX quote, returned by [`PaymentRouter::quote_swap`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwapQuote {
@@ -124,7 +109,7 @@ pub struct SwapQuote {
     /// Tightest `min_amount_out` that still respects the contract's
     /// `max_slippage_bps` for this quote.
     pub min_amount_out: i128,
-    /// Configured maximum slippage, in basis opoints, that produced
+    /// Configured maximum slippage, in basis points, that produced
     /// `min_amount_out`.
     pub max_slippage_bps: i128,
 }
@@ -172,10 +157,6 @@ pub enum ActionType {
     /// Arm the dead man's switch: nominate a backup admin and its claim
     /// timeout in seconds.
     SetBackupAdmin(Address, u64),
-    /// Configure tiered dead man's switch succession:
-    /// Tier 1 backup address, Tier 1 delay (seconds),
-    /// Tier 2 council signers, Tier 2 threshold, Tier 2 delay (seconds).
-    SetTieredDeadMansSwitch(Address, u64, Vec<Address>, u32, u64),
     /// Allow swap routing to invoke a DEX router contract.
     RegisterDex(Address),
     /// Stop swap routing from invoking a DEX router contract.
@@ -233,48 +214,6 @@ pub struct MultisigConfig {
     pub signers: Vec<Address>,
     /// The minimum number of signers required to approve an upgrade.
     pub threshold: u32,
-}
-
-/// A batch of payments committed by a 32-byte Merkle root.
-///
-/// The sender deposits `total_amount` of `token` and commits the Merkle root
-/// with the contract. Recipients then claim their individual payments by submitting
-/// the Merkle inclusion proof for their leaf. This keeps the on-chain work constant
-/// per claim and avoids iterating a linear recipient vector.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MerkleBatch {
-    /// Address that funded the batch and may reclaim unclaimed funds.
-    pub sender: Address,
-    /// Contract ID of the token being distributed.
-    pub token: Address,
-    /// Total amount deposited for this batch, in the token's smallest unit.
-    pub total_amount: i128,
-    /// Amount already paid out to claiming recipients.
-    pub claimed_amount: i128,
-    /// SHA-256 Merkle root over the batch leaves.
-    pub merkle_root: BytesN<32>,
-    /// Unix timestamp (seconds) after which the sender may reclaim the
-    /// remaining balance.
-    pub expiration: u64,
-    /// Whether the batch has been closed and its remaining funds reclaimed.
-    pub reclaimed: bool,
-}
-
-/// Status of an in-flight dead man's switch claim challenge window.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DmsClaimStatus {
-    /// Address that initiated the claim.
-    pub claimant: Address,
-    /// Ledger timestamp when the claim was initiated.
-    pub initiated_at: u64,
-    /// Timestamp when the grace period challenge window expires.
-    pub grace_period_end: u64,
-    /// Target candidate admin address to be granted ownership.
-    pub candidate_admin: Address,
-    /// Succession tier (1 = primary backup, 2 = multi-sig council).
-    pub tier: u32,
 }
 
 /// Adapter interface implemented by the DEX used for an arbitrary token swap.
