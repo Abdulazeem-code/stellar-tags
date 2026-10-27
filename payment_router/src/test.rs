@@ -5312,14 +5312,8 @@ fn test_operator_renews_heartbeat_resets_dms_clock() {
     // Advance past the new timeout.
     advance_time(&env, PaymentRouter::MIN_DMS_TIMEOUT + 1);
 
-    // Now the backup can claim.
+    // Now the backup can claim (transfers admin immediately).
     client.claim_admin(&backup);
-
-    // Advance past the 72-hour grace period.
-    advance_time(&env, PaymentRouter::DMS_GRACE_PERIOD + 1);
-
-    // Execute the claim to transfer admin.
-    client.execute_claim_admin();
 
     assert_eq!(client.get_admin(), Some(backup));
 }
