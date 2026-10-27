@@ -167,6 +167,8 @@ pub enum DataKey {
     MultisigThreshold,
     /// Signer approvals collected for a specific upgrade WASM hash.
     UpgradeApproval(BytesN<32>),
+    /// Executed proposal hashes recorded to prevent replay attacks.
+    ExecutedProposal(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
     /// Tiered pause level for the emergency circuit breaker (issue #890).
