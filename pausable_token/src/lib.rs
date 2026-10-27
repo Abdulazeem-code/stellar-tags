@@ -3,9 +3,16 @@
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, String,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
+    symbol_short, Address, Bytes, BytesN, Env, String, Vec,
 };
+
+/// Interface implemented by compliance hook contracts.
+#[contractclient(name = "ComplianceHookClient")]
+pub trait ComplianceHook {
+    fn validate_transfer(env: Env, from: Address, to: Address, amount: i128)
+        -> Result<bool, Error>;
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +31,9 @@ pub enum DataKey {
     Liquidator,
     Allowance(Address, Address),
     PermitNonce(Address),
+    FrozenUntil(Address),
+    ComplianceHook,
+    MaxSupply,
 }
 
 #[contracttype]
@@ -137,6 +147,10 @@ pub enum Error {
     InsufficientTransferable = 14,
     NotRegisteredLiquidator = 15,
     AllowanceExpired = 16,
+    ComplianceCheckFailed = 17,
+    SupplyCapExceeded = 18,
+    BatchSizeExceeded = 19,
+    BatchLengthMismatch = 20,
 }
 
 #[contract]
@@ -144,6 +158,8 @@ pub struct PausableToken;
 
 const DAY_IN_LEDGERS: u32 = 17280;
 const MAX_PERMIT_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+pub const DEFAULT_MAX_SUPPLY: i128 = 10_000_000_000_000_000;
+pub const MAX_BATCH_SIZE: u32 = 30;
 
 #[contractimpl]
 impl PausableToken {
@@ -171,6 +187,7 @@ impl PausableToken {
         store.set(&DataKey::Symbol, &symbol);
         store.set(&DataKey::Decimals, &decimals);
         store.set(&DataKey::TotalSupply, &0i128);
+        store.set(&DataKey::MaxSupply, &DEFAULT_MAX_SUPPLY);
         store.set(&DataKey::Paused, &false);
         Self::bump_instance(&env);
 
@@ -237,6 +254,9 @@ impl PausableToken {
             env.storage()
                 .persistent()
                 .remove(&DataKey::Frozen(account.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::FrozenUntil(account.clone()));
         }
         let topic = if frozen {
             symbol_short!("frozen")
@@ -256,139 +276,160 @@ impl PausableToken {
         Self::set_frozen(env, account, false)
     }
 
-    /// Returns true when the account's Transferable partition is under
-    /// regulatory freeze. CollateralLocked funds remain reachable by the
-    /// registered liquidator.
-    pub fn is_partition_frozen(env: Env, account: Address) -> bool {
-        Self::is_partition_frozen_internal(&env, &account)
-    }
-
-    /// Regulatory freeze: locks the account's Transferable partition.
-    ///
-    /// User-initiated movement (transfer, transfer_from, burn, burn_from,
-    /// approve, permit, lock_collateral) is blocked; the registered
-    /// liquidator can still unwind the CollateralLocked partition.
-    pub fn freeze_partition(env: Env, account: Address) -> Result<(), Error> {
-        Self::set_partition_frozen(env, account, true)
-    }
-
-    pub fn unfreeze_partition(env: Env, account: Address) -> Result<(), Error> {
-        Self::set_partition_frozen(env, account, false)
-    }
-
-    fn set_partition_frozen(env: Env, account: Address, frozen: bool) -> Result<(), Error> {
+    pub fn freeze_account_until(
+        env: Env,
+        account: Address,
+        until_timestamp: u64,
+    ) -> Result<(), Error> {
         let admin = Self::require_admin_auth(&env)?;
-        if frozen {
-            let key = DataKey::PartitionFrozen(account.clone());
-            env.storage().persistent().set(&key, &true);
-            Self::bump_user(&env, &key);
-        } else {
+        if until_timestamp <= env.ledger().timestamp() {
             env.storage()
                 .persistent()
-                .remove(&DataKey::PartitionFrozen(account.clone()));
-        }
-        let topic = if frozen {
-            symbol_short!("frzpart")
+                .remove(&DataKey::FrozenUntil(account.clone()));
+            env.events().publish(
+                (symbol_short!("unfreeze"), admin, account),
+                env.ledger().sequence(),
+            );
         } else {
-            symbol_short!("unfrzpart")
-        };
-        env.events()
-            .publish((topic, admin, account), env.ledger().sequence());
+            let key = DataKey::FrozenUntil(account.clone());
+            env.storage().persistent().set(&key, &until_timestamp);
+            Self::bump_user(&env, &key);
+            env.events().publish(
+                (symbol_short!("frz_until"), admin, account),
+                until_timestamp,
+            );
+        }
         Ok(())
     }
 
-    /// Amount of the account's balance held in the CollateralLocked
-    /// partition.
-    pub fn collateral_locked(env: Env, account: Address) -> i128 {
-        Self::read_collateral_locked(&env, &account)
-    }
-
-    /// Balance minus collateral locked — the part a partition-frozen account
-    /// may not move.
-    pub fn transferable_balance(env: Env, account: Address) -> i128 {
-        Self::read_transferable(&env, &account)
-    }
-
-    /// Moves `amount` from the Transferable partition into CollateralLocked.
-    ///
-    /// Requires the account's own authorization, and is blocked while the
-    /// Transferable partition is frozen so a sanctioned account cannot keep
-    /// reshuffling funds.
-    pub fn lock_collateral(env: Env, account: Address, amount: i128) -> Result<(), Error> {
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        account.require_auth();
-        if Self::is_paused_internal(&env) {
-            return Err(Error::Paused);
-        }
-        if Self::is_partition_frozen_internal(&env, &account) {
-            return Err(Error::AccountFrozen);
-        }
-        if Self::read_transferable(&env, &account) < amount {
-            return Err(Error::InsufficientTransferable);
-        }
-        let key = DataKey::CollateralLocked(account.clone());
-        let current = Self::read_collateral_locked(&env, &account);
-        env.storage().persistent().set(&key, &(current + amount));
-        Self::bump_user(&env, &key);
-        env.events()
-            .publish((symbol_short!("lockcol"), account), amount);
-        Ok(())
-    }
-
-    /// Admin: register the settlement/liquidation contract allowed to unwind
-    /// locked collateral regardless of pause or freeze state.
-    pub fn set_liquidator(env: Env, liquidator: Address) -> Result<(), Error> {
+    pub fn cancel_freeze(env: Env, account: Address) -> Result<(), Error> {
         let admin = Self::require_admin_auth(&env)?;
         env.storage()
-            .instance()
-            .set(&DataKey::Liquidator, &liquidator);
-        Self::bump_instance(&env);
+            .persistent()
+            .remove(&DataKey::Frozen(account.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FrozenUntil(account.clone()));
         env.events().publish(
-            (symbol_short!("liquidatr"), admin, liquidator),
+            (symbol_short!("unfreeze"), admin, account),
             env.ledger().sequence(),
         );
         Ok(())
     }
 
-    /// Settlement hook: debits `amount` of `from`'s CollateralLocked
-    /// partition and credits it to `to`.
-    ///
-    /// Deliberately bypasses the pause and both freeze flags so
-    /// collateralized positions can always be unwound.
-    pub fn liquidate(
+    pub fn cancel_freeze_until(env: Env, account: Address) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FrozenUntil(account.clone()));
+        env.events().publish(
+            (symbol_short!("unfreeze"), admin, account),
+            env.ledger().sequence(),
+        );
+        Ok(())
+    }
+
+    pub fn frozen_until(env: Env, account: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FrozenUntil(account))
+            .unwrap_or(0)
+    }
+
+    pub fn set_compliance_hook(env: Env, hook: Address) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::ComplianceHook, &hook);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("set_hook"), admin), hook);
+        Ok(())
+    }
+
+    pub fn register_compliance_hook(env: Env, hook: Address) -> Result<(), Error> {
+        Self::set_compliance_hook(env, hook)
+    }
+
+    pub fn remove_compliance_hook(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        env.storage().instance().remove(&DataKey::ComplianceHook);
+        Self::bump_instance(&env);
+        env.events().publish((symbol_short!("del_hook"), admin), ());
+        Ok(())
+    }
+
+    pub fn deregister_compliance_hook(env: Env) -> Result<(), Error> {
+        Self::remove_compliance_hook(env)
+    }
+
+    pub fn compliance_hook(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ComplianceHook)
+    }
+
+    pub fn check_compliance(
         env: Env,
-        liquidator: Address,
         from: Address,
         to: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        if amount <= 0 {
+        Self::validate_compliance(&env, &from, &to, amount)
+    }
+
+    pub fn is_transfer_compliant(env: Env, from: Address, to: Address, amount: i128) -> bool {
+        Self::validate_compliance(&env, &from, &to, amount).is_ok()
+    }
+
+    pub fn transfer_checked(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if amount < 0 {
             return Err(Error::InvalidAmount);
         }
-        let registered: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Liquidator)
-            .ok_or(Error::NotRegisteredLiquidator)?;
-        if registered != liquidator {
-            return Err(Error::NotRegisteredLiquidator);
-        }
-        liquidator.require_auth();
-        if Self::read_collateral_locked(&env, &from) < amount {
-            return Err(Error::InsufficientBalance);
-        }
-        // Debit the total balance and the locked partition by the same
-        // amount so the ledger supply stays balanced after the move to `to`.
+        Self::assert_settled(&env, &from, &to)?;
+        from.require_auth();
+        Self::validate_compliance(&env, &from, &to, amount)?;
         Self::debit(&env, &from, amount)?;
-        let key = DataKey::CollateralLocked(from.clone());
-        let locked = Self::read_collateral_locked(&env, &from);
-        env.storage().persistent().set(&key, &(locked - amount));
-        Self::bump_user(&env, &key);
         Self::credit(env.clone(), &to, amount);
         env.events()
-            .publish((symbol_short!("liquidate"), from, to), amount);
+            .publish((symbol_short!("transfer"), from, to), amount);
+        Ok(())
+    }
+
+    pub fn transfer_from_checked(
+        env: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Self::assert_settled(&env, &from, &to)?;
+        Self::assert_movable(&env, &spender)?;
+        spender.require_auth();
+        let allowance = Self::read_allowance(&env, &from, &spender);
+        if allowance.amount < amount {
+            return Err(Error::InsufficientAllowance);
+        }
+        Self::validate_compliance(&env, &from, &to, amount)?;
+        Self::write_allowance(
+            &env,
+            &from,
+            &spender,
+            &Allowance {
+                amount: allowance.amount - amount,
+                expiration_ledger: allowance.expiration_ledger,
+            },
+        );
+        Self::debit(&env, &from, amount)?;
+        Self::credit(env.clone(), &to, amount);
+        env.events()
+            .publish((symbol_short!("transfer"), from, to), amount);
         Ok(())
     }
 
@@ -397,6 +438,31 @@ impl PausableToken {
             .instance()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0)
+    }
+
+    pub fn max_supply(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSupply)
+            .unwrap_or(DEFAULT_MAX_SUPPLY)
+    }
+
+    pub fn set_max_supply(env: Env, new_max_supply: i128) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        if new_max_supply < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let total_supply = Self::total_supply(env.clone());
+        if new_max_supply < total_supply {
+            return Err(Error::SupplyCapExceeded);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxSupply, &new_max_supply);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("set_cap"), admin), new_max_supply);
+        Ok(())
     }
 
     pub fn transfer_allowed(env: Env, from: Address, to: Address) -> bool {
@@ -527,9 +593,63 @@ impl PausableToken {
         Self::assert_movable(&env, &to)?;
 
         let supply = Self::total_supply(env.clone());
+        let max_supply = Self::max_supply(env.clone());
+        let new_supply = supply.checked_add(amount).ok_or(Error::SupplyCapExceeded)?;
+        if new_supply > max_supply {
+            return Err(Error::SupplyCapExceeded);
+        }
+
         Self::credit(env.clone(), &to, amount);
-        Self::set_total_supply(&env, supply + amount);
+        Self::set_total_supply(&env, new_supply);
         env.events().publish((symbol_short!("mint"), to), amount);
+        Ok(())
+    }
+
+    pub fn batch_mint(env: Env, recipients: Vec<Address>, amounts: Vec<i128>) -> Result<(), Error> {
+        let admin = Self::require_admin_auth(&env)?;
+        if recipients.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+        if recipients.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchSizeExceeded);
+        }
+        if recipients.len() != amounts.len() {
+            return Err(Error::BatchLengthMismatch);
+        }
+
+        let mut total_batch_amount: i128 = 0;
+        for i in 0..recipients.len() {
+            let amount = amounts.get(i).ok_or(Error::BatchLengthMismatch)?;
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let recipient = recipients.get(i).ok_or(Error::BatchLengthMismatch)?;
+            Self::assert_movable(&env, &recipient)?;
+            total_batch_amount = total_batch_amount
+                .checked_add(amount)
+                .ok_or(Error::SupplyCapExceeded)?;
+        }
+
+        let current_supply = Self::total_supply(env.clone());
+        let max_supply = Self::max_supply(env.clone());
+        let new_supply = current_supply
+            .checked_add(total_batch_amount)
+            .ok_or(Error::SupplyCapExceeded)?;
+        if new_supply > max_supply {
+            return Err(Error::SupplyCapExceeded);
+        }
+
+        for i in 0..recipients.len() {
+            let recipient = recipients.get(i).ok_or(Error::BatchLengthMismatch)?;
+            let amount = amounts.get(i).ok_or(Error::BatchLengthMismatch)?;
+            Self::credit(env.clone(), &recipient, amount);
+            env.events()
+                .publish((symbol_short!("mint"), recipient), amount);
+        }
+        Self::set_total_supply(&env, new_supply);
+        env.events()
+            .publish((symbol_short!("batchmint"), admin), total_batch_amount);
+
         Ok(())
     }
 
@@ -616,10 +736,24 @@ impl PausableToken {
     }
 
     fn is_frozen_internal(env: &Env, account: &Address) -> bool {
-        env.storage()
+        if env
+            .storage()
             .persistent()
             .get(&DataKey::Frozen(account.clone()))
             .unwrap_or(false)
+        {
+            return true;
+        }
+
+        if let Some(frozen_until) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::FrozenUntil(account.clone()))
+        {
+            return env.ledger().timestamp() < frozen_until;
+        }
+
+        false
     }
 
     fn is_partition_frozen_internal(env: &Env, account: &Address) -> bool {
@@ -666,6 +800,27 @@ impl PausableToken {
     fn assert_settled(env: &Env, from: &Address, to: &Address) -> Result<(), Error> {
         Self::assert_movable(env, from)?;
         Self::assert_movable(env, to)
+    }
+
+    fn validate_compliance(
+        env: &Env,
+        from: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if let Some(hook) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ComplianceHook)
+        {
+            let client = ComplianceHookClient::new(env, &hook);
+            match client.try_validate_transfer(from, to, &amount) {
+                Ok(Ok(true)) => Ok(()),
+                _ => Err(Error::ComplianceCheckFailed),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     fn read_balance(env: &Env, account: &Address) -> i128 {
@@ -786,61 +941,15 @@ impl TokenInterface for PausableToken {
     }
 
     fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        if amount < 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
-        }
-        if let Err(err) = Self::assert_settled(&env, &from, &to) {
+        if let Err(err) = Self::transfer_checked(env.clone(), from, to, amount) {
             panic_with_error!(&env, err);
         }
-        if let Err(err) = Self::assert_transferable(&env, &from, amount) {
-            panic_with_error!(&env, err);
-        }
-        from.require_auth();
-        if let Err(err) = Self::debit(&env, &from, amount) {
-            panic_with_error!(&env, err);
-        }
-        Self::credit(env.clone(), &to, amount);
-        env.events()
-            .publish((symbol_short!("transfer"), from, to), amount);
     }
 
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
-        if amount < 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
-        }
-        if let Err(err) = Self::assert_settled(&env, &from, &to) {
+        if let Err(err) = Self::transfer_from_checked(env.clone(), spender, from, to, amount) {
             panic_with_error!(&env, err);
         }
-        if let Err(err) = Self::assert_transferable(&env, &from, amount) {
-            panic_with_error!(&env, err);
-        }
-        if let Err(err) = Self::assert_movable(&env, &spender) {
-            panic_with_error!(&env, err);
-        }
-        spender.require_auth();
-        let allowance = Self::read_allowance(&env, &from, &spender);
-        if allowance.expiration_ledger > 0 && env.ledger().sequence() > allowance.expiration_ledger
-        {
-            panic_with_error!(&env, Error::AllowanceExpired);
-        }
-        if allowance.amount < amount {
-            panic_with_error!(&env, Error::InsufficientAllowance);
-        }
-        Self::write_allowance(
-            &env,
-            &from,
-            &spender,
-            &Allowance {
-                amount: allowance.amount - amount,
-                expiration_ledger: allowance.expiration_ledger,
-            },
-        );
-        if let Err(err) = Self::debit(&env, &from, amount) {
-            panic_with_error!(&env, err);
-        }
-        Self::credit(env.clone(), &to, amount);
-        env.events()
-            .publish((symbol_short!("transfer"), from, to), amount);
     }
 
     fn burn(env: Env, from: Address, amount: i128) {

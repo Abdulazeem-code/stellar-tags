@@ -6,6 +6,7 @@ pub mod errors;
 pub mod fees;
 pub mod rate_limit;
 pub mod storage;
+pub mod swaps;
 pub mod timelock;
 pub mod types;
 
@@ -298,7 +299,7 @@ impl PaymentRouter {
     }
 
     /// Returns whether a DEX router has been approved for swap routing.
-    fn is_dex_registered_internal(env: &Env, dex: &Address) -> bool {
+    pub(crate) fn is_dex_registered_internal(env: &Env, dex: &Address) -> bool {
         env.storage()
             .persistent()
             .get(&DataKey::RegisteredDex(dex.clone()))
@@ -314,7 +315,7 @@ impl PaymentRouter {
     /// the Soroban host reverts every balance and storage change made earlier
     /// in the same transaction.
     #[allow(clippy::too_many_arguments)]
-    fn invoke_dex_swap(
+    pub(crate) fn invoke_dex_swap(
         env: &Env,
         dex: &Address,
         sell_token: &Address,
@@ -3245,6 +3246,53 @@ impl PaymentRouter {
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_swap_payment(&env, &payment, &platform_treasury, fee_bps, fee_cap)
+    }
+
+    /// Routes a payment through multiple DEX pools using split routing.
+    ///
+    /// Splits volume across multiple DEX pools according to `splits` weights (which must sum
+    /// to exactly 10,000 bps = 100%), executes swaps sequentially within the atomic transaction,
+    /// and aggregates total output tokens for the recipient (minus platform fee).
+    ///
+    /// # Parameters
+    /// - `sender`: Address paying with `sell_token`. Must authorize the call.
+    /// - `recipient`: Destination address receiving `buy_token`.
+    /// - `sell_token`: Contract address of token being sold.
+    /// - `buy_token`: Contract address of token being purchased.
+    /// - `amount_in`: Total amount of `sell_token` to divide and swap.
+    /// - `splits`: Array of [`SplitRoute`] specifying dex_address, weight_bps, and min_amount_out.
+    ///
+    /// # Returns
+    /// The net amount of `buy_token` delivered to recipient after platform fee.
+    pub fn route_split_payment_with_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        sell_token: Address,
+        buy_token: Address,
+        amount_in: i128,
+        splits: Vec<SplitRoute>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_swaps_not_paused(&env)?;
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        swaps::process_split_payment_with_swap(
+            &env,
+            &sender,
+            &recipient,
+            &sell_token,
+            &buy_token,
+            amount_in,
+            &splits,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
     }
 
     /// Routes several swap-routed payments in a single transaction. If any

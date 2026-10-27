@@ -1,9 +1,11 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
-use soroban_sdk::{Address, Bytes, Env, String, Symbol, TryFromVal, Vec};
+use soroban_sdk::{Address, Bytes, Env, IntoVal, String, Symbol, TryFromVal, Vec};
 
 struct Fixture {
     env: Env,
@@ -643,175 +645,193 @@ fn emits_standard_transfer_and_control_events() {
     assert!(names.contains(symbol_short!("init")));
 }
 
-// ── Partition-based freeze and segregated collateral recovery ───────────────
-
 #[test]
-fn collateral_lock_splits_transferable_balance() {
+fn time_bound_freeze_blocks_transfer_and_automatically_unfreezes_post_timestamp() {
     let f = Fixture::new();
+    f.env.ledger().with_mut(|info| info.timestamp = 1_000);
 
-    f.token.lock_collateral(&f.alice, &400_000);
-    assert_eq!(f.token.collateral_locked(&f.alice), 400_000);
-    assert_eq!(f.token.transferable_balance(&f.alice), 600_000);
-    // Locking moves value between partitions, it does not burn it.
-    assert_eq!(f.token.balance(&f.alice), 1_000_000);
-    assert_eq!(f.token.total_supply(), 2_000_000);
+    let freeze_until = 2_000;
+    f.token.freeze_account_until(&f.alice, &freeze_until);
 
-    // A transfer that fits in the Transferable partition succeeds.
-    f.token.transfer(&f.alice, &f.bob, &600_000);
-    assert_eq!(f.token.balance(&f.bob), 1_600_000);
-    assert_eq!(f.token.collateral_locked(&f.alice), 400_000);
+    assert!(f.token.is_frozen(&f.alice));
+    assert_eq!(f.token.frozen_until(&f.alice), freeze_until);
+    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+    assert!(!f.token.transfer_allowed(&f.bob, &f.alice));
 
-    // One more unit would have to come out of the locked partition.
-    // (The panic-based transfer entrypoint cannot be probed with try_ on
-    // this toolchain — the host aborts the process instead of unwinding —
-    // so the blocked transfer is asserted through the partition invariant:
-    // nothing transferable remains, and the locked partition is untouched.)
-    assert_eq!(f.token.transferable_balance(&f.alice), 0);
-    assert_eq!(f.token.collateral_locked(&f.alice), 400_000);
-    assert_eq!(f.token.balance(&f.alice), 400_000);
-    assert_eq!(f.token.balance(&f.bob), 1_600_000);
-
-    // Burning is capped by the Transferable partition too: bob locks some
-    // collateral, and burns only what remains free.
-    f.token.lock_collateral(&f.bob, &250_000);
-    assert_eq!(f.token.transferable_balance(&f.bob), 1_350_000);
-    f.token.burn(&f.bob, &1_350_000);
-    assert_eq!(f.token.collateral_locked(&f.bob), 250_000);
-    assert_eq!(f.token.balance(&f.bob), 250_000);
-    assert_eq!(f.token.total_supply(), 650_000);
-}
-
-#[test]
-fn lock_collateral_rejects_amounts_beyond_transferable_balance() {
-    let f = Fixture::new();
-
-    let result = f.token.try_lock_collateral(&f.alice, &1_000_001);
-    assert_eq!(
-        result.unwrap_err().unwrap(),
-        Error::InsufficientTransferable
-    );
-    assert_eq!(f.token.collateral_locked(&f.alice), 0);
-
-    let result = f.token.try_lock_collateral(&f.alice, &0);
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidAmount);
-}
-
-#[test]
-fn partition_freeze_blocks_user_moves_but_not_liquidation() {
-    let f = Fixture::new();
-    let liquidator = Address::generate(&f.env);
-    f.token.set_liquidator(&liquidator);
-    f.token.lock_collateral(&f.alice, &300_000);
-
-    f.token.freeze_partition(&f.alice);
-    assert!(f.token.is_partition_frozen(&f.alice));
-    assert!(!f.token.is_partition_frozen(&f.bob));
+    // Transfer from frozen sender is rejected
     assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
 
-    // Every user-initiated move is gated shut...
-    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
-    // ...and the Result-based paths report the regulatory freeze directly.
-    let result = f.token.try_lock_collateral(&f.alice, &1);
+    // Transfer to frozen recipient is also rejected
+    assert!(!f.token.transfer_allowed(&f.bob, &f.alice));
+
+    // Minting to frozen account is also rejected
+    let result = f.token.try_mint(&f.alice, &100);
     assert_eq!(result.unwrap_err().unwrap(), Error::AccountFrozen);
 
-    // ...while reads stay available so wallets can still render state.
+    // Balances remain untouched
     assert_eq!(f.token.balance(&f.alice), 1_000_000);
-    assert_eq!(f.token.collateral_locked(&f.alice), 300_000);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
 
-    // The registered liquidation contract unwinds the collateral.
-    f.token.liquidate(&liquidator, &f.alice, &f.bob, &300_000);
-    assert_eq!(f.token.collateral_locked(&f.alice), 0);
-    assert_eq!(f.token.balance(&f.alice), 700_000);
-    assert_eq!(f.token.balance(&f.bob), 1_300_000);
-    assert_eq!(f.token.total_supply(), 2_000_000);
-
-    // Lifting the partition freeze restores user movement of what remains.
-    f.token.unfreeze_partition(&f.alice);
-    assert!(!f.token.is_partition_frozen(&f.alice));
-    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
-    f.token.transfer(&f.alice, &f.bob, &700_000);
-    assert_eq!(f.token.balance(&f.alice), 0);
-}
-
-#[test]
-fn liquidation_works_under_pause_and_whole_account_freeze() {
-    let f = Fixture::new();
-    let liquidator = Address::generate(&f.env);
-    f.token.set_liquidator(&liquidator);
-    f.token.lock_collateral(&f.alice, &250_000);
-
-    // Escrow recovery must survive every control switch at once.
-    f.token.freeze(&f.alice);
-    f.token.freeze_partition(&f.alice);
-    f.token.pause();
-
-    f.token.liquidate(&liquidator, &f.alice, &f.bob, &250_000);
-    assert_eq!(f.token.collateral_locked(&f.alice), 0);
-    assert_eq!(f.token.balance(&f.alice), 750_000);
-    assert_eq!(f.token.balance(&f.bob), 1_250_000);
-    assert_eq!(f.token.total_supply(), 2_000_000);
-
-    // The user side is still fully locked down.
+    // One second before expiry, account is still frozen
+    f.env.ledger().with_mut(|info| info.timestamp = 1_999);
+    assert!(f.token.is_frozen(&f.alice));
     assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+    let result = f.token.try_mint(&f.alice, &100);
+    assert_eq!(result.unwrap_err().unwrap(), Error::AccountFrozen);
+
+    // At expiration timestamp (and after), transfers automatically resume
+    f.env.ledger().with_mut(|info| info.timestamp = 2_000);
+    assert!(!f.token.is_frozen(&f.alice));
+    assert!(f.token.transfer_allowed(&f.alice, &f.bob));
+    assert!(f.token.transfer_allowed(&f.bob, &f.alice));
+
+    f.token.transfer(&f.alice, &f.bob, &100);
+    assert_eq!(f.token.balance(&f.alice), 999_900);
+    assert_eq!(f.token.balance(&f.bob), 1_000_100);
+
+    f.token.transfer(&f.bob, &f.alice, &50);
+    assert_eq!(f.token.balance(&f.alice), 999_950);
+    assert_eq!(f.token.balance(&f.bob), 1_000_050);
 }
 
 #[test]
-fn only_the_registered_liquidator_may_settle() {
-    let f = Fixture::new();
-    let liquidator = Address::generate(&f.env);
-    let stranger = Address::generate(&f.env);
-    f.token.set_liquidator(&liquidator);
-    f.token.lock_collateral(&f.alice, &100_000);
-
-    // Before any registration takes effect for `stranger` it is rejected.
-    let result = f.token.try_liquidate(&stranger, &f.alice, &stranger, &1);
-    assert_eq!(result.unwrap_err().unwrap(), Error::NotRegisteredLiquidator);
-    assert_eq!(f.token.collateral_locked(&f.alice), 100_000);
-
-    // A re-registration replaces the previous liquidator.
-    f.token.set_liquidator(&stranger);
-    let result = f.token.try_liquidate(&liquidator, &f.alice, &f.bob, &1);
-    assert_eq!(result.unwrap_err().unwrap(), Error::NotRegisteredLiquidator);
-
-    f.token.liquidate(&stranger, &f.alice, &stranger, &100_000);
-    assert_eq!(f.token.collateral_locked(&f.alice), 0);
-    assert_eq!(f.token.balance(&f.alice), 900_000);
-}
-
-#[test]
-fn liquidate_cannot_exceed_the_locked_partition() {
-    let f = Fixture::new();
-    let liquidator = Address::generate(&f.env);
-    f.token.set_liquidator(&liquidator);
-    f.token.lock_collateral(&f.alice, &100_000);
-
-    // The Transferable partition is off-limits to the liquidator.
-    let result = f
-        .token
-        .try_liquidate(&liquidator, &f.alice, &f.bob, &100_001);
-    assert_eq!(result.unwrap_err().unwrap(), Error::InsufficientBalance);
-    assert_eq!(f.token.balance(&f.alice), 1_000_000);
-    assert_eq!(f.token.collateral_locked(&f.alice), 100_000);
-
-    let result = f.token.try_liquidate(&liquidator, &f.alice, &f.bob, &0);
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidAmount);
-}
-
-#[test]
-fn partition_freeze_emits_events_and_spender_allowances_are_blocked() {
+fn time_bound_freeze_blocks_transfer_from_and_automatically_unfreezes_post_timestamp() {
     let f = Fixture::new();
     let spender = Address::generate(&f.env);
+    f.env.ledger().with_mut(|info| info.timestamp = 1_000);
+
     f.token
-        .approve(&f.alice, &spender, &100_000, &(f.ledger() + 1_000));
-    f.token.lock_collateral(&f.alice, &50_000);
+        .approve(&f.alice, &spender, &500_000, &(f.ledger() + 1_000));
+    assert_eq!(f.token.allowance(&f.alice, &spender), 500_000);
 
-    f.token.freeze_partition(&f.alice);
+    let freeze_until = 3_000;
+    f.token.freeze_account_until(&f.alice, &freeze_until);
 
-    // Spenders cannot pull funds out of a frozen partition either.
-    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+    // Spender cannot move Alice's funds while Alice is frozen
     assert!(!f.token.transfer_allowed(&f.alice, &spender));
-    // The pre-existing allowance is preserved, not cancelled.
-    assert_eq!(f.token.allowance(&f.alice, &spender), 100_000);
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
+
+    // Advance to post-freeze
+    f.env.ledger().with_mut(|info| info.timestamp = 3_000);
+
+    // transfer_from automatically works now
+    assert!(f.token.transfer_allowed(&f.alice, &spender));
+    f.token.transfer_from(&spender, &f.alice, &f.bob, &10_000);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 490_000);
+    assert_eq!(f.token.balance(&f.alice), 990_000);
+    assert_eq!(f.token.balance(&f.bob), 1_010_000);
+
+    // Now freeze the spender
+    let spender_freeze_until = 4_000;
+    f.token
+        .freeze_account_until(&spender, &spender_freeze_until);
+    assert!(f.token.is_frozen(&spender));
+    assert!(!f.token.transfer_allowed(&f.alice, &spender));
+
+    // Spender unfreezes automatically post-freeze
+    f.env.ledger().with_mut(|info| info.timestamp = 4_000);
+    assert!(!f.token.is_frozen(&spender));
+    assert!(f.token.transfer_allowed(&f.alice, &spender));
+
+    f.token.transfer_from(&spender, &f.alice, &f.bob, &10_000);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 480_000);
+    assert_eq!(f.token.balance(&f.alice), 980_000);
+    assert_eq!(f.token.balance(&f.bob), 1_020_000);
+}
+
+#[test]
+fn admin_can_extend_and_cancel_freeze_at_any_time() {
+    let f = Fixture::new();
+    f.env.ledger().with_mut(|info| info.timestamp = 1_000);
+
+    // Initial freeze until 5_000
+    f.token.freeze_account_until(&f.alice, &5_000);
+    assert!(f.token.is_frozen(&f.alice));
+    assert_eq!(f.token.frozen_until(&f.alice), 5_000);
+
+    // Admin extends freeze until 10_000
+    f.token.freeze_account_until(&f.alice, &10_000);
+    assert_eq!(f.token.frozen_until(&f.alice), 10_000);
+
+    // At timestamp 6_000, initial freeze would have expired, but extended freeze is still active
+    f.env.ledger().with_mut(|info| info.timestamp = 6_000);
+    assert!(f.token.is_frozen(&f.alice));
+    assert!(!f.token.transfer_allowed(&f.alice, &f.bob));
+    let result = f.token.try_mint(&f.alice, &50);
+    assert_eq!(result.unwrap_err().unwrap(), Error::AccountFrozen);
+
+    // Admin cancels freeze explicitly via cancel_freeze
+    f.token.cancel_freeze(&f.alice);
+    assert!(!f.token.is_frozen(&f.alice));
+    assert_eq!(f.token.frozen_until(&f.alice), 0);
+    f.token.transfer(&f.alice, &f.bob, &50);
+    assert_eq!(f.token.balance(&f.bob), 1_000_050);
+
+    // Freeze Bob until 15_000
+    f.token.freeze_account_until(&f.bob, &15_000);
+    assert!(f.token.is_frozen(&f.bob));
+    assert_eq!(f.token.frozen_until(&f.bob), 15_000);
+
+    // Admin cancels freeze by setting timestamp to 0 (or <= current timestamp)
+    f.token.freeze_account_until(&f.bob, &0);
+    assert!(!f.token.is_frozen(&f.bob));
+    assert_eq!(f.token.frozen_until(&f.bob), 0);
+    f.token.transfer(&f.bob, &f.alice, &50);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
+
+    // Freeze Bob until 20_000 and cancel via unfreeze
+    f.token.freeze_account_until(&f.bob, &20_000);
+    assert!(f.token.is_frozen(&f.bob));
+    f.token.unfreeze(&f.bob);
+    assert!(!f.token.is_frozen(&f.bob));
+    assert_eq!(f.token.frozen_until(&f.bob), 0);
+
+    // Freeze Bob until 25_000 and cancel via cancel_freeze_until
+    f.token.freeze_account_until(&f.bob, &25_000);
+    assert!(f.token.is_frozen(&f.bob));
+    f.token.cancel_freeze_until(&f.bob);
+    assert!(!f.token.is_frozen(&f.bob));
+    assert_eq!(f.token.frozen_until(&f.bob), 0);
+}
+
+#[test]
+fn time_bound_freeze_stores_in_datakey_frozen_until() {
+    let f = Fixture::new();
+    f.env.ledger().with_mut(|info| info.timestamp = 500);
+
+    let until = 12_345;
+    f.token.freeze_account_until(&f.alice, &until);
+
+    let stored: u64 = f
+        .env
+        .as_contract(&f.id, || {
+            f.env
+                .storage()
+                .persistent()
+                .get(&DataKey::FrozenUntil(f.alice.clone()))
+        })
+        .expect("FrozenUntil entry should exist in persistent storage");
+
+    assert_eq!(stored, 12_345);
+
+    // Once cancelled, entry is removed from storage
+    f.token.cancel_freeze(&f.alice);
+    let stored_after: Option<u64> = f.env.as_contract(&f.id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get(&DataKey::FrozenUntil(f.alice.clone()))
+    });
+    assert!(stored_after.is_none());
+}
+
+#[test]
+fn emits_time_bound_freeze_events() {
+    let f = Fixture::new();
+    f.env.ledger().with_mut(|info| info.timestamp = 500);
+
+    f.token.freeze_account_until(&f.bob, &5_000);
 
     let mut names: Vec<Symbol> = Vec::new(&f.env);
     for (_, topics, _) in f.env.events().all() {
@@ -821,11 +841,798 @@ fn partition_freeze_emits_events_and_spender_allowances_are_blocked() {
             }
         }
     }
-    assert!(names.contains(symbol_short!("frzpart")));
-    assert!(names.contains(symbol_short!("lockcol")));
 
-    f.token.unfreeze_partition(&f.alice);
-    f.token.transfer_from(&spender, &f.alice, &f.bob, &1);
-    assert_eq!(f.token.allowance(&f.alice, &spender), 99_999);
-    assert_eq!(f.token.balance(&f.bob), 1_000_001);
+    assert!(names.contains(symbol_short!("frz_until")));
+}
+
+// ── Mock Compliance Hook Contract & Tests (Issue #912) ───────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+enum MockHookKey {
+    Sanctioned(Address),
+    MaxTransferAmount,
+    ShouldRevert,
+    ReturnFalse,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MockHookError {
+    Sanctioned = 1,
+    LimitExceeded = 2,
+    ForcedRevert = 3,
+}
+
+#[contract]
+struct MockComplianceHook;
+
+#[contractimpl]
+impl MockComplianceHook {
+    pub fn sanction(env: Env, account: Address) {
+        env.storage()
+            .instance()
+            .set(&MockHookKey::Sanctioned(account), &true);
+    }
+
+    pub fn set_max_transfer_amount(env: Env, max: i128) {
+        env.storage()
+            .instance()
+            .set(&MockHookKey::MaxTransferAmount, &max);
+    }
+
+    pub fn set_should_revert(env: Env, revert: bool) {
+        env.storage()
+            .instance()
+            .set(&MockHookKey::ShouldRevert, &revert);
+    }
+
+    pub fn set_return_false(env: Env, return_false: bool) {
+        env.storage()
+            .instance()
+            .set(&MockHookKey::ReturnFalse, &return_false);
+    }
+
+    pub fn validate_transfer(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<bool, Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&MockHookKey::ShouldRevert)
+            .unwrap_or(false)
+        {
+            return Err(Error::Unauthorized);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&MockHookKey::ReturnFalse)
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        let from_sanctioned: bool = env
+            .storage()
+            .instance()
+            .get(&MockHookKey::Sanctioned(from))
+            .unwrap_or(false);
+        if from_sanctioned {
+            return Ok(false);
+        }
+
+        let to_sanctioned: bool = env
+            .storage()
+            .instance()
+            .get(&MockHookKey::Sanctioned(to))
+            .unwrap_or(false);
+        if to_sanctioned {
+            return Ok(false);
+        }
+
+        if let Some(max) = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&MockHookKey::MaxTransferAmount)
+        {
+            if amount > max {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+fn assert_transfer_fails_compliance(f: &Fixture, from: &Address, to: &Address, amount: i128) {
+    assert_eq!(
+        f.token.try_transfer_checked(from, to, &amount),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+    assert_eq!(
+        f.token.try_check_compliance(from, to, &amount),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+    assert!(!f.token.is_transfer_compliant(from, to, &amount));
+}
+
+fn assert_transfer_from_fails_compliance(
+    f: &Fixture,
+    spender: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) {
+    assert_eq!(
+        f.token
+            .try_transfer_from_checked(spender, from, to, &amount),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+    assert_eq!(
+        f.token.try_check_compliance(from, to, &amount),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+    assert!(!f.token.is_transfer_compliant(from, to, &amount));
+}
+
+#[test]
+fn admin_can_register_and_deregister_compliance_hook() {
+    let f = Fixture::new();
+    assert_eq!(f.token.compliance_hook(), None);
+
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+
+    // Register via set_compliance_hook
+    f.token.set_compliance_hook(&hook_id);
+    assert_eq!(f.token.compliance_hook(), Some(hook_id.clone()));
+
+    // Deregister via deregister_compliance_hook
+    f.token.deregister_compliance_hook();
+    assert_eq!(f.token.compliance_hook(), None);
+
+    // Register via alias register_compliance_hook
+    f.token.register_compliance_hook(&hook_id);
+    assert_eq!(f.token.compliance_hook(), Some(hook_id.clone()));
+
+    // Deregister via remove_compliance_hook
+    f.token.remove_compliance_hook();
+    assert_eq!(f.token.compliance_hook(), None);
+}
+
+#[test]
+fn compliance_hook_operations_require_initialization() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, PausableToken);
+    let token = PausableTokenClient::new(&env, &contract_id);
+    let hook_id = Address::generate(&env);
+
+    assert_eq!(
+        token.try_set_compliance_hook(&hook_id),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        token.try_deregister_compliance_hook(),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+#[ignore = "quarantined: Soroban require_auth traps via non-unwinding host panic in native test mode"]
+fn non_admin_cannot_register_or_deregister_compliance_hook() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, PausableToken);
+    let token = PausableTokenClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    token.initialize(
+        &admin,
+        &String::from_str(&env, "Pausable USD"),
+        &String::from_str(&env, "PUSD"),
+        &7,
+    );
+
+    let stranger = Address::generate(&env);
+    let hook_id = env.register_contract(None, MockComplianceHook);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &stranger,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_compliance_hook",
+            args: (&hook_id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = token.try_set_compliance_hook(&hook_id);
+    assert!(res.is_err());
+
+    let res_dereg = token.try_deregister_compliance_hook();
+    assert!(res_dereg.is_err());
+}
+
+#[test]
+fn compliance_hook_allows_valid_transfers_and_transfer_from() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    f.token.set_compliance_hook(&hook_id);
+
+    assert!(f.token.is_transfer_compliant(&f.alice, &f.bob, &100_000));
+    f.token.check_compliance(&f.alice, &f.bob, &100_000);
+
+    // Transfer succeeds
+    f.token.transfer(&f.alice, &f.bob, &100_000);
+    assert_eq!(f.token.balance(&f.alice), 900_000);
+    assert_eq!(f.token.balance(&f.bob), 1_100_000);
+
+    // Spender transfer_from succeeds
+    let spender = Address::generate(&f.env);
+    f.token
+        .approve(&f.alice, &spender, &200_000, &(f.ledger() + 1_000));
+    f.token.transfer_from(&spender, &f.alice, &f.bob, &50_000);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 150_000);
+    assert_eq!(f.token.balance(&f.alice), 850_000);
+    assert_eq!(f.token.balance(&f.bob), 1_150_000);
+}
+
+#[test]
+fn compliance_hook_rejects_transfer_when_returning_false() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    let hook_client = MockComplianceHookClient::new(&f.env, &hook_id);
+    f.token.set_compliance_hook(&hook_id);
+
+    // Configure hook to reject
+    hook_client.set_return_false(&true);
+
+    assert!(!f.token.is_transfer_compliant(&f.alice, &f.bob, &100_000));
+    assert_eq!(
+        f.token.try_check_compliance(&f.alice, &f.bob, &100_000),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+
+    assert_transfer_fails_compliance(&f, &f.alice, &f.bob, 100_000);
+
+    // Balances remain untouched
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
+}
+
+#[test]
+fn compliance_hook_rejects_transfer_from_when_returning_false() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    let hook_client = MockComplianceHookClient::new(&f.env, &hook_id);
+    f.token.set_compliance_hook(&hook_id);
+
+    let spender = Address::generate(&f.env);
+    f.token
+        .approve(&f.alice, &spender, &200_000, &(f.ledger() + 1_000));
+
+    // Configure hook to reject
+    hook_client.set_return_false(&true);
+
+    assert!(!f.token.is_transfer_compliant(&f.alice, &f.bob, &50_000));
+    assert_eq!(
+        f.token.try_check_compliance(&f.alice, &f.bob, &50_000),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+
+    assert_transfer_from_fails_compliance(&f, &spender, &f.alice, &f.bob, 50_000);
+
+    // Allowance and balances remain untouched
+    assert_eq!(f.token.allowance(&f.alice, &spender), 200_000);
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
+}
+
+#[test]
+fn compliance_hook_rejects_transfer_when_hook_reverts() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    let hook_client = MockComplianceHookClient::new(&f.env, &hook_id);
+    f.token.set_compliance_hook(&hook_id);
+
+    // Configure hook to panic/revert
+    hook_client.set_should_revert(&true);
+
+    assert!(!f.token.is_transfer_compliant(&f.alice, &f.bob, &100_000));
+    assert_eq!(
+        f.token.try_check_compliance(&f.alice, &f.bob, &100_000),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+
+    assert_transfer_fails_compliance(&f, &f.alice, &f.bob, 100_000);
+
+    // Balances remain untouched
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
+}
+
+#[test]
+fn compliance_hook_rejects_transfer_from_when_hook_reverts() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    let hook_client = MockComplianceHookClient::new(&f.env, &hook_id);
+    f.token.set_compliance_hook(&hook_id);
+
+    let spender = Address::generate(&f.env);
+    f.token
+        .approve(&f.alice, &spender, &200_000, &(f.ledger() + 1_000));
+
+    // Configure hook to panic/revert
+    hook_client.set_should_revert(&true);
+
+    assert!(!f.token.is_transfer_compliant(&f.alice, &f.bob, &50_000));
+    assert_eq!(
+        f.token.try_check_compliance(&f.alice, &f.bob, &50_000),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+
+    assert_transfer_from_fails_compliance(&f, &spender, &f.alice, &f.bob, 50_000);
+
+    // Allowance and balances remain untouched
+    assert_eq!(f.token.allowance(&f.alice, &spender), 200_000);
+    assert_eq!(f.token.balance(&f.alice), 1_000_000);
+    assert_eq!(f.token.balance(&f.bob), 1_000_000);
+}
+
+#[test]
+fn compliance_hook_enforces_sanctions_on_sender_and_recipient() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    let hook_client = MockComplianceHookClient::new(&f.env, &hook_id);
+    f.token.set_compliance_hook(&hook_id);
+
+    let charlie = Address::generate(&f.env);
+    f.token.mint(&charlie, &500_000);
+
+    // Sanction Alice
+    hook_client.sanction(&f.alice);
+
+    // Alice cannot send
+    assert!(!f.token.is_transfer_compliant(&f.alice, &f.bob, &10_000));
+    assert_eq!(
+        f.token.try_check_compliance(&f.alice, &f.bob, &10_000),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+    assert_transfer_fails_compliance(&f, &f.alice, &f.bob, 10_000);
+
+    // Alice cannot receive
+    assert!(!f.token.is_transfer_compliant(&charlie, &f.alice, &10_000));
+    assert_eq!(
+        f.token.try_check_compliance(&charlie, &f.alice, &10_000),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+    assert_transfer_fails_compliance(&f, &charlie, &f.alice, 10_000);
+
+    // Non-sanctioned addresses Charlie and Bob can transfer
+    assert!(f.token.is_transfer_compliant(&charlie, &f.bob, &20_000));
+    f.token.transfer(&charlie, &f.bob, &20_000);
+    assert_eq!(f.token.balance(&charlie), 480_000);
+    assert_eq!(f.token.balance(&f.bob), 1_020_000);
+}
+
+#[test]
+fn compliance_hook_enforces_custom_transfer_limits() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    let hook_client = MockComplianceHookClient::new(&f.env, &hook_id);
+    f.token.set_compliance_hook(&hook_id);
+
+    // Set max transfer amount to 500
+    hook_client.set_max_transfer_amount(&500);
+
+    // Transfer above limit fails
+    assert!(!f.token.is_transfer_compliant(&f.alice, &f.bob, &501));
+    assert_eq!(
+        f.token.try_check_compliance(&f.alice, &f.bob, &501),
+        Err(Ok(Error::ComplianceCheckFailed))
+    );
+    assert_transfer_fails_compliance(&f, &f.alice, &f.bob, 501);
+
+    // Transfer at or below limit succeeds
+    assert!(f.token.is_transfer_compliant(&f.alice, &f.bob, &500));
+    f.token.transfer(&f.alice, &f.bob, &500);
+    assert_eq!(f.token.balance(&f.alice), 999_500);
+    assert_eq!(f.token.balance(&f.bob), 1_000_500);
+
+    // transfer_from above limit fails
+    let spender = Address::generate(&f.env);
+    f.token
+        .approve(&f.alice, &spender, &10_000, &(f.ledger() + 1_000));
+    assert_transfer_from_fails_compliance(&f, &spender, &f.alice, &f.bob, 501);
+
+    // transfer_from at limit succeeds
+    f.token.transfer_from(&spender, &f.alice, &f.bob, &500);
+    assert_eq!(f.token.allowance(&f.alice, &spender), 9_500);
+    assert_eq!(f.token.balance(&f.alice), 999_000);
+    assert_eq!(f.token.balance(&f.bob), 1_001_000);
+}
+
+#[test]
+fn deregistering_hook_restores_unrestricted_transfers() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+    let hook_client = MockComplianceHookClient::new(&f.env, &hook_id);
+    f.token.set_compliance_hook(&hook_id);
+
+    // Revert all transfers
+    hook_client.set_return_false(&true);
+    assert_transfer_fails_compliance(&f, &f.alice, &f.bob, 10_000);
+
+    // Deregister hook
+    f.token.deregister_compliance_hook();
+    assert_eq!(f.token.compliance_hook(), None);
+
+    // Transfer now succeeds without restriction
+    assert!(f.token.is_transfer_compliant(&f.alice, &f.bob, &10_000));
+    f.token.transfer(&f.alice, &f.bob, &10_000);
+    assert_eq!(f.token.balance(&f.alice), 990_000);
+    assert_eq!(f.token.balance(&f.bob), 1_010_000);
+}
+
+#[test]
+fn emits_compliance_hook_events() {
+    let f = Fixture::new();
+    let hook_id = f.env.register_contract(None, MockComplianceHook);
+
+    f.token.set_compliance_hook(&hook_id);
+    f.token.remove_compliance_hook();
+
+    let mut names: Vec<Symbol> = Vec::new(&f.env);
+    for (_, topics, _) in f.env.events().all() {
+        if let Some(first) = topics.first() {
+            if let Ok(name) = Symbol::try_from_val(&f.env, &first) {
+                names.push_back(name);
+            }
+        }
+    }
+
+    assert!(names.contains(symbol_short!("set_hook")));
+    assert!(names.contains(symbol_short!("del_hook")));
+}
+
+#[test]
+fn max_supply_reported_after_initialization() {
+    let f = Fixture::new();
+    assert_eq!(f.token.max_supply(), DEFAULT_MAX_SUPPLY);
+}
+
+#[test]
+fn admin_can_set_max_supply() {
+    let f = Fixture::new();
+    let new_cap = 5_000_000;
+    f.token.set_max_supply(&new_cap);
+    assert_eq!(f.token.max_supply(), new_cap);
+
+    let mut found_event = false;
+    for (_, topics, data) in f.env.events().all() {
+        if let Some(first) = topics.first() {
+            if let Ok(name) = Symbol::try_from_val(&f.env, &first) {
+                if name == symbol_short!("set_cap") {
+                    let admin_val = topics.get(1).unwrap();
+                    let admin: Address = Address::try_from_val(&f.env, &admin_val).unwrap();
+                    let cap: i128 = i128::try_from_val(&f.env, &data).unwrap();
+                    assert_eq!(admin, f.admin);
+                    assert_eq!(cap, new_cap);
+                    found_event = true;
+                }
+            }
+        }
+    }
+    assert!(found_event);
+}
+
+#[test]
+fn set_max_supply_below_current_total_supply_fails() {
+    let f = Fixture::new();
+    let res = f.token.try_set_max_supply(&1_999_999);
+    assert_eq!(res.unwrap_err().unwrap(), Error::SupplyCapExceeded);
+    assert_eq!(f.token.max_supply(), DEFAULT_MAX_SUPPLY);
+}
+
+#[test]
+fn set_max_supply_negative_fails() {
+    let f = Fixture::new();
+    let res = f.token.try_set_max_supply(&-1);
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidAmount);
+}
+
+#[test]
+fn mint_enforces_max_supply() {
+    let f = Fixture::new();
+    let carol = Address::generate(&f.env);
+
+    f.token.set_max_supply(&2_000_500);
+
+    f.token.mint(&carol, &500);
+    assert_eq!(f.token.balance(&carol), 500);
+    assert_eq!(f.token.total_supply(), 2_000_500);
+
+    let res = f.token.try_mint(&carol, &1);
+    assert_eq!(res.unwrap_err().unwrap(), Error::SupplyCapExceeded);
+    assert_eq!(f.token.balance(&carol), 500);
+    assert_eq!(f.token.total_supply(), 2_000_500);
+}
+
+#[test]
+fn batch_mint_distributes_tokens_accurately() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+    let r3 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    recipients.push_back(r3.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(200);
+    amounts.push_back(300);
+
+    f.token.batch_mint(&recipients, &amounts);
+
+    assert_eq!(f.token.balance(&r1), 100);
+    assert_eq!(f.token.balance(&r2), 200);
+    assert_eq!(f.token.balance(&r3), 300);
+    assert_eq!(f.token.total_supply(), 2_000_600);
+
+    let mut mint_count = 0;
+    let mut found_batch_event = false;
+    for (_, topics, data) in f.env.events().all() {
+        if let Some(first) = topics.first() {
+            if let Ok(name) = Symbol::try_from_val(&f.env, &first) {
+                if name == symbol_short!("mint") {
+                    mint_count += 1;
+                } else if name == symbol_short!("batchmint") {
+                    let total: i128 = i128::try_from_val(&f.env, &data).unwrap();
+                    assert_eq!(total, 600);
+                    found_batch_event = true;
+                }
+            }
+        }
+    }
+    assert_eq!(mint_count, 5);
+    assert!(found_batch_event);
+}
+
+#[test]
+fn batch_mint_up_to_30_recipients_succeeds() {
+    let f = Fixture::new();
+    let mut recipients = Vec::new(&f.env);
+    let mut amounts = Vec::new(&f.env);
+
+    for _ in 0..30 {
+        recipients.push_back(Address::generate(&f.env));
+        amounts.push_back(10);
+    }
+
+    assert_eq!(recipients.len(), 30);
+    f.token.batch_mint(&recipients, &amounts);
+
+    assert_eq!(f.token.total_supply(), 2_000_000 + 300);
+    for i in 0..30 {
+        let r = recipients.get(i).unwrap();
+        assert_eq!(f.token.balance(&r), 10);
+    }
+}
+
+#[test]
+fn batch_mint_exceeding_30_recipients_fails() {
+    let f = Fixture::new();
+    let mut recipients = Vec::new(&f.env);
+    let mut amounts = Vec::new(&f.env);
+
+    for _ in 0..31 {
+        recipients.push_back(Address::generate(&f.env));
+        amounts.push_back(10);
+    }
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::BatchSizeExceeded);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+    for i in 0..31 {
+        let r = recipients.get(i).unwrap();
+        assert_eq!(f.token.balance(&r), 0);
+    }
+}
+
+#[test]
+fn batch_mint_length_mismatch_fails() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::BatchLengthMismatch);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_empty_fails() {
+    let f = Fixture::new();
+    let recipients = Vec::new(&f.env);
+    let amounts = Vec::new(&f.env);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidAmount);
+}
+
+#[test]
+fn batch_mint_invalid_amount_fails() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(0);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidAmount);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_supply_cap_exceeded_reverts_atomically() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    f.token.set_max_supply(&2_000_250);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(200);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::SupplyCapExceeded);
+
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_blocked_when_paused() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+
+    f.token.pause();
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
+    assert_eq!(f.token.balance(&r1), 0);
+
+    f.token.unpause();
+    f.token.batch_mint(&recipients, &amounts);
+    assert_eq!(f.token.balance(&r1), 100);
+}
+
+#[test]
+fn batch_mint_blocked_for_frozen_recipient() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    f.token.freeze(&r2);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(100);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::AccountFrozen);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+    assert_eq!(f.token.total_supply(), 2_000_000);
+}
+
+#[test]
+fn batch_mint_blocked_for_time_bound_frozen_recipient_until_timestamp() {
+    let f = Fixture::new();
+    f.env.ledger().with_mut(|info| info.timestamp = 1_000);
+
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+    let freeze_until = 2_000;
+    f.token.freeze_account_until(&r2, &freeze_until);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(100);
+
+    let res = f.token.try_batch_mint(&recipients, &amounts);
+    assert_eq!(res.unwrap_err().unwrap(), Error::AccountFrozen);
+    assert_eq!(f.token.balance(&r1), 0);
+    assert_eq!(f.token.balance(&r2), 0);
+
+    f.env.ledger().with_mut(|info| info.timestamp = 2_000);
+    f.token.batch_mint(&recipients, &amounts);
+    assert_eq!(f.token.balance(&r1), 100);
+    assert_eq!(f.token.balance(&r2), 100);
+    assert_eq!(f.token.total_supply(), 2_000_200);
+}
+
+#[test]
+fn batch_mint_with_repeated_recipient_accumulates_balance() {
+    let f = Fixture::new();
+    let r1 = Address::generate(&f.env);
+    let r2 = Address::generate(&f.env);
+
+    let mut recipients = Vec::new(&f.env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    recipients.push_back(r1.clone());
+
+    let mut amounts = Vec::new(&f.env);
+    amounts.push_back(100);
+    amounts.push_back(200);
+    amounts.push_back(300);
+
+    f.token.batch_mint(&recipients, &amounts);
+    assert_eq!(f.token.balance(&r1), 400);
+    assert_eq!(f.token.balance(&r2), 200);
+    assert_eq!(f.token.total_supply(), 2_000_600);
+}
+
+#[test]
+fn supply_cap_and_batch_mint_require_initialization() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, PausableToken);
+    let token = PausableTokenClient::new(&env, &contract_id);
+
+    let r1 = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1);
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100);
+
+    assert_eq!(
+        token.try_set_max_supply(&1_000_000),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        token.try_batch_mint(&recipients, &amounts),
+        Err(Ok(Error::NotInitialized))
+    );
 }

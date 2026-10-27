@@ -11,6 +11,7 @@ pub const TOTAL_WEIGHT_BPS: u32 = 10_000;
 /// Divides `amount_in` across each split route proportionally by its weight in basis points,
 /// executes swaps sequentially against registered DEX adapters, verifies per-split `min_amount_out`,
 /// calculates platform fees on the aggregate received tokens, and delivers remainder to recipient.
+#[allow(clippy::too_many_arguments)]
 pub fn process_split_payment_with_swap(
     env: &Env,
     sender: &Address,
@@ -173,11 +174,7 @@ pub fn process_split_payment_with_swap(
     }
 
     env.events().publish(
-        (
-            symbol_short!("routed"),
-            sender.clone(),
-            recipient.clone(),
-        ),
+        (symbol_short!("routed"), sender.clone(), recipient.clone()),
         remainder,
     );
 
