@@ -2141,7 +2141,7 @@ fn sign_quote_payload(
     payload.append(&contract_id.to_xdr(env));
     payload.append(&sender.to_xdr(env));
     payload.append(&recipient.to_xdr(env));
-    payload.append(&quote.to_xdr(env));
+    payload.append(&quote.clone().to_xdr(env));
     payload.append(&soroban_sdk::Bytes::from_slice(
         env,
         &maker_pubkey.to_array(),
@@ -2188,13 +2188,7 @@ fn test_signed_quote_settles_input_and_output() {
     );
 
     assert_eq!(
-        client.route_payment_with_quote(
-            &sender,
-            &recipient,
-            &quote,
-            &maker_pubkey,
-            &signature,
-        ),
+        client.route_payment_with_quote(&sender, &recipient, &quote, &maker_pubkey, &signature,),
         12_000
     );
     assert_eq!(input_client.balance(&sender), 0);
@@ -2237,13 +2231,8 @@ fn test_expired_signed_quote_is_rejected() {
         &signing_key,
     );
 
-    let result = client.try_route_payment_with_quote(
-        &sender,
-        &recipient,
-        &quote,
-        &maker_pubkey,
-        &signature,
-    );
+    let result =
+        client.try_route_payment_with_quote(&sender, &recipient, &quote, &maker_pubkey, &signature);
     assert_eq!(result.unwrap_err().unwrap(), Error::QuoteExpired);
 }
 
@@ -4703,9 +4692,7 @@ fn test_swap_with_wrong_output_asset_reverts_with_asset_mismatch() {
     unexpected_admin.mint(&f.dex, &10_000);
     f.dex_client.set_output_token(&unexpected_token);
 
-    let res = f
-        .client
-        .try_route_payment_with_swap(&f.payment(10_000, 1));
+    let res = f.client.try_route_payment_with_swap(&f.payment(10_000, 1));
     assert_eq!(res.unwrap_err().unwrap(), Error::AssetMismatch);
 
     assert_eq!(f.sell_client.balance(&f.sender), 1_000_000);

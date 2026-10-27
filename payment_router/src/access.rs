@@ -1,6 +1,6 @@
 use crate::errors::Error;
 use crate::storage::{
-    DataKey, PauseLevel, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
+    DataKey, ExtraKey, PauseLevel, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use crate::types::ActionType;
@@ -226,7 +226,7 @@ pub fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
     let threshold: u32 = env
         .storage()
         .instance()
-        .get(&DataKey::MultisigThreshold)
+        .get(&ExtraKey::MultisigThreshold)
         .ok_or(Error::MultisigNotInitialized)?;
     let signers: Vec<Address> = env
         .storage()
@@ -256,7 +256,7 @@ pub fn validate_multisig_config(signers: &Vec<Address>, threshold: u32) -> Resul
 pub fn load_upgrade_approvals(env: &Env, new_wasm_hash: &BytesN<32>) -> Vec<Address> {
     env.storage()
         .persistent()
-        .get(&DataKey::UpgradeApproval(new_wasm_hash.clone()))
+        .get(&ExtraKey::UpgradeApproval(new_wasm_hash.clone()))
         .unwrap_or_else(|| Vec::new(env))
 }
 
@@ -296,7 +296,7 @@ pub fn apply_upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
         .update_current_contract_wasm(new_wasm_hash.clone());
     env.storage()
         .persistent()
-        .remove(&DataKey::UpgradeApproval(new_wasm_hash.clone()));
+        .remove(&ExtraKey::UpgradeApproval(new_wasm_hash.clone()));
 }
 
 pub fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
@@ -305,7 +305,7 @@ pub fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
         .set(&DataKey::MultisigSigners, &signers);
     env.storage()
         .instance()
-        .set(&DataKey::MultisigThreshold, &threshold);
+        .set(&ExtraKey::MultisigThreshold, &threshold);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);

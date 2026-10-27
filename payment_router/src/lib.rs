@@ -451,7 +451,7 @@ impl PaymentRouter {
         payload.append(&env.current_contract_address().to_xdr(env));
         payload.append(&sender.to_xdr(env));
         payload.append(&recipient.to_xdr(env));
-        payload.append(&quote.to_xdr(env));
+        payload.append(&quote.clone().to_xdr(env));
         payload.append(&Bytes::from_slice(env, &maker_pubkey.to_array()));
         let hash = env.crypto().sha256(&payload);
         Bytes::from(&hash)
@@ -1653,8 +1653,9 @@ impl PaymentRouter {
     }
 
     /// Appends a new payment telemetry observation to the temporary storage ring buffer.
-    pub fn record_telemetry(env: Env, volume: u32, status: u8) -> PackedTelemetryRecord {
-        let timestamp = env.ledger().timestamp() as u32;
+    pub fn record_telemetry(env: Env, volume: u32, status: u32) -> PackedTelemetryRecord {
+        let timestamp = u32::try_from(env.ledger().timestamp()).unwrap_or(u32::MAX);
+        let status = u8::try_from(status).unwrap_or(u8::MAX);
         storage::append_telemetry(&env, timestamp, volume, status)
     }
 
@@ -3252,7 +3253,7 @@ impl PaymentRouter {
         if quote.token_in == quote.token_out
             || quote.amount_in <= 0
             || quote.amount_out <= 0
-            || quote.quote_id.is_empty()
+            || quote.quote_id.len() == 0
         {
             return Err(Error::InvalidSwapParams);
         }
@@ -3281,8 +3282,7 @@ impl PaymentRouter {
         Self::verify_kyc_for_amount(&env, &sender, quote.amount_in)?;
         let _ = Self::load_fee_config(&env)?;
 
-        let message =
-            Self::build_quote_message(&env, &sender, &recipient, &quote, &maker_pubkey);
+        let message = Self::build_quote_message(&env, &sender, &recipient, &quote, &maker_pubkey);
         env.crypto()
             .ed25519_verify(&maker_pubkey, &message, &signature);
 
@@ -4482,7 +4482,7 @@ impl PaymentRouter {
         }
         signer.require_auth();
 
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let key = ExtraKey::UpgradeApproval(new_wasm_hash.clone());
         let mut approvals: Vec<Address> = env
             .storage()
             .persistent()
@@ -4542,7 +4542,7 @@ impl PaymentRouter {
         }
         signer.require_auth();
 
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let key = ExtraKey::UpgradeApproval(new_wasm_hash.clone());
         let mut approvals: Vec<Address> = env
             .storage()
             .persistent()
@@ -4596,7 +4596,7 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let key = ExtraKey::UpgradeApproval(new_wasm_hash.clone());
         if env.storage().persistent().has(&key) {
             env.storage().persistent().remove(&key);
         }

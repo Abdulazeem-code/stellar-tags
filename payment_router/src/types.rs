@@ -1,4 +1,4 @@
-use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, String, Vec};
 
 /// A user's rolling 24-hour spending record.
 ///
@@ -259,6 +259,22 @@ pub struct MerkleBatch {
     pub expiration: u64,
     /// Whether the batch has been closed and its remaining funds reclaimed.
     pub reclaimed: bool,
+}
+
+/// Status of an in-flight dead man's switch claim challenge window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmsClaimStatus {
+    /// Address that initiated the claim.
+    pub claimant: Address,
+    /// Ledger timestamp when the claim was initiated.
+    pub initiated_at: u64,
+    /// Timestamp when the grace period challenge window expires.
+    pub grace_period_end: u64,
+    /// Target candidate admin address to be granted ownership.
+    pub candidate_admin: Address,
+    /// Succession tier (1 = primary backup, 2 = multi-sig council).
+    pub tier: u32,
 }
 
 /// Adapter interface implemented by the DEX used for an arbitrary token swap.

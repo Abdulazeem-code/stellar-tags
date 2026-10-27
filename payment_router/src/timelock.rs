@@ -35,8 +35,8 @@ use crate::access::{
 };
 use crate::errors::Error;
 use crate::storage::{
-    DataKey, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD, SECONDS_IN_24H,
+    DataKey, ExtraKey, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, SECONDS_IN_24H,
 };
 use crate::types::{ActionType, TimelockEntry};
 use crate::PaymentRouter;
@@ -257,7 +257,7 @@ const PREPARE_HOOK: &str = "prepare_upgrade";
 const COMMIT_HOOK: &str = "commit_upgrade";
 
 /// A prepared cross-contract upgrade waiting for its 48-hour timelock to
-/// elapse.  Stored under [`DataKey::TwoPhaseCommit`] keyed by `upgrade_id`.
+/// elapse.  Stored under [`ExtraKey::TwoPhaseCommit`] keyed by `upgrade_id`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TwoPhaseCommit {
@@ -338,7 +338,7 @@ pub fn prepare_cross_contract_upgrade(
         }
     }
 
-    let key = DataKey::TwoPhaseCommit(upgrade_id.clone());
+    let key = ExtraKey::TwoPhaseCommit(upgrade_id.clone());
     if env.storage().persistent().has(&key) {
         return Err(Error::TimelockPending);
     }
@@ -422,7 +422,7 @@ pub fn commit_cross_contract_upgrade(env: &Env, upgrade_id: BytesN<32>) -> Resul
     let admin = require_admin(env)?;
     admin.require_auth();
 
-    let key = DataKey::TwoPhaseCommit(upgrade_id.clone());
+    let key = ExtraKey::TwoPhaseCommit(upgrade_id.clone());
     let manifest: TwoPhaseCommit = env
         .storage()
         .persistent()
@@ -491,7 +491,7 @@ pub fn get_cross_contract_upgrade(
 ) -> Result<TwoPhaseCommit, Error> {
     env.storage()
         .persistent()
-        .get(&DataKey::TwoPhaseCommit(upgrade_id))
+        .get(&ExtraKey::TwoPhaseCommit(upgrade_id))
         .ok_or(Error::TimelockNotFound)
 }
 
