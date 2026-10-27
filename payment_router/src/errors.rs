@@ -97,8 +97,7 @@ pub enum Error {
     InvalidMultisigConfig = 37,
     /// The calling address is not a member of the multi-signature admin group.
     NotMultisigSigner = 38,
-    /// The number of collected upgrade approvals is below the configured
-    /// threshold, so the upgrade is not authorized yet.
+    /// The number of collected approvals is below the configured threshold.
     InsufficientApprovals = 39,
     /// No multi-signature admin group has been configured yet.  Upgrades fail
     /// closed until `set_multisig_config` has been called, so a freshly
@@ -115,6 +114,10 @@ pub enum Error {
     CyclicSwapPath = 49,
     /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
     InvalidSlippageConfig = 50,
+    /// The multisig approval threshold is outside the valid signer range.
+    InvalidThreshold = 51,
+    /// A multisig signer set contains the same address more than once.
+    DuplicateSigner = 52,
 }
 
 #[allow(non_upper_case_globals)]
