@@ -10,6 +10,7 @@ import { dailyVolume, fetchAccountPayments, relativeTime } from '../lib/payments
 import {
   API_BASE,
   TOKEN_ADDRESS,
+  TREASURY_ADDRESS,
   apiErrorMessage,
   errorMessage,
   formatShortAddress,
@@ -148,6 +149,7 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
         assembledTransaction = await client.route_payment({
           sender: userPublicKey,
           recipient: recipientAddress,
+          platform_treasury: TREASURY_ADDRESS,
           token_address: TOKEN_ADDRESS,
           amount: amountStroops,
         });
