@@ -41,6 +41,7 @@ const {
 } = require('./src/horizonBackoff');
 const metrics = require('./src/metrics');
 const { publishPaymentUpdate } = require('./src/sse');
+const { createPaymentWithOutbox } = require('./src/services/settlementOutbox');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -361,22 +362,6 @@ const watchAccount = (accountId) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
 
-          // Hand the payment to the webhook dispatcher so any endpoint the
-          // recipient registered actually gets notified. A failing dispatch
-          // must never tear the stream down with it.
-          dispatchPaymentWebhooks({ prisma, payment }).catch((err) =>
-            logger.error('Webhook dispatch failed for %s', accountId, { err }),
-          );
-
-          prisma.payment.create({
-            data: {
-              transactionHash: payment.transaction_hash,
-              fromAddress: payment.from,
-              toAddress: payment.to,
-              amount: parseFloat(payment.amount),
-              assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
-              status: 'completed'
-            }
           }).then((created) =>
             // Fan the new payment out to connected SSE clients via Redis, so
             // every API process can stream the status update (#730).

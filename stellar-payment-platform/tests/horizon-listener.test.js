@@ -18,8 +18,7 @@ const mockLogger = {
   debug: jest.fn(),
 };
 jest.mock('../src/logger', () => ({
-  logger: mockLogger,
-  httpLogger: (req, res, next) => next(),
+
 }));
 
 jest.mock('../src/config/redis', () => ({
@@ -776,6 +775,10 @@ describe('Horizon listener publishes status updates to SSE (#730)', () => {
     // Flush prisma.payment.create(...).then(publishPaymentUpdate)
     await new Promise((resolve) => setImmediate(resolve));
 
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.outboxMessage.create).toHaveBeenCalledWith({
+      data: { eventType: 'payment.created', payload: expect.objectContaining({ paymentId: 'PAY-123' }) },
+    });
     expect(publishPaymentUpdate).toHaveBeenCalledTimes(1);
     const [, paymentId, payload] = publishPaymentUpdate.mock.calls[0];
     expect(paymentId).toBe('PAY-123');
