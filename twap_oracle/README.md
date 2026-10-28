@@ -37,6 +37,9 @@ reference asset). No scaling is applied by the contract.
 * **No future timestamps.** `timestamp` may not exceed the ledger clock.
 * **Derived cumulative.** `cumulative_price` is computed inside the contract
   from the previous observation; callers never supply it.
+* **Geometric TWAP.** Observations also accumulate `log2(price)` in Q64.64
+  fixed-point form. `geometric_twap` averages that accumulator and applies a
+  fixed-point `exp2`; no floating-point arithmetic is used.
 * **Bounded, checked prices.** Prices must be positive and at or below
   `MAX_PRICE`; every multiply/add is checked, so an out-of-range value cannot
   wrap the accumulator into a bogus average.

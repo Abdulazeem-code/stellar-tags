@@ -4,7 +4,9 @@ use crate::storage::{
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use crate::types::ActionType;
-use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
+use core::cmp::Ordering;
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
 // ── Role-Based Access Control (RBAC) Helpers ─────────────────────────────────
 
 pub fn set_role_internal(env: &Env, role: Role, account: &Address) {
@@ -251,20 +253,96 @@ pub fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
 }
 
 pub fn validate_multisig_config(signers: &Vec<Address>, threshold: u32) -> Result<u32, Error> {
-    if signers.is_empty() {
-        return Err(Error::InvalidMultisigConfig);
-    }
-    if threshold == 0 || threshold > signers.len() {
-        return Err(Error::InvalidMultisigConfig);
+    let min_threshold = if signers.len() >= 2 { 2 } else { 1 };
+    if signers.is_empty() || threshold < min_threshold || threshold > signers.len() {
+        return Err(Error::InvalidThreshold);
     }
     for i in 0..signers.len() {
         for j in (i + 1)..signers.len() {
             if signers.get(i) == signers.get(j) {
-                return Err(Error::InvalidMultisigConfig);
+                return Err(Error::DuplicateSigner);
             }
         }
     }
     Ok(threshold)
+}
+
+fn compare_bytes(left: &Bytes, right: &Bytes) -> Ordering {
+    let common = core::cmp::min(left.len(), right.len());
+    let mut index = 0u32;
+    while index < common {
+        match left.get(index).cmp(&right.get(index)) {
+            Ordering::Equal => index += 1,
+            ordering => return ordering,
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+/// Returns the signer addresses in lexicographic XDR order.
+///
+/// # Panics
+///
+/// Panics if a signer address cannot be read from the supplied vector.
+pub fn sorted_multisig_signers(env: &Env, signers: &Vec<Address>) -> Vec<Address> {
+    let mut sorted: Vec<Address> = Vec::new(env);
+    let mut index = 0u32;
+    while index < signers.len() {
+        let signer = signers.get(index).unwrap();
+        let signer_xdr = signer.clone().to_xdr(env);
+        let mut insert_at = sorted.len();
+        let mut current = 0u32;
+        while current < sorted.len() {
+            let existing_xdr = sorted.get(current).unwrap().to_xdr(env);
+            if compare_bytes(&signer_xdr, &existing_xdr) == Ordering::Less {
+                insert_at = current;
+                break;
+            }
+            current += 1;
+        }
+        sorted.insert(insert_at, signer);
+        index += 1;
+    }
+    sorted
+}
+
+fn multisig_config_hash(env: &Env, signers: &Vec<Address>, threshold: u32) -> BytesN<32> {
+    env.crypto()
+        .sha256(&(signers.clone(), threshold).to_xdr(env))
+}
+
+pub fn approve_multisig_config(
+    env: &Env,
+    signers: &Vec<Address>,
+    threshold: u32,
+    signer: Address,
+) -> Result<u32, Error> {
+    validate_multisig_config(signers, threshold)?;
+    let (current_signers, _) = load_multisig_config(env)?;
+    if !current_signers.contains(&signer) {
+        return Err(Error::NotMultisigSigner);
+    }
+    signer.require_auth();
+
+    let sorted_signers = sorted_multisig_signers(env, signers);
+    let key =
+        DataKey::MultisigConfigApproval(multisig_config_hash(env, &sorted_signers, threshold));
+    let mut approvals: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if approvals.contains(&signer) {
+        return Err(Error::AlreadyApproved);
+    }
+    approvals.push_back(signer);
+    env.storage().persistent().set(&key, &approvals);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+    Ok(approvals.len())
 }
 
 pub fn load_upgrade_approvals(env: &Env, new_wasm_hash: &BytesN<32>) -> Vec<Address> {
@@ -313,16 +391,48 @@ pub fn apply_upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
         .remove(&DataKey::UpgradeApproval(new_wasm_hash.clone()));
 }
 
-pub fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
-    env.storage()
-        .instance()
-        .set(&DataKey::MultisigSigners, &signers);
+pub fn store_multisig_config(
+    env: &Env,
+    signers: Vec<Address>,
+    threshold: u32,
+) -> Result<(), Error> {
+    validate_multisig_config(&signers, threshold)?;
+    let has_signers = env.storage().instance().has(&DataKey::MultisigSigners);
+    let has_threshold = env.storage().instance().has(&DataKey::MultisigThreshold);
+    if has_signers || has_threshold {
+        let (current_signers, current_threshold) = load_multisig_config(env)?;
+        let sorted_signers = sorted_multisig_signers(env, &signers);
+        let key =
+            DataKey::MultisigConfigApproval(multisig_config_hash(env, &sorted_signers, threshold));
+        let stored: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut approvals = 0u32;
+        for i in 0..stored.len() {
+            if let Some(approver) = stored.get(i) {
+                if current_signers.contains(&approver) {
+                    approvals += 1;
+                }
+            }
+        }
+        if approvals < current_threshold {
+            return Err(Error::InsufficientApprovals);
+        }
+        env.storage().persistent().remove(&key);
+    }
+    env.storage().instance().set(
+        &DataKey::MultisigSigners,
+        &sorted_multisig_signers(env, &signers),
+    );
     env.storage()
         .instance()
         .set(&DataKey::MultisigThreshold, &threshold);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    Ok(())
 }
 
 pub fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
