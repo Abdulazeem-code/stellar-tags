@@ -75,6 +75,12 @@ const findUserRecord = async (username) => {
 };
 
 /**
+ * @param {object} params
+ * @param {boolean} [params.allowPublicKeySignature=true] accept a bare signer
+ *   public key as the "signature" (multi-signer threshold path). That path only
+ *   checks the key is a signer on the account; it proves nothing cryptographically,
+ *   and account public keys are public. Pass false for destructive operations so
+ *   only a real signed message is accepted.
  * @returns {Promise<{username: string, address: string}>} the authenticated user
  * @throws {Error} with `statusCode` set on any failure
  */
@@ -83,6 +89,7 @@ const authenticateUsernameOwner = async ({
   signature: rawSignature,
   signerAddress: rawSignerAddress,
   operation = 'webhook',
+  allowPublicKeySignature = true,
 }) => {
   const username = typeof rawUsername === 'string' ? rawUsername.trim() : '';
   const signature = typeof rawSignature === 'string' ? rawSignature.trim() : '';
@@ -99,7 +106,7 @@ const authenticateUsernameOwner = async ({
 
   const message = `${operation}:${normalizedUsername}`;
 
-  if (StrKey.isValidEd25519PublicKey(signature) && !signerAddress) {
+  if (allowPublicKeySignature && StrKey.isValidEd25519PublicKey(signature) && !signerAddress) {
     const verificationResult = await verifyMultiSignerThreshold(
       userRecord.address,
       [signature],
