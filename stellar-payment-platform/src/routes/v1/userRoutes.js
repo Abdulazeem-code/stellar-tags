@@ -41,7 +41,7 @@ const {
   activityQuerySchema,
 } = require('../../schemas');
 const { createSignatureRateLimiter } = require('../../middleware/signatureRateLimit');
-const { idempotencyMiddleware } = require('../../../middleware/idempotency');
+const { idempotencyMiddleware } = require("../../middleware/idempotency");
 
 const buildUserSearchWhere = (search) => {
   if (!search) return {};

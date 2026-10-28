@@ -27,7 +27,7 @@ const { streamAdminExport } = require('../../utils/exporter');
 const { getRoutingStats } = require('../../services/statsService');
 const { getRoutingStatsFromAnalytics, getAnalyticsPool } = require('../../analytics/analyticsRepository');
 const { auditLogMiddleware } = require('../../middleware/auditLog');
-const { idempotencyMiddleware } = require('../../../middleware/idempotency');
+const { idempotencyMiddleware } = require("../../middleware/idempotency");
 const { logger } = require('../../logger');
 const {
   parsePagination,

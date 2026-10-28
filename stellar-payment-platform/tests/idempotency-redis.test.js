@@ -2,7 +2,7 @@
 
 const express = require('express');
 const request = require('supertest');
-const { idempotencyMiddleware } = require('../middleware/idempotency');
+const { idempotencyMiddleware } = require('../src/middleware/idempotency.js');
 const { logger } = require('../src/logger');
 
 class FakeRedis {

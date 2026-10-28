@@ -16,7 +16,7 @@ jest.mock('../prismaClient', () => ({
 process.env.NODE_ENV = 'test';
 process.env.ADMIN_API_KEY = 'test-admin-key';
 
-const { idempotencyMiddleware, IDEMPOTENCY_HEADER } = require('../middleware/idempotency');
+const { idempotencyMiddleware, IDEMPOTENCY_HEADER } = require("../src/middleware/idempotency.js");
 const buildAdminRouter = require('../src/routes/v1/adminRoutes');
 
 describe('admin block idempotency', () => {
