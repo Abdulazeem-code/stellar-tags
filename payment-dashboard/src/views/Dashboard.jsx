@@ -9,7 +9,6 @@ import { signTransaction } from '../lib/wallets';
 import { dailyVolume, fetchAccountPayments, relativeTime } from '../lib/payments';
 import {
   API_BASE,
-  DEFAULT_FEDERATION_DOMAIN,
   TOKEN_ADDRESS,
   apiErrorMessage,
   errorMessage,
@@ -226,7 +225,7 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
             value={recipient}
             onChange={(event) => setRecipient(event.target.value)}
             onFocus={() => setShowRecent(true)}
-            placeholder={`name, name*${DEFAULT_FEDERATION_DOMAIN} or G...`}
+            placeholder="name or G..."
             autoComplete="off"
             spellCheck="false"
             required
