@@ -6,7 +6,6 @@ import { checkTag, validateTag, TAG_MAX } from '../lib/tags';
 import { signMessage, walletName, connectedWalletId } from '../lib/wallets';
 import {
   API_BASE,
-  DEFAULT_FEDERATION_DOMAIN,
   apiErrorMessage,
   formatShortAddress,
   fullTag,
@@ -128,7 +127,7 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
   // (the API can take a while to wake up).
   const checking = Boolean(cleaned) && (cleaned !== debounced.trim() || availability.for !== debounced);
   const shown = checking ? { state: 'checking', text: 'Checking...' } : availability;
-  const full = `${(cleaned || 'yourname').toLowerCase()}*${DEFAULT_FEDERATION_DOMAIN}`;
+  const full = (cleaned || 'yourname').toLowerCase();
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -223,7 +222,7 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
 
         <div className="form__group">
           <label htmlFor="username">Username</label>
-          <div className={`field field--joined ${ruleError ? 'is-invalid' : ''}`}>
+          <div className={`field ${ruleError ? 'is-invalid' : ''}`}>
             <input
               id="username"
               value={username}
@@ -235,7 +234,6 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
               aria-describedby="username-status"
               aria-invalid={Boolean(ruleError)}
             />
-            <span className="field__suffix">*{DEFAULT_FEDERATION_DOMAIN}</span>
           </div>
           <p id="username-status" className={`tag-check__status tag-check__status--${shown.state}`} aria-live="polite">
             <span className="dot" aria-hidden="true" />
