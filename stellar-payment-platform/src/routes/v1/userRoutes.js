@@ -1,7 +1,7 @@
 const express = require('express');
 const xss = require('xss');
 const { StrKey } = require('@stellar/stellar-sdk');
-const { prisma } = require('../../../prismaClient');
+const { prisma, isPrismaConnectionError } = require('../../../prismaClient');
 const { getBalances } = require('../../services/ledgerService');
 const { verifyMultiSignerThreshold } = require('../../multisigner-verifier');
 const { logger } = require('../../logger');
@@ -234,7 +234,11 @@ router.post('/register', signatureRateLimiter, idempotency, requireJson, validat
       return next(notFoundError);
     }
 
-    if (error.statusCode === 401) {
+    if (
+      error instanceof ApiError ||
+      (error.statusCode && error.statusCode < 500) ||
+      isPrismaConnectionError(error)
+    ) {
       return next(error);
     }
 

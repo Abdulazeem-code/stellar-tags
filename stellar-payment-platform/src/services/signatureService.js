@@ -38,7 +38,9 @@ const verifyFreighterRegistrationSignature = ({
       }
     }
   } else {
-    throw new Error('Invalid message signature format.');
+    const error = new Error('Invalid message signature format.');
+    error.statusCode = 400;
+    throw error;
   }
 
   // --- SEP-0053 Verification Logic ---

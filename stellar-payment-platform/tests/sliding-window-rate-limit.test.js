@@ -208,4 +208,14 @@ describe("sliding window rate limiter", () => {
     await limiter({}, createResponse(), next);
     expect(next).toHaveBeenCalledTimes(2);
   });
+
+  it("uses the local limit for signature requests when Redis is not configured in production", async () => {
+    const originalEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    const limiter = createSignatureRateLimiter(null);
+    process.env.NODE_ENV = originalEnv;
+    const next = jest.fn();
+    await limiter({ socket: { remoteAddress: "127.0.0.3" } }, createResponse(), next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
 });
