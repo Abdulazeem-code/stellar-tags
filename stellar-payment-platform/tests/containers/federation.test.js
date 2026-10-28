@@ -27,6 +27,7 @@ const request = require('supertest');
 const { app } = require('../../server');
 const {
   closeRedis,
+  idempotencyKey,
   makeAddress,
   prisma,
   resetTestState,
@@ -38,7 +39,13 @@ const FEDERATION_URL = '/api/v1/federation';
 const byName = (q) => request(app).get(FEDERATION_URL).query({ q, type: 'name' });
 const byId = (q) => request(app).get(FEDERATION_URL).query({ q, type: 'id' });
 
-const register = (body) => request(app).post('/api/v1/register').send(body);
+// Every mutating /api/v1 request must carry an Idempotency-Key: paymentRoutes
+// mounts idempotencyMiddleware(redisClient, { enforce: true }) at the v1 root.
+const register = (body) =>
+  request(app)
+    .post('/api/v1/register')
+    .set('Idempotency-Key', idempotencyKey('register'))
+    .send(body);
 
 describe('federation (real PostgreSQL)', () => {
   beforeAll(async () => {
@@ -186,7 +193,8 @@ describe('federation (real PostgreSQL)', () => {
 
       // Unregistering soft-deletes the row and invalidates the cache entry, so
       // the next lookup must reach Postgres instead of replaying the cache.
-      const del = await request(app).delete('/api/v1/register/revoked');
+      const del = await request(app).delete('/api/v1/register/revoked')
+        .set('Idempotency-Key', idempotencyKey('register'));
       expect(del.status).toBe(200);
 
       const afterDelete = await byName('revoked');

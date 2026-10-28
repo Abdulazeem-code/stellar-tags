@@ -33,6 +33,24 @@ function normalizeNameTag(value) {
   return trimmed.includes('*') ? trimmed : `${trimmed}*${DEFAULT_FEDERATION_DOMAIN}`;
 }
 
+/**
+ * The canonical federation address of a username.
+ *
+ * `normalizeNameTag` already qualifies a bare name, so a name that comes back
+ * from the database is usually fully qualified (`alice*localhost`). Appending
+ * the domain a second time would produce `alice*localhost*localhost`, so the
+ * domain is only added when it is genuinely missing.
+ *
+ * @param {string} username A bare or already-qualified username.
+ * @returns {string} The fully qualified federation address.
+ */
+function toFederationAddress(username) {
+  const name = typeof username === 'string' ? username.trim() : '';
+  if (!name) return '';
+  if (name.includes('*')) return name;
+  return `${name}*${process.env.DOMAIN || DEFAULT_FEDERATION_DOMAIN}`;
+}
+
 function validateMemo(memoType, memo) {
   if (!memoType && !memo) return null;
   if (memoType && !memo) return 'memo is required when memo_type is provided.';
@@ -71,6 +89,7 @@ const shouldFallbackToLocalRegistry = (error) => {
 
 module.exports = {
   normalizeNameTag,
+  toFederationAddress,
   validateMemo,
   RESERVED_NAMES,
   RESERVED_USERNAMES,

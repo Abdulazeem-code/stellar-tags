@@ -23,6 +23,24 @@ const DEFAULT_EVENTUALLY_INTERVAL_MS = 20;
 /** Tables owned by the app; `_prisma_migrations` is deliberately excluded. */
 const PRISMA_OWNED_TABLES = ['_prisma_migrations'];
 
+let idempotencyCounter = 0;
+
+/**
+ * A fresh `Idempotency-Key` for a mutating request.
+ *
+ * Every mutating `/api/v1` request must carry one: `paymentRoutes` mounts
+ * `idempotencyMiddleware(redisClient, { enforce: true })` at the v1 root, so
+ * the requirement covers the admin, webhook and registration routes too. The
+ * key has to be unique per request, otherwise the second request with the same
+ * key is replayed instead of executed.
+ *
+ * @param {string} [prefix] Distinguishes the call sites in the failure output.
+ */
+function idempotencyKey(prefix = 'test') {
+  idempotencyCounter += 1;
+  return `${prefix}-${idempotencyCounter}`;
+}
+
 function requireEnv(name) {
   const value = process.env[name];
   if (!value) {
@@ -37,12 +55,12 @@ function requireEnv(name) {
 
 /** The shared, real Prisma client. Created lazily so env vars are in place. */
 function prisma() {
-  return require('../../prismaClient').prisma;
+  return require('../../../prismaClient').prisma;
 }
 
 /** The `pg` pool used by the raw-SQL modules (src/db.js and friends). */
 function pgPool() {
-  return require('../../src/db').pool;
+  return require('../../../src/db').pool;
 }
 
 /**
@@ -138,10 +156,12 @@ async function waitForDependencies(app) {
 /** Truncate every app table, so each test starts from an empty schema. */
 async function resetPostgres() {
   const client = prisma();
-  const { rows } = await client.$queryRawUnsafe(
+  // Prisma's `$queryRawUnsafe` resolves to a plain array of row objects (unlike
+  // `pg`'s `{ rows }` envelope), so the result must not be destructured.
+  const rows = await client.$queryRawUnsafe(
     `SELECT tablename FROM pg_tables WHERE schemaname = current_schema()`,
   );
-  const tables = rows
+  const tables = (rows || [])
     .map((row) => row.tablename)
     .filter((name) => !PRISMA_OWNED_TABLES.includes(name));
 
@@ -165,7 +185,7 @@ async function resetRedis() {
  * Flushed explicitly so a value cached by one test cannot answer another.
  */
 function resetInMemoryCaches() {
-  const { cache } = require('../../src/cache');
+  const { cache } = require('../../../src/cache');
   cache.flushAll();
 }
 
@@ -242,6 +262,7 @@ async function insertPayments(rows) {
 module.exports = {
   closeRedis,
   eventually,
+  idempotencyKey,
   insertPayments,
   insertUser,
   insertWalletBalance,

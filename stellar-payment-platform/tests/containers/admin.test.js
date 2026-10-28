@@ -27,6 +27,7 @@ const { app } = require('../../server');
 const {
   closeRedis,
   eventually,
+  idempotencyKey,
   insertPayments,
   insertUser,
   makeAddress,
@@ -41,7 +42,13 @@ const BLOCK_URL = '/api/v1/admin/block';
 const EXPORT_URL = '/api/v1/admin/export';
 const AUDIT_LOGS_URL = '/api/v1/admin/audit-logs';
 
-const asAdmin = (req) => req.set('x-api-key', ADMIN_API_KEY);
+// Every mutating /api/v1 request must carry an Idempotency-Key: paymentRoutes
+// mounts idempotencyMiddleware(redisClient, { enforce: true }) at the v1 root,
+// so the requirement covers the admin routes too.
+const asAdmin = (req) =>
+  req
+    .set('x-api-key', ADMIN_API_KEY)
+    .set('Idempotency-Key', idempotencyKey('admin'));
 
 const EPOCH = new Date('2026-01-01T00:00:00.000Z');
 const at = (days) => new Date(EPOCH.getTime() + days * 24 * 60 * 60 * 1000);
@@ -75,7 +82,12 @@ describe('admin (real PostgreSQL)', () => {
 
     it('rejects a missing or wrong API key on every admin route', async () => {
       const unauthenticated = [
-        request(app).post(BLOCK_URL).send({ address: makeAddress('X') }),
+        // No API key, but a valid Idempotency-Key, so the 401 comes from auth
+        // rather than from the idempotency guard.
+        request(app)
+          .post(BLOCK_URL)
+          .set('Idempotency-Key', idempotencyKey('anon'))
+          .send({ address: makeAddress('X') }),
         request(app).get(EXPORT_URL),
         request(app).get(EXPORT_URL).set('x-api-key', 'wrong-key'),
         request(app).get(AUDIT_LOGS_URL),

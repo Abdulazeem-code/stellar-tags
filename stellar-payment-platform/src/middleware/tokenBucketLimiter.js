@@ -38,6 +38,47 @@ const TOKEN_BUCKET_LUA = `
 `;
 
 /**
+ * True when the client speaks node-redis's command API
+ * (`eval(script, { keys, arguments })`); false for ioredis
+ * (`eval(script, numkeys, ...args)`).
+ *
+ * The API server connects with node-redis while the Horizon listener and the
+ * BullMQ workers use ioredis, and the two disagree on how `EVAL` takes its
+ * arguments, so the script is invoked through whichever convention the client
+ * actually implements.
+ */
+const usesNodeRedisApi = (client) =>
+  typeof client.isOpen === 'boolean' || typeof client.isReady === 'boolean';
+
+/**
+ * Run `script` against `key` with `args`, whichever Redis client is in use.
+ *
+ * Every argument is stringified: Redis only accepts strings and integers as
+ * command arguments, and node-redis rejects a float outright.
+ */
+const evalScript = async (client, script, key, args) => {
+  const values = args.map(String);
+
+  if (usesNodeRedisApi(client)) {
+    if (typeof client.eval === 'function') {
+      return client.eval(script, { keys: [key], arguments: values });
+    }
+    if (typeof client.sendCommand === 'function') {
+      return client.sendCommand(['EVAL', script, '1', key, ...values]);
+    }
+    return null;
+  }
+
+  if (typeof client.eval === 'function') {
+    return client.eval(script, 1, key, ...values);
+  }
+  if (typeof client.call === 'function') {
+    return client.call('EVAL', script, 1, key, ...values);
+  }
+  return null;
+};
+
+/**
  * Creates a Token Bucket rate limiter middleware backed by Redis.
  * @param {Object} redisClient - IORedis or Redis client instance.
  * @param {Object} options - Configuration options.
@@ -79,14 +120,13 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
       const requested = 1;
 
       // Evaluate Lua script
-      let result;
-      if (typeof redisClient.eval === 'function') {
-        result = await redisClient.eval(TOKEN_BUCKET_LUA, 1, key, capacity, refillRate, now, requested);
-      } else if (typeof redisClient.sendCommand === 'function') {
-        // Fallback for redis v4 if it doesn't support eval directly the same way
-        result = await redisClient.sendCommand(['EVAL', TOKEN_BUCKET_LUA, '1', key, String(capacity), String(refillRate), String(now), String(requested)]);
-      }
-      
+      const result = await evalScript(redisClient, TOKEN_BUCKET_LUA, key, [
+        capacity,
+        refillRate,
+        now,
+        requested,
+      ]);
+
       if (!result) return next();
 
       const [allowed, remainingTokens, maxCapacity, lastRefill] = result;

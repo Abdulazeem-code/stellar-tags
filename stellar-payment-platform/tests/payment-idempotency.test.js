@@ -17,7 +17,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
   StrKey: { isValidEd25519PublicKey: jest.fn(() => true) },
 }));
 
-const { idempotencyMiddleware, IDEMPOTENCY_HEADER } = require('../middleware/idempotency');
+const { idempotencyMiddleware, IDEMPOTENCY_HEADER } = require("../src/middleware/idempotency.js");
 const buildPaymentRouter = require('../src/routes/v1/paymentRoutes');
 
 const baseIntent = {

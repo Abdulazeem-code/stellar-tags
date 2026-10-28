@@ -21,3 +21,6 @@ certs/
 
 # Jest coverage reports
 coverage/
+
+# Jest cache of the container-backed integration phase
+.jest-cache-integration/

@@ -125,10 +125,7 @@ pub enum ProxyDataKey {
     LogicContract,
     /// A delegated signing key and its remaining spend allowance / expiry.
     Session(Address),
-    /// Nonce for meta-transactions with relayer fee compensation.
-    MetaNonce(Address),
-    /// Replay protection nonce for meta-transactions per account.
-    Nonce(Address),
+
 }
 
 /// Remaining spending allowance and expiry for a delegated session key.

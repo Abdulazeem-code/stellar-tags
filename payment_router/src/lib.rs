@@ -2,6 +2,8 @@
 pub mod access;
 mod archival;
 pub mod dead_mans_switch;
+pub mod dead_mans_switch;
+>>>>>>> upstream/main
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
@@ -197,10 +199,6 @@ impl PaymentRouter {
         access::is_paused_internal(env)
     }
     #[inline]
-    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
-        access::require_circuit_closed(env)
-    }
-    #[inline]
     fn get_pause_level_internal(env: &Env) -> PauseLevel {
         access::get_pause_level(env)
     }
@@ -209,6 +207,16 @@ impl PaymentRouter {
         access::set_pause_level(env, level);
     }
     #[inline]
+    fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+        access::require_circuit_closed(env)
+    }
+    #[inline]
+    #[inline]
+    fn set_pause_level_internal(env: &Env, level: PauseLevel) {
+        access::set_pause_level(env, level);
+    }
+    #[inline]
+>>>>>>> upstream/main
     fn require_not_fully_halted(env: &Env) -> Result<(), Error> {
         access::require_not_fully_halted(env)
     }
@@ -1615,6 +1623,45 @@ impl PaymentRouter {
         Self::is_paused_internal(&env)
     }
 
+    /// Sets the tiered circuit-breaker level (issue #890). Pauser-protected.
+    ///
+    /// `PauseLevel::None` resumes every route, `PauseLevel::SwapsOnly` blocks
+    /// swap-routed payments while direct payments keep flowing, and
+    /// `PauseLevel::FullHalt` blocks both.
+    ///
+    /// # Parameters
+    /// - `level`: The pause level to activate.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
+    /// has no admin set yet.
+    ///
+    /// # Panics
+    /// Panics if the current Pauser does not authorize the call.
+    ///
+    /// This is NOT timelocked — operational pausing must remain instant.
+    pub fn set_pause_level(env: Env, level: PauseLevel) -> Result<(), Error> {
+        Self::require_role(&env, Role::Pauser)?;
+
+        Self::set_pause_level_internal(&env, level);
+
+        env.events()
+            .publish((symbol_short!("pause_lvl"),), (level,));
+
+        Ok(())
+    }
+
+    /// Returns the current tiered circuit-breaker level (issue #890).
+    ///
+    /// # Returns
+    /// The active `PauseLevel`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_pause_level(env: Env) -> PauseLevel {
+        Self::get_pause_level_internal(&env)
+    }
+
     /// Returns the cumulative amount a given sender has routed through the contract.
     ///
     /// # Parameters
@@ -2504,55 +2551,14 @@ impl PaymentRouter {
         env.ledger().timestamp().saturating_sub(last) >= timeout
     }
 
-    // ── Dead Man's Switch — Operator Heartbeat (issue #889) ──────────────────
 
-    /// Appoints `operator` as the designated heartbeat renewal address.
-    ///
-    /// The operator can call `renew_heartbeat` to reset the DMS clock without
-    /// holding any other admin privileges.  This avoids exposing cold-storage
-    /// admin keys for routine monthly renewals.
-    ///
-    /// Only one operator may be designated at a time; calling this again
-    /// overwrites the previous designation.
-    ///
-    /// # Parameters
-    /// - `operator`: Address to designate as the heartbeat operator.
-    ///
-    /// # Returns
-    /// `Ok(())` on success.
-    ///
-    /// # Errors
-    /// - `Error::NotInitialized` — contract has no admin.
-    /// - `Error::Unauthorized` — caller is not the admin.
-    ///
-    /// # Panics
-    /// Panics if the admin does not authorize the call.
     pub fn set_heartbeat_operator(env: Env, operator: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
         dead_mans_switch::set_heartbeat_operator_internal(&env, &operator);
 
-        env.events()
-            .publish((Symbol::new(&env, "hb_operator_set"), admin), operator);
 
-        log!(&env, "Heartbeat operator set");
-        Ok(())
-    }
-
-    /// Removes the designated heartbeat operator.
-    ///
-    /// After removal, only the primary admin (`ping`) or a routed payment can
-    /// reset the DMS clock.
-    ///
-    /// # Returns
-    /// `Ok(())` on success.
-    ///
-    /// # Errors
-    /// - `Error::NotInitialized` — contract has no admin.
-    ///
-    /// # Panics
-    /// Panics if the admin does not authorize the call.
     pub fn remove_heartbeat_operator(env: Env) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
@@ -2560,18 +2566,7 @@ impl PaymentRouter {
         dead_mans_switch::remove_heartbeat_operator_internal(&env);
 
         env.events().publish(
-            (Symbol::new(&env, "hb_operator_rm"), admin),
-            env.ledger().timestamp(),
-        );
 
-        log!(&env, "Heartbeat operator removed");
-        Ok(())
-    }
-
-    /// Returns the currently designated heartbeat operator, if any.
-    ///
-    /// # Returns
-    /// `Some(operator)` if one is configured, otherwise `None`.
     ///
     /// # Panics
     /// Does not panic.
@@ -2579,26 +2574,7 @@ impl PaymentRouter {
         dead_mans_switch::get_heartbeat_operator_internal(&env)
     }
 
-    /// Renews the dead man's switch heartbeat on behalf of the configured
-    /// heartbeat operator (issue #889).
-    ///
-    /// The `operator` address must match the stored `DataKey::HeartbeatOperator`
-    /// and must authorize this call.  The operator may **only** reset the
-    /// heartbeat timestamp — it cannot modify the backup admin address, the
-    /// DMS timeout, or any other contract parameter.
-    ///
-    /// # Parameters
-    /// - `operator`: The address claiming operator privileges.  Must match the
-    ///   configured heartbeat operator.
-    ///
-    /// # Returns
-    /// `Ok(())` on success.
-    ///
-    /// # Errors
-    /// - `Error::Unauthorized` — `operator` does not match the stored operator
-    ///   or no operator has been configured.
-    /// - `Error::InvalidDmsConfig` — the dead man's switch is not currently
-    ///   armed (no heartbeat timestamp exists).
+
     ///
     /// # Panics
     /// Panics if `operator` does not authorize the call.
@@ -2667,9 +2643,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        Self::require_not_fully_halted(&env)?;
 
         let max_amount: i128 = env
             .storage()
@@ -2749,9 +2723,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        Self::require_swaps_not_paused(&env)?;
         if sender == recipient {
             return Err(Error::InvalidRecipient);
         }
@@ -2812,6 +2784,7 @@ impl PaymentRouter {
         )
     }
 
+
     /// Routes multiple payments in a single transaction. If any payment fails,
     /// the entire batch is reverted atomically.
     ///
@@ -2833,8 +2806,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        // Tiered circuit breaker (issue #890): direct payments are only
-        // blocked at FullHalt.  SwapsOnly leaves them unaffected.
+
         Self::require_not_fully_halted(&env)?;
 
         // Pre-validate the whole batch before authorizing or moving any
@@ -2952,9 +2924,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        Self::require_not_fully_halted(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3235,8 +3205,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        // Tiered circuit breaker (issue #890): swap routing is blocked at
-        // both SwapsOnly and FullHalt (i.e. any non-None level).
+
         Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -3312,8 +3281,7 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        // Tiered circuit breaker (issue #890): swap routing is blocked at
-        // both SwapsOnly and FullHalt (i.e. any non-None level).
+
         Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;

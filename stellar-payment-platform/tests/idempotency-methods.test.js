@@ -2,7 +2,7 @@
 
 const express = require('express');
 const request = require('supertest');
-const { idempotencyMiddleware, IDEMPOTENCY_HEADER } = require('../middleware/idempotency');
+const { idempotencyMiddleware, IDEMPOTENCY_HEADER } = require("../src/middleware/idempotency.js");
 
 // The in-memory fallback path is exercised by passing a null/falsey redisClient.
 const buildApp = (method, path, handler) => {

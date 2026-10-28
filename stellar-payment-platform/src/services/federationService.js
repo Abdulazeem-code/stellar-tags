@@ -1,7 +1,7 @@
 'use strict';
 
 const { prisma } = require('../../prismaClient');
-const { USER_DATABASE, PRIMARY_USERNAME_ORDER } = require('../utils');
+const { USER_DATABASE, PRIMARY_USERNAME_ORDER, toFederationAddress } = require('../utils');
 
 const resolveFederationId = async (queryValue) => {
   const row = await prisma.user.findFirst({
@@ -18,7 +18,7 @@ const resolveFederationId = async (queryValue) => {
   }
 
   const response = {
-    stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
+    stellar_address: toFederationAddress(row.username),
     account_id: row.address,
   };
   if (row.memoType) {
@@ -31,7 +31,7 @@ const resolveFederationId = async (queryValue) => {
 const resolveFederationName = async (queryName) => {
   const row = await prisma.user.findFirst({
     where: { username: queryName, deletedAt: null },
-    select: { address: true, memoType: true, memo: true, flaggedAt: true },
+    select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
   });
 
   if (row && row.flaggedAt) {
@@ -40,14 +40,24 @@ const resolveFederationName = async (queryName) => {
     throw forbiddenError;
   }
 
-  const address = row?.address || USER_DATABASE[queryName];
-  if (!address) return null;
+  // A name lookup answers with the name it resolved, so `stellar_address` is
+  // the federation address rather than the account id (SEP-0002). The
+  // built-in registry is the exception: it maps a name straight to an address
+  // and keeps no username to report.
+  if (!row) {
+    const legacyAddress = USER_DATABASE[queryName];
+    if (!legacyAddress) return null;
+    return {
+      stellar_address: legacyAddress,
+      account_id: legacyAddress,
+    };
+  }
 
   const response = {
-    stellar_address: address,
-    account_id: address,
+    stellar_address: toFederationAddress(row.username),
+    account_id: row.address,
   };
-  if (row?.memoType) {
+  if (row.memoType) {
     response.memo_type = row.memoType;
     response.memo = row.memo;
   }

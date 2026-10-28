@@ -6,7 +6,7 @@ const { asyncHandler } = require('../../middleware/asyncHandler');
 const { bulkPaymentSchema } = require('../../schemas/paymentSchema');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { logger } = require('../../logger');
-const { idempotencyMiddleware } = require('../../../middleware/idempotency');
+const { idempotencyMiddleware } = require("../../middleware/idempotency");
 const routingRuleService = require('../../services/routingRuleService');
 
 module.exports = (redisClient) => {

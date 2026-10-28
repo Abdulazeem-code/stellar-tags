@@ -14,12 +14,14 @@ const {
   keysetWhereDesc,
   paginateByKeyset,
   cursorPaginatedResponse,
+  cursorAfterRow,
 } = require('../../pagination');
 const { authenticateUsernameOwner } = require('../../services/ownershipService');
 const { listActivity, serializeActivity, ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const {
   normalizeNameTag,
+  toFederationAddress,
   validateMemo,
   RESERVED_NAMES,
   RESERVED_USERNAMES,
@@ -39,7 +41,7 @@ const {
   activityQuerySchema,
 } = require('../../schemas');
 const { createSignatureRateLimiter } = require('../../middleware/signatureRateLimit');
-const { idempotencyMiddleware } = require('../../../middleware/idempotency');
+const { idempotencyMiddleware } = require("../../middleware/idempotency");
 
 const buildUserSearchWhere = (search) => {
   if (!search) return {};
@@ -199,7 +201,7 @@ router.post('/register', signatureRateLimiter, idempotency, requireJson, validat
       username: normalizedUsername,
       address,
       is_primary: isPrimary,
-      federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      federation_address: toFederationAddress(normalizedUsername),
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,
@@ -408,7 +410,12 @@ router.get('/lookup', validateSchema({ query: lookupQuerySchema }), asyncHandler
       };
     }));
 
-    return res.json(paginatedResponse(data, totalCount, { page, limit }));
+    // Advertise the keyset envelope as well: a keyset walk cannot start with a
+    // cursor, so the first (offset) page has to hand the client one.
+    const hasMore = skip + rows.length < totalCount;
+    const nextCursor = hasMore ? cursorAfterRow(rows[rows.length - 1]) : null;
+
+    return res.json(paginatedResponse(data, totalCount, { page, limit, hasMore, nextCursor }));
   } catch (error) {
     return next(error);
   }
@@ -472,6 +479,11 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
       };
     }));
 
+    // Advertise the keyset envelope as well: a keyset walk cannot start with a
+    // cursor, so the first (offset) page has to hand the client one.
+    const hasMore = skip + rows.length < totalCount;
+    const nextCursor = hasMore ? cursorAfterRow(rows[rows.length - 1]) : null;
+
     res.json({
       data,
       meta: {
@@ -481,10 +493,14 @@ router.get('/users', validateSchema({ query: usersQuerySchema }), asyncHandler(a
         currentPage: page,
         limit,
         totalPages,
+        hasMore,
+        nextCursor,
       },
       totalCount,
       totalPages,
       currentPage: page,
+      hasMore,
+      nextCursor,
     });
   } catch (error) {
     return next(error);

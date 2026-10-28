@@ -9,15 +9,33 @@ function parsePagination(query, defaultLimit = 10, maxLimit = 100) {
   return { page, limit, skip };
 }
 
-function paginatedResponse(data, totalCount, { page, limit }) {
+/**
+ * Offset-paginated response body.
+ *
+ * `hasMore` and `nextCursor` are optional: when they are supplied the body
+ * also carries the keyset envelope, so a client can continue the walk with
+ * `?cursor=…` instead of `?page=…`. A keyset walk has to start somewhere and
+ * the first request cannot carry a cursor, so the offset response advertises
+ * the cursor that points past its last row.
+ */
+function paginatedResponse(data, totalCount, { page, limit, hasMore, nextCursor }) {
   const totalPages = Math.ceil(totalCount / limit);
-  return {
+  const body = {
     data,
     meta: { total: totalCount, page, limit, totalPages },
     totalCount,
     totalPages,
     currentPage: page,
   };
+  if (hasMore !== undefined) {
+    body.meta.hasMore = hasMore;
+    body.hasMore = hasMore;
+  }
+  if (nextCursor !== undefined) {
+    body.meta.nextCursor = nextCursor;
+    body.nextCursor = nextCursor;
+  }
+  return body;
 }
 
 // --- Keyset (cursor-based) pagination ---
@@ -148,6 +166,21 @@ function paginateByKeyset(rows, limit) {
 }
 
 /**
+ * The cursor that points just past `row` — the last row of a page.
+ *
+ * `row` must carry the same sort key the listing is ordered by
+ * (`createdAt` + `username`), so the seek continues exactly where the page
+ * stopped instead of skipping or repeating rows.
+ *
+ * @param {{createdAt?: Date|string, username?: string}|null|undefined} row
+ * @returns {string|null} An opaque cursor, or null when the row cannot carry one.
+ */
+function cursorAfterRow(row) {
+  if (!row || !row.createdAt) return null;
+  return encodeCursor({ createdAt: row.createdAt, username: row.username });
+}
+
+/**
  * Response body for a cursor-paginated listing. `nextCursor` is echoed at the
  * top level and inside `meta`; clients pass it back as `?cursor=`.
  */
@@ -171,4 +204,5 @@ module.exports = {
   keysetWhereAscById,
   paginateByKeyset,
   cursorPaginatedResponse,
+  cursorAfterRow,
 };

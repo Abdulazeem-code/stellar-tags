@@ -47,15 +47,17 @@ describe('GET /federation', () => {
     const response = await request(app).get('/federation?q=alice*localhost');
     
     expect(response.status).toBe(200);
+    // SEP-0002: a name lookup answers with the name it resolved in
+    // `stellar_address` and the account in `account_id`.
     expect(response.body).toEqual({
-      stellar_address: 'GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G',
+      stellar_address: 'alice*localhost',
       account_id: 'GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G',
       memo_type: 'text',
       memo: 'PlatformPayment',
     });
     expect(prisma.user.findFirst).toHaveBeenCalledWith({
       where: { username: 'alice*localhost', deletedAt: null },
-      select: { address: true, memoType: true, memo: true, flaggedAt: true },
+      select: { username: true, address: true, memoType: true, memo: true, flaggedAt: true },
     });
   });
 

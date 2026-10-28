@@ -111,35 +111,5 @@ pub enum Error {
     /// A reentrant call was detected.
     ReentrantCall = 42,
     /// A multi-hop swap path contains the same asset more than once.
-    CyclicSwapPath = 49,
-    /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
-    InvalidSlippageConfig = 50,
-    /// The multisig approval threshold is outside the valid signer range.
-    InvalidThreshold = 51,
-    /// A multisig signer set contains the same address more than once.
-    DuplicateSigner = 52,
-}
 
-#[allow(non_upper_case_globals)]
-impl Error {
-    pub const RoleNotAuthorized: Self = Self::RoleNotFound;
-    pub const TimelockNotFoundLegacy: Self = Self::TimelockNotFound;
-    pub const SlippageExceededSwap: Self = Self::SlippageExceeded;
-    pub const MerkleBatchNotFound: Self = Self::LimitExceeded;
-    pub const MerkleBatchAlreadyExists: Self = Self::LimitExceeded;
-    pub const InvalidMerkleProof: Self = Self::InvalidSignature;
-    pub const MerklePaymentAlreadyClaimed: Self = Self::AlreadyApproved;
-    pub const MerkleBatchNotExpired: Self = Self::TimelockNotReady;
-    pub const MerkleBatchExpired: Self = Self::SwapDeadlineExpired;
-    pub const MerkleAmountMismatch: Self = Self::LimitExceeded;
-    pub const InvalidUpgradeManifest: Self = Self::InvalidMultisigConfig;
-    pub const UpgradeManifestExpired: Self = Self::SwapDeadlineExpired;
-    pub const UpgradePrepareFailed: Self = Self::Unauthorized;
-    pub const UpgradeCommitFailed: Self = Self::Unauthorized;
-    pub const DmsClaimPending: Self = Self::TimelockPending;
-    pub const DmsNoClaimPending: Self = Self::TimelockNotFound;
-    pub const DmsGracePeriodActive: Self = Self::TimelockNotReady;
-    pub const DmsGracePeriodExpired: Self = Self::TimelockNotFound;
-    pub const NotCouncilSigner: Self = Self::Unauthorized;
-    pub const DmsTier2NotEligible: Self = Self::InvalidDmsConfig;
 }

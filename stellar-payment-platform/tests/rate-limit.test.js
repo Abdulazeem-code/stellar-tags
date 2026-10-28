@@ -24,7 +24,17 @@ jest.mock('redis', () => {
       return {
         on: jest.fn(),
         connect: jest.fn().mockResolvedValue(),
-        eval: jest.fn(async (script, numkeys, key, capacityStr, refillRateStr, nowStr, requestedStr) => {
+        // Accepts both Redis client conventions: node-redis calls
+        // `eval(script, { keys, arguments })`, ioredis calls
+        // `eval(script, numkeys, key, ...args)`.
+        eval: jest.fn(async (script, ...rest) => {
+          const nodeRedisStyle =
+            rest[0] && typeof rest[0] === 'object' && !Array.isArray(rest[0]);
+          const key = nodeRedisStyle ? rest[0].keys[0] : rest[1];
+          const [capacityStr, refillRateStr, nowStr, requestedStr] = nodeRedisStyle
+            ? rest[0].arguments
+            : rest.slice(2);
+
           const capacity = Number(capacityStr);
           const refillRate = Number(refillRateStr);
           const now = Number(nowStr);
