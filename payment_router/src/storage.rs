@@ -205,6 +205,23 @@ pub const USER_LIFETIME_THRESHOLD: u32 = USER_BUMP_AMOUNT - DAY_IN_LEDGERS;
 pub const PERSISTENT_BUMP_AMOUNT: u32 = USER_BUMP_AMOUNT;
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = USER_LIFETIME_THRESHOLD;
 
+/// Number of boolean user flags packed into the per-user `u256` bitmap
+/// (issue #894). Bit `i` records the state of user flag `i` (e.g. KYC
+/// verified, rate-limited, VIP tier, active subscription).
+pub const USER_FLAG_BITS: u32 = 256;
+/// Byte length of the packed flag bitmap (256 bits = 32 bytes).
+pub const USER_FLAG_BYTES: usize = 32;
+
+/// TTL bump for temporary storage entries (shorter than persistent).
+pub const TEMPORARY_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
+/// Lifetime threshold for temporary storage entries.
+pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = TEMPORARY_BUMP_AMOUNT - DAY_IN_LEDGERS;
+
+/// Default capacity for the telemetry ring buffer.
+pub const DEFAULT_TELEMETRY_CAPACITY: u32 = 1000;
+/// Maximum capacity for the telemetry ring buffer.
+pub const MAX_TELEMETRY_CAPACITY: u32 = 10000;
+
 // ── Reentrancy Guard ─────────────────────────────────────────────────────────
 
 pub struct ReentrancyGuard<'a> {
@@ -244,16 +261,18 @@ pub fn pack_user_record(
     last_reset_time: u64,
     accumulated_amount: i128,
     volume: i128,
-) -> BytesN<40> {
-    let mut buf = [0u8; 40];
+    flags: &BytesN<32>,
+) -> BytesN<72> {
+    let mut buf = [0u8; 72];
     buf[..8].copy_from_slice(&last_reset_time.to_be_bytes());
     buf[8..24].copy_from_slice(&accumulated_amount.to_be_bytes());
     buf[24..40].copy_from_slice(&volume.to_be_bytes());
+    buf[40..72].copy_from_slice(flags.to_array().as_slice());
     BytesN::from_array(env, &buf)
 }
 
-pub fn unpack_user_record(packed: &BytesN<40>) -> (u64, i128, i128) {
-    let buf: [u8; 40] = packed.to_array();
+pub fn unpack_user_record(env: &Env, packed: &BytesN<72>) -> (u64, i128, i128, BytesN<32>) {
+    let buf: [u8; 72] = packed.to_array();
     let last_reset_time = u64::from_be_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
@@ -265,7 +284,73 @@ pub fn unpack_user_record(packed: &BytesN<40>) -> (u64, i128, i128) {
         buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33],
         buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
     ]);
-    (last_reset_time, accumulated_amount, volume)
+    // `buf` is always 72 bytes, so `buf[40..72]` is exactly 32 bytes and the
+    // conversion below is infallible.
+    let mut flags = [0u8; 32];
+    flags.copy_from_slice(&buf[40..72]);
+    (
+        last_reset_time,
+        accumulated_amount,
+        volume,
+        BytesN::from_array(env, &flags),
+    )
+}
+
+/// Returns `true` when the flag at `bit` (0..=255) is set in the packed
+/// `u256` bitmap.
+pub fn flag_get(flags: &BytesN<32>, bit: u8) -> bool {
+    let byte = (bit / 8) as usize;
+    let offset = bit % 8;
+    let b: [u8; 32] = flags.to_array();
+    b.get(byte).copied().unwrap_or(0) >> offset & 1 == 1
+}
+
+/// Returns a copy of `flags` with the flag at `bit` (0..=255) set to `val`.
+pub fn flag_set(env: &Env, flags: &BytesN<32>, bit: u8, val: bool) -> BytesN<32> {
+    let mut buf: [u8; 32] = flags.to_array();
+    let byte = (bit / 8) as usize;
+    let offset = bit % 8;
+    if byte < buf.len() {
+        if val {
+            buf[byte] |= 1u8 << offset;
+        } else {
+            buf[byte] &= !(1u8 << offset);
+        }
+    }
+    BytesN::from_array(env, &buf)
+}
+
+/// Reads the flag at `bit` for `sender` from its packed `UserRecord`.
+pub fn user_has_flag(env: &Env, sender: &Address, bit: u8) -> bool {
+    let record_key = DataKey::UserRecord(sender.clone());
+    let Some(packed) = env
+        .storage()
+        .persistent()
+        .get::<DataKey, BytesN<72>>(&record_key)
+    else {
+        return false;
+    };
+    let (_lrt, _aa, _vol, flags) = unpack_user_record(env, &packed);
+    flag_get(&flags, bit)
+}
+
+/// Persists `val` for the flag at `bit` for `sender`, keeping the rest of the
+/// packed `UserRecord` intact.
+pub fn user_set_flag(env: &Env, sender: &Address, bit: u8, val: bool) {
+    let record_key = DataKey::UserRecord(sender.clone());
+    let current_time = env.ledger().timestamp();
+    let (last_reset_time, accumulated_amount, volume, flags, _legacy) =
+        load_user_record(env, sender, current_time);
+    let new_flags = flag_set(env, &flags, bit, val);
+    env.storage().persistent().set(
+        &record_key,
+        &pack_user_record(env, last_reset_time, accumulated_amount, volume, &new_flags),
+    );
+    env.storage().persistent().extend_ttl(
+        &record_key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 pub fn unpack_legacy_spending(packed: &BytesN<24>) -> (u64, i128) {
@@ -306,16 +391,20 @@ pub fn current_window(env: &Env) -> u32 {
     env.ledger().sequence()
 }
 
-pub fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+pub fn load_user_record(
+    env: &Env,
+    sender: &Address,
+    current_time: u64,
+) -> (u64, i128, i128, BytesN<32>, bool) {
     let record_key = DataKey::UserRecord(sender.clone());
 
     if let Some(packed) = env
         .storage()
         .persistent()
-        .get::<DataKey, BytesN<40>>(&record_key)
+        .get::<DataKey, BytesN<72>>(&record_key)
     {
-        let (last_reset_time, accumulated_amount, volume) = unpack_user_record(&packed);
-        return (last_reset_time, accumulated_amount, volume, false);
+        let (last_reset_time, accumulated_amount, volume, flags) = unpack_user_record(env, &packed);
+        return (last_reset_time, accumulated_amount, volume, flags, false);
     }
 
     let legacy_spending: Option<(u64, i128)> = env
@@ -334,6 +423,7 @@ pub fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64,
         last_reset_time,
         accumulated_amount,
         legacy_volume,
+        BytesN::from_array(env, &[0u8; 32]),
         legacy_found,
     )
 }
@@ -342,7 +432,7 @@ pub fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i
     let current_time = env.ledger().timestamp();
     let record_key = DataKey::UserRecord(sender.clone());
 
-    let (mut last_reset_time, mut accumulated_amount, volume, legacy_found) =
+    let (mut last_reset_time, mut accumulated_amount, volume, flags, legacy_found) =
         load_user_record(env, sender, current_time);
 
     if current_time - last_reset_time >= SECONDS_IN_24H {
@@ -362,7 +452,7 @@ pub fn accrue_user_record(env: &Env, sender: &Address, amount: i128) -> Result<i
 
     env.storage().persistent().set(
         &record_key,
-        &pack_user_record(env, last_reset_time, accumulated_amount, new_volume),
+        &pack_user_record(env, last_reset_time, accumulated_amount, new_volume, &flags),
     );
     env.storage().persistent().extend_ttl(
         &record_key,
