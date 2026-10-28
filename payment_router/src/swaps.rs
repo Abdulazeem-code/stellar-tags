@@ -103,11 +103,11 @@ pub fn process_split_payment_with_swap(
     let mut allocated_in: i128 = 0;
 
     for (idx, split) in splits.iter().enumerate() {
-        let is_last = (idx as u32) == num_splits - 1;
+        let is_last = u32::try_from(idx).unwrap_or(0) == num_splits.saturating_sub(1);
         let split_amount_in = if is_last {
             amount_in - allocated_in
         } else {
-            (amount_in * (split.weight_bps as i128)) / (TOTAL_WEIGHT_BPS as i128)
+            (amount_in * i128::from(split.weight_bps)) / i128::from(TOTAL_WEIGHT_BPS)
         };
         allocated_in += split_amount_in;
 
