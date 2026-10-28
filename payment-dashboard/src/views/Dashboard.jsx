@@ -11,10 +11,12 @@ import { dailyVolume, fetchAccountPayments, relativeTime } from '../lib/payments
 import {
   API_BASE,
   TOKEN_ADDRESS,
+  TREASURY_ADDRESS,
   apiErrorMessage,
   errorMessage,
   formatShortAddress,
   fullTag,
+  loadStellarSdk,
   resolveRecipient,
 } from './shared';
 
@@ -157,11 +159,42 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
           token_address: TOKEN_ADDRESS,
           amount: amountStroops,
         });
-      } catch (err) {
-        if (/account not found/i.test(err?.message || '')) {
-          throw new Error('Your account does not exist on testnet yet. Fund it with Friendbot first.', { cause: err });
+      } catch (clientErr) {
+        const errMsg = String(clientErr?.message || '');
+        if (errMsg.includes('MismatchingParameterLen') || errMsg.includes('UnexpectedSize')) {
+          const { Contract, nativeToScVal, rpc: sdkRpc, TransactionBuilder } =
+            await loadStellarSdk();
+          const server = new sdkRpc.Server(SOROBAN_RPC);
+          const account = await server.getAccount(userPublicKey);
+          const contract = new Contract(networks.testnet.contractId);
+          const tx = new TransactionBuilder(account, {
+            fee: '100',
+            networkPassphrase: networks.testnet.networkPassphrase,
+          })
+            .addOperation(
+              contract.call(
+                'route_payment',
+                nativeToScVal(userPublicKey, { type: 'address' }),
+                nativeToScVal(recipientAddress, { type: 'address' }),
+                nativeToScVal(TREASURY_ADDRESS, { type: 'address' }),
+                nativeToScVal(TOKEN_ADDRESS, { type: 'address' }),
+                nativeToScVal(amountStroops, { type: 'i128' }),
+              ),
+            )
+            .setTimeout(300)
+            .build();
+
+          const sim = await server.simulateTransaction(tx);
+          if (!sdkRpc.Api.isSimulationSuccess(sim)) {
+            throw new Error(`Simulation failed: ${sim.error || 'rejected by network'}`, { cause: clientErr });
+          }
+          assembledTransaction = sdkRpc.assembleTransaction(tx, sim).build();
+        } else {
+          if (/account not found/i.test(clientErr?.message || '')) {
+            throw new Error('Your account does not exist on testnet yet. Fund it with Friendbot first.', { cause: clientErr });
+          }
+          throw new Error(`Simulation failed: ${clientErr.message}`, { cause: clientErr });
         }
-        throw new Error(`Simulation failed: ${err.message}`, { cause: err });
       }
       if (assembledTransaction.result?.isErr?.()) {
         const reason = assembledTransaction.result.unwrapErr()?.message;
