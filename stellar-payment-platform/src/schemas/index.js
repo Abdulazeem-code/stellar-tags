@@ -279,6 +279,58 @@ const adminDlqReplayBodySchema = z
   })
   .loose();
 
+/**
+ * POST /v1/webhooks/replay body.
+ *
+ * Allows merchants to replay webhook deliveries by event IDs or time range.
+ * - eventIds: array of event IDs to replay (optional)
+ * - startDate: ISO date string (YYYY-MM-DD) inclusive lower bound (optional)
+ * - endDate: ISO date string (YYYY-MM-DD) inclusive upper bound (optional)
+ * - status: filter by delivery status ('failed' | 'success' | 'replayed') (optional)
+ * - eventType: filter by event type (optional)
+ * - webhookId: filter by webhook ID (optional)
+ * - dryRun: preview the replay without executing (optional, default false)
+ * - limit: maximum number of deliveries to replay (optional, default 1000)
+ */
+const webhookReplayBodySchema = z
+  .object({
+    eventIds: z.array(z.string().trim().min(1)).max(1000).optional(),
+    startDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD')
+      .optional(),
+    endDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD')
+      .optional(),
+    status: z.enum(['failed', 'success', 'replayed']).optional(),
+    eventType: z.string().trim().min(1).max(128).optional(),
+    webhookId: z.string().trim().min(1).max(128).optional(),
+    dryRun: z.boolean().default(false),
+    limit: clampedInt(1000, 1, 1000),
+  })
+  .loose()
+  .refine(
+    (value) => {
+      if (value.startDate && value.endDate) {
+        return new Date(value.startDate) <= new Date(value.endDate);
+      }
+      return true;
+    },
+    { error: 'startDate must be on or before endDate', path: ['startDate'] },
+  )
+  .refine(
+    (value) => {
+      const hasEventIds = value.eventIds && value.eventIds.length > 0;
+      const hasDateRange = value.startDate || value.endDate;
+      const hasOtherFilters = value.status || value.eventType || value.webhookId;
+      return hasEventIds || hasDateRange || hasOtherFilters;
+    },
+    { error: 'At least one filter required: eventIds, startDate/endDate, status, eventType, or webhookId', path: ['eventIds'] },
+  );
+
 /** POST /auth/api-keys - generate a new API key */
 const createApiKeyBodySchema = z
   .object({
@@ -364,6 +416,7 @@ module.exports = {
   adminRoutingStatsQuerySchema,
   adminDlqQuerySchema,
   adminDlqReplayBodySchema,
+  webhookReplayBodySchema,
   createApiKeyBodySchema,
   revokeApiKeyBodySchema,
   rotateApiKeyBodySchema,
