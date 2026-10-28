@@ -15,6 +15,7 @@ import {
   errorMessage,
   formatShortAddress,
   fullTag,
+  loadStellarSdk,
   resolveRecipient,
 } from './shared';
 
@@ -149,12 +150,42 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
         assembledTransaction = await client.route_payment({
           sender: userPublicKey,
           recipient: recipientAddress,
-          platform_treasury: TREASURY_ADDRESS,
           token_address: TOKEN_ADDRESS,
           amount: amountStroops,
         });
-      } catch (err) {
-        throw new Error(`Simulation failed: ${err.message}`, { cause: err });
+      } catch (clientErr) {
+        const errMsg = String(clientErr?.message || '');
+        if (errMsg.includes('MismatchingParameterLen') || errMsg.includes('UnexpectedSize')) {
+          const { Contract, nativeToScVal, rpc: sdkRpc, TransactionBuilder } =
+            await loadStellarSdk();
+          const server = new sdkRpc.Server(SOROBAN_RPC);
+          const account = await server.getAccount(userPublicKey);
+          const contract = new Contract(networks.testnet.contractId);
+          const tx = new TransactionBuilder(account, {
+            fee: '100',
+            networkPassphrase: networks.testnet.networkPassphrase,
+          })
+            .addOperation(
+              contract.call(
+                'route_payment',
+                nativeToScVal(userPublicKey, { type: 'address' }),
+                nativeToScVal(recipientAddress, { type: 'address' }),
+                nativeToScVal(TREASURY_ADDRESS, { type: 'address' }),
+                nativeToScVal(TOKEN_ADDRESS, { type: 'address' }),
+                nativeToScVal(amountStroops, { type: 'i128' }),
+              ),
+            )
+            .setTimeout(300)
+            .build();
+
+          const sim = await server.simulateTransaction(tx);
+          if (!sdkRpc.Api.isSimulationSuccess(sim)) {
+            throw new Error(`Simulation failed: ${sim.error || 'rejected by network'}`, { cause: clientErr });
+          }
+          assembledTransaction = sdkRpc.assembleTransaction(tx, sim).build();
+        } else {
+          throw new Error(`Simulation failed: ${clientErr.message}`, { cause: clientErr });
+        }
       }
 
       toast.loading('Approve the transaction in your wallet...', { id: toastId });
