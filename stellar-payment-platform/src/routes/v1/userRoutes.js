@@ -199,7 +199,9 @@ router.post('/register', signatureRateLimiter, idempotency, requireJson, validat
       username: normalizedUsername,
       address,
       is_primary: isPrimary,
-      federation_address: `${normalizedUsername}*${process.env.DOMAIN || 'localhost'}`,
+      // normalizeNameTag already appended the domain, so the stored username is
+      // the full federation address.
+      federation_address: normalizedUsername,
       ...(verificationResult && {
         verification: {
           accountId: verificationResult.accountId,
@@ -287,7 +289,12 @@ router.all('/register', (req, res, next) => next(new ApiError('METHOD_NOT_ALLOWE
 
 // #18 — Soft-delete endpoint. Sets deleted_at to now() instead of running a
 // hard DELETE so the row is preserved for historical auditing.
-router.delete('/register/:username', asyncHandler(async (req, res, next) => {
+//
+// The caller must prove they own the account behind the username by signing
+// `unregister:<username*domain>` with its key (SEP-53 signed message), sent as
+// `X-Stellar-Signature` / `X-Stellar-Signer` headers or `signature` /
+// `signerAddress` in the JSON body. A bare public key is not accepted.
+router.delete('/register/:username', signatureRateLimiter, asyncHandler(async (req, res, next) => {
   const username = normalizeNameTag(
     typeof req.params.username === 'string' ? req.params.username.trim() : '',
   ).toLowerCase();
@@ -298,6 +305,9 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
     return next(error);
   }
 
+  const signature = req.get('x-stellar-signature') || req.body?.signature;
+  const signerAddress = req.get('x-stellar-signer') || req.body?.signerAddress;
+
   try {
     const existing = await prisma.user.findFirst({
       where: { username, deletedAt: null },
@@ -307,6 +317,26 @@ router.delete('/register/:username', asyncHandler(async (req, res, next) => {
       const notFoundError = new Error('Username not found or already deleted');
       notFoundError.statusCode = 404;
       return next(notFoundError);
+    }
+
+    if (!signature || typeof signature !== 'string') {
+      return next(new ApiError(
+        'UNAUTHENTICATED',
+        `Sign "unregister:${username}" with the account key and send it as X-Stellar-Signature.`,
+      ));
+    }
+
+    try {
+      await authenticateUsernameOwner({
+        username,
+        signature,
+        signerAddress,
+        operation: 'unregister',
+        allowPublicKeySignature: false,
+      });
+    } catch (authError) {
+      if (authError.statusCode && authError.statusCode < 500) return next(authError);
+      return next(new ApiError('UNAUTHENTICATED', 'Signature verification failed.', { cause: authError }));
     }
 
     await prisma.user.update({

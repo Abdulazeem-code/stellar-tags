@@ -43,6 +43,9 @@ const {
 } = require('./support/harness');
 
 const REGISTER_URL = '/api/v1/register';
+// Keypair.verify is stubbed to true in this suite, so any base64 value passes
+// the cryptographic check; the signer/owner match is still enforced for real.
+const STUB_SIGNATURE = 'c3R1Yi1zaWduYXR1cmU=';
 
 const register = (body) => request(app).post(REGISTER_URL).send(body);
 
@@ -193,7 +196,10 @@ describe('registration (real PostgreSQL)', () => {
       const address = makeAddress('GONE');
       expect((await register({ username: 'goner', address })).status).toBe(201);
 
-      const del = await request(app).delete(`${REGISTER_URL}/goner`);
+      const del = await request(app)
+        .delete(`${REGISTER_URL}/goner`)
+        .set('X-Stellar-Signature', STUB_SIGNATURE)
+        .set('X-Stellar-Signer', address);
 
       expect(del.status).toBe(200);
       expect(del.body).toMatchObject({ ok: true, username: 'goner*localhost', deleted: true });
@@ -214,7 +220,11 @@ describe('registration (real PostgreSQL)', () => {
     it('still occupies the primary key, so the username cannot be re-registered', async () => {
       const address = makeAddress('RETAKE');
       expect((await register({ username: 'retaken', address })).status).toBe(201);
-      expect((await request(app).delete(`${REGISTER_URL}/retaken`)).status).toBe(200);
+      const del = await request(app)
+        .delete(`${REGISTER_URL}/retaken`)
+        .set('X-Stellar-Signature', STUB_SIGNATURE)
+        .set('X-Stellar-Signer', address);
+      expect(del.status).toBe(200);
 
       const res = await register({ username: 'retaken', address: makeAddress('OTHER') });
 
@@ -227,6 +237,32 @@ describe('registration (real PostgreSQL)', () => {
 
       expect(res.status).toBe(404);
       expect(res.body).toMatchObject({ error: { code: 'NOT_FOUND' } });
+    });
+
+    it('refuses to unregister without an ownership signature', async () => {
+      const address = makeAddress('UNSIGNED');
+      expect((await register({ username: 'keepme', address })).status).toBe(201);
+
+      const res = await request(app).delete(`${REGISTER_URL}/keepme`);
+
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({ error: { code: 'UNAUTHENTICATED' } });
+      const row = await prisma().user.findUnique({ where: { username: 'keepme*localhost' } });
+      expect(row.deletedAt).toBeNull();
+    });
+
+    it('refuses a signature made by a different account', async () => {
+      const address = makeAddress('VICTIM');
+      expect((await register({ username: 'victim', address })).status).toBe(201);
+
+      const res = await request(app)
+        .delete(`${REGISTER_URL}/victim`)
+        .set('X-Stellar-Signature', STUB_SIGNATURE)
+        .set('X-Stellar-Signer', makeAddress('ATTACKER'));
+
+      expect(res.status).toBe(401);
+      const row = await prisma().user.findUnique({ where: { username: 'victim*localhost' } });
+      expect(row.deletedAt).toBeNull();
     });
   });
 });
