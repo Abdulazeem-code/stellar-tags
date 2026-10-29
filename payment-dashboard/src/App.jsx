@@ -114,11 +114,22 @@ function App() {
       connectResolver.current = null;
       toast.success(`${walletName(id)} connected.`);
 
+      if (localStorage.getItem(`stellar_tag_${publicKey}`)) {
+        setRegistrationState('existing');
+      }
+
       try {
-        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(publicKey)}`);
+        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(publicKey)}`, {
+          signal: AbortSignal.timeout(6000),
+        });
         if (response.ok) {
+          const data = await response.json().catch(() => null);
+          if (data?.username) {
+            localStorage.setItem(`stellar_tag_${publicKey}`, data.username);
+          }
           setRegistrationState('existing');
         } else if (response.status === 404) {
+          localStorage.removeItem(`stellar_tag_${publicKey}`);
           setRegistrationState('new');
           handleNavigate('register');
           return;

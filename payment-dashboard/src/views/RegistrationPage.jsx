@@ -97,17 +97,30 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
   const [memoError, setMemoError] = useState('');
   const [status, setStatus] = useState({ tone: '', text: '' });
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [existing, setExisting] = useState({ key: '', tag: '' });
+  const [existing, setExisting] = useState(() => {
+    const cached = typeof window !== 'undefined' && userPublicKey ? localStorage.getItem(`stellar_tag_${userPublicKey}`) || '' : '';
+    return { key: cached ? userPublicKey : '', tag: cached };
+  });
 
   useEffect(() => {
     if (!userPublicKey) return undefined;
     let active = true;
-    fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`)
+    fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`, {
+      signal: AbortSignal.timeout(6000),
+    })
       .then(async (response) => {
         const data = response.ok ? await response.json().catch(() => null) : null;
-        if (active) setExisting({ key: userPublicKey, tag: data?.username || '' });
+        if (active) {
+          if (data?.username) {
+            localStorage.setItem(`stellar_tag_${userPublicKey}`, data.username);
+            setExisting({ key: userPublicKey, tag: data.username });
+          } else if (response.status === 404) {
+            localStorage.removeItem(`stellar_tag_${userPublicKey}`);
+            setExisting({ key: userPublicKey, tag: '' });
+          }
+        }
       })
-      .catch(() => active && setExisting({ key: userPublicKey, tag: '' }));
+      .catch(() => active && setExisting((prev) => (prev.key ? prev : { key: userPublicKey, tag: '' })));
     return () => {
       active = false;
     };
@@ -195,6 +208,7 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
 
       setStatus({ tone: 'ok', text: `${full} is yours.` });
       toast.success(`${full} is yours.`);
+      localStorage.setItem(`stellar_tag_${address}`, cleaned.toLowerCase());
       setExisting({ key: address, tag: cleaned.toLowerCase() });
       onRegistered?.();
     } catch (error) {
