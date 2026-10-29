@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
-import { Client as PaymentRouterClient, networks } from '@stellar-tags/payment-router';
+import { networks } from '@stellar-tags/payment-router';
 import Icon from '../components/Icon';
 import ConnectPrompt from '../components/ConnectPrompt';
 import RecentAddresses from '../components/RecentAddresses';
@@ -141,60 +141,70 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
       toast.loading('Simulating the payment_router call...', { id: toastId });
       const amountStroops = BigInt(Math.floor(amountValue * 10000000));
 
-      // Build and simulate the payment through the type-safe client generated
-      // from the contract ABI (packages/types). The sender has to be the
-      // transaction source: without publicKey the SDK builds the transaction
-      // from a placeholder account and the network rejects it.
-      const client = new PaymentRouterClient({
-        ...networks.testnet,
-        rpcUrl: SOROBAN_RPC,
-        publicKey: userPublicKey,
-      });
+      const { Contract, nativeToScVal, rpc: sdkRpc, TransactionBuilder } =
+        await loadStellarSdk();
+      const server = new sdkRpc.Server(SOROBAN_RPC);
+      const account = await server.getAccount(userPublicKey);
+      const contract = new Contract(networks.testnet.contractId);
 
+      // Build and simulate the route_payment call. The deployed testnet contract
+      // (CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER) expects 5 parameters:
+      // (sender, recipient, platform_treasury, token_address, amount).
+      // If upgraded in the future, fallback to 4 parameters (sender, recipient, token_address, amount).
       let assembledTransaction;
       try {
-        assembledTransaction = await client.route_payment({
-          sender: userPublicKey,
-          recipient: recipientAddress,
-          token_address: TOKEN_ADDRESS,
-          amount: amountStroops,
-        });
-      } catch (clientErr) {
-        const errMsg = String(clientErr?.message || '');
-        if (errMsg.includes('MismatchingParameterLen') || errMsg.includes('UnexpectedSize')) {
-          const { Contract, nativeToScVal, rpc: sdkRpc, TransactionBuilder } =
-            await loadStellarSdk();
-          const server = new sdkRpc.Server(SOROBAN_RPC);
-          const account = await server.getAccount(userPublicKey);
-          const contract = new Contract(networks.testnet.contractId);
-          const tx = new TransactionBuilder(account, {
-            fee: '100',
-            networkPassphrase: networks.testnet.networkPassphrase,
-          })
-            .addOperation(
-              contract.call(
-                'route_payment',
-                nativeToScVal(userPublicKey, { type: 'address' }),
-                nativeToScVal(recipientAddress, { type: 'address' }),
-                nativeToScVal(TREASURY_ADDRESS, { type: 'address' }),
-                nativeToScVal(TOKEN_ADDRESS, { type: 'address' }),
-                nativeToScVal(amountStroops, { type: 'i128' }),
-              ),
-            )
-            .setTimeout(300)
-            .build();
+        const tx5 = new TransactionBuilder(account, {
+          fee: '100',
+          networkPassphrase: networks.testnet.networkPassphrase,
+        })
+          .addOperation(
+            contract.call(
+              'route_payment',
+              nativeToScVal(userPublicKey, { type: 'address' }),
+              nativeToScVal(recipientAddress, { type: 'address' }),
+              nativeToScVal(TREASURY_ADDRESS, { type: 'address' }),
+              nativeToScVal(TOKEN_ADDRESS, { type: 'address' }),
+              nativeToScVal(amountStroops, { type: 'i128' }),
+            ),
+          )
+          .setTimeout(300)
+          .build();
 
-          const sim = await server.simulateTransaction(tx);
-          if (!sdkRpc.Api.isSimulationSuccess(sim)) {
-            throw new Error(`Simulation failed: ${sim.error || 'rejected by network'}`, { cause: clientErr });
-          }
-          assembledTransaction = sdkRpc.assembleTransaction(tx, sim).build();
+        const sim5 = await server.simulateTransaction(tx5);
+        if (sdkRpc.Api.isSimulationSuccess(sim5)) {
+          assembledTransaction = sdkRpc.assembleTransaction(tx5, sim5).build();
         } else {
-          if (/account not found/i.test(clientErr?.message || '')) {
-            throw new Error('Your account does not exist on testnet yet. Fund it with Friendbot first.', { cause: clientErr });
+          const simErr = String(sim5.error || '');
+          if (simErr.includes('MismatchingParameterLen') || simErr.includes('UnexpectedSize')) {
+            const tx4 = new TransactionBuilder(account, {
+              fee: '100',
+              networkPassphrase: networks.testnet.networkPassphrase,
+            })
+              .addOperation(
+                contract.call(
+                  'route_payment',
+                  nativeToScVal(userPublicKey, { type: 'address' }),
+                  nativeToScVal(recipientAddress, { type: 'address' }),
+                  nativeToScVal(TOKEN_ADDRESS, { type: 'address' }),
+                  nativeToScVal(amountStroops, { type: 'i128' }),
+                ),
+              )
+              .setTimeout(300)
+              .build();
+            const sim4 = await server.simulateTransaction(tx4);
+            if (!sdkRpc.Api.isSimulationSuccess(sim4)) {
+              throw new Error(`Simulation failed: ${sim4.error || 'rejected by network'}`);
+            }
+            assembledTransaction = sdkRpc.assembleTransaction(tx4, sim4).build();
+          } else {
+            throw new Error(`Simulation failed: ${sim5.error || 'rejected by network'}`);
           }
-          throw new Error(`Simulation failed: ${clientErr.message}`, { cause: clientErr });
         }
+      } catch (err) {
+        if (/account not found/i.test(err?.message || '')) {
+          throw new Error('Your account does not exist on testnet yet. Fund it with Friendbot first.', { cause: err });
+        }
+        throw err;
       }
       if (assembledTransaction.result?.isErr?.()) {
         const reason = assembledTransaction.result.unwrapErr()?.message;
