@@ -332,9 +332,10 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
   );
 }
 
-function ReceivePanel({ receive, onNavigate }) {
+function ReceivePanel({ receive, userPublicKey, onNavigate }) {
   const [copied, setCopied] = useState('');
   const tag = fullTag(receive.tag);
+  const address = receive.address || userPublicKey || '';
 
   const copy = async (value, label) => {
     try {
@@ -346,7 +347,7 @@ function ReceivePanel({ receive, onNavigate }) {
     }
   };
 
-  if (receive.loading) {
+  if (!address) {
     return (
       <div className="skeleton-list" aria-busy="true">
         <span className="skeleton dither-12" />
@@ -359,7 +360,7 @@ function ReceivePanel({ receive, onNavigate }) {
     <div className="receive">
       <div className="receive__qr">
         <img
-          src={`https://api.qrserver.com/v1/create-qr-code/?size=176x176&margin=8&data=${encodeURIComponent(receive.address)}`}
+          src={`https://api.qrserver.com/v1/create-qr-code/?size=176x176&margin=8&data=${encodeURIComponent(address)}`}
           alt="QR code of your wallet address"
           width="176"
           height="176"
@@ -376,6 +377,10 @@ function ReceivePanel({ receive, onNavigate }) {
               </button>
             </div>
           </div>
+        ) : receive.loading ? (
+          <div className="skeleton-list" aria-busy="true">
+            <span className="skeleton dither-12" />
+          </div>
         ) : (
           <div className="notice notice--info">
             <span>No tag yet. Claim one so people can pay you by name.</span>
@@ -387,8 +392,8 @@ function ReceivePanel({ receive, onNavigate }) {
         <div className="copy-field">
           <span className="eyebrow">Wallet address</span>
           <div className="copy-field__row">
-            <span className="mono break">{receive.address}</span>
-            <button type="button" className="icon-button" onClick={() => copy(receive.address, 'Address')}>
+            <span className="mono break">{address}</span>
+            <button type="button" className="icon-button" onClick={() => copy(address, 'Address')}>
               <Icon name={copied === 'Address' ? 'check' : 'copy'} size={16} label="Copy address" />
             </button>
           </div>
@@ -411,7 +416,15 @@ function Dashboard({
 }) {
   const [tab, setTab] = useState('send');
   const [showBalance, setShowBalance] = useState(true);
-  const [receiveData, setReceiveData] = useState({ key: '', address: '', tag: '', error: '' });
+  const [receiveData, setReceiveData] = useState(() => {
+    const cachedTag = typeof window !== 'undefined' && userPublicKey ? localStorage.getItem(`stellar_tag_${userPublicKey}`) || '' : '';
+    return {
+      key: cachedTag ? userPublicKey : '',
+      address: userPublicKey || '',
+      tag: cachedTag,
+      error: '',
+    };
+  });
   const [activityData, setActivityData] = useState({ key: '', rows: [], error: '' });
   const [activityNonce, setActivityNonce] = useState(0);
 
@@ -419,19 +432,27 @@ function Dashboard({
     if (!userPublicKey) return undefined;
     let active = true;
 
+    const cachedTag = localStorage.getItem(`stellar_tag_${userPublicKey}`) || '';
+
     const load = async () => {
       try {
-        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`);
+        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`, {
+          signal: AbortSignal.timeout(6000),
+        });
         const rawBody = await response.text();
         const data = rawBody ? JSON.parse(rawBody) : null;
         if (!active) return;
 
         if (response.ok && data) {
-          setReceiveData({ key: userPublicKey, address: data.address, tag: data.username, error: '' });
+          if (data.username) {
+            localStorage.setItem(`stellar_tag_${userPublicKey}`, data.username);
+          }
+          setReceiveData({ key: userPublicKey, address: data.address || userPublicKey, tag: data.username || '', error: '' });
           onRegistrationStateChange('existing');
           return;
         }
         if (response.status === 404) {
+          localStorage.removeItem(`stellar_tag_${userPublicKey}`);
           setReceiveData({ key: userPublicKey, address: userPublicKey, tag: '', error: '' });
           // "skipped", not "new", so the app does not keep redirecting to registration.
           onRegistrationStateChange('skipped');
@@ -440,13 +461,13 @@ function Dashboard({
         throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`));
       } catch (error) {
         if (!active) return;
-        setReceiveData({
+        setReceiveData((prev) => ({
           key: userPublicKey,
           address: userPublicKey,
-          tag: '',
-          error: errorMessage(error, 'Unable to load receive details.'),
-        });
-        onRegistrationStateChange('unknown');
+          tag: prev.tag || '',
+          error: prev.tag ? '' : errorMessage(error, 'Unable to load receive details.'),
+        }));
+        onRegistrationStateChange(cachedTag ? 'existing' : 'unknown');
       }
     };
 
@@ -568,7 +589,7 @@ function Dashboard({
           {tab === 'send' ? (
             <SendPanel userPublicKey={userPublicKey} onRefreshBalance={onRefreshBalance} />
           ) : (
-            <ReceivePanel receive={receive} onNavigate={onNavigate} />
+            <ReceivePanel receive={receive} userPublicKey={userPublicKey} onNavigate={onNavigate} />
           )}
         </div>
       </section>
