@@ -116,6 +116,15 @@ impl PaymentRouter {
         access::validate_multisig_config(signers, threshold)
     }
     #[inline]
+    fn approve_multisig_config_internal(
+        env: &Env,
+        signers: &Vec<Address>,
+        threshold: u32,
+        signer: Address,
+    ) -> Result<u32, Error> {
+        access::approve_multisig_config(env, signers, threshold, signer)
+    }
+    #[inline]
     fn load_effective_approvals(
         env: &Env,
         signers: &Vec<Address>,
@@ -136,15 +145,23 @@ impl PaymentRouter {
         access::apply_upgrade(env, new_wasm_hash);
     }
     #[inline]
-    fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
-        access::store_multisig_config(env, signers, threshold);
+    fn store_multisig_config(
+        env: &Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        access::store_multisig_config(env, signers, threshold)
     }
     #[inline]
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
         fees::load_fee_config(env)
     }
     #[inline]
-    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+    fn load_user_record(
+        env: &Env,
+        sender: &Address,
+        current_time: u64,
+    ) -> (u64, i128, i128, BytesN<32>, bool) {
         storage::load_user_record(env, sender, current_time)
     }
     #[inline]
@@ -974,7 +991,7 @@ impl PaymentRouter {
                 Self::apply_upgrade(&env, &new_wasm_hash);
             }
             ActionType::SetMultisigConfig(signers, threshold) => {
-                Self::store_multisig_config(&env, signers, threshold);
+                Self::store_multisig_config(&env, signers, threshold)?;
             }
             ActionType::RegisterDex(dex) => {
                 let key = DataKey::RegisteredDex(dex.clone());
@@ -1654,13 +1671,14 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_user_record(env: Env, user: Address) -> UserRecord {
         let current_time = env.ledger().timestamp();
-        let (last_reset_time, accumulated_amount, volume, _) =
+        let (last_reset_time, accumulated_amount, volume, flags, _) =
             Self::load_user_record(&env, &user, current_time);
 
         UserRecord {
             accumulated_amount,
             volume,
             last_reset_time,
+            flags,
         }
     }
 
@@ -1708,9 +1726,17 @@ impl PaymentRouter {
             // The legacy `UserVolume` already counts every amount in the
             // current window (each payment incremented both counters), so the
             // window balance must not be added again here.
+            // Legacy data carries no flags, so the bitmap starts zeroed.
+            let zero_flags = BytesN::from_array(&env, &[0u8; 32]);
             env.storage().persistent().set(
                 &record_key,
-                &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
+                &pack_user_record(
+                    &env,
+                    last_reset_time,
+                    accumulated_amount,
+                    legacy_volume,
+                    &zero_flags,
+                ),
             );
             env.storage().persistent().extend_ttl(
                 &record_key,
@@ -3155,6 +3181,10 @@ impl PaymentRouter {
     ) -> Result<i128, Error> {
         swap.sender.require_auth();
 
+        // Tiered circuit breaker: swap routing is halted under any pause
+        // level other than `None`, before any DEX or balance check.
+        access::require_swaps_not_paused(env)?;
+
         // --- Validate the swap parameters -----------------------------------
         if swap.sell_token == swap.buy_token {
             return Err(Error::InvalidSwapParams);
@@ -3958,9 +3988,8 @@ impl PaymentRouter {
     // single admin key, because that fallback is the vulnerability being fixed.
 
     // The admin is the root of trust for this call only: it can re-point the
-    // group but still cannot upgrade the contract by itself. Prefer
-    // `queue_action(ActionType::SetMultisigConfig(…))` to put the 24-hour
-    // timelock in front of a rotation, which this direct setter bypasses.
+    // group but still cannot upgrade the contract by itself. Both direct and
+    // timelocked rotations require the existing group's approval threshold.
     /// Configures the multi-signature admin group that authorizes upgrades.
     ///
     /// The signer set is replaced wholesale: addresses that are not in
@@ -3971,14 +4000,15 @@ impl PaymentRouter {
     /// # Parameters
     /// - `signers`: The N addresses whose signatures count. Must be non-empty
     ///   and free of duplicates.
-    /// - `threshold`: The M signers required to authorize an upgrade, in
-    ///   `1..=signers.len()`.
+    /// - `threshold`: The M signers required to authorize an upgrade. At least
+    ///   two approvals are required when the signer set has two or more members.
     ///
     /// # Returns
-    /// `Ok(())` on success, `Err(Error::InvalidMultisigConfig)` if the signer
-    /// set is empty or holds a duplicate, or the threshold is zero or larger
-    /// than the set, or `Err(Error::NotInitialized)` if the contract has no
-    /// admin set yet.
+    /// `Ok(())` on success, `Err(Error::InvalidThreshold)` if the threshold
+    /// is outside the quorum bounds, `Err(Error::DuplicateSigner)` if a signer
+    /// occurs more than once, or `Err(Error::InsufficientApprovals)` if the
+    /// existing group has not approved the rotation, or
+    /// `Err(Error::NotInitialized)` if the contract has no admin set yet.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
@@ -3991,7 +4021,7 @@ impl PaymentRouter {
         admin.require_auth();
 
         let validated = Self::validate_multisig_config(&signers, threshold)?;
-        Self::store_multisig_config(&env, signers, validated);
+        Self::store_multisig_config(&env, signers, validated)?;
 
         env.events()
             .publish((Symbol::new(&env, "multisig_config_set"), admin), validated);
@@ -4002,6 +4032,18 @@ impl PaymentRouter {
             validated
         );
         Ok(())
+    }
+
+    /// Records an existing multisig member's approval of a proposed signer
+    /// set and threshold. The current threshold must approve before the admin
+    /// can apply the change with `set_multisig_config`.
+    pub fn approve_multisig_config(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+        signer: Address,
+    ) -> Result<u32, Error> {
+        Self::approve_multisig_config_internal(&env, &signers, threshold, signer)
     }
 
     /// Returns the current multi-signature admin group.

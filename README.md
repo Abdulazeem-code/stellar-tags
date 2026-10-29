@@ -817,13 +817,14 @@ When signers coordinate separately, each one can approve on its own and whoever 
 
 A signer can withdraw their approval before the upgrade lands, and the admin can cancel pending approvals for a hash. Changing the group re-validates approvals already collected against the new threshold.
 
-Rotating the group is a normal admin action, and like other admin powers it can be routed through the timelock (`ActionType::SetMultisigConfig`) so that group changes take effect after a delay instead of instantly.
+The first group is configured by the admin. Later rotations require approval from the current group's full threshold: each current signer calls `approve_multisig_config` for the proposed sorted signer set and threshold, after which the admin may apply it directly or queue it through the timelock (`ActionType::SetMultisigConfig`). A set with two or more signers must use a threshold of at least two; signer addresses are stored in deterministic sorted order.
 
 ### Contract Interface for Upgrades
 
 | Function | Purpose |
 | --- | --- |
-| `set_multisig_config(signers, threshold)` | Configure the M-of-N group (admin-gated, or timelocked). |
+| `set_multisig_config(signers, threshold)` | Configure the M-of-N group (admin-gated; existing groups must approve rotations). |
+| `approve_multisig_config(signers, threshold, signer)` | Record an existing signer's approval of an exact group rotation. |
 | `get_multisig_config() -> MultisigConfig` | Read the current signers and threshold. |
 | `approve_upgrade(signer, new_wasm_hash)` | Record one signer approval for an exact WASM hash. |
 | `revoke_upgrade_approval(signer, new_wasm_hash)` | Withdraw a recorded approval. |

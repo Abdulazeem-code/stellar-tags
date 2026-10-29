@@ -24,7 +24,11 @@
 //!   retained history to cover it, so a caller cannot average over a single
 //!   freshly written observation.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use core::cmp::Ordering;
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+};
 
 /// A Soroban-compatible 256-bit unsigned integer type backed by high and low 128-bit words.
 #[contracttype]
@@ -175,6 +179,11 @@ pub const DEFAULT_MAX_SINGLE_UPDATE_DEVIATION_BPS: u32 = 1_000;
 
 /// Divisor for basis points calculations.
 pub const BPS_DIVISOR: i128 = 10_000;
+const Q64: i128 = 1i128 << 64;
+#[allow(dead_code)]
+const Q63: u128 = 1u128 << 63;
+#[allow(dead_code)]
+const OUTLIER_BPS: i128 = 1_500;
 
 /// Upper bound for a single observation price. Keeps `price * elapsed` well
 /// inside `i128` for any realistic ledger gap.
@@ -192,6 +201,42 @@ pub struct Observation {
     pub cumulative_price: u256,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogObservation {
+    pub timestamp: u64,
+    pub cumulative_log_price: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedPricePayload {
+    pub base: Symbol,
+    pub quote: Symbol,
+    pub price: i128,
+    pub timestamp: u64,
+    pub signer: BytesN<32>,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregatedOraclePrice {
+    pub base: Symbol,
+    pub quote: Symbol,
+    pub price: i128,
+    pub timestamp: u64,
+    pub valid_signatures: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolObservation {
+    pub price: i128,
+    pub liquidity: i128,
+    pub timestamp: u64,
+}
+
 /// Storage keys for the oracle.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,6 +246,7 @@ pub enum DataKey {
     Staleness(Address, Address),
     CircuitBreakerTripped,
     MaxSingleUpdateDeviationBps,
+    CumulativeLogs(Address, Address),
 }
 
 /// Oracle errors surfaced to callers.
@@ -221,6 +267,7 @@ pub enum Error {
     PriceStale = 11,
     CircuitBreakerTripped = 12,
     InvalidConfig = 13,
+    OracleUnavailable = 14,
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -235,6 +282,205 @@ fn read_observations(env: &Env, base: &Address, quote: &Address) -> Vec<Observat
         .instance()
         .get(&DataKey::Pair(base.clone(), quote.clone()))
         .unwrap_or_else(|| Vec::new(env))
+}
+
+fn read_cumulative_logs(
+    env: &Env,
+    base: &Address,
+    quote: &Address,
+    observations: &Vec<Observation>,
+) -> Result<Vec<LogObservation>, Error> {
+    let key = DataKey::CumulativeLogs(base.clone(), quote.clone());
+    let stored: Option<Vec<LogObservation>> = env.storage().instance().get(&key);
+    if let Some(logs) = stored {
+        if logs.len() == observations.len() {
+            return Ok(logs);
+        }
+    }
+
+    let mut logs = Vec::new(env);
+    let mut cumulative = 0i128;
+    let mut index = 0u32;
+    while index < observations.len() {
+        let observation = observations.get(index).unwrap();
+        if index > 0 {
+            let previous = observations.get(index - 1).unwrap();
+            let elapsed = i128::from(
+                observation
+                    .timestamp
+                    .checked_sub(previous.timestamp)
+                    .ok_or(Error::TimestampNotMonotonic)?,
+            );
+            cumulative = cumulative
+                .checked_add(
+                    log2_q64(previous.price)?
+                        .checked_mul(elapsed)
+                        .ok_or(Error::PriceOverflow)?,
+                )
+                .ok_or(Error::PriceOverflow)?;
+        }
+        logs.push_back(LogObservation {
+            timestamp: observation.timestamp,
+            cumulative_log_price: cumulative,
+        });
+        index += 1;
+    }
+    Ok(logs)
+}
+
+fn log2_q64(value: i128) -> Result<i128, Error> {
+    if value <= 0 {
+        return Err(Error::InvalidPrice);
+    }
+    let value = u128::try_from(value).map_err(|_| Error::InvalidPrice)?;
+    let highest_bit = value.ilog2();
+    let integer = i128::from(highest_bit);
+    let mut normalized = if highest_bit >= 63 {
+        value >> (highest_bit - 63)
+    } else {
+        value << (63 - highest_bit)
+    };
+    let mut fraction = 0u128;
+    let mut bit = 0u32;
+    while bit < 32 {
+        normalized = normalized
+            .checked_mul(normalized)
+            .ok_or(Error::PriceOverflow)?
+            >> 63;
+        if normalized >= (1u128 << 64) {
+            normalized >>= 1;
+            fraction |= 1u128 << (63 - bit);
+        }
+        bit += 1;
+    }
+    let fractional = i128::try_from(fraction).map_err(|_| Error::PriceOverflow)?;
+    integer
+        .checked_mul(Q64)
+        .and_then(|whole| whole.checked_add(fractional))
+        .ok_or(Error::PriceOverflow)
+}
+
+#[allow(dead_code)]
+fn exp2_q64(value: i128) -> Result<i128, Error> {
+    const ROOTS_Q63: [u128; 32] = [
+        13043817825332782212,
+        10968499650544839023,
+        10058158527438640871,
+        9631725603661576981,
+        9425337585438007767,
+        9323807973325342579,
+        9273454034941487980,
+        9248379135337035441,
+        9235867122425417553,
+        9229617465154500136,
+        9226494222562136017,
+        9224932997620185949,
+        9224152484218207415,
+        9223762252282022473,
+        9223567142504825508,
+        9223469589163912706,
+        9223420812880372951,
+        9223396424835331638,
+        9223384230836993049,
+        9223378133843869261,
+        9223375085348818743,
+        9223373561101671328,
+        9223372798978192081,
+        9223372417916476073,
+        9223372227385623972,
+        9223372132120199398,
+        9223372084487487480,
+        9223372060671131613,
+        9223372048762953703,
+        9223372042808864754,
+        9223372039831820280,
+        9223372038343298044,
+    ];
+    if value < 0 {
+        return Err(Error::InvalidPrice);
+    }
+    let whole = value / Q64;
+    if whole > 126 {
+        return Err(Error::PriceOverflow);
+    }
+    let fractional = u128::try_from(value % Q64).map_err(|_| Error::PriceOverflow)? >> 1;
+    let mut result = Q63;
+    let mut bit = 0u32;
+    while bit < 32 {
+        if (fractional & (1u128 << (62 - bit))) != 0 {
+            result = result
+                .checked_mul(ROOTS_Q63[bit as usize])
+                .ok_or(Error::PriceOverflow)?
+                >> 63;
+        }
+        bit += 1;
+    }
+    let integer_scaled = match whole.cmp(&63) {
+        Ordering::Less => {
+            let whole_bits = u32::try_from(whole).map_err(|_| Error::PriceOverflow)?;
+            let shift = 63 - whole_bits;
+            let truncated = result >> shift;
+            let remainder = result & ((1u128 << shift) - 1);
+            if remainder >= (1u128 << (shift - 1)) {
+                truncated + 1
+            } else {
+                truncated
+            }
+        }
+        Ordering::Equal => result,
+        Ordering::Greater => result
+            .checked_shl(u32::try_from(whole - 63).map_err(|_| Error::PriceOverflow)?)
+            .ok_or(Error::PriceOverflow)?,
+    };
+    i128::try_from(integer_scaled).map_err(|_| Error::PriceOverflow)
+}
+
+#[allow(unused_mut)]
+#[allow(dead_code)]
+fn median(mut prices: Vec<i128>) -> Result<i128, Error> {
+    if prices.is_empty() {
+        return Err(Error::OracleUnavailable);
+    }
+    let mut i = 1u32;
+    while i < prices.len() {
+        let value = prices.get(i).unwrap();
+        let mut j = i;
+        while j > 0 && prices.get(j - 1).unwrap() > value {
+            prices.set(j, prices.get(j - 1).unwrap());
+            j -= 1;
+        }
+        prices.set(j, value);
+        i += 1;
+    }
+    let mid = prices.len() / 2;
+    if prices.len() % 2 == 1 {
+        Ok(prices.get(mid).unwrap())
+    } else {
+        let lower = prices.get(mid - 1).unwrap();
+        let upper = prices.get(mid).unwrap();
+        Ok(i128::midpoint(lower, upper))
+    }
+}
+
+#[allow(dead_code)]
+fn oracle_price_digest(
+    env: &Env,
+    base: &Symbol,
+    quote: &Symbol,
+    price: i128,
+    timestamp: u64,
+    signer: &BytesN<32>,
+) -> BytesN<32> {
+    let encoded = (
+        env.current_contract_address(),
+        base.clone(),
+        quote.clone(),
+        price,
+        timestamp,
+        signer.clone(),
+    )
+        .to_xdr(env);
+    env.crypto().sha256(&encoded)
 }
 
 #[contract]
@@ -320,8 +566,10 @@ impl TwapOracle {
         }
 
         let mut observations = read_observations(&env, &base, &quote);
+        let mut log_observations = read_cumulative_logs(&env, &base, &quote, &observations)?;
 
         let mut cumulative_price = u256::ZERO;
+        let mut cumulative_log_price = 0;
         if !observations.is_empty() {
             let previous = observations.get(observations.len() - 1).unwrap();
 
@@ -360,12 +608,25 @@ impl TwapOracle {
             let elapsed = u256::from(timestamp - previous.timestamp);
             let increment = u256::from(previous.price.cast_unsigned()).wrapping_mul(elapsed);
             cumulative_price = previous.cumulative_price.wrapping_add(increment);
+
+            let previous_log = log_observations.get(log_observations.len() - 1).unwrap();
+            let log_increment = log2_q64(previous.price)?
+                .checked_mul(i128::from(timestamp - previous.timestamp))
+                .ok_or(Error::PriceOverflow)?;
+            cumulative_log_price = previous_log
+                .cumulative_log_price
+                .checked_add(log_increment)
+                .ok_or(Error::PriceOverflow)?;
         }
 
         observations.push_back(Observation {
             timestamp,
             price,
             cumulative_price,
+        });
+        log_observations.push_back(LogObservation {
+            timestamp,
+            cumulative_log_price,
         });
 
         // Drop the oldest entry once the retained history is full.
@@ -377,12 +638,23 @@ impl TwapOracle {
                 index += 1;
             }
             observations = pruned;
+
+            let mut pruned_logs = Vec::new(&env);
+            index = 1;
+            while index < log_observations.len() {
+                pruned_logs.push_back(log_observations.get(index).unwrap());
+                index += 1;
+            }
+            log_observations = pruned_logs;
         }
 
         let count = observations.len();
         env.storage()
             .instance()
-            .set(&DataKey::Pair(base, quote), &observations);
+            .set(&DataKey::Pair(base.clone(), quote.clone()), &observations);
+        env.storage()
+            .instance()
+            .set(&DataKey::CumulativeLogs(base, quote), &log_observations);
 
         Ok(count)
     }

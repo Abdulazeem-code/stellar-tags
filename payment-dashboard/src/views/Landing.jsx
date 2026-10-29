@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import DitherSphere from '../components/DitherSphere';
 import Icon, { BrandMark } from '../components/Icon';
 import { useDebounce } from '../useDebounce';
-import { API_BASE, CONTRACT_ID, DEFAULT_FEDERATION_DOMAIN } from './shared';
+import { API_BASE, CONTRACT_ID } from './shared';
 import { WALLETS } from '../lib/wallets';
 import { checkTag } from '../lib/tags';
 
@@ -73,7 +73,6 @@ function TagChecker({ onNavigate }) {
           spellCheck="false"
           maxLength={20}
         />
-        <span className="field__suffix">*{DEFAULT_FEDERATION_DOMAIN}</span>
         <button type="submit" className="btn btn--primary">
           Claim <Icon name="arrow" size={16} />
         </button>
@@ -156,7 +155,7 @@ export default function Landing({ onNavigate, onConnectWallet, userPublicKey }) 
               <span className="display__dim"> Not a 56-character key.</span>
             </h1>
             <p className="lede">
-              Stellar Tags maps a handle like <span className="mono text-paper">you*{DEFAULT_FEDERATION_DOMAIN}</span> to
+              Stellar Tags maps a handle like <span className="mono text-paper">you</span> to
               your wallet. Claim it once, then send and receive XLM by name, routed through a Soroban
               contract.
             </p>
@@ -172,7 +171,7 @@ export default function Landing({ onNavigate, onConnectWallet, userPublicKey }) 
               <span className="planet__scan" aria-hidden="true" />
               <div className="planet__chip mono">
                 <span className="text-dim">RESOLVED</span>
-                <span>aliphatic*{DEFAULT_FEDERATION_DOMAIN}</span>
+                <span>aliphatic</span>
                 <span className="text-blue">to GAAF...LWST</span>
               </div>
             </div>
@@ -260,7 +259,7 @@ export default function Landing({ onNavigate, onConnectWallet, userPublicKey }) 
                 <span>testnet</span>
               </div>
               <pre className="terminal__body">
-                <span className="text-muted">$ curl "{API_BASE}/federation?q=aliphatic*{DEFAULT_FEDERATION_DOMAIN}&amp;type=name"</span>
+                <span className="text-muted">$ curl "{API_BASE}/federation?q=aliphatic&amp;type=name"</span>
                 {'\n'}
                 <span>{'{ "account_id": "GAAF...6LWST" }'}</span>
                 {'\n'}
