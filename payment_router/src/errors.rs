@@ -136,10 +136,13 @@ impl Error {
     pub const UpgradeManifestExpired: Self = Self::SwapDeadlineExpired;
     pub const UpgradePrepareFailed: Self = Self::Unauthorized;
     pub const UpgradeCommitFailed: Self = Self::Unauthorized;
+    pub const QuoteExpired: Self = Self::SwapDeadlineExpired;
+    pub const QuoteAlreadyUsed: Self = Self::InvalidNonce;
+    pub const AssetMismatch: Self = Self::InvalidSwapPath;
     pub const DmsClaimPending: Self = Self::TimelockPending;
     pub const DmsNoClaimPending: Self = Self::TimelockNotFound;
     pub const DmsGracePeriodActive: Self = Self::TimelockNotReady;
     pub const DmsGracePeriodExpired: Self = Self::TimelockNotFound;
-    pub const NotCouncilSigner: Self = Self::Unauthorized;
+    pub const NotCouncilSigner: Self = Self::NotMultisigSigner;
     pub const DmsTier2NotEligible: Self = Self::InvalidDmsConfig;
 }

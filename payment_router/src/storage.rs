@@ -56,6 +56,20 @@ pub enum Role {
     UpgradeManager = 7,
 }
 
+/// Storage keys for the most recently added upgrade and batch features. Kept
+/// separate so `DataKey` stays within Soroban's generated enum size limit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtraKey {
+    MultisigThreshold,
+    UpgradeApproval(BytesN<32>),
+    ReentrancyGuard,
+    MerkleClaimedBits(u64),
+    TwoPhaseCommit(BytesN<32>),
+    TelemetryHeader,
+    TelemetrySlot(u32),
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +123,8 @@ pub enum DataKey {
     UserRole(Address, Role),
     /// Monotonic nonce for meta-transaction replay protection.
     MetaNonce(Address),
+    /// Whether a maker quote identified by its quote ID has been settled.
+    UsedQuote(Address, soroban_sdk::String),
     /// Trusted issuer/oracle queried for high-value payment senders.
     KycOracle,
     /// Payments strictly above this amount require a valid KYC claim.
@@ -233,14 +249,14 @@ impl<'a> ReentrancyGuard<'a> {
         let is_locked: bool = env
             .storage()
             .instance()
-            .get(&DataKey::ReentrancyGuard)
+            .get(&ExtraKey::ReentrancyGuard)
             .unwrap_or(false);
         if is_locked {
             return Err(Error::ReentrantCall);
         }
         env.storage()
             .instance()
-            .set(&DataKey::ReentrancyGuard, &true);
+            .set(&ExtraKey::ReentrancyGuard, &true);
         Ok(Self { env })
     }
 }
@@ -250,7 +266,7 @@ impl Drop for ReentrancyGuard<'_> {
         self.env
             .storage()
             .instance()
-            .set(&DataKey::ReentrancyGuard, &false);
+            .set(&ExtraKey::ReentrancyGuard, &false);
     }
 }
 
