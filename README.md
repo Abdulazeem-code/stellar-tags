@@ -1,915 +1,198 @@
+<div align="center">
+
 # Stellar Tags
 
-Stellar Tags is a payment platform that combines a Soroban smart contract, a Node.js server, and a React dashboard. It is structured as a small mono-repo so each piece can be developed and deployed independently while still working together as a single product.
+**Human-readable payment tags for the Stellar network.**
+Send to `alice*stellartags` instead of a 56-character `G...` address.
 
-## What is inside
+[![CI](https://github.com/Abdulazeem-code/stellar-tags/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdulazeem-code/stellar-tags/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+![Soroban](https://img.shields.io/badge/Soroban-smart%20contracts-7B3FE4)
+![Node](https://img.shields.io/badge/Node-22-339933?logo=node.js&logoColor=white)
+![React](https://img.shields.io/badge/React-Vite-61DAFB?logo=react&logoColor=black)
 
-- `payment-dashboard/` - React + Vite frontend dashboard.
-- `stellar-payment-platform/` - Node.js server for API and business logic.
-- `payment_router/` - Rust/Soroban contract.
+[Quick start](#quick-start) · [Architecture](#architecture) · [Documentation](#documentation) · [Contributing](#contributing)
 
-## Key features
+</div>
 
-- Desired specific username
-- Fast transfer
-- Secured payment flows
+---
 
-## Architecture Map
+## What is Stellar Tags?
 
-The following diagram maps exactly how data flows between the user, Render, and the Stellar network.
+Stellar addresses are long and easy to get wrong. Stellar Tags lets anyone claim a
+short username, a **tag**, and get paid to it. Under the hood it is a full
+payment stack:
 
-```text
-[ User / Browser ]
-       |
-       | (Vite App hosted on Vercel)
-       v
-[ payment-dashboard ]
-  (src/App.jsx: Wallet connections & UI)
-       |
-       | HTTP API Calls (via VITE_API_BASE)
-       v
-[ stellar-payment-platform ] <---> [ PostgreSQL Database ]
-  (server.js: Server router on Render)        (via Prisma ORM: User/payment layout)
-       |
-       | Stellar Network / RPC
-       v
-[ payment_router ]
-  (src/lib.rs: Soroban smart contract routing logic)
-```
+- a **Soroban smart contract** that routes payments, takes platform fees, swaps
+  tokens through DEXes and refunds payments that cannot be delivered,
+- a **Node.js API** that runs a [SEP-0002 federation](https://developers.stellar.org/docs/learn/encyclopedia/network-configuration/federation)
+  server, merchant webhooks, analytics and fraud checks,
+- a **React dashboard** where users connect a wallet, claim a tag, and send or
+  receive payments.
 
-**Data Flow:**
-1. **User** accesses the `payment-dashboard` and connects their Stellar wallet.
-2. The dashboard queries the `stellar-payment-platform` server for user registrations and payment routing information.
-3. The server interacts with its PostgreSQL database (via the Prisma ORM) to resolve usernames to addresses using the endpoints documented below.
-4. When a payment is initiated, it's routed through the `payment_router` Soroban contract on the Stellar network.
+## Features
 
-## Repository structure
-
-```text
-.
-├── payment-dashboard/
-│   ├── .env                 # Frontend environment variables
-│   └── src/
-│       └── App.jsx          # Wallet connections and React UI
-├── payment_router/
-│   └── src/
-│       └── lib.rs           # Soroban smart contract logic
-└── stellar-payment-platform/
-    ├── server.js            # Server router (Express API endpoints)
-    └── prisma/
-        └── schema.prisma    # Prisma schema for the PostgreSQL database
-```
-
-## Getting started
-
-> These steps are split by module so you can run only what you need.
-
-### Docker Compose profiles
-
-Every service in `docker-compose.yml` belongs to a profile, so
-`docker compose up` on its own starts nothing and you always say which stack
-you want:
-
-| Command | Starts |
+| | |
 | --- | --- |
-| `docker compose --profile dev up` | backend, postgres, redis |
-| `docker compose --profile full up` | the same, plus the built frontend on :3000 |
-| `docker compose --profile test up` | the API under test on :5001 and its own database |
-| `docker compose --profile integration up` | a local standalone Stellar network on :8000 |
+| 🏷️ **Username tags** | Claim `name*domain`, keep up to 5 aliases per address, resolve both ways via SEP-0002 federation. |
+| ⚡ **On-chain routing** | `route_payment`, batch payments, split payments and multi-hop swaps in one Soroban contract. |
+| 🔁 **Token swaps** | Pay in one asset, deliver another, with slippage limits and DEX adapters. |
+| ↩️ **Safe refunds** | Undeliverable payments go to a refund balance the sender can claim later, instead of aborting the transaction. |
+| 🔐 **Hardened admin** | Role-based access, timelocked actions, M-of-N multisig upgrades, emergency freeze, a dead man's switch. |
+| 🗳️ **Fee governance** | Token-weighted proposals and votes for changing fees. |
+| 🔔 **Merchant webhooks** | HMAC-signed deliveries, retries with backoff, a dead letter queue with replay. |
+| 📡 **Live status** | Server-Sent Events stream for payment status updates. |
+| 📊 **Observability** | Prometheus metrics, Grafana dashboard, structured logs, audit logs, CQRS analytics on TimescaleDB. |
+| 🕶️ **Research** | Zero-knowledge private payments (Groth16 / BLS12-381), flash loans, yield escrow, TWAP oracle. |
 
-`dev` is the everyday one. `full` adds the frontend, which is the slowest
-thing in the file to build and is not needed for backend work.
+## Architecture
 
-The dev and test stacks use separate databases on separate host ports (5432
-and 5433), so you can run both at once:
-
-```bash
-docker compose --profile dev --profile test up -d
+```mermaid
+flowchart TD
+    U([User / Wallet]) --> D[payment-dashboard<br/>React + Vite]
+    D -- REST / SSE --> A[stellar-payment-platform<br/>Node.js + Express]
+    D -- Soroban RPC --> C[payment_router<br/>Soroban contract]
+    A <--> P[(PostgreSQL<br/>Prisma)]
+    A <--> R[(Redis<br/>rate limits, queues, streams)]
+    R --> W[Workers<br/>webhooks · fraud · analytics]
+    W --> T[(TimescaleDB<br/>analytics read model)]
+    A -- Horizon / RPC --> S{{Stellar network}}
+    C --- S
+    W -- signed webhooks --> M([Merchants])
 ```
 
-`COMPOSE_PROFILES` works too, if you would rather not repeat the flag:
+1. The user opens the dashboard and connects a Stellar wallet.
+2. The dashboard asks the API to register a tag or resolve one to an address.
+3. The API stores tags in PostgreSQL and serves them over federation.
+4. Payments are signed in the wallet and routed through the `payment_router` contract.
+5. The Horizon listener picks up the result, pushes live updates to the dashboard,
+   and queues signed webhooks for merchants.
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| [`payment-dashboard/`](payment-dashboard) | React + Vite frontend: landing, registration, send/receive, history, analytics |
+| [`stellar-payment-platform/`](stellar-payment-platform) | Node.js API, Prisma schema, background workers (webhooks, fraud, analytics, outbox) |
+| [`payment_router/`](payment_router) | Main Soroban contract: routing, fees, swaps, refunds, governance, upgrades |
+| [`payment_proxy/`](payment_proxy) | Upgradeable proxy contract |
+| [`timelock_escrow/`](timelock_escrow) · [`yield_escrow/`](yield_escrow) | Escrow contracts |
+| [`flash_loan/`](flash_loan) · [`twap_oracle/`](twap_oracle) · [`pausable_token/`](pausable_token) | Supporting DeFi contracts |
+| [`zk_payment/`](zk_payment) | Zero-knowledge private payment contract and circuit (research, testnet only) |
+| [`packages/types/`](packages/types) | TypeScript bindings generated from the `payment_router` ABI |
+| [`contracts/`](contracts) | Solidity bridge for Axelar cross-chain payments |
+| [`scripts/`](scripts) | Contract build, deploy and upgrade CLI, binding generation |
+| [`tests/integration/`](tests/integration) | Contract integration tests against a local Stellar node |
+| [`docs/`](docs) | Guides and reference |
+
+## Quick start
+
+**You need:** Node 22, Docker, and (for contracts) Rust stable with the
+`wasm32-unknown-unknown` target and the [`stellar` CLI](https://developers.stellar.org/docs/tools/cli).
 
 ```bash
-export COMPOSE_PROFILES=dev
-docker compose up -d
+git clone https://github.com/Abdulazeem-code/stellar-tags.git
+cd stellar-tags
 ```
 
-Stop a stack with the same profile you started it with, otherwise Compose
-will not know which services it is meant to remove:
+**1. Start Postgres, Redis and the API**
 
 ```bash
-docker compose --profile dev down
+docker compose --profile dev up -d
 ```
 
-The `integration` profile pulls `stellar/quickstart`, a multi-gigabyte image
-used only by the Soroban contract tests in `tests/integration/`. It is kept
-out of `test` so the API tests do not drag it in.
-
-### Frontend dashboard
-
-```bash
-cd payment-dashboard
-npm install
-npm run dev
-```
-
-### Server
-
-The server uses **PostgreSQL** as its database, accessed through the
-[Prisma ORM](https://www.prisma.io/). You need a running Postgres instance
-(local install, Docker, or a hosted provider) before starting the server.
+Or run the API outside Docker:
 
 ```bash
 cd stellar-payment-platform
 npm install
-
-# 1. Create your local env file and point DATABASE_URL at your Postgres DB
-cp .env.example .env
-#    then edit .env (see "Database setup" below)
-
-# 2. Apply the schema to your database
+cp .env.example .env        # set DATABASE_URL
 npm run prisma:migrate
-
-# 3. Fill the database with test data
-npm run db:seed
-
-# 4. Start the server
-npm run dev
+npm run db:seed             # 50 users, webhooks, payment intents, API keys
+npm run dev                 # http://localhost:5000
 ```
 
-#### Database setup
-
-The connection string lives in `stellar-payment-platform/.env` as `DATABASE_URL`.
-Copy `.env.example` to `.env` and set it to your own Postgres database:
-
-```env
-DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/DATABASE?schema=public"
-```
-
-For a typical local install that becomes, for example:
-
-```env
-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/stellar_tags?schema=public"
-```
-
-The quickest way to get a local database is the dev profile, which also
-brings up Redis:
+**2. Start the dashboard**
 
 ```bash
-docker compose --profile dev up -d postgres redis
-```
-
-Or a single container, if you want nothing else:
-
-```bash
-docker run --name stellar-postgres -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=stellar_tags -p 5432:5432 -d postgres:16
-```
-
-Useful Prisma commands (run from `stellar-payment-platform/`):
-
-| Command | Description |
-| --- | --- |
-| `npm run prisma:migrate` | Create/apply migrations against your dev database |
-| `npm run prisma:deploy` | Apply existing migrations (CI / production) |
-| `npm run prisma:generate` | Regenerate the Prisma Client after schema changes |
-| `npm run prisma:studio` | Open Prisma Studio to browse the data |
-| `npm run db:seed` | Populate the database with test data (see below) |
-
-> `.env` is gitignored — never commit real credentials. Each contributor keeps
-> their own local `DATABASE_URL`.
-
-#### Seed data
-
-`npm run db:seed` populates an empty database with 50 users, 10 webhooks,
-20 payment intents and 2 API keys, so the API has something to answer with
-before you have registered anything by hand. `prisma migrate reset` runs it
-automatically.
-
-The data covers the cases the endpoints branch on: usernames with every memo
-type, several addresses carrying aliases alongside their primary username,
-flagged and soft-deleted users, webhooks that are healthy, never delivered,
-and failing on both sides of the retry cutoff, and payment intents in each
-status.
-
-Re-running is safe. Every record is upserted on its natural key and the
-identities are derived from a fixed seed, so a second run updates the same
-rows rather than adding a set. Pass `--reset` to delete the seeded rows first:
-
-```bash
-npm run db:seed -- --reset
-```
-
-Both API keys are printed on each run, since only their hashes are stored.
-Use the active one as `X-Api-Key`; the revoked one is there to exercise the
-rejection path. The script refuses to run against a non-local `DATABASE_URL`
-unless `SEED_ALLOW_REMOTE=1` is set.
-
-### Render deployment
-
-The repository includes a [render.yaml](render.yaml) blueprint for the backend API and its PostgreSQL database. When you deploy from Render, import the blueprint or create the service from the repo so `DATABASE_URL` is injected automatically from the managed database.
-
-If you deploy the backend without the blueprint, make sure the web service has a PostgreSQL `DATABASE_URL` secret configured before startup. The container runs Prisma migrations on boot, so the variable must already exist.
-
-### Smart contract (Soroban)
-
-```bash
-cd payment_router
-cargo build
-```
-
-### ZK anonymous tag routing (issue #668)
-
-The `zk_payment/` crate is a standalone Soroban contract (SDK 27) that verifies
-a Groth16/BLS12-381 proof before recording a private payment, using only a
-commitment and a one-time nullifier as public inputs. The research spike is in
-[docs/research-zk-anonymous-routing.md](docs/research-zk-anonymous-routing.md)
-and the contract/circuit usage guide is in
-[docs/zk-private-payments.md](docs/zk-private-payments.md).
-
-```bash
-cd zk_payment
-cargo test
-```
-
-The checked-in setup is for tests only and is not safe for real funds; see the
-research document's limitations section.
-
-### Contract storage benchmarks (issue #663)
-
-Per-user tag registration writes a single packed `UserRecord` ledger entry
-(24-hour spending window + lifetime volume in one `BytesN<40>`) instead of the
-legacy two-entry `UserSpending` + `UserVolume` split. The benchmark tests fail
-CI if the registration write path ever costs more than 80% of the legacy path:
-
-```bash
-cd payment_router
-cargo test benchmark -- --nocapture
-```
-
-### Contract TypeScript bindings
-
-The TypeScript client for the `payment_router` contract lives in
-[`packages/types`](packages/types) and is **auto-generated** from the contract
-ABI, so the React dashboard gets end-to-end type safety with the Rust contract
-instead of manually copying contract IDs and argument shapes.
-
-Regenerate the bindings after any change to the contract's public interface
-(the contract must build with the `wasm32-unknown-unknown` target, and the
-`stellar` CLI must be on your PATH):
-
-```bash
-npm run generate:bindings
-```
-
-The result is committed to `packages/types` and consumed by the frontend as
-`@stellar-tags/payment-router` (a `file:` dependency). The `bindings-check` CI
-job fails the build if the checked-in bindings ever drift from the contract
-ABI.
-
-## Webhook signature verification
-
-Every webhook delivery includes an HMAC-SHA256 signature in the
-`X-Webhook-Signature` header (and the backward-compatible alias
-`X-Stellar-Tags-Signature`). Merchants must verify this signature before
-trusting the payload.
-
-See [docs/webhook-signature-verification.md](docs/webhook-signature-verification.md)
-for step-by-step verification examples in Node.js, Python, and Go.
-
-## Internal service-to-service mTLS
-
-Service-to-service calls are encrypted and mutually authenticated: the API
-requires a client certificate signed by an internal CA before a request is
-routed, and a peer with no valid certificate never reaches a handler. An
-internal CA issues, rotates and retires the certificates, including a
-zero-downtime cutover to a new issuing CA. Off by default, so local development
-and CI keep using plain HTTP.
-
-```sh
-MTLS_ENABLED=true docker compose --profile dev --profile mtls up --build
-```
-
-See [docs/mtls.md](docs/mtls.md) for the PKI layout, rotation runbook and
-configuration reference.
-
-## Tests
-
-```bash
-# frontend
 cd payment-dashboard
-npm test
-
-# server
-cd ../stellar-payment-platform
-npm test
-
-# contract
-cd ../payment_router
-cargo test
+npm install
+echo "VITE_API_BASE=http://localhost:5000" > .env
+npm run dev                 # http://localhost:3000
 ```
 
-### Coverage
-
-The server runs with coverage in CI via `npm run test:coverage` (same as
-`npm test` plus `--coverage`). Minimum coverage thresholds are set in
-`stellar-payment-platform/package.json` under `jest.coverageThreshold` — CI
-fails the build when coverage drops below the floor, and the `lcov`/HTML report
-is uploaded as a build artifact. Raise the thresholds as coverage improves so
-the floor keeps pace with the suite.
-
-
-## Environment variables
-
-To ensure a seamless local developer installation requiring zero guesswork, please configure the following environment variables in their respective directories:
-
-### Frontend (`payment-dashboard/.env`)
-- `VITE_API_BASE` - The base URL where the frontend expects the Node.js server API to be running (e.g., `http://localhost:5000`).
-
-### Server (`stellar-payment-platform/.env` or exported directly)
-- `DATABASE_URL` - **(Required)** PostgreSQL connection string used by Prisma (see [Database setup](#database-setup)).
-- `PORT` - (Optional) The port for the Node.js server to listen on. Defaults to `5000`.
-- `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default) or `public`.
-- `STELLAR_TAG_DOMAIN` - (Optional) Extra origin to add to the CORS allow-list.
-- `LOG_DIR` - (Optional) Directory for the rotating log files. Defaults to `stellar-payment-platform/logs`.
-- `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
-- `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
-- `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
-- `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). `warn` (default) logs a clear warning and continues; `strict` logs an error and exits non-zero before the server binds a port; `off` skips the check. Set to `strict` where you want deploys to fail fast on schema drift instead of failing on the first query.
-- `REDIS_URL` / `REDIS_CLUSTER_NODES` - (Optional) Redis connection for rate limiting and the BullMQ queues. The dead letter queue is only enabled when one of these is set; see [Dead letter queue](#dead-letter-queue-admindlq).
-- `MAX_RETRY_ATTEMPTS` - (Optional) Total delivery attempts before a webhook job is parked on the dead letter queue. Defaults to `5`.
-- `RETRY_BACKOFF_MS` - (Optional) Base delay in milliseconds for the exponential backoff between retry attempts. Defaults to `1000`.
-- `DLQ_ALERT_THRESHOLD` - (Optional) Log an error once the dead letter queue holds this many messages. Defaults to `10`.
-- `DLQ_ALERT_COOLDOWN_MS` - (Optional) Minimum gap in milliseconds between two depth alerts, so a queue that stays deep does not log on every job. Defaults to `300000`.
-- `DLQ_REPLAY_BATCH_LIMIT` - (Optional) Largest number of messages one `POST /admin/dlq/replay` call replays. Defaults to `100`.
-
-For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
-
-## Logging
-
-The server logs through a shared [Winston](https://github.com/winstonjs/winston) logger
-(`stellar-payment-platform/src/logger.js`). Import it instead of calling `console` directly:
-
-```js
-const { logger } = require('./src/logger');
-
-logger.info('Registered tag', { correlationId: req.correlationId, tag });
-logger.error(err);
-```
-
-Log records are written as JSON to `stellar-payment-platform/logs/`:
-
-- `application-YYYY-MM-DD.log` - everything at `LOG_LEVEL` and above.
-- `error-YYYY-MM-DD.log` - errors only, so incidents are easy to find.
-
-Both files rotate **daily and whenever they pass 20MB**, older files are gzipped, and
-anything beyond the retention window is deleted, so logs cannot exhaust the disk. A
-human-readable copy is also printed to the console (silenced when `NODE_ENV=test`, which
-also disables file output so test runs leave no logs behind).
-
-## Error responses
-
-Every API error leaves the server in one shape, produced by a single terminal
-handler (`stellar-payment-platform/src/middleware/errorHandler.js`):
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": "VALIDATION_FAILED",
-    "message": "Invalid request body",
-    "details": [{ "field": "username", "message": "username is required" }]
-  },
-  "correlation_id": "3f2a…",
-  "reference_id": "9b41…"
-}
-```
-
-`error.code` is the stable part of the contract — branch on it rather than on
-the status or the message text, which may be reworded. `details` appears only
-when the failure is field-level. `correlation_id` is on every error;
-`reference_id` is added on `5xx` and matches the logged stack.
-
-| Code | Status | Raised when |
-| --- | --- | --- |
-| `INVALID_INPUT` | 400 | Malformed query, JSON, or a rejected value |
-| `UNAUTHENTICATED` | 401 | Missing or failed signature verification |
-| `FORBIDDEN` | 403 | Reserved name, blocked address |
-| `NOT_FOUND` | 404 | No such tag, address, or route |
-| `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
-| `CONFLICT` | 409 | Username already taken, or an address is at its 5-username limit |
-| `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
-| `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
-| `VALIDATION_FAILED` | 422 | Body failed its schema |
-| `RATE_LIMITED` | 429 | Rate limit exhausted |
-| `INTERNAL_ERROR` | 500 | Unhandled failure |
-| `UPSTREAM_ERROR` | 502 | Horizon or another upstream failed |
-| `SERVICE_UNAVAILABLE` | 503 | Database or Redis unreachable, request timeout |
-
-To raise one, throw or pass an `ApiError` — the handler is the only place that
-turns an error into a response:
-
-```js
-const { ApiError } = require('./src/errors');
-
-return next(new ApiError('CONFLICT', 'Username is already taken. Please choose another.'));
-```
-
-A `5xx` from an unexpected throw always reports the generic message so
-internals are never leaked; the real error goes to the log under
-`reference_id`. A message passed deliberately to `ApiError` is sent as written.
-
-`GET /health` is exempt: it reports component status (`{ status, database,
-redis, horizon }`) rather than an API error.
-
-## Request validation
-
-Incoming request bodies and query strings are validated by
-[zod](https://zod.dev) schemas before any route handler runs. Schemas live in
-`stellar-payment-platform/src/schemas/index.js`, and
-`src/middleware/validateSchema.js` turns them into route middleware:
-
-```js
-const { validateSchema } = require('./src/middleware/validateSchema');
-const { registerBodySchema, usersQuerySchema } = require('./src/schemas');
-
-app.post('/register', validateSchema({ body: registerBodySchema }), handler);
-app.get('/users', validateSchema({ query: usersQuerySchema }), handler);
-```
-
-The validated part is replaced with the parsed result, so handlers receive
-values that are already trimmed and coerced — `req.query.limit` is a number,
-not a string — and never re-check types themselves.
-
-Failures short-circuit before the handler and respond with the field-level
-errors, using the status that matches where the bad input came from:
-
-| Failure | Status | Body |
-| --- | --- | --- |
-| Invalid `req.body` | `422 Unprocessable Entity` | `{ success: false, errors: [{ field, message }] }` |
-| Invalid `req.query` | `400 Bad Request` | `{ success: false, errors: [{ field, message }] }` |
-
-Two rules are deliberately *not* in the schemas, because the handlers own them
-and answer `400` with their own domain-specific messages: Stellar address
-format (checked with `StrKey`) and memo pairing/format (checked with
-`validateMemo`). `page` and `limit` clamp to their bounds rather than being
-rejected, so `?limit=1000` still returns the maximum page size.
-
-## Detailed Endpoint Documentation
-
-The Node.js server (`stellar-payment-platform/server.js`) exposes the following endpoints for username and payment lookups:
-
-### `GET /federation`
-Resolves a given username tag to a Stellar address.
-- **Query Parameter:** `q` (string) - The username tag to lookup (e.g., `alice*localhost`).
-- **Returns:** A JSON object with `stellar_address`, `account_id`, `memo_type`, and `memo`.
-- **Status Codes:**
-  - `200 OK`: Address found.
-  - `400 Bad Request`: Missing `q` parameter.
-  - `404 Not Found`: Name tag not found.
-  - `500 Internal Server Error`: Database lookup failed.
-
-### `POST /register`
-Registers a new username and associates it with a Stellar address. An address
-may hold up to 5 usernames (aliases), e.g. `payments*domain` and
-`support*domain` for one business account. The first username registered for an
-address is its primary; reverse (`type=id`) federation lookups resolve to it.
-- **Body Parameters (JSON):** 
-  - `username` (string) - The desired username.
-  - `address` (string) - The user's Stellar address.
-- **Returns:** A JSON object with registration details `{ ok: true, username, address, is_primary }`.
-- **Status Codes:**
-  - `200 OK`: Registration successful.
-  - `400 Bad Request`: Missing `username` or `address`.
-  - `409 Conflict`: Username already taken, or the address already has the maximum of 5 usernames.
-  - `500 Internal Server Error`: Database lookup or insertion failed.
-
-### `GET /lookup`
-Resolves a given Stellar address to its registered username. When an address has
-several usernames, the primary one is returned.
-- **Query Parameter:** `address` (string) - The Stellar address to lookup.
-- **Returns:** A JSON object with `username` and `address`.
-- **Status Codes:**
-  - `200 OK`: Username found.
-  - `400 Bad Request`: Missing `address` parameter.
-  - `404 Not Found`: Username not found for this address.
-  - `500 Internal Server Error`: Database lookup failed.
-
-### `GET /users/:username/activity`
-Returns the caller's own activity trail: registrations, transfers,
-unregistrations, webhook creation and deletion, and blocks applied to their
-address.
-
-Ownership is proven the same way the webhook endpoints prove it. Sign the
-message `activity:<username>` with the account key and send the base64
-signature:
+**3. Build and test the contracts**
 
 ```bash
-curl "http://localhost:5000/users/ada*localhost/activity?limit=20" \
-  -H "X-Stellar-Signature: <base64 signature>" \
-  -H "X-Stellar-Signer: <G... public key>"
+cargo test --workspace
 ```
 
-The signature may also be sent in the request body as `signature` /
-`signerAddress`, matching `GET /webhooks`.
+**4. Try it**
 
-- **Query Parameters:**
-  - `page` (optional) - 1-based page number, default 1.
-  - `limit` (optional) - rows per page, default 10, capped at 100.
-  - `startDate` / `endDate` (optional) - inclusive bounds on `created_at`.
-- **Returns:** `{ data, meta: { total, page, limit, totalPages } }`, newest
-  first. Each row carries `id`, `action`, `metadata`, `ip_address` and
-  `created_at`.
-- **Status Codes:**
-  - `200 OK`: Trail returned.
-  - `400 Bad Request`: Missing signature, or an unparseable/inverted date range.
-  - `401 Unauthorized`: The signature does not belong to the account behind the
-    username.
-  - `404 Not Found`: Username not registered.
+```bash
+curl http://localhost:5000/health
+curl "http://localhost:5000/users?limit=5"                          # pick a seeded username
+curl "http://localhost:5000/federation?q=<username>*localhost&type=name"
+```
 
-Actions are namespaced: `user.registered`, `user.unregistered`,
-`user.transferred`, `user.blocked`, `webhook.created`, `webhook.deleted`. Rows
-are removed with the user, so a purge does not leave a trail behind.
+See the [development guide](docs/development.md) for every Compose profile,
+database options, seed data details and deployment to Render.
 
-### `GET /health`
-Aggregates the status of every external dependency: PostgreSQL (a `SELECT 1`
-through Prisma), Redis (`PING`) and Stellar Horizon (an HTTP request to
-`HORIZON_BASE`). The three probes run in parallel.
-- **Returns:** `{ status, timestamp, database, redis, horizon }`, where each
-  dependency is `up`, `down`, or `not configured` (Redis, when `REDIS_URL` is
-  unset). A `DOWN` response also carries a `message` naming the failures.
-- **Status Codes:**
-  - `200 OK`: Every configured dependency responded.
-  - `503 Service Unavailable`: At least one dependency is down.
+## Running tests
 
-`HEALTH_HORIZON_TIMEOUT_MS` (default 3000) bounds the Horizon probe so a
-hanging Horizon cannot hold the response open.
-
-### `GET /transactions/export`
-Streams the account's payment history as a CSV download.
-- **Query Parameters:** `address` (required) - Stellar public key. `order` (optional) - `desc` (default) or `asc`.
-- **Returns:** `text/csv` with a `Content-Disposition` attachment header. Columns: `id`, `created_at`, `type`, `from`, `to`, `amount`, `asset_type`, `asset_code`, `asset_issuer`, `transaction_hash`.
-- **Status Codes:**
-  - `200 OK`: Stream started. Sent chunked, so there is no `Content-Length`.
-  - `400 Bad Request`: Missing or invalid `address`.
-  - `404 Not Found`: Account not found on Horizon.
-  - `502 Bad Gateway`: Horizon request failed.
-
-Pages of 200 records are fetched from Horizon with its cursor, converted, and
-flushed as they arrive, so neither the full result set nor the full CSV is held
-in memory: heap use plateaus around 18MB whether the export is 5,000 rows or
-100,000. Writes respect socket backpressure, and `EXPORT_MAX_PAGES`
-(default 500) bounds a single export — a truncated export is logged as a
-warning. Because the response is committed once streaming starts, a mid-stream
-failure can only be logged and the connection cut, since the JSON error
-envelope needs unsent headers.
-
-The `/payments` collection mixes operation types that name the same concepts
-differently, so participant and amount columns are normalised per type: a
-`create_account` reports `funder`/`account`/`starting_balance` and an
-`account_merge` reports `account`/`into`.
-
-### `GET /admin/export`
-Streams transaction records from the database as a CSV or NDJSON download for external accounting.
-- **Query Parameters:**
-  - `format` (optional) – `csv` (default) or `json`.
-  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
-  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
-- **Returns:** `text/csv` or `application/x-ndjson` with a `Content-Disposition: attachment` header.
-- **Status Codes:**
-  - `200 OK`: Stream started.
-  - `400 Bad Request`: Invalid date format or `startDate` after `endDate`.
-  - `401 Unauthorized`: Missing or invalid API key.
-
-Records are fetched 500 at a time and written directly to the response, so heap use stays bounded regardless of export size. JSON output is newline-delimited (one object per line) for easy streaming parsing.
-
-### `GET /admin/stats/routing`
-Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
-- **Query Parameters:**
-  - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
-  - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
-  - `groupBy` (optional) – `'day'` (default), `'week'`, or `'month'`.
-  - `interval` (optional) – Alias for `groupBy`.
-  - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
-- **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
-- **Status Codes:**
-  - `200 OK`: Statistics retrieved successfully.
-  - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, or invalid `groupBy`.
-  - `401 Unauthorized`: Missing or invalid API key.
-
-### `GET /admin/audit-logs`
-Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
-- **Query Parameters:**
-  - `limit` (optional) – Maximum number of records to return (1-100, default 50).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
-- **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
-- **Status Codes:**
-  - `200 OK`: Audit logs retrieved successfully.
-  - `401 Unauthorized`: Missing or invalid API key.
-
-Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
-
-### `GET /admin/webhooks/health`
-Aggregates webhook delivery health so operators can spot broken merchant integrations.
-- **Query Parameters:**
-  - `username` (optional) – Scope the aggregates to one merchant's webhooks.
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
-- **Returns:** JSON object with `success: true`, a `summary` (`total`, `healthy`, `failing`, `successRate24h`), and `failingOver24h` — the webhooks that have been failing continuously for more than 24 hours.
-- **Status Codes:**
-  - `200 OK`: Health snapshot retrieved successfully.
-  - `401 Unauthorized`: Missing or invalid API key.
-
-A webhook is "failing" while its `failingSince` timestamp is set (cleared on the next successful delivery). `successRate24h` is the share of webhooks with a delivery attempt in the last 24h that are currently healthy; it is `null` when nothing has been active in that window.
-
-### Dead letter queue: `/admin/dlq`
-
-Webhook deliveries that exhaust `MAX_RETRY_ATTEMPTS` are parked on the
-`payment-retries-dlq` BullMQ queue instead of being retried forever, so they can
-be inspected and replayed by hand. Parked jobs keep their original payload,
-attempt count, failure reason, and a truncated stack trace, and are never retried
-or removed on their own.
-
-The dead letter queue needs Redis. With neither `REDIS_URL` nor
-`REDIS_CLUSTER_NODES` set, the worker logs a warning and falls back to the legacy
-database-backed dead letter handling; `GET /admin/dlq` then reports
-`available: false` with an empty list, and the per-message endpoints below return
-`503`.
-
-All endpoints below require `x-api-key` matching `ADMIN_API_KEY`. The mutating
-ones (`POST`, `DELETE`) additionally require an `Idempotency-Key` header, as with
-every other mutating `/api/v1` request, so a retried or double-clicked call
-cannot replay a message twice. Webhook secrets are redacted from every payload
-before it is returned.
-
-| Endpoint | Purpose |
+| Area | Command |
 | --- | --- |
-| `GET /admin/dlq` | List parked messages |
-| `GET /admin/dlq/:id` | Read one message |
-| `POST /admin/dlq/:id/replay` | Replay one message |
-| `POST /admin/dlq/replay` | Replay a batch |
-| `DELETE /admin/dlq/:id` | Discard one message |
+| Dashboard | `npm --prefix payment-dashboard run lint` and `run build` (no unit tests yet) |
+| API | `npm --prefix stellar-payment-platform test` |
+| Contracts | `cargo test --workspace` |
+| Contract integration | `npm run test:integration` (needs `docker compose --profile integration up`) |
+| Load test | `npm run load:test` |
+| Lint | `npm run lint` |
 
-**`GET /admin/dlq`**
-- **Query Parameters:** `limit` (optional, 1-100, default `20`), `page` (optional, default `1`), `username` (optional) to scope the listing to one merchant. A non-numeric `limit` or `page` falls back to the default rather than failing.
-- **Returns:** `success: true`, `available`, `messages`, and `meta` (`total`, `page`, `limit`, `totalPages`). `total` always describes the same set as `messages`: unfiltered, BullMQ counts the queue directly; filtered, the queue is walked in full so the page and the count stay consistent.
-- **Status Codes:** `200 OK`, `401 Unauthorized`.
+CI runs lint, the frontend build, API unit and integration tests with coverage
+thresholds, `rustfmt` / `clippy`, contract tests, and a check that the generated
+TypeScript bindings still match the contract.
 
-**`GET /admin/dlq/:id`**
-- **Returns:** `success: true` and the `message`, with `failureReason`, `stack`, `attemptsMade`, and the redacted `payload`.
-- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable` (no Redis).
+## Documentation
 
-**`POST /admin/dlq/:id/replay`**
-- **Headers:** `x-api-key`, `Idempotency-Key`.
-- **Returns:** `success: true`, `replayed: true`, `replayedJobId`, and the `queue` the job went back to. The attempt budget is reset, so a replayed job gets a fresh set of retries.
-- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`.
+**Guides**
 
-**`POST /admin/dlq/replay`**
-- **Headers:** `x-api-key`, `Idempotency-Key`.
-- **Body (optional):** `limit` (capped at `DLQ_REPLAY_BATCH_LIMIT`) and `username` to narrow the batch. An empty body replays the whole queue up to that cap.
-- **Returns:** `success: true`, counts of `replayed` and `failed`, a `failed` array of `{ id, error }` for messages that could not be replayed, and `capped` when the queue held more messages than the batch limit allowed. Per-message failures are reported without failing the whole batch.
-- **Status Codes:** `200 OK`, `401 Unauthorized`, `503 Service Unavailable`.
+- [Development guide](docs/development.md): Compose profiles, database, seed data, tests, Render deployment
+- [Configuration](docs/configuration.md): environment variables, logging, internal mTLS
+- [Smart contracts](docs/smart-contracts.md): refunds, swaps, governance, deployment, multisig upgrades
+- [API reference](docs/api-reference.md): endpoints, error codes, validation, SSE, DLQ, metrics
 
-**`DELETE /admin/dlq/:id`**
-- **Headers:** `x-api-key`, `Idempotency-Key`.
-- **Returns:** `success: true`, `id`, `discarded: true`. The message is dropped without being replayed, which is permanent.
-- **Status Codes:** `200 OK`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`.
+**Deep dives**
 
-### `GET /payments/:paymentId/events`
+- [Analytics (CQRS)](docs/analytics-cqrs.md) · [Observability and fraud](docs/observability-and-fraud.md) · [Grafana dashboard](docs/grafana-dashboard.md)
+- [Webhook signature verification](docs/webhook-signature-verification.md) · [mTLS](docs/mtls.md)
+- [DEX token swaps](docs/dex-token-swaps.md) · [Flash loans](docs/flash-loans.md) · [Data archival](docs/data-archival.md)
+- [ZK private payments](docs/zk-private-payments.md) · [ZK routing research](docs/research-zk-anonymous-routing.md)
+- [Cross-chain setup](CROSS_CHAIN_SETUP.md) · [Axelar integration](AXELAR_INTEGRATION.md)
+- [Postman collection](docs/api-collections/Stellar-Tags-API.postman_collection.json)
 
-Server-Sent Events stream of payment status updates (#730). The flow is
-strictly one-way (server → client), so clients use the browser's `EventSource`
-and reconnection is handled natively — no custom retry logic, and the server
-advertises its preferred reconnect delay with a `retry:` hint.
-- **Path Parameter:** `paymentId` (string, 1-128 chars of `[A-Za-z0-9_-]`) -
-  payment or payment-intent id.
-- **Returns:** a `text/event-stream` response that stays open until the client
-  disconnects, emitting:
-  - `connected` - `{ paymentId }`, sent as soon as the stream opens.
-  - `snapshot` - `{ paymentId, status, transactionHash? }`, the last known
-    status, so a client that just (re)connected converges immediately instead
-    of waiting for the next transition.
-  - `payment-update` - `{ paymentId, status, ... }` on every status change.
-    Publishers (e.g. the Horizon listener) push these to Redis, so every API
-    node fans them out to its own connected streams.
-- **Client usage:** open `new EventSource(url)` with
-  `url = "${API_BASE}/api/payments/<id>/events"`; a ready-made wrapper
-  (handlers + teardown) lives in `payment-dashboard/src/lib/paymentEvents.js`.
-- **Status Codes:** `200 OK`, `400 Bad Request` (invalid `paymentId`),
-  `429 Too Many Requests` (per-IP stream budget).
+## Deployment
 
-### `GET /metrics`
+- **API + database:** the [`render.yaml`](render.yaml) blueprint deploys the API with a managed
+  PostgreSQL database. Migrations run on boot.
+- **Dashboard:** any static host (for example Vercel) with `VITE_API_BASE` pointing at the API.
+- **Contracts:** `./scripts/deploy_contract.sh deploy --network testnet` builds, optimizes,
+  deploys and writes the new contract ID into both `.env` files. Upgrades need an M-of-N
+  signer group; see [Smart contracts](docs/smart-contracts.md#multisig-contract-upgrades).
 
-Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
-rate limiter so a scraper on a fixed interval is never throttled.
-- **Returns:** all metrics below, prefixed `stellar_tags_`.
-- **Status Codes:** `200 OK`.
+> ⚠️ Stellar Tags has not been audited. The ZK setup in `zk_payment/` is for tests
+> only. Do not use it with real funds.
 
-| Metric | Type | Description |
-| --- | --- | --- |
-| `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
-| `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
-| `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
-| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code`; buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s |
-| `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
-| `db_pool_connections_busy` | gauge | Connections executing a query |
-| `db_pool_connections_idle` | gauge | Connections open but unused |
-| `db_pool_queries_waiting` | gauge | Queries queued waiting for a connection |
-| `redis_connections_active` | gauge | `1` while Redis is ready for commands, else `0` |
-| `stellar_tags_dlq_depth` | gauge | Messages currently parked on `payment-retries-dlq`; reads `0` when Redis is unavailable |
-| `stellar_tags_dlq_messages_total` | counter | Messages ever routed to the dead letter queue |
+## Contributing
 
-Memory and CPU come from `prom-client`'s default collectors. The pool gauges read
-Prisma's `$metrics` (which requires the `metrics` preview feature in
-`schema.prisma`) and report `0` when it is unavailable. The dead letter queue
-depth is read at scrape time, so a restart does not reset it and no work happens
-unless something asks for the value.
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
+Pre-commit hooks run ESLint and `prisma validate`, and CI must pass before a PR is merged.
 
-`monitoring/prometheus-dlq-alerts.yml` contains ready-to-load rules that fire when
-the backlog grows past `DLQ_ALERT_THRESHOLD`, and when it keeps rising for 15
-minutes.
-
-## Smart Contract Refund Mechanism
-
-When a recipient cannot receive routed tokens (e.g. missing trustline, invalid contract recipient, or transfer rejection), the `PaymentRouter` smart contract prevents whole-transaction aborts by capturing the unrouteable tokens into the contract and crediting the sender's internal refund ledger (`DataKey::RefundBalance(user, token)`).
-
-### Claiming Refunds
-Users can query and withdraw their credited refunds at any time using the pull-based withdrawal pattern:
-- `get_refund_balance(user: Address, token: Address) -> i128`: Query available internal refund balance.
-- `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
-- `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
-
-### Arbitrary-token swaps
-
-`route_payment_with_swap` accepts a DEX adapter, an input/output token pair, a
-full token `path`, and `min_amount_out`. The adapter receives the input token and
-must return `[amount_received, unused_input]`; the router rejects malformed
-paths or slippage below the caller's minimum and credits unused input to the
-sender's refund balance. Existing same-token `route_payment` and
-`route_payments` calls remain unchanged.
-
-### Fee governance
-
-The contract supports token-weighted fee proposals. A SuperAdmin first calls
-`configure_governance(governance_token, quorum)`. A token holder can then call
-`propose_fee_change` and `vote_fee_proposal`; after the voting period, anyone
-can call `execute_fee_proposal` when yes votes exceed no votes and quorum is
-met. A voter can vote only once per proposal, and fee updates are applied only
-after successful finalization.
-
-## Smart Contract Deployment & Upgrades
-
-The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts/deploy_contract.sh`) to automate WASM compilation, optimization, network deployment, contract initialization, and contract upgrades.
-
-### CLI Usage
-
-```bash
-# Display help and available options
-./scripts/deploy_contract.sh --help
-
-# Deploy contract to testnet (compiles, optimizes, deploys, and updates .env configs)
-./scripts/deploy_contract.sh deploy --network testnet
-
-# Dry-run deployment (simulates workflow without on-chain transactions)
-./scripts/deploy_contract.sh deploy --network testnet --dry-run
-
-# Deploy with custom admin and funding source
-./scripts/deploy_contract.sh deploy --network testnet --source S... --admin G... --treasury G...
-
-# Deploy to mainnet
-./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
-
-# Compile and optimize WASM only
-./scripts/deploy_contract.sh build
-```
-
-### Multisig Contract Upgrades
-
-A contract's WASM can only be replaced by an **M-of-N signer group** — no single key, not even the admin, can upgrade it on its own. A contract with no group configured is permanently frozen against upgrades, which is deliberate: an unconfigured deployment fails closed rather than falling back to the admin.
-
-An upgrade proceeds in two steps:
-
-1. **Collect M approvals.** Each signer records their own signature against one exact WASM hash via `approve_upgrade`. Approvals are bound to that artifact, so a different build starts from zero.
-2. **Install.** Once M of the N signers have approved, *anyone* can call `upgrade` with the hash to install it. No further signature is needed at this step, and the approvals are consumed so they cannot be replayed.
-
-```bash
-# Configure a 2-of-3 upgrade group (the admin must sign this once)
-./scripts/deploy_contract.sh set-multisig --contract-id C... --network testnet --source S... \
-  --signer G1...:S1... --signer G2...:S2... --signer G3...:S3... --threshold 2
-
-# Upload new WASM, collect 2 approvals, and install it
-./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S... \
-  --signer G1...:S1... --signer G2...:S2...
-```
-
-When signers coordinate separately, each one can approve on its own and whoever collects the last required signature runs the upgrade:
-
-```bash
-# Each signer runs this for the same hash
-./scripts/deploy_contract.sh approve --contract-id C... --network testnet \
-  --signer G1...:S1... --new-wasm-hash <HASH>
-
-# Then, once the threshold is met
-./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S... \
-  --signer G1...:S1... --signer G2...:S2...
-```
-
-A signer can withdraw their approval before the upgrade lands, and the admin can cancel pending approvals for a hash. Changing the group re-validates approvals already collected against the new threshold.
-
-The first group is configured by the admin. Later rotations require approval from the current group's full threshold: each current signer calls `approve_multisig_config` for the proposed sorted signer set and threshold, after which the admin may apply it directly or queue it through the timelock (`ActionType::SetMultisigConfig`). A set with two or more signers must use a threshold of at least two; signer addresses are stored in deterministic sorted order.
-
-### Contract Interface for Upgrades
-
-| Function | Purpose |
-| --- | --- |
-| `set_multisig_config(signers, threshold)` | Configure the M-of-N group (admin-gated; existing groups must approve rotations). |
-| `approve_multisig_config(signers, threshold, signer)` | Record an existing signer's approval of an exact group rotation. |
-| `get_multisig_config() -> MultisigConfig` | Read the current signers and threshold. |
-| `approve_upgrade(signer, new_wasm_hash)` | Record one signer approval for an exact WASM hash. |
-| `revoke_upgrade_approval(signer, new_wasm_hash)` | Withdraw a recorded approval. |
-| `cancel_upgrade(new_wasm_hash)` | Discard all pending approvals for a hash (admin). |
-| `get_upgrade_approvals(new_wasm_hash) -> Vec<Address>` | List who has approved a hash. |
-| `is_upgrade_authorized(new_wasm_hash) -> bool` | Check whether a hash has reached its threshold. |
-| `upgrade(new_wasm_hash)` | Install a hash once its threshold is met. |
-
-### Automation & Config Updates
-
-Upon successful deployment, the tool automatically updates the contract address across:
-- `stellar-payment-platform/.env` (`PAYMENT_ROUTER_CONTRACT_ID`, `CONTRACT_ID`)
-- `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
-- `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
-
-## Architecture notes
-
-- The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.
-- The dashboard calls the Node.js API at `http://localhost:5000` via `VITE_API_BASE` and a `/api` proxy.
-- The Soroban contract handles on-chain payment routing logic.
-
-## CQRS Analytics Architecture
-
-Complex aggregation queries for the admin analytics dashboard are separated from the primary transactional database using Command Query Responsibility Segregation (CQRS).
-
-### How it works
-
-```text
-[ Payment Write Path ]
-  POST /payments → Prisma → PostgreSQL (write model)
-         │
-         │  Redis Streams XADD  (async, non-blocking)
-         ▼
-[ Message Broker: Redis Streams `analytics` ]
-         │
-         │  XREADGROUP (analytics-processors group)
-         ▼
-[ Analytics Consumer: analytics-worker.js ]
-         │
-         │  INSERT / ON CONFLICT UPDATE
-         ▼
-[ Analytics Read Model: TimescaleDB ]
-  payment_analytics        (raw events, hypertable)
-  payment_analytics_daily  (pre-aggregated daily rollup)
-         │
-         │  SQL query
-         ▼
-[ GET /admin/stats/routing ]  ← reads from TimescaleDB, not PostgreSQL
-```
-
-### Components
-
-| Component | File | Description |
-|---|---|---|
-| Event Publisher | `src/analytics/eventPublisher.js` | Publishes `payment.created` / `payment.updated` events to the `analytics` Redis stream |
-| Analytics Consumer | `src/analytics/analyticsConsumer.js` | XREADGROUP consumer that reads from the stream and writes to TimescaleDB |
-| Analytics Repository | `src/analytics/analyticsRepository.js` | Pool, DDL bootstrap, upsert, and aggregation query against TimescaleDB |
-| Analytics Worker | `analytics-worker.js` | Standalone worker process entry point (mirrors `fraud-worker.js`) |
-| Publisher Middleware | `src/middleware/analyticsPublisher.js` | Express middleware for fire-and-forget event publishing on response |
-
-### Fallback behaviour
-
-When `ANALYTICS_DATABASE_URL` is not set (e.g. local development without TimescaleDB), `GET /admin/stats/routing` automatically falls back to querying the primary PostgreSQL database via Prisma, preserving backward compatibility.
-
-### Running the analytics stack locally
-
-```bash
-# Start with TimescaleDB and the analytics worker
-docker compose --profile dev up
-
-# The analytics-worker starts automatically in the dev profile.
-# It initialises the TimescaleDB schema on startup and begins
-# consuming from the Redis Streams analytics channel.
-```
-
-### Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `ANALYTICS_DATABASE_URL` | _(unset)_ | TimescaleDB connection string |
-| `ANALYTICS_STREAM` | `analytics` | Redis stream name for payment events |
-| `ANALYTICS_CONSUMER_GROUP` | `analytics-processors` | Redis consumer group |
-| `ANALYTICS_STREAM_MAX_LEN` | `10000` | Approximate max entries kept in the stream |
-| `ANALYTICS_POOL_MAX` | `5` | Max connections in the TimescaleDB pool |
+1. Fork the repo and create a branch: `git checkout -b feat/my-feature`
+2. Make your change, with tests
+3. Run `npm run lint` and the relevant test suites
+4. Open a pull request against `main`
 
 ## License
 
-See [LICENSE](LICENSE).
+[GPL-3.0](LICENSE)
