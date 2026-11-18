@@ -54,6 +54,7 @@ const {
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
 } = require('./src/utils');
+const { setupGraphQL } = require('./src/graphql');
 
 dotenv.config();
 
@@ -198,6 +199,13 @@ app.use(express.json());
 
 app.use(limiter);
 app.use(express.json({ limit: '10kb' }));
+
+// Attach the GraphQL endpoint at /graphql alongside the REST routes. The
+// deferred handler is mounted here — before the nested-object rejection and
+// the terminal 404/error handlers — so /graphql stays reachable once Apollo
+// has finished starting. `graphQLReady` resolves when the endpoint is live.
+const graphQLReady = setupGraphQL(app);
+
 const isPrimitive = (v) => v === null || v === undefined || typeof v !== 'object';
 
 const rejectNestedObjects = (req, res, next) => {
@@ -943,6 +951,12 @@ const gracefulShutdown = (server, prismaClient, signal) => {
 
 
 if (require.main === module) {
+  // Surface GraphQL startup failures without blocking REST from serving; the
+  // /graphql handler returns 503 until (and unless) the endpoint is ready.
+  graphQLReady.catch((err) => {
+    logger.error(err, 'GraphQL endpoint unavailable; REST continues to serve.');
+  });
+
   const server = app.listen(PORT, '0.0.0.0', () => {
     logger.info(`Server successfully initialized on port ${PORT}`);
   });
@@ -958,4 +972,4 @@ if (require.main === module) {
   process.on('SIGINT', (sig) => gracefulShutdown(server, prisma, sig));
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
+module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo, graphQLReady };
