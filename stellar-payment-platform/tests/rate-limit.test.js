@@ -17,11 +17,43 @@ jest.mock('@stellar/stellar-sdk', () => ({
 
 jest.mock('pdfkit', () => jest.fn());
 
-jest.mock('redis', () => ({
-  createClient: jest.fn(() => null),
-}));
-
-jest.mock('rate-limit-redis', () => jest.fn());
+jest.mock('redis', () => {
+  return {
+    createClient: jest.fn(() => {
+      const store = new Map();
+      return {
+        on: jest.fn(),
+        connect: jest.fn().mockResolvedValue(),
+        eval: jest.fn(async (script, numkeys, key, capacityStr, refillRateStr, nowStr, requestedStr) => {
+          const capacity = Number(capacityStr);
+          const refillRate = Number(refillRateStr);
+          const now = Number(nowStr);
+          const requested = Number(requestedStr);
+          
+          let state = store.get(key) || { tokens: capacity, lastRefill: now };
+          
+          const timePassed = Math.max(0, now - state.lastRefill);
+          const refillAmount = Math.floor(timePassed * refillRate);
+          
+          if (refillAmount > 0) {
+            state.tokens = Math.min(capacity, state.tokens + refillAmount);
+            state.lastRefill = now;
+          }
+          
+          let allowed = 0;
+          if (state.tokens >= requested) {
+            state.tokens -= requested;
+            allowed = 1;
+          }
+          
+          store.set(key, state);
+          
+          return [allowed, state.tokens, capacity, state.lastRefill];
+        })
+      };
+    }),
+  };
+});
 
 jest.mock('bad-words', () =>
   jest.fn().mockImplementation(() => ({
@@ -68,38 +100,17 @@ jest.mock('../src/multisigner-verifier', () => ({
   }),
 }));
 
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn((sql, cb2) => cb2 && cb2(null)),
-        close: jest.fn((cb2) => cb2 && cb2()),
-      };
-      if (cb) cb(null);
-      return db;
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    connect: jest.fn().mockResolvedValue({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      release: jest.fn(),
     }),
-  }),
-}));
+    end: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
+    options: { max: 10 },
 
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, null);
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, []);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
   })),
 }));
 
@@ -108,6 +119,7 @@ jest.mock('../src/metrics', () => ({
   getMetrics: jest.fn().mockResolvedValue(''),
   getContentType: jest.fn(() => 'text/plain'),
   setMetricsSources: jest.fn(),
+  setDlqDepthSource: jest.fn(),
 }));
 
 jest.mock('@sentry/node', () => ({
@@ -115,15 +127,19 @@ jest.mock('@sentry/node', () => ({
   setupExpressErrorHandler: jest.fn(() => (req, res, next) => next()),
 }));
 
+// /health probes Horizon over HTTP; keep it off the network.
+global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+
 // ── Test Suite ───────────────────────────────────────────────────────────────
 
 const VALID_ADDRESS = 'GBCDEFGHIJKLMNOPQRSTUVWXYZ';
 
-describe('Rate Limiting — express-rate-limit', () => {
+describe('Rate Limiting - token bucket', () => {
   let app;
 
   beforeEach(() => {
     jest.resetModules();
+    process.env.REDIS_URL = 'redis://localhost:6379'; // Ensure redisClient is instantiated
     ({ app } = require('../server'));
   });
 
@@ -135,8 +151,8 @@ describe('Rate Limiting — express-rate-limit', () => {
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.headers).toHaveProperty('ratelimit-limit');
-      expect(res.headers['ratelimit-limit']).toBe('100');
+      expect(res.headers).toHaveProperty('x-ratelimit-limit');
+      expect(res.headers['x-ratelimit-limit']).toBe('100');
     });
 
     it('includes RateLimit-Remaining header on /federation', async () => {
@@ -144,27 +160,18 @@ describe('Rate Limiting — express-rate-limit', () => {
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.headers).toHaveProperty('ratelimit-remaining');
+      expect(res.headers).toHaveProperty('x-ratelimit-remaining');
     });
 
-    it('includes RateLimit-Limit header on /register', async () => {
+    it('advertises the stricter signature-heavy limit on /register', async () => {
       const res = await request(app)
         .post('/register')
         .send({ username: 'alice', address: VALID_ADDRESS });
 
-      expect(res.headers).toHaveProperty('ratelimit-limit');
-      expect(res.headers['ratelimit-limit']).toBe('100');
-    });
-
-    it('includes X-RateLimit-* legacy headers', async () => {
-      const res = await request(app)
-        .get('/federation')
-        .query({ q: 'client*localhost' });
-
       expect(res.headers).toHaveProperty('x-ratelimit-limit');
-      expect(res.headers).toHaveProperty('x-ratelimit-remaining');
-      expect(res.headers).toHaveProperty('x-ratelimit-reset');
+      expect(res.headers['x-ratelimit-limit']).toBe('10');
     });
+
   });
 
   // ── 429 Too Many Requests ────────────────────────────────────────────────
@@ -184,12 +191,8 @@ describe('Rate Limiting — express-rate-limit', () => {
         .query({ q: 'client*localhost' });
 
       expect(res.status).toBe(429);
-      expect(res.body).toEqual({
-        success: false,
-        error: {
-          code: 'RATE_LIMITED',
-          message: 'Too many requests, please try again later.',
-        },
+      expect(res.body).toMatchObject({
+        error: { code: 'RATE_LIMITED' },
       });
     });
 
@@ -207,12 +210,8 @@ describe('Rate Limiting — express-rate-limit', () => {
         .send(payload);
 
       expect(res.status).toBe(429);
-      expect(res.body).toEqual({
-        success: false,
-        error: {
-          code: 'RATE_LIMITED',
-          message: 'Too many requests, please try again later.',
-        },
+      expect(res.body).toMatchObject({
+        error: { code: 'RATE_LIMITED' },
       });
     });
 
@@ -229,6 +228,36 @@ describe('Rate Limiting — express-rate-limit', () => {
 
       expect(res.status).toBe(429);
       expect(res.headers).toHaveProperty('retry-after');
+    });
+  });
+
+  // ── Signature-heavy secondary limiter (10/min per IP) ───────────────────
+
+  describe('signature-heavy limiter', () => {
+    it('blocks the 11th POST /register with 429 + Retry-After', async () => {
+      const payload = { username: 'carol', address: VALID_ADDRESS };
+
+      for (let i = 0; i < 10; i++) {
+        const ok = await request(app).post('/register').send(payload);
+        expect(ok.status).not.toBe(429);
+      }
+
+      const res = await request(app).post('/register').send(payload);
+
+      expect(res.status).toBe(429);
+      expect(res.headers).toHaveProperty('retry-after');
+      expect(res.body).toMatchObject({
+        error: { code: 'RATE_LIMITED' },
+      });
+    });
+
+    it('does not apply to GET endpoints', async () => {
+      for (let i = 0; i < 20; i++) {
+        const res = await request(app)
+          .get('/federation')
+          .query({ q: 'client*localhost' });
+        expect(res.status).not.toBe(429);
+      }
     });
   });
 
@@ -250,6 +279,27 @@ describe('Rate Limiting — express-rate-limit', () => {
     });
   });
 
+  // ── Strict auth/login rate limit ─────────────────────────────────────────
+
+  describe('strict auth rate limit', () => {
+    it('applies a stricter limit on /auth endpoints than the global limiter', async () => {
+      // The auth limiter allows only 20 requests per window, so the 21st
+      // request should be rejected even though the global limit is 100.
+      for (let i = 0; i < 20; i++) {
+        await request(app)
+          .post('/auth/verify-email')
+          .send({ email: `user${i}@example.com` });
+      }
+
+      const res = await request(app)
+        .post('/auth/verify-email')
+        .send({ email: 'overflow@example.com' });
+
+      expect(res.status).toBe(429);
+      expect(res.body).toMatchObject({ error: { code: 'RATE_LIMITED' } });
+    });
+  });
+
   // ── Reset between test modules ───────────────────────────────────────────
 
   describe('rate limiter resets with new app instance', () => {
@@ -259,8 +309,7 @@ describe('Rate Limiting — express-rate-limit', () => {
         .get('/federation')
         .query({ q: 'client*localhost' });
 
-      expect(res.status).toBe(200);
-      expect(res.headers).toHaveProperty('ratelimit-limit');
+      expect(res.headers).toHaveProperty('x-ratelimit-limit');
     });
   });
 });

@@ -6,7 +6,14 @@
     "start": "npm --prefix stellar-payment-platform start",
     "lint": "eslint .",
     "prepare": "husky",
-    "load:test": "artillery run artillery.yml"
+    "load:test": "artillery run artillery.yml",
+    "generate:bindings": "bash scripts/generate-bindings.sh",
+    "test:integration": "bash tests/integration/run.sh",
+    "contract:build": "node scripts/deploy.js build",
+    "contract:deploy": "node scripts/deploy.js deploy",
+    "contract:upgrade": "node scripts/deploy.js upgrade",
+    "contract:set-multisig": "node scripts/deploy.js set-multisig",
+    "contract:approve": "node scripts/deploy.js approve"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -18,7 +25,7 @@
   },
   "lint-staged": {
     "stellar-payment-platform/**/*.js": "eslint",
-    "payment-dashboard/**/*.{js,jsx}": "npm --prefix payment-dashboard run lint"
+    "payment-dashboard/**/*.{js,jsx}": "eslint --config payment-dashboard/eslint.config.js"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^2.5.0",

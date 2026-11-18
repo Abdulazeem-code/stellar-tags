@@ -1,383 +1,198 @@
+<div align="center">
+
 # Stellar Tags
 
-Stellar Tags is a payment platform that combines a Soroban smart contract, a Node.js server, and a React dashboard. It is structured as a small mono-repo so each piece can be developed and deployed independently while still working together as a single product.
+**Human-readable payment tags for the Stellar network.**
+Send to `alice*stellartags` instead of a 56-character `G...` address.
 
-## What is inside
+[![CI](https://github.com/Abdulazeem-code/stellar-tags/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdulazeem-code/stellar-tags/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+![Soroban](https://img.shields.io/badge/Soroban-smart%20contracts-7B3FE4)
+![Node](https://img.shields.io/badge/Node-22-339933?logo=node.js&logoColor=white)
+![React](https://img.shields.io/badge/React-Vite-61DAFB?logo=react&logoColor=black)
 
-- `payment-dashboard/` - React + Vite frontend dashboard.
-- `stellar-payment-platform/` - Node.js server for API and business logic.
-- `payment_router/` - Rust/Soroban contract.
+[Quick start](#quick-start) · [Architecture](#architecture) · [Documentation](#documentation) · [Contributing](#contributing)
 
-## Key features
+</div>
 
-- Desired specific username
-- Fast transfer
-- Secured payment flows
+---
 
-## Architecture Map
+## What is Stellar Tags?
 
-The following diagram maps exactly how data flows between the user, Render, and the Stellar network.
+Stellar addresses are long and easy to get wrong. Stellar Tags lets anyone claim a
+short username, a **tag**, and get paid to it. Under the hood it is a full
+payment stack:
 
-```text
-[ User / Browser ]
-       |
-       | (Vite App hosted on Vercel)
-       v
-[ payment-dashboard ]
-  (src/App.jsx: Wallet connections & UI)
-       |
-       | HTTP API Calls (via VITE_API_BASE)
-       v
-[ stellar-payment-platform ] <---> [ PostgreSQL Database ]
-  (server.js: Server router on Render)        (via Prisma ORM: User/payment layout)
-       |
-       | Stellar Network / RPC
-       v
-[ payment_router ]
-  (src/lib.rs: Soroban smart contract routing logic)
+- a **Soroban smart contract** that routes payments, takes platform fees, swaps
+  tokens through DEXes and refunds payments that cannot be delivered,
+- a **Node.js API** that runs a [SEP-0002 federation](https://developers.stellar.org/docs/learn/encyclopedia/network-configuration/federation)
+  server, merchant webhooks, analytics and fraud checks,
+- a **React dashboard** where users connect a wallet, claim a tag, and send or
+  receive payments.
+
+## Features
+
+| | |
+| --- | --- |
+| 🏷️ **Username tags** | Claim `name*domain`, keep up to 5 aliases per address, resolve both ways via SEP-0002 federation. |
+| ⚡ **On-chain routing** | `route_payment`, batch payments, split payments and multi-hop swaps in one Soroban contract. |
+| 🔁 **Token swaps** | Pay in one asset, deliver another, with slippage limits and DEX adapters. |
+| ↩️ **Safe refunds** | Undeliverable payments go to a refund balance the sender can claim later, instead of aborting the transaction. |
+| 🔐 **Hardened admin** | Role-based access, timelocked actions, M-of-N multisig upgrades, emergency freeze, a dead man's switch. |
+| 🗳️ **Fee governance** | Token-weighted proposals and votes for changing fees. |
+| 🔔 **Merchant webhooks** | HMAC-signed deliveries, retries with backoff, a dead letter queue with replay. |
+| 📡 **Live status** | Server-Sent Events stream for payment status updates. |
+| 📊 **Observability** | Prometheus metrics, Grafana dashboard, structured logs, audit logs, CQRS analytics on TimescaleDB. |
+| 🕶️ **Research** | Zero-knowledge private payments (Groth16 / BLS12-381), flash loans, yield escrow, TWAP oracle. |
+
+## Architecture
+
+```mermaid
+flowchart TD
+    U([User / Wallet]) --> D[payment-dashboard<br/>React + Vite]
+    D -- REST / SSE --> A[stellar-payment-platform<br/>Node.js + Express]
+    D -- Soroban RPC --> C[payment_router<br/>Soroban contract]
+    A <--> P[(PostgreSQL<br/>Prisma)]
+    A <--> R[(Redis<br/>rate limits, queues, streams)]
+    R --> W[Workers<br/>webhooks · fraud · analytics]
+    W --> T[(TimescaleDB<br/>analytics read model)]
+    A -- Horizon / RPC --> S{{Stellar network}}
+    C --- S
+    W -- signed webhooks --> M([Merchants])
 ```
 
-**Data Flow:**
-1. **User** accesses the `payment-dashboard` and connects their Stellar wallet.
-2. The dashboard queries the `stellar-payment-platform` server for user registrations and payment routing information.
-3. The server interacts with its PostgreSQL database (via the Prisma ORM) to resolve usernames to addresses using the endpoints documented below.
-4. When a payment is initiated, it's routed through the `payment_router` Soroban contract on the Stellar network.
+1. The user opens the dashboard and connects a Stellar wallet.
+2. The dashboard asks the API to register a tag or resolve one to an address.
+3. The API stores tags in PostgreSQL and serves them over federation.
+4. Payments are signed in the wallet and routed through the `payment_router` contract.
+5. The Horizon listener picks up the result, pushes live updates to the dashboard,
+   and queues signed webhooks for merchants.
 
-## Repository structure
+## Repository layout
 
-```text
-.
-├── payment-dashboard/
-│   ├── .env                 # Frontend environment variables
-│   └── src/
-│       └── App.jsx          # Wallet connections and React UI
-├── payment_router/
-│   └── src/
-│       └── lib.rs           # Soroban smart contract logic
-└── stellar-payment-platform/
-    ├── server.js            # Server router (Express API endpoints)
-    └── prisma/
-        └── schema.prisma    # Prisma schema for the PostgreSQL database
-```
+| Path | What it is |
+| --- | --- |
+| [`payment-dashboard/`](payment-dashboard) | React + Vite frontend: landing, registration, send/receive, history, analytics |
+| [`stellar-payment-platform/`](stellar-payment-platform) | Node.js API, Prisma schema, background workers (webhooks, fraud, analytics, outbox) |
+| [`payment_router/`](payment_router) | Main Soroban contract: routing, fees, swaps, refunds, governance, upgrades |
+| [`payment_proxy/`](payment_proxy) | Upgradeable proxy contract |
+| [`timelock_escrow/`](timelock_escrow) · [`yield_escrow/`](yield_escrow) | Escrow contracts |
+| [`flash_loan/`](flash_loan) · [`twap_oracle/`](twap_oracle) · [`pausable_token/`](pausable_token) | Supporting DeFi contracts |
+| [`zk_payment/`](zk_payment) | Zero-knowledge private payment contract and circuit (research, testnet only) |
+| [`packages/types/`](packages/types) | TypeScript bindings generated from the `payment_router` ABI |
+| [`contracts/`](contracts) | Solidity bridge for Axelar cross-chain payments |
+| [`scripts/`](scripts) | Contract build, deploy and upgrade CLI, binding generation |
+| [`tests/integration/`](tests/integration) | Contract integration tests against a local Stellar node |
+| [`docs/`](docs) | Guides and reference |
 
-## Getting started
+## Quick start
 
-> These steps are split by module so you can run only what you need.
-
-### Frontend dashboard
+**You need:** Node 22, Docker, and (for contracts) Rust stable with the
+`wasm32-unknown-unknown` target and the [`stellar` CLI](https://developers.stellar.org/docs/tools/cli).
 
 ```bash
-cd payment-dashboard
-npm install
-npm run dev
+git clone https://github.com/Abdulazeem-code/stellar-tags.git
+cd stellar-tags
 ```
 
-### Server
+**1. Start Postgres, Redis and the API**
 
-The server uses **PostgreSQL** as its database, accessed through the
-[Prisma ORM](https://www.prisma.io/). You need a running Postgres instance
-(local install, Docker, or a hosted provider) before starting the server.
+```bash
+docker compose --profile dev up -d
+```
+
+Or run the API outside Docker:
 
 ```bash
 cd stellar-payment-platform
 npm install
-
-# 1. Create your local env file and point DATABASE_URL at your Postgres DB
-cp .env.example .env
-#    then edit .env (see "Database setup" below)
-
-# 2. Apply the schema to your database
+cp .env.example .env        # set DATABASE_URL
 npm run prisma:migrate
-
-# 3. Start the server
-npm run dev
+npm run db:seed             # 50 users, webhooks, payment intents, API keys
+npm run dev                 # http://localhost:5000
 ```
 
-#### Database setup
-
-The connection string lives in `stellar-payment-platform/.env` as `DATABASE_URL`.
-Copy `.env.example` to `.env` and set it to your own Postgres database:
-
-```env
-DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/DATABASE?schema=public"
-```
-
-For a typical local install that becomes, for example:
-
-```env
-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/stellar_tags?schema=public"
-```
-
-The quickest way to get a local database is Docker:
+**2. Start the dashboard**
 
 ```bash
-docker run --name stellar-postgres -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=stellar_tags -p 5432:5432 -d postgres:16
-```
-
-Useful Prisma commands (run from `stellar-payment-platform/`):
-
-| Command | Description |
-| --- | --- |
-| `npm run prisma:migrate` | Create/apply migrations against your dev database |
-| `npm run prisma:deploy` | Apply existing migrations (CI / production) |
-| `npm run prisma:generate` | Regenerate the Prisma Client after schema changes |
-| `npm run prisma:studio` | Open Prisma Studio to browse the data |
-
-> `.env` is gitignored — never commit real credentials. Each contributor keeps
-> their own local `DATABASE_URL`.
-
-### Render deployment
-
-The repository includes a [render.yaml](render.yaml) blueprint for the backend API and its PostgreSQL database. When you deploy from Render, import the blueprint or create the service from the repo so `DATABASE_URL` is injected automatically from the managed database.
-
-If you deploy the backend without the blueprint, make sure the web service has a PostgreSQL `DATABASE_URL` secret configured before startup. The container runs Prisma migrations on boot, so the variable must already exist.
-
-### Smart contract (Soroban)
-
-```bash
-cd payment_router
-cargo build
-```
-
-## Tests
-
-```bash
-# frontend
 cd payment-dashboard
-npm test
-
-# server
-cd ../stellar-payment-platform
-npm test
-
-# contract
-cd ../payment_router
-cargo test
+npm install
+echo "VITE_API_BASE=http://localhost:5000" > .env
+npm run dev                 # http://localhost:3000
 ```
 
-## Environment variables
+**3. Build and test the contracts**
 
-To ensure a seamless local developer installation requiring zero guesswork, please configure the following environment variables in their respective directories:
-
-### Frontend (`payment-dashboard/.env`)
-- `VITE_API_BASE` - The base URL where the frontend expects the Node.js server API to be running (e.g., `http://localhost:5000`).
-
-### Server (`stellar-payment-platform/.env` or exported directly)
-- `DATABASE_URL` - **(Required)** PostgreSQL connection string used by Prisma (see [Database setup](#database-setup)).
-- `PORT` - (Optional) The port for the Node.js server to listen on. Defaults to `5000`.
-- `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default) or `public`.
-- `STELLAR_TAG_DOMAIN` - (Optional) Extra origin to add to the CORS allow-list.
-- `LOG_DIR` - (Optional) Directory for the rotating log files. Defaults to `stellar-payment-platform/logs`.
-- `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
-- `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
-- `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
-
-For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
-
-## Logging
-
-The server logs through a shared [Winston](https://github.com/winstonjs/winston) logger
-(`stellar-payment-platform/src/logger.js`). Import it instead of calling `console` directly:
-
-```js
-const { logger } = require('./src/logger');
-
-logger.info('Registered tag', { correlationId: req.correlationId, tag });
-logger.error(err);
+```bash
+cargo test --workspace
 ```
 
-Log records are written as JSON to `stellar-payment-platform/logs/`:
+**4. Try it**
 
-- `application-YYYY-MM-DD.log` - everything at `LOG_LEVEL` and above.
-- `error-YYYY-MM-DD.log` - errors only, so incidents are easy to find.
-
-Both files rotate **daily and whenever they pass 20MB**, older files are gzipped, and
-anything beyond the retention window is deleted, so logs cannot exhaust the disk. A
-human-readable copy is also printed to the console (silenced when `NODE_ENV=test`, which
-also disables file output so test runs leave no logs behind).
-
-## Error responses
-
-Every API error leaves the server in one shape, produced by a single terminal
-handler (`stellar-payment-platform/src/middleware/errorHandler.js`):
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": "VALIDATION_FAILED",
-    "message": "Invalid request body",
-    "details": [{ "field": "username", "message": "username is required" }]
-  },
-  "correlation_id": "3f2a…",
-  "reference_id": "9b41…"
-}
+```bash
+curl http://localhost:5000/health
+curl "http://localhost:5000/users?limit=5"                          # pick a seeded username
+curl "http://localhost:5000/federation?q=<username>*localhost&type=name"
 ```
 
-`error.code` is the stable part of the contract — branch on it rather than on
-the status or the message text, which may be reworded. `details` appears only
-when the failure is field-level. `correlation_id` is on every error;
-`reference_id` is added on `5xx` and matches the logged stack.
+See the [development guide](docs/development.md) for every Compose profile,
+database options, seed data details and deployment to Render.
 
-| Code | Status | Raised when |
-| --- | --- | --- |
-| `INVALID_INPUT` | 400 | Malformed query, JSON, or a rejected value |
-| `UNAUTHENTICATED` | 401 | Missing or failed signature verification |
-| `FORBIDDEN` | 403 | Reserved name, blocked address |
-| `NOT_FOUND` | 404 | No such tag, address, or route |
-| `METHOD_NOT_ALLOWED` | 405 | Wrong verb on a known path |
-| `CONFLICT` | 409 | Username or address already registered |
-| `PAYLOAD_TOO_LARGE` | 413 | Body over the 10kb cap |
-| `UNSUPPORTED_MEDIA_TYPE` | 415 | Non-JSON body on a JSON endpoint |
-| `VALIDATION_FAILED` | 422 | Body failed its schema |
-| `RATE_LIMITED` | 429 | Rate limit exhausted |
-| `INTERNAL_ERROR` | 500 | Unhandled failure |
-| `UPSTREAM_ERROR` | 502 | Horizon or another upstream failed |
-| `SERVICE_UNAVAILABLE` | 503 | Database or Redis unreachable, request timeout |
+## Running tests
 
-To raise one, throw or pass an `ApiError` — the handler is the only place that
-turns an error into a response:
+| Area | Command |
+| --- | --- |
+| Dashboard | `npm --prefix payment-dashboard run lint` and `run build` (no unit tests yet) |
+| API | `npm --prefix stellar-payment-platform test` |
+| Contracts | `cargo test --workspace` |
+| Contract integration | `npm run test:integration` (needs `docker compose --profile integration up`) |
+| Load test | `npm run load:test` |
+| Lint | `npm run lint` |
 
-```js
-const { ApiError } = require('./src/errors');
+CI runs lint, the frontend build, API unit and integration tests with coverage
+thresholds, `rustfmt` / `clippy`, contract tests, and a check that the generated
+TypeScript bindings still match the contract.
 
-return next(new ApiError('CONFLICT', 'Address already registered'));
-```
+## Documentation
 
-A `5xx` from an unexpected throw always reports the generic message so
-internals are never leaked; the real error goes to the log under
-`reference_id`. A message passed deliberately to `ApiError` is sent as written.
+**Guides**
 
-`GET /health` is exempt: it reports component status (`{ status, database,
-redis }`) rather than an API error.
+- [Development guide](docs/development.md): Compose profiles, database, seed data, tests, Render deployment
+- [Configuration](docs/configuration.md): environment variables, logging, internal mTLS
+- [Smart contracts](docs/smart-contracts.md): refunds, swaps, governance, deployment, multisig upgrades
+- [API reference](docs/api-reference.md): endpoints, error codes, validation, SSE, DLQ, metrics
 
-## Request validation
+**Deep dives**
 
-Incoming request bodies and query strings are validated by
-[zod](https://zod.dev) schemas before any route handler runs. Schemas live in
-`stellar-payment-platform/src/schemas/index.js`, and
-`src/middleware/validateSchema.js` turns them into route middleware:
+- [Analytics (CQRS)](docs/analytics-cqrs.md) · [Observability and fraud](docs/observability-and-fraud.md) · [Grafana dashboard](docs/grafana-dashboard.md)
+- [Webhook signature verification](docs/webhook-signature-verification.md) · [mTLS](docs/mtls.md)
+- [DEX token swaps](docs/dex-token-swaps.md) · [Flash loans](docs/flash-loans.md) · [Data archival](docs/data-archival.md)
+- [ZK private payments](docs/zk-private-payments.md) · [ZK routing research](docs/research-zk-anonymous-routing.md)
+- [Cross-chain setup](CROSS_CHAIN_SETUP.md) · [Axelar integration](AXELAR_INTEGRATION.md)
+- [Postman collection](docs/api-collections/Stellar-Tags-API.postman_collection.json)
 
-```js
-const { validateSchema } = require('./src/middleware/validateSchema');
-const { registerBodySchema, usersQuerySchema } = require('./src/schemas');
+## Deployment
 
-app.post('/register', validateSchema({ body: registerBodySchema }), handler);
-app.get('/users', validateSchema({ query: usersQuerySchema }), handler);
-```
+- **API + database:** the [`render.yaml`](render.yaml) blueprint deploys the API with a managed
+  PostgreSQL database. Migrations run on boot.
+- **Dashboard:** any static host (for example Vercel) with `VITE_API_BASE` pointing at the API.
+- **Contracts:** `./scripts/deploy_contract.sh deploy --network testnet` builds, optimizes,
+  deploys and writes the new contract ID into both `.env` files. Upgrades need an M-of-N
+  signer group; see [Smart contracts](docs/smart-contracts.md#multisig-contract-upgrades).
 
-The validated part is replaced with the parsed result, so handlers receive
-values that are already trimmed and coerced — `req.query.limit` is a number,
-not a string — and never re-check types themselves.
+> ⚠️ Stellar Tags has not been audited. The ZK setup in `zk_payment/` is for tests
+> only. Do not use it with real funds.
 
-Failures short-circuit before the handler and respond with the field-level
-errors, using the status that matches where the bad input came from:
+## Contributing
 
-| Failure | Status | Body |
-| --- | --- | --- |
-| Invalid `req.body` | `422 Unprocessable Entity` | `{ success: false, errors: [{ field, message }] }` |
-| Invalid `req.query` | `400 Bad Request` | `{ success: false, errors: [{ field, message }] }` |
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
+Pre-commit hooks run ESLint and `prisma validate`, and CI must pass before a PR is merged.
 
-Two rules are deliberately *not* in the schemas, because the handlers own them
-and answer `400` with their own domain-specific messages: Stellar address
-format (checked with `StrKey`) and memo pairing/format (checked with
-`validateMemo`). `page` and `limit` clamp to their bounds rather than being
-rejected, so `?limit=1000` still returns the maximum page size.
-
-## Detailed Endpoint Documentation
-
-The Node.js server (`stellar-payment-platform/server.js`) exposes the following endpoints for username and payment lookups:
-
-### `GET /federation`
-Resolves a given username tag to a Stellar address.
-- **Query Parameter:** `q` (string) - The username tag to lookup (e.g., `alice*localhost`).
-- **Returns:** A JSON object with `stellar_address`, `account_id`, `memo_type`, and `memo`.
-- **Status Codes:**
-  - `200 OK`: Address found.
-  - `400 Bad Request`: Missing `q` parameter.
-  - `404 Not Found`: Name tag not found.
-  - `500 Internal Server Error`: Database lookup failed.
-
-### `POST /register`
-Registers a new username and associates it with a Stellar address.
-- **Body Parameters (JSON):** 
-  - `username` (string) - The desired username.
-  - `address` (string) - The user's Stellar address.
-- **Returns:** A JSON object with registration details `{ ok: true, username, address }`.
-- **Status Codes:**
-  - `200 OK`: Registration successful.
-  - `400 Bad Request`: Missing `username` or `address`.
-  - `409 Conflict`: Address or username already registered.
-  - `500 Internal Server Error`: Database lookup or insertion failed.
-
-### `GET /lookup`
-Resolves a given Stellar address to its registered username.
-- **Query Parameter:** `address` (string) - The Stellar address to lookup.
-- **Returns:** A JSON object with `username` and `address`.
-- **Status Codes:**
-  - `200 OK`: Username found.
-  - `400 Bad Request`: Missing `address` parameter.
-  - `404 Not Found`: Username not found for this address.
-  - `500 Internal Server Error`: Database lookup failed.
-
-### `GET /health`
-A simple health check endpoint.
-- **Returns:** `{ status: 'ok' }`
-- **Status Codes:** `200 OK`.
-
-### `GET /transactions/export`
-Streams the account's payment history as a CSV download.
-- **Query Parameters:** `address` (required) - Stellar public key. `order` (optional) - `desc` (default) or `asc`.
-- **Returns:** `text/csv` with a `Content-Disposition` attachment header. Columns: `id`, `created_at`, `type`, `from`, `to`, `amount`, `asset_type`, `asset_code`, `asset_issuer`, `transaction_hash`.
-- **Status Codes:**
-  - `200 OK`: Stream started. Sent chunked, so there is no `Content-Length`.
-  - `400 Bad Request`: Missing or invalid `address`.
-  - `404 Not Found`: Account not found on Horizon.
-  - `502 Bad Gateway`: Horizon request failed.
-
-Pages of 200 records are fetched from Horizon with its cursor, converted, and
-flushed as they arrive, so neither the full result set nor the full CSV is held
-in memory: heap use plateaus around 18MB whether the export is 5,000 rows or
-100,000. Writes respect socket backpressure, and `EXPORT_MAX_PAGES`
-(default 500) bounds a single export — a truncated export is logged as a
-warning. Because the response is committed once streaming starts, a mid-stream
-failure can only be logged and the connection cut, since the JSON error
-envelope needs unsent headers.
-
-The `/payments` collection mixes operation types that name the same concepts
-differently, so participant and amount columns are normalised per type: a
-`create_account` reports `funder`/`account`/`starting_balance` and an
-`account_merge` reports `account`/`into`.
-
-### `GET /metrics`
-Prometheus scrape endpoint, served in the Prometheus text format. Exempt from the
-rate limiter so a scraper on a fixed interval is never throttled.
-- **Returns:** all metrics below, prefixed `stellar_tags_`.
-- **Status Codes:** `200 OK`.
-
-| Metric | Type | Description |
-| --- | --- | --- |
-| `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, ... | gauge | Memory usage |
-| `process_cpu_user_seconds_total`, `process_cpu_system_seconds_total` | counter | CPU usage |
-| `http_requests_total` | counter | Requests by `method`, `route`, `status_code` |
-| `http_request_duration_seconds` | histogram | Request latency by `method`, `route`, `status_code` |
-| `db_pool_connections_open` | gauge | Connections open in the Prisma pool |
-| `db_pool_connections_busy` | gauge | Connections executing a query |
-| `db_pool_connections_idle` | gauge | Connections open but unused |
-| `db_pool_queries_waiting` | gauge | Queries queued waiting for a connection |
-| `redis_connections_active` | gauge | `1` while Redis is ready for commands, else `0` |
-
-Memory and CPU come from `prom-client`'s default collectors. The pool gauges read
-Prisma's `$metrics` (which requires the `metrics` preview feature in
-`schema.prisma`) and report `0` when it is unavailable.
-
-## Architecture notes
-
-- The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.
-- The dashboard calls the Node.js API at `http://localhost:5000` via `VITE_API_BASE` and a `/api` proxy.
-- The Soroban contract handles on-chain payment routing logic.
+1. Fork the repo and create a branch: `git checkout -b feat/my-feature`
+2. Make your change, with tests
+3. Run `npm run lint` and the relevant test suites
+4. Open a pull request against `main`
 
 ## License
 
-See [LICENSE](LICENSE).
+[GPL-3.0](LICENSE)

@@ -81,7 +81,7 @@ describe('GET /transactions/export', () => {
   describe('response framing', () => {
     test('streams CSV with download headers', async () => {
       mockPages([[record(1)]]);
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
 
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toContain('text/csv');
@@ -91,7 +91,7 @@ describe('GET /transactions/export', () => {
 
     test('does not set Content-Length, so the body is streamed', async () => {
       mockPages([[record(1)]]);
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
 
       expect(res.headers['content-length']).toBeUndefined();
       expect(res.headers['transfer-encoding']).toBe('chunked');
@@ -99,7 +99,7 @@ describe('GET /transactions/export', () => {
 
     test('emits a header row followed by one row per record', async () => {
       mockPages([[record(1), record(2)]]);
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
       const lines = res.text.trim().split('\r\n');
 
       expect(lines[0]).toBe(COLUMNS.join(','));
@@ -110,7 +110,7 @@ describe('GET /transactions/export', () => {
 
     test('emits only the header row when there are no transactions', async () => {
       mockPages([[]]);
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
 
       expect(res.status).toBe(200);
       expect(res.text).toBe(`${COLUMNS.join(',')}\r\n`);
@@ -122,7 +122,7 @@ describe('GET /transactions/export', () => {
       const full = Array.from({ length: 200 }, (_, i) => record(i));
       const chain = mockPages([full, [record(999)]]);
 
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
       const lines = res.text.trim().split('\r\n');
 
       expect(lines).toHaveLength(202);
@@ -132,21 +132,21 @@ describe('GET /transactions/export', () => {
 
     test('requests the maximum page size so pages are not fetched one row at a time', async () => {
       const chain = mockPages([[record(1)]]);
-      await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
 
       expect(chain.limit).toHaveBeenCalledWith(200);
     });
 
     test('passes the requested order through', async () => {
       const chain = mockPages([[record(1)]]);
-      await request(app).get(`/transactions/export?address=${ADDRESS}&order=asc`);
+      await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}&order=asc`);
 
       expect(chain.order).toHaveBeenCalledWith('asc');
     });
 
     test('defaults to desc for an unknown order', async () => {
       const chain = mockPages([[record(1)]]);
-      await request(app).get(`/transactions/export?address=${ADDRESS}&order=sideways`);
+      await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}&order=sideways`);
 
       expect(chain.order).toHaveBeenCalledWith('desc');
     });
@@ -201,7 +201,7 @@ describe('GET /transactions/export', () => {
 
     test('escapes a malicious memo inside a streamed row', async () => {
       mockPages([[record(1, { to: 'a,b"c' })]]);
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
 
       expect(res.text).toContain('"a,b""c"');
     });
@@ -236,7 +236,7 @@ describe('GET /transactions/export', () => {
         transaction_hash: 'hash-ca',
       }]]);
 
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
       const row = res.text.trim().split('\r\n')[1];
 
       expect(row).toBe('ca-1,2026-07-30T00:00:00Z,create_account,GFUNDER,GNEW,100.0000000,native,,,hash-ca');
@@ -245,7 +245,7 @@ describe('GET /transactions/export', () => {
 
   describe('errors before the stream is committed', () => {
     test('rejects a missing address with the standard envelope', async () => {
-      const res = await request(app).get('/transactions/export');
+      const res = await request(app).get('/api/v1/transactions/export');
 
       expect(res.status).toBe(400);
       expect(res.body).toMatchObject({
@@ -255,7 +255,7 @@ describe('GET /transactions/export', () => {
     });
 
     test('rejects a non-Stellar address', async () => {
-      const res = await request(app).get('/transactions/export?address=not-a-key');
+      const res = await request(app).get('/api/v1/transactions/export?address=not-a-key');
 
       expect(res.status).toBe(400);
       expect(res.body.error.message).toBe('Invalid Stellar account');
@@ -269,7 +269,7 @@ describe('GET /transactions/export', () => {
         call: jest.fn().mockRejectedValue({ response: { status: 404 } }),
       });
 
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
 
       expect(res.status).toBe(404);
       expect(res.body.error.code).toBe('NOT_FOUND');
@@ -283,7 +283,7 @@ describe('GET /transactions/export', () => {
         call: jest.fn().mockRejectedValue(new Error('network down')),
       });
 
-      const res = await request(app).get(`/transactions/export?address=${ADDRESS}`);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
 
       expect(res.status).toBe(502);
       expect(res.body.error.code).toBe('UPSTREAM_ERROR');

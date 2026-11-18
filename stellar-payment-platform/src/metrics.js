@@ -12,18 +12,22 @@ const httpRequestCounter = new client.Counter({
   labelNames: ['method', 'route', 'status_code'],
 });
 
-// Custom histogram: request duration in seconds
+// Custom histogram: request duration in seconds, bucketed for SLO work
+// (10ms, 50ms, 100ms, 500ms, 1s, 5s) so p50/p95/p99 latency can be derived.
 const httpRequestDuration = new client.Histogram({
   name: 'stellar_tags_http_request_duration_seconds',
   help: 'HTTP request duration in seconds',
   labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
 });
 
 // The Prisma and Redis clients are created after this module is imported, so
 // they are registered later via setMetricsSources and read at scrape time.
 let prismaSource = null;
 let redisSource = null;
+// The DLQ lives in Redis, which is optional, so its depth is read through a
+// reader the DLQ module registers rather than a client this module creates.
+let dlqDepthSource = null;
 
 /**
  * Registers the live clients the connection gauges report on. Passing a null
@@ -32,6 +36,14 @@ let redisSource = null;
 function setMetricsSources({ prisma, redisClient } = {}) {
   if (prisma !== undefined) prismaSource = prisma;
   if (redisClient !== undefined) redisSource = redisClient;
+}
+
+/**
+ * Registers the function the DLQ depth gauge reads on each scrape. Passing null
+ * leaves the gauge reporting zero.
+ */
+function setDlqDepthSource(readDepth) {
+  if (readDepth !== undefined) dlqDepthSource = readDepth;
 }
 
 const EMPTY_POOL = { active: 0, idle: 0, size: 0, waiters: 0 };
@@ -103,6 +115,26 @@ const redisConnectionsActive = new client.Gauge({
   },
 });
 
+// Gauge: payment retry jobs currently parked in the dead letter queue. Read on
+// every scrape so the value is never stale, and 0 when Redis is unconfigured.
+const dlqDepth = new client.Gauge({
+  name: 'stellar_tags_dlq_depth',
+  help: 'Payment retry jobs currently waiting in the dead letter queue',
+  async collect() {
+    if (!dlqDepthSource) {
+      this.set(0);
+      return;
+    }
+    this.set(await dlqDepthSource());
+  },
+});
+
+// Counter: payment retry jobs routed to the dead letter queue since boot.
+const dlqMessagesTotal = new client.Counter({
+  name: 'stellar_tags_dlq_messages_total',
+  help: 'Total payment retry jobs moved to the dead letter queue',
+});
+
 /**
  * Express middleware that tracks request count and latency.
  * Attach to app BEFORE route handlers.
@@ -112,7 +144,13 @@ function metricsMiddleware(req, res, next) {
 
   res.on('finish', () => {
     const duration = (Date.now() - start) / 1000;
-    const route = req.route?.path ?? req.path ?? 'unknown';
+    // Normalize the route label: use the matched route pattern (never the raw
+    // path, query string, or concrete ids), include the router mount prefix
+    // (e.g. "/api/v1"), and collapse unmatched/404 paths to "unknown" so label
+    // cardinality stays bounded even under arbitrary-path probing.
+    const route = req.route
+      ? `${req.baseUrl || ''}${req.route.path}`
+      : 'unknown';
     const labels = {
       method: req.method,
       route,
@@ -145,9 +183,12 @@ module.exports = {
   getMetrics,
   getContentType,
   setMetricsSources,
+  setDlqDepthSource,
   dbPoolConnectionsOpen,
   dbPoolConnectionsBusy,
   dbPoolConnectionsIdle,
   dbPoolQueriesWaiting,
   redisConnectionsActive,
+  dlqDepth,
+  dlqMessagesTotal,
 };

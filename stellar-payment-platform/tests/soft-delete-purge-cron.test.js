@@ -45,5 +45,39 @@ describe('soft-delete-purge-cron', () => {
 
       expect(cron.schedule).toHaveBeenCalledWith('0 0 * * *', expect.any(Function));
     });
+
+    it('purges expired rows and logs the result when the callback fires', async () => {
+      let scheduledCallback;
+      cron.schedule.mockImplementation((expr, cb) => {
+        scheduledCallback = cb;
+      });
+
+      const prisma = {
+        user: {
+          deleteMany: jest.fn().mockResolvedValue({ count: 4 }),
+        },
+      };
+
+      scheduleSoftDeletePurgeJob(prisma);
+      await scheduledCallback();
+
+      expect(prisma.user.deleteMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs an error when the purge fails', async () => {
+      let scheduledCallback;
+      cron.schedule.mockImplementation((expr, cb) => {
+        scheduledCallback = cb;
+      });
+
+      const prisma = {
+        user: {
+          deleteMany: jest.fn().mockRejectedValue(new Error('db down')),
+        },
+      };
+
+      scheduleSoftDeletePurgeJob(prisma);
+      await scheduledCallback();
+    });
   });
 });

@@ -1,8 +1,39 @@
 **/node_modules
 .git
+.gitignore
 .github
 .husky
 payment_router
 *.md
 .env
+**/.env
 *.db
+**/*.sqlite
+**/*.sqlite3
+**/coverage
+**/dist
+**/logs
+**/*.log
+**/.DS_Store
+
+# Backend test files & artifacts — never needed inside an image
+# (CI runs tests on the runner; the api-test service builds from the
+# stellar-payment-platform context, which has its own .dockerignore)
+stellar-payment-platform/tests
+stellar-payment-platform/*.test.js
+stellar-payment-platform/test_*.txt
+stellar-payment-platform/test_output.txt
+stellar-payment-platform/data
+stellar-payment-platform/artillery.yml
+
+# Root-level files not referenced by any image build
+docs
+tmp_server.js
+artillery.yml
+docker-compose.yml
+
+# Internal PKI material (#736) — private keys must never enter a build context.
+# Certificates are mounted as a volume or a secret at runtime instead.
+**/certs
+**/*.pem
+**/*.key

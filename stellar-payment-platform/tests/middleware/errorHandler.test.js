@@ -205,6 +205,16 @@ describe('error envelope', () => {
 });
 
 describe('errors module', () => {
+  test('captures the complete public error response contract', () => {
+    const responseShapes = Object.fromEntries(
+      Object.keys(ERROR_CODES).map((code) => [
+        code,
+        errorBody(code, 'message'),
+      ]),
+    );
+    expect(responseShapes).toMatchSnapshot();
+  });
+
   test('defaults an unknown code to INTERNAL_ERROR rather than trusting input', () => {
     const err = new ApiError('NOT_A_REAL_CODE');
     expect(err.code).toBe('INTERNAL_ERROR');

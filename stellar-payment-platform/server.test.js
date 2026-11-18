@@ -13,6 +13,9 @@ jest.mock('pdfkit', () => jest.fn());
 // test process does not register a real timer.
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+jest.mock('./src/graphql', () => ({
+  createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+}));
 
 // bad-words ships as ESM; Jest runs in CJS mode — mock the module so the
 // test suite can require server.js without a transform error.
@@ -33,6 +36,10 @@ jest.mock('./prismaClient', () => ({
       findMany: jest.fn(),
       count: jest.fn(),
       create: jest.fn(),
+    },
+    walletBalance: {
+      findMany: jest.fn().mockResolvedValue([]),
+      upsert: jest.fn(),
     },
     $transaction: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ '1': 1 }]),
@@ -62,39 +69,36 @@ jest.mock('./src/multisigner-verifier', () => ({
   isSingleSignerAccount: jest.fn().mockReturnValue(true),
 }));
 
-jest.mock('sqlite3', () => ({
-  verbose: () => ({
-    Database: jest.fn().mockImplementation((_path, cb) => {
-      const db = {
-        run: jest.fn(function (...args) {
-          const fn = args.find((a) => typeof a === 'function');
-          if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-        }),
-        serialize: jest.fn((fn) => fn && fn()),
-        close: jest.fn((cb) => cb && cb()),
-      };
-      if (cb) cb(null);
-      return db;
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    connect: jest.fn().mockResolvedValue({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      release: jest.fn(),
     }),
-  }),
+    end: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
+    options: { max: 10 },
+  })),
 }));
 
 jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-
-jest.mock('generic-pool', () => ({
-  createPool: jest.fn(() => ({
-    acquire: jest.fn().mockResolvedValue({
-      run: jest.fn(function (...args) {
-        const fn = args.find((a) => typeof a === 'function');
-        if (fn) fn.call({ lastID: 1, changes: 1 }, null);
-      }),
-    }),
-    release: jest.fn(),
-    drain: jest.fn().mockResolvedValue(undefined),
-    clear: jest.fn().mockResolvedValue(undefined),
-  })),
+jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
+jest.mock('./src/graphql', () => ({
+  createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
 }));
+
+// closeSse is awaited in gracefulShutdown before server.close() is called.
+// Resolve immediately so tests that check server.close() synchronously still pass.
+jest.mock('./src/sse', () => {
+  const actual = jest.requireActual('./src/sse');
+  return {
+    ...actual,
+    initSse: jest.fn(),
+    closeSse: jest.fn().mockResolvedValue(undefined),
+  };
+});
 
 describe('gracefulShutdown', () => {
   let gracefulShutdown;
@@ -121,13 +125,15 @@ describe('gracefulShutdown', () => {
     jest.restoreAllMocks();
   });
 
-  test('SIGTERM — calls server.close()', () => {
+  test('SIGTERM — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
+    await Promise.resolve(); // flush closeSse().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
-  test('SIGINT — calls server.close()', () => {
+  test('SIGINT — calls server.close()', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGINT');
+    await Promise.resolve(); // flush closeSse().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
   });
 
@@ -154,7 +160,8 @@ describe('gracefulShutdown', () => {
     });
 
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-    await Promise.resolve();
+    await Promise.resolve(); // flush closeSse().then(...)
+    await Promise.resolve(); // flush server.close callback
 
     expect(callOrder).toEqual(['server.close', 'prisma.$disconnect']);
   });
@@ -169,11 +176,74 @@ describe('gracefulShutdown', () => {
     expect(mockPrisma.$disconnect).not.toHaveBeenCalled();
   });
 
-  test('second signal is a no-op (double-invocation guard)', () => {
+  test('second signal is a no-op (double-invocation guard)', async () => {
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
     gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
-
+    await Promise.resolve(); // flush closeSse().then(...)
     expect(mockServer.close).toHaveBeenCalledTimes(1);
+  });
+
+  test('disconnects Redis after Prisma when redis client is provided', async () => {
+    const mockRedis = { quit: jest.fn().mockResolvedValue(undefined) };
+    mockServer.close.mockImplementation((cb) => cb());
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM', mockRedis);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockPrisma.$disconnect).toHaveBeenCalledTimes(1);
+    expect(mockRedis.quit).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
+  test('Redis disconnected after Prisma — correct order', async () => {
+    const callOrder = [];
+    const mockRedis = {
+      quit: jest.fn().mockImplementation(() => {
+        callOrder.push('redis.quit');
+        return Promise.resolve();
+      }),
+    };
+    mockServer.close.mockImplementation((cb) => {
+      callOrder.push('server.close');
+      cb();
+    });
+    mockPrisma.$disconnect.mockImplementation(() => {
+      callOrder.push('prisma.$disconnect');
+      return Promise.resolve();
+    });
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM', mockRedis);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callOrder).toEqual(['server.close', 'prisma.$disconnect', 'redis.quit']);
+  });
+
+  test('skips Redis disconnect when no redis client is provided', async () => {
+    mockServer.close.mockImplementation((cb) => cb());
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockPrisma.$disconnect).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
+  test('logs Redis error but still exits 0 if redis.quit() rejects', async () => {
+    const mockRedis = { quit: jest.fn().mockRejectedValue(new Error('Redis gone')) };
+    mockServer.close.mockImplementation((cb) => cb());
+
+    gracefulShutdown(mockServer, mockPrisma, 'SIGTERM', mockRedis);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockRedis.quit).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
   });
 });
 
@@ -271,49 +341,22 @@ describe('GET /lookup — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-
-    jest.mock('sqlite3', () => ({
-      verbose: () => ({
-        Database: jest.fn().mockImplementation((_path, cb) => {
-          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
-          if (cb) cb(null);
-          return db;
-        }),
-      }),
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));
 
-    const mockConn = {
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (sql.includes('COUNT(*)')) {
-          if (fn) fn(null, { total: 2 });
-        } else if (sql.includes('WHERE address =')) {
-          if (fn) fn(null, { username: 'alice*localhost' });
-        } else {
-          if (fn) fn(null, null);
-        }
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        const rows = [
-          { username: 'alice*localhost', address: VALID_ADDRESS, created_at: '2024-01-01T00:00:00.000Z' },
-          { username: 'bob*localhost', address: 'GBOB0000000000000000000000000000000000000000000000000000', created_at: '2024-01-02T00:00:00.000Z' },
-        ];
-        if (fn) fn(null, rows);
-      }),
-    };
-
-    jest.mock('generic-pool', () => ({
-      createPool: jest.fn(() => ({
-        acquire: jest.fn().mockResolvedValue(mockConn),
-        release: jest.fn(),
-        drain: jest.fn().mockResolvedValue(undefined),
-        clear: jest.fn().mockResolvedValue(undefined),
+    jest.mock('pg', () => ({
+      Pool: jest.fn().mockImplementation(() => ({
+        query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
+        end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -388,44 +431,22 @@ describe('GET /users — pagination and search', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-
-    jest.mock('sqlite3', () => ({
-      verbose: () => ({
-        Database: jest.fn().mockImplementation((_path, cb) => {
-          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
-          if (cb) cb(null);
-          return db;
-        }),
-      }),
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));
 
-    const mockConn = {
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, { total: 25 });
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        const rows = Array.from({ length: 10 }, (_, i) => ({
-          username: `user${i}*localhost`,
-          address: `G${'A'.repeat(55)}${i}`,
-          created_at: '2024-01-01T00:00:00.000Z',
-        }));
-        if (fn) fn(null, rows);
-      }),
-    };
-
-    jest.mock('generic-pool', () => ({
-      createPool: jest.fn(() => ({
-        acquire: jest.fn().mockResolvedValue(mockConn),
-        release: jest.fn(),
-        drain: jest.fn().mockResolvedValue(undefined),
-        clear: jest.fn().mockResolvedValue(undefined),
+    jest.mock('pg', () => ({
+      Pool: jest.fn().mockImplementation(() => ({
+        query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
+        end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -501,7 +522,11 @@ describe('POST /register — block secret keys', () => {
     }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+    }));
 
     ({ app } = require('./server'));
     request = require('supertest');
@@ -767,7 +792,6 @@ describe('GET /federation — memo fields in response', () => {
   test('returns stored text memo in federation response', async () => {
     prisma.user.findFirst.mockResolvedValue({ address: VALID_ADDRESS, memoType: 'text', memo: 'pay123' });
     const res = await request(app).get('/federation?q=alice*localhost&type=name');
-    console.warn('RES BODY:', res.body);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ memo_type: 'text', memo: 'pay123' });
   });
@@ -802,41 +826,22 @@ describe('API v1 routing', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
-jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
-
-    jest.mock('sqlite3', () => ({
-      verbose: () => ({
-        Database: jest.fn().mockImplementation((_path, cb) => {
-          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
-          if (cb) cb(null);
-          return db;
-        }),
-      }),
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
     }));
 
-    const mockConn = {
-      run: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn.call({ lastID: 0, changes: 0 }, null);
-      }),
-      get: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, { total: 2 });
-      }),
-      all: jest.fn((sql, params, cb) => {
-        const fn = typeof params === 'function' ? params : cb;
-        if (fn) fn(null, [
-          { username: 'alice*localhost', address: 'GABC', created_at: '2024-01-01T00:00:00.000Z' },
-        ]);
-      }),
-    };
-
-    jest.mock('generic-pool', () => ({
-      createPool: jest.fn(() => ({
-        acquire: jest.fn().mockResolvedValue(mockConn),
-        release: jest.fn(),
-        drain: jest.fn().mockResolvedValue(undefined),
-        clear: jest.fn().mockResolvedValue(undefined),
+    jest.mock('pg', () => ({
+      Pool: jest.fn().mockImplementation(() => ({
+        query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+        }),
+        end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -910,7 +915,7 @@ describe('Idempotency Middleware', () => {
     // First request
     const res1 = await request(app)
       .post('/register')
-      .set('X-Idempotency-Key', 'test-key-123')
+      .set('Idempotency-Key', 'test-key-123')
       .set('Content-Type', 'application/json')
       .send(payload);
     
@@ -920,7 +925,7 @@ describe('Idempotency Middleware', () => {
     // Second request with SAME key
     const res2 = await request(app)
       .post('/register')
-      .set('X-Idempotency-Key', 'test-key-123')
+      .set('Idempotency-Key', 'test-key-123')
       .set('Content-Type', 'application/json')
       .send(payload);
     
@@ -952,6 +957,11 @@ describe('Database disconnection — 503 handling', () => {
     jest.mock('@stellar/stellar-sdk', () => ({ Horizon: { Server: jest.fn() }, StrKey: { isValidEd25519PublicKey: jest.fn(() => true) } }));
     jest.mock('pdfkit', () => jest.fn());
     jest.mock('./src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
+    jest.mock('./src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
+    jest.mock('./src/reconciliation-cron', () => ({ scheduleReconciliationJob: jest.fn(), scheduleLedgerReconciliationJob: jest.fn() }));
+    jest.mock('./src/graphql', () => ({
+      createGraphQLMiddleware: jest.fn(() => (req, res, next) => next()),
+    }));
     jest.mock('./src/multisigner-verifier', () => ({
       verifyMultiSignerThreshold: jest.fn().mockResolvedValue({
         success: true, accountId: 'GDUMMY', operationType: 'management',
@@ -963,28 +973,16 @@ describe('Database disconnection — 503 handling', () => {
       isSingleSignerAccount: jest.fn().mockReturnValue(true),
     }));
 
-    jest.mock('sqlite3', () => ({
-      verbose: () => ({
-        Database: jest.fn().mockImplementation((_path, cb) => {
-          const db = { run: jest.fn((sql, cb2) => cb2 && cb2(null)), close: jest.fn((cb2) => cb2 && cb2()) };
-          if (cb) cb(null);
-          return db;
+    jest.mock('pg', () => ({
+      Pool: jest.fn().mockImplementation(() => ({
+        query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
         }),
-      }),
-    }));
-
-    const mockConn = {
-      run: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null); }),
-      get: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null, null); }),
-      all: jest.fn((sql, params, cb) => { const fn = typeof params === 'function' ? params : cb; if (fn) fn(null, []); }),
-    };
-
-    jest.mock('generic-pool', () => ({
-      createPool: jest.fn(() => ({
-        acquire: jest.fn().mockResolvedValue(mockConn),
-        release: jest.fn(),
-        drain: jest.fn().mockResolvedValue(undefined),
-        clear: jest.fn().mockResolvedValue(undefined),
+        end: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        options: { max: 10 },
       })),
     }));
 
@@ -1054,7 +1052,7 @@ describe('Database disconnection — 503 handling', () => {
     ['P1001'],
     ['P1008'],
   ])('POST /api/v1/register returns 503 when Prisma throws %s', async (code) => {
-    prisma.user.findFirst.mockRejectedValue(makePrismaError(code));
+    prisma.user.count.mockRejectedValue(makePrismaError(code));
 
     const res = await request(app)
       .post('/api/v1/register')
@@ -1063,11 +1061,11 @@ describe('Database disconnection — 503 handling', () => {
     expect(res.body.error.message).toBe('Service Unavailable');
   });
 
-  test('server.js routes with SQLite fallback still return normally for Prisma P10 errors', async () => {
+  test('server.js federation route returns 503 on Prisma P10 connection errors', async () => {
     prisma.user.findFirst.mockRejectedValue(makePrismaError('P1001'));
 
     const res = await request(app).get('/federation?q=nonexistent*localhost&type=name');
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(503);
   });
 
 });

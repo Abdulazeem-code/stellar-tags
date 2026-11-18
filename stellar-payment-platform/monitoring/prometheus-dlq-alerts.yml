@@ -1,0 +1,61 @@
+# Prometheus alerting rules for the Stellar Tags payment retry dead letter queue.
+#
+# Load with:
+#   rule_files:
+#     - /etc/prometheus/rules/stellar-tags-dlq.yml
+#
+# The gauge `stellar_tags_dlq_depth` is read on every scrape, and
+# `stellar_tags_dlq_messages_total` counts every job routed to the DLQ since
+# boot. Two conditions are alerted on: a queue that is simply too deep, and a
+# queue that keeps growing even while it is still small.
+
+groups:
+  - name: stellar-tags-dlq
+    interval: 1m
+    rules:
+      # A depth above the default DLQ_ALERT_THRESHOLD (10) means deliveries are
+      # failing faster than they are being cleared. The threshold the process
+      # logs against is DLQ_ALERT_THRESHOLD; keep this in step with it.
+      - alert: StellarTagsDlqDepthHigh
+        expr: stellar_tags_dlq_depth > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: stellar-tags
+        annotations:
+          summary: Payment retry DLQ depth is {{ $value }}
+          description: >-
+            The payment retry dead letter queue has held {{ $value }} messages
+            for more than 5 minutes. Inspect with GET /admin/dlq and replay with
+            POST /admin/dlq/replay.
+
+      # Sustained growth over 15 minutes catches a queue that is still shallow
+      # but filling steadily, which the depth rule above would not fire on.
+      - alert: StellarTagsDlqSustainedGrowth
+        expr: increase(stellar_tags_dlq_messages_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: stellar-tags
+        annotations:
+          summary: Payment retry DLQ is still growing after 15 minutes
+          description: >-
+            {{ $value }} payment retry jobs were moved to the dead letter queue
+            in the last 15 minutes and the queue has not been drained. A merchant
+            endpoint is likely failing, or replay is not keeping up.
+
+      # The replay and discard endpoints are the operator's lever; if they stop
+      # being called while the queue grows, the queue is never going to drain.
+      - alert: StellarTagsDlqNoReplayActivity
+        expr: >-
+          stellar_tags_dlq_depth > 10
+          and increase(stellar_tags_dlq_messages_total[1h]) > 0
+        for: 1h
+        labels:
+          severity: critical
+          service: stellar-tags
+        annotations:
+          summary: Payment retry DLQ has not been drained for an hour
+          description: >-
+            The dead letter queue is at {{ $value }} and has been receiving new
+            failures for an hour without being replayed or discarded.
