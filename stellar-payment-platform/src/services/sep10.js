@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const { ApiError } = require('../errors');
 const { getSep10Config } = require('../config/sep10');
 const { sep10ChallengeQuerySchema } = require('../schemas/sep10ChallengeSchema');
+const { sep10TokenBodySchema } = require('../schemas/sep10TokenSchema');
 
 const CHALLENGE_KEY_PREFIX = 'sep10:challenge:';
 
@@ -30,7 +31,7 @@ function validateQuery(query) {
   return parsed.data;
 }
 
-function loadSdk() {
+function loadSdk({ verify = false } = {}) {
   let sdk;
   try {
     sdk = require('@stellar/stellar-sdk');
@@ -38,14 +39,20 @@ function loadSdk() {
     throw new ApiError('INTERNAL_ERROR', 'Stellar SDK is unavailable');
   }
 
-  if (
-    !sdk ||
-    !sdk.WebAuth ||
-    typeof sdk.WebAuth.buildChallengeTx !== 'function' ||
-    !sdk.Keypair ||
-    typeof sdk.Keypair.fromSecret !== 'function' ||
-    !sdk.StrKey
-  ) {
+  const required = [
+    Boolean(sdk && sdk.WebAuth),
+    typeof sdk?.WebAuth?.buildChallengeTx === 'function',
+    typeof sdk?.Keypair?.fromSecret === 'function',
+    Boolean(sdk?.StrKey),
+  ];
+  if (verify) {
+    required.push(
+      typeof sdk?.WebAuth?.readChallengeTx === 'function',
+      typeof sdk?.WebAuth?.verifyChallengeTxSigners === 'function',
+      typeof sdk?.WebAuth?.verifyChallengeTxThreshold === 'function',
+    );
+  }
+  if (required.some((ok) => !ok)) {
     throw new ApiError('INTERNAL_ERROR', 'Stellar SDK does not support SEP-10 challenges');
   }
 
@@ -144,8 +151,168 @@ async function createSep10Challenge(query, redisClient, env = process.env) {
   return { transaction, network_passphrase: config.networkPassphrase };
 }
 
+function validateTokenBody(body) {
+  const parsed = sep10TokenBodySchema.safeParse(body ?? {});
+  if (!parsed.success) {
+    const issue = parsed.error && parsed.error.issues && parsed.error.issues[0];
+    throw invalid(issue && issue.message ? issue.message : 'Invalid challenge request');
+  }
+  return parsed.data;
+}
+
+const isAccountNotFound = (error) => {
+  const status = Number(error?.response?.status ?? error?.status ?? error?.statusCode);
+  return status === 404 || /account not found/i.test(String(error?.message || ''));
+};
+
+function clientDomainFromTransaction(tx) {
+  const operation = (tx && Array.isArray(tx.operations)
+    ? tx.operations
+    : []
+  ).find((op) => op && op.name === 'client_domain');
+
+  if (!operation || operation.value === undefined || operation.value === null) return null;
+
+  const value = Buffer.isBuffer(operation.value)
+    ? operation.value.toString('utf8')
+    : String(operation.value);
+  return value.trim() || null;
+}
+
+/**
+ * Verifies a signed SEP-10 challenge and exchanges it for a JWT.
+ *
+ * Dependencies are injectable so tests can supply a fake SDK/Horizon/JWT
+ * signer. Production uses the real helpers lazily.
+ */
+async function verifySep10Challenge(body, redisClient, env = process.env, deps = {}) {
+  const config = getSep10Config(env);
+  if (!config.enabled) {
+    throw new ApiError('NOT_FOUND', 'SEP-10 is not enabled');
+  }
+  if (
+    !redisClient ||
+    typeof redisClient.get !== 'function' ||
+    typeof redisClient.del !== 'function'
+  ) {
+    throw new ApiError('SERVICE_UNAVAILABLE', 'Redis is not configured');
+  }
+
+  const { transaction } = validateTokenBody(body);
+  const hash = challengeHash(transaction);
+  const key = `${CHALLENGE_KEY_PREFIX}${hash}`;
+
+  // The hash must have been recorded by GET /auth and not consumed already.
+  let stored;
+  try {
+    stored = await redisClient.get(key);
+  } catch (err) {
+    throw new ApiError('SERVICE_UNAVAILABLE', 'Redis is unavailable', { cause: err });
+  }
+  if (!stored || stored !== hash) {
+    throw new ApiError('INVALID_INPUT', 'Invalid or expired challenge');
+  }
+
+  const sdk = deps.sdk || loadSdk({ verify: true });
+
+  let verification;
+  try {
+    verification = sdk.WebAuth.readChallengeTx(
+      transaction,
+      config.signingKey,
+      config.networkPassphrase,
+      config.homeDomain,
+      config.webAuthDomain,
+    );
+  } catch (err) {
+    // One generic message for every structural/signature check so a caller
+    // cannot learn which validation rule failed.
+    throw new ApiError('INVALID_INPUT', 'Invalid challenge transaction', { cause: err });
+  }
+
+  const clientAccountID = verification.clientAccountID;
+  const memo = verification.memo == null ? null : String(verification.memo);
+  const clientDomain = clientDomainFromTransaction(verification.tx);
+
+  // Required at call time (not module load) so a disabled SEP-10 setup does
+  // not pull in the Horizon SDK. `deps` lets callers inject the helper.
+  const loadAccount = deps.loadAccount || require('../services/stellarService').loadAccount;
+  let account = null;
+  try {
+    account = await loadAccount(clientAccountID);
+  } catch (err) {
+    if (!isAccountNotFound(err)) {
+      throw new ApiError('SERVICE_UNAVAILABLE', 'Horizon is unavailable', { cause: err });
+    }
+  }
+
+  try {
+    if (account) {
+      const threshold = Number(account.thresholds?.med_threshold ?? 0);
+      const signers = (Array.isArray(account.signers) ? account.signers : []).map((signer) => {
+        const weight = Number(signer.weight);
+        return { key: signer.key, weight: Number.isFinite(weight) ? weight : 0 };
+      });
+
+      sdk.WebAuth.verifyChallengeTxThreshold(
+        transaction,
+        config.signingKey,
+        config.networkPassphrase,
+        Number.isFinite(threshold) ? threshold : 0,
+        signers,
+        config.homeDomain,
+        config.webAuthDomain,
+      );
+    } else {
+      // An account that does not exist can only prove its own master key.
+      sdk.WebAuth.verifyChallengeTxSigners(
+        transaction,
+        config.signingKey,
+        config.networkPassphrase,
+        [clientAccountID],
+        config.homeDomain,
+        config.webAuthDomain,
+      );
+    }
+  } catch (err) {
+    throw new ApiError('UNAUTHENTICATED', 'Invalid challenge signature', { cause: err });
+  }
+
+  // Consume the challenge only after all verification rules have passed.
+  let deleted;
+  try {
+    deleted = await redisClient.del(key);
+  } catch (err) {
+    throw new ApiError('SERVICE_UNAVAILABLE', 'Redis is unavailable', { cause: err });
+  }
+  if (!deleted) {
+    throw new ApiError('INVALID_INPUT', 'Invalid or expired challenge');
+  }
+
+  const signJwt = deps.signToken || require('../utils/jwt').signToken;
+  const claims = {
+    iss: config.webAuthEndpoint,
+    sub: clientAccountID.startsWith('M') || !memo
+      ? clientAccountID
+      : `${clientAccountID}:${memo}`,
+    jti: hash,
+    home_domain: config.homeDomain,
+    ...(clientDomain ? { client_domain: clientDomain } : {}),
+  };
+
+  let token;
+  try {
+    token = signJwt(claims, { expiresIn: config.jwtExpiry });
+  } catch (err) {
+    throw new ApiError('SERVICE_UNAVAILABLE', 'JWT signing is unavailable', { cause: err });
+  }
+
+  return { token };
+}
+
 module.exports = {
   createSep10Challenge,
+  verifySep10Challenge,
   challengeHash,
   CHALLENGE_KEY_PREFIX,
 };
