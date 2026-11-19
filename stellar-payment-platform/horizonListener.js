@@ -15,6 +15,7 @@ const {
 } = require('./src/services/stellarService');
 const { publishPaymentUpdate } = require('./src/sse');
 const { createPaymentWithOutbox } = require('./src/services/settlementOutbox');
+const { matchPayment } = require('./src/services/paymentRequestMatcher');
 
 
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
@@ -118,6 +119,9 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
+          matchPayment(prisma, payment).catch((err) =>
+            logger.error({ err }, '[listener] Payment request matcher failed'),
+          );
           createPaymentWithOutbox(prisma, {
             transactionHash: payment.transaction_hash,
             fromAddress: payment.from,
