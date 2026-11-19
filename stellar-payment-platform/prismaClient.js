@@ -92,6 +92,15 @@ try {
       findUnique: async () => null,
       count: async () => 0,
     },
+    paymentRequest: {
+      create: async (args) => args.data || {},
+      findUnique: async () => null,
+      findFirst: async () => null,
+      findMany: async () => [],
+      update: async () => ({}),
+      updateMany: async () => ({ count: 0 }),
+      count: async () => 0,
+    },
     $transaction: async (arg) => {
       if (typeof arg === 'function') {
         return arg(prisma);
