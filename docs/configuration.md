@@ -42,7 +42,22 @@ SIGNING_KEY="G..."
 WEB_AUTH_ENDPOINT="https://example.com/auth"
 ```
 
-`SIGNING_KEY` is public; the matching secret never leaves the server configuration. SEP-10 allows the auth server to live on a different domain from the home domain, which is why `SEP10_WEB_AUTH_DOMAIN` is independent of `SEP10_HOME_DOMAIN`. This change only covers configuration and discovery; the `/auth` challenge/token endpoints are separate work.
+`SIGNING_KEY` is public; the matching secret never leaves the server configuration. SEP-10 allows the auth server to live on a different domain from the home domain, which is why `SEP10_WEB_AUTH_DOMAIN` is independent of `SEP10_HOME_DOMAIN`.
+
+### SEP-10 challenge endpoint
+
+With SEP-10 enabled, `GET /auth` issues a challenge transaction for a wallet:
+
+```text
+GET /auth?account=G...&memo=123&home_domain=example.com&client_domain=wallet.example.com
+```
+
+- `account` is required and may be a `G...` or muxed `M...` address.
+- `memo` is optional, accepts only a uint64 ID value, and is rejected for muxed accounts.
+- `home_domain` is optional; when supplied it must equal `SEP10_HOME_DOMAIN`.
+- `client_domain` is accepted and ignored for now; client-domain verification is separate work.
+
+Success returns `{ "transaction": "<base64 XDR>", "network_passphrase": "..." }`. The challenge hash is stored in Redis with a TTL equal to `SEP10_CHALLENGE_TIMEOUT_SECONDS` so it can be consumed only once by the token endpoint. When SEP-10 is disabled the endpoint returns `404`; if Redis is unavailable it returns `503`. Validation errors use the SEP-10 `{ "error": "..." }` response shape.
 
 ## Logging
 
