@@ -183,6 +183,22 @@ const adminBlockBodySchema = z
   })
   .loose();
 
+const paymentRequestBodySchema = z
+  .object({
+    tag: z.string({ error: 'tag is required' }).trim().min(1, 'tag is required').max(256),
+    amount: z.union([z.string(), z.number()])
+      .transform((value) => String(value))
+      .pipe(z.string().trim().min(1)),
+    asset: z.string().trim().min(1).max(32).optional().default('XLM'),
+    memoType: z.enum(['text', 'id', 'hash']).optional(),
+    memo_type: z.enum(['text', 'id', 'hash']).optional(),
+    memo: z.string().trim().max(28).optional(),
+    description: z.string().trim().max(140).optional(),
+    expiresAt: z.string().trim().min(1).optional(),
+    expires_at: z.string().trim().min(1).optional(),
+  })
+  .loose();
+
 /**
  * GET /admin/export query.
  *
@@ -360,6 +376,7 @@ module.exports = {
   verifyEmailConfirmBodySchema,
   adminBlockBodySchema,
   exportQuerySchema,
+  paymentRequestBodySchema,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
   adminDlqQuerySchema,

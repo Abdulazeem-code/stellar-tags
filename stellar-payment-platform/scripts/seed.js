@@ -47,6 +47,8 @@ const USER_COUNT = 50;
 const WEBHOOK_COUNT = 10;
 const PAYMENT_INTENT_COUNT = 20;
 const API_KEY_COUNT = 2;
+const PAYMENT_REQUEST_COUNT = 8;
+const PAYMENT_REQUEST_STATUSES = ['pending', 'paid', 'expired', 'cancelled'];
 
 // The first ALIAS_ADDRESS_COUNT addresses carry ALIASES_PER_ADDRESS usernames
 // each so reverse (type=id) federation lookups and the isPrimary tiebreak have
@@ -231,6 +233,30 @@ const buildPaymentIntents = (users) => {
   });
 };
 
+const buildPaymentRequests = (users) => {
+  return Array.from({ length: PAYMENT_REQUEST_COUNT }, (_, index) => {
+    const status = PAYMENT_REQUEST_STATUSES[index % PAYMENT_REQUEST_STATUSES.length];
+    const user = users[index % users.length];
+    const createdAt = anchoredDate(`payment-request:${index}`, 30);
+    const expiresAt = new Date(createdAt.getTime() + (status === 'expired' ? -DAY_MS : 2 * DAY_MS));
+    return {
+      id: stableId(`payment-request:${index}`),
+      tag: user.username,
+      destination: user.address,
+      amount: amountFor(index),
+      asset: index % 3 === 0 ? 'XLM' : 'USDC',
+      memoType: 'text',
+      memo: `seed-pr-${String(index).padStart(3, '0')}`,
+      description: `Seed payment request ${index + 1}`,
+      status,
+      expiresAt,
+      paidAt: status === 'paid' ? new Date(createdAt.getTime() + 2 * 60 * 60 * 1000) : null,
+      transactionHash: status === 'paid' ? digest(`payment-request-tx:${index}`).toString('hex') : null,
+      createdAt,
+    };
+  });
+};
+
 // ---------------------------------------------------------------------------
 // API keys
 // ---------------------------------------------------------------------------
@@ -293,12 +319,15 @@ const assertSeedable = (env = process.env) => {
   }
 };
 
-const resetSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys }) => {
+const resetSeedData = async (prisma, { users, webhooks, paymentIntents, paymentRequests = [], apiKeys }) => {
   // Webhooks cascade from their user, but the seed deletes them explicitly so a
   // reset stays correct if an owner has since been removed by hand.
   await prisma.webhook.deleteMany({ where: { id: { in: webhooks.map((w) => w.id) } } });
   await prisma.paymentIntent.deleteMany({
     where: { id: { in: paymentIntents.map((p) => p.id) } },
+  });
+  await prisma.paymentRequest.deleteMany({
+    where: { id: { in: paymentRequests.map((p) => p.id) } },
   });
   await prisma.apiKey.deleteMany({ where: { id: { in: apiKeys.map((k) => k.record.id) } } });
   await prisma.user.deleteMany({
@@ -306,7 +335,7 @@ const resetSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys 
   });
 };
 
-const writeSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys }) => {
+const writeSeedData = async (prisma, { users, webhooks, paymentIntents, paymentRequests = [], apiKeys }) => {
   for (const user of users) {
     const { username, ...rest } = user;
     await prisma.user.upsert({
@@ -328,6 +357,15 @@ const writeSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys 
   for (const intent of paymentIntents) {
     const { id, ...rest } = intent;
     await prisma.paymentIntent.upsert({ where: { id }, create: { id, ...rest }, update: rest });
+  }
+
+  for (const request of paymentRequests) {
+    const { id, ...rest } = request;
+    await prisma.paymentRequest.upsert({
+      where: { id },
+      create: { id, ...rest },
+      update: rest,
+    });
   }
 
   for (const { record } of apiKeys) {
@@ -353,6 +391,7 @@ const seedDatabase = async ({ reset = false } = {}) => {
     users,
     webhooks: buildWebhooks(users),
     paymentIntents: buildPaymentIntents(users),
+    paymentRequests: buildPaymentRequests(users),
     apiKeys: buildApiKeys(),
   };
 
@@ -366,7 +405,8 @@ const seedDatabase = async ({ reset = false } = {}) => {
 
     logger.info(
       `Seeded ${data.users.length} users, ${data.webhooks.length} webhooks, ` +
-        `${data.paymentIntents.length} payment intents, ${data.apiKeys.length} API keys.`,
+        `${data.paymentIntents.length} payment intents, ${data.paymentRequests.length} payment requests, ` +
+        `${data.apiKeys.length} API keys.`,
     );
     for (const { rawKey, record } of data.apiKeys) {
       const state = record.revokedAt ? 'revoked' : 'active';
@@ -388,6 +428,7 @@ module.exports = {
   buildUsers,
   buildWebhooks,
   buildPaymentIntents,
+  buildPaymentRequests,
   buildApiKeys,
   resetSeedData,
   writeSeedData,
@@ -398,6 +439,8 @@ module.exports = {
   WEBHOOK_COUNT,
   PAYMENT_INTENT_COUNT,
   API_KEY_COUNT,
+  PAYMENT_REQUEST_COUNT,
   PAYMENT_STATUSES,
+  PAYMENT_REQUEST_STATUSES,
   MAX_RETRY_BACKLOG_DAYS,
 };
