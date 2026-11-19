@@ -57,7 +57,11 @@ GET /auth?account=G...&memo=123&home_domain=example.com&client_domain=wallet.exa
 - `home_domain` is optional; when supplied it must equal `SEP10_HOME_DOMAIN`.
 - `client_domain` is accepted and ignored for now; client-domain verification is separate work.
 
-Success returns `{ "transaction": "<base64 XDR>", "network_passphrase": "..." }`. The challenge hash is stored in Redis with a TTL equal to `SEP10_CHALLENGE_TIMEOUT_SECONDS` so it can be consumed only once by the token endpoint. When SEP-10 is disabled the endpoint returns `404`; if Redis is unavailable it returns `503`. Validation errors use the SEP-10 `{ "error": "..." }` response shape.
+Success returns `{ "transaction": "<base64 XDR>", "network_passphrase": "..." }`. The challenge hash is stored in Redis with a TTL equal to `SEP10_CHALLENGE_TIMEOUT_SECONDS` so it can be consumed only once.
+
+`POST /auth` exchanges the signed challenge for a JWT. Both `application/json` (`{ "transaction": "..." }`) and `application/x-www-form-urlencoded` (`transaction=...`) bodies are accepted. The server verifies the challenge with the SDK, checks the client account's medium threshold on Horizon (or the master key when the account does not exist), consumes the stored hash, and returns `{ "token": "<jwt>" }`. The JWT includes `iss`, `sub`, `iat`, `exp`, `jti`, `home_domain` and, when present, `client_domain`; it is signed with the same RS256 key published at `/.well-known/jwks.json`.
+
+When SEP-10 is disabled the endpoint returns `404`; if Redis or Horizon is unavailable it returns `503`. Validation errors use the SEP-10 `{ "error": "..." }` response shape.
 
 ## Logging
 

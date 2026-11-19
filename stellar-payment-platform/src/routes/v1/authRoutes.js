@@ -7,7 +7,7 @@ const { requireJson } = require('../../middleware/requireJson');
 const { verifyEmailBodySchema, verifyEmailConfirmBodySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { signToken } = require('../../utils/jwt');
-const { createSep10Challenge } = require('../../services/sep10');
+const { createSep10Challenge, verifySep10Challenge } = require('../../services/sep10');
 
 const REFRESH_COOKIE = 'stellar_refresh_token';
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -50,6 +50,12 @@ module.exports = (redisClient) => {
     if (!redisClient) {
       return next(new ApiError('SERVICE_UNAVAILABLE', 'Redis is not configured'));
     }
+    return next();
+  };
+
+  // SEP-10 requires wildcard CORS on both endpoints, including error responses.
+  const setSep10Cors = (_req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
     return next();
   };
 
@@ -112,10 +118,66 @@ module.exports = (redisClient) => {
    */
   router.get(
     '/',
+    setSep10Cors,
     asyncHandler(async (req, res) => {
       try {
         const challenge = await createSep10Challenge(req.query, redisClient);
         return res.json(challenge);
+      } catch (err) {
+        return sendSep10Error(req, res, err);
+      }
+    }),
+  );
+
+  // SEP-10 browsers may preflight the root auth endpoint from any origin.
+  router.options('/', setSep10Cors, (req, res) => {
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    return res.status(204).end();
+  });
+
+  /**
+   * @openapi
+   * /auth:
+   *   post:
+   *     tags:
+   *       - sep-10
+   *     description: Exchange a signed SEP-10 challenge for a JWT
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required: [transaction]
+   *             properties:
+   *               transaction:
+   *                 type: string
+   *         application/x-www-form-urlencoded:
+   *           schema:
+   *             type: object
+   *             required: [transaction]
+   *             properties:
+   *               transaction:
+   *                 type: string
+   *     responses:
+   *       200:
+   *         description: Session JWT
+   *       400:
+   *         description: Invalid challenge
+   *       401:
+   *         description: Invalid signature or threshold
+   *       503:
+   *         description: Horizon or Redis unavailable
+   */
+  router.post(
+    '/',
+    setSep10Cors,
+    express.urlencoded({ extended: false, limit: 1024 }),
+    asyncHandler(async (req, res) => {
+      try {
+        const result = await verifySep10Challenge(req.body, redisClient);
+        return res.json(result);
       } catch (err) {
         return sendSep10Error(req, res, err);
       }

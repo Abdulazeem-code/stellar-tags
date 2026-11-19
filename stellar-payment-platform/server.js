@@ -166,6 +166,16 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+// SEP-10 requires wildcard CORS on the root auth endpoint. This must run before
+// the global CORS policy so browser wallets from any origin can preflight it;
+// /auth sub-paths (email OTP, API keys) keep the existing policy.
+app.options("/auth", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  return res.status(204).end();
+});
+
 app.use(cors(corsOptions));
 
 // Apply metrics middleware to track all HTTP requests
