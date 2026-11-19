@@ -7,6 +7,7 @@ const { requireJson } = require('../../middleware/requireJson');
 const { verifyEmailBodySchema, verifyEmailConfirmBodySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { signToken } = require('../../utils/jwt');
+const { createSep10Challenge } = require('../../services/sep10');
 
 const REFRESH_COOKIE = 'stellar_refresh_token';
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -51,6 +52,75 @@ module.exports = (redisClient) => {
     }
     return next();
   };
+
+  // SEP-10 errors use the spec's flat `{ "error": "..." }` body rather than the
+  // platform envelope. Only expected ApiErrors are surfaced verbatim; anything
+  // unexpected is logged without request/transaction details and generalized.
+  const sendSep10Error = (req, res, err) => {
+    if (err instanceof ApiError) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+
+    logger.error(
+      {
+        err: { name: err && err.name, message: err && err.message },
+        correlationId: req.correlationId,
+      },
+      'SEP-10 challenge failed',
+    );
+    return res.status(500).json({ error: 'Internal server error' });
+  };
+
+  /**
+   * @openapi
+   * /auth:
+   *   get:
+   *     tags:
+   *       - sep-10
+   *     description: Issue a SEP-10 challenge transaction
+   *     parameters:
+   *       - in: query
+   *         name: account
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: Client G... or M... account.
+   *       - in: query
+   *         name: memo
+   *         schema:
+   *           type: string
+   *         description: Optional uint64 ID memo, not allowed with muxed accounts.
+   *       - in: query
+   *         name: home_domain
+   *         schema:
+   *           type: string
+   *         description: Optional; must match the configured home domain.
+   *       - in: query
+   *         name: client_domain
+   *         schema:
+   *           type: string
+   *         description: Accepted and ignored pending client-domain support.
+   *     responses:
+   *       200:
+   *         description: Challenge transaction and network passphrase
+   *       400:
+   *         description: Invalid challenge request
+   *       404:
+   *         description: SEP-10 is disabled
+   *       503:
+   *         description: Redis unavailable
+   */
+  router.get(
+    '/',
+    asyncHandler(async (req, res) => {
+      try {
+        const challenge = await createSep10Challenge(req.query, redisClient);
+        return res.json(challenge);
+      } catch (err) {
+        return sendSep10Error(req, res, err);
+      }
+    }),
+  );
 
   // POST /auth/verify-email
   // Body: { email }
