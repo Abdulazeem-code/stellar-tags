@@ -24,6 +24,8 @@ const dotenv = require("dotenv");
 const timeout = require("connect-timeout");
 const compression = require("compression");
 const { logger, httpLogger } = require("./src/logger");
+const { getSep10Config } = require("./src/config/sep10");
+const { buildStellarToml } = require("./src/utils/stellarToml");
 const {
   metricsMiddleware,
   getMetrics,
@@ -55,6 +57,14 @@ const { createHttpServer, describeTlsStatus } = require("./src/config/tls");
 const { requireMutualTls, serviceIdentity } = require("./src/middleware/mtls");
 
 dotenv.config();
+
+// SEP-10 is opt-in. Validate the signing key here so a bad secret aborts the
+// boot rather than publishing a broken SIGNING_KEY. The disabled state is
+// announced once, without ever logging the secret itself.
+const sep10Config = getSep10Config();
+if (!sep10Config.enabled) {
+  logger.info("SEP-10 disabled: SEP10_SIGNING_SECRET is not set.");
+}
 
 // #295 ΓÇö Only report to Sentry when a DSN is configured, so local/dev/test
 // runs without SENTRY_DSN never try to reach out to Sentry.
@@ -426,7 +436,11 @@ app.get("/.well-known/stellar.toml", (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader("Content-Type", "text/plain");
   res.send(
-    `FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`,
+    buildStellarToml({
+      federationServerUrl: process.env.FEDERATION_SERVER_URL,
+      domain: process.env.STELLAR_TAG_DOMAIN,
+      sep10: sep10Config,
+    }),
   );
 });
 
