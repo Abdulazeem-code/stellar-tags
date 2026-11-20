@@ -7,6 +7,7 @@ const { requireJson } = require('../../middleware/requireJson');
 const { verifyEmailBodySchema, verifyEmailConfirmBodySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { signToken } = require('../../utils/jwt');
+const { createSep10Challenge, verifySep10Challenge } = require('../../services/sep10');
 
 const REFRESH_COOKIE = 'stellar_refresh_token';
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -51,6 +52,137 @@ module.exports = (redisClient) => {
     }
     return next();
   };
+
+  // SEP-10 requires wildcard CORS on both endpoints, including error responses.
+  const setSep10Cors = (_req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return next();
+  };
+
+  // SEP-10 errors use the spec's flat `{ "error": "..." }` body rather than the
+  // platform envelope. Only expected ApiErrors are surfaced verbatim; anything
+  // unexpected is logged without request/transaction details and generalized.
+  const sendSep10Error = (req, res, err) => {
+    if (err instanceof ApiError) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+
+    logger.error(
+      {
+        err: { name: err && err.name, message: err && err.message },
+        correlationId: req.correlationId,
+      },
+      'SEP-10 challenge failed',
+    );
+    return res.status(500).json({ error: 'Internal server error' });
+  };
+
+  /**
+   * @openapi
+   * /auth:
+   *   get:
+   *     tags:
+   *       - sep-10
+   *     description: Issue a SEP-10 challenge transaction
+   *     parameters:
+   *       - in: query
+   *         name: account
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: Client G... or M... account.
+   *       - in: query
+   *         name: memo
+   *         schema:
+   *           type: string
+   *         description: Optional uint64 ID memo, not allowed with muxed accounts.
+   *       - in: query
+   *         name: home_domain
+   *         schema:
+   *           type: string
+   *         description: Optional; must match the configured home domain.
+   *       - in: query
+   *         name: client_domain
+   *         schema:
+   *           type: string
+   *         description: Accepted and ignored pending client-domain support.
+   *     responses:
+   *       200:
+   *         description: Challenge transaction and network passphrase
+   *       400:
+   *         description: Invalid challenge request
+   *       404:
+   *         description: SEP-10 is disabled
+   *       503:
+   *         description: Redis unavailable
+   */
+  router.get(
+    '/',
+    setSep10Cors,
+    asyncHandler(async (req, res) => {
+      try {
+        const challenge = await createSep10Challenge(req.query, redisClient);
+        return res.json(challenge);
+      } catch (err) {
+        return sendSep10Error(req, res, err);
+      }
+    }),
+  );
+
+  // SEP-10 browsers may preflight the root auth endpoint from any origin.
+  router.options('/', setSep10Cors, (req, res) => {
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    return res.status(204).end();
+  });
+
+  /**
+   * @openapi
+   * /auth:
+   *   post:
+   *     tags:
+   *       - sep-10
+   *     description: Exchange a signed SEP-10 challenge for a JWT
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required: [transaction]
+   *             properties:
+   *               transaction:
+   *                 type: string
+   *         application/x-www-form-urlencoded:
+   *           schema:
+   *             type: object
+   *             required: [transaction]
+   *             properties:
+   *               transaction:
+   *                 type: string
+   *     responses:
+   *       200:
+   *         description: Session JWT
+   *       400:
+   *         description: Invalid challenge
+   *       401:
+   *         description: Invalid signature or threshold
+   *       503:
+   *         description: Horizon or Redis unavailable
+   */
+  router.post(
+    '/',
+    setSep10Cors,
+    express.urlencoded({ extended: false, limit: 1024 }),
+    asyncHandler(async (req, res) => {
+      try {
+        const result = await verifySep10Challenge(req.body, redisClient);
+        return res.json(result);
+      } catch (err) {
+        return sendSep10Error(req, res, err);
+      }
+    }),
+  );
 
   // POST /auth/verify-email
   // Body: { email }
