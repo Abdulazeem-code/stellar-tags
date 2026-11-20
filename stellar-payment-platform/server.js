@@ -13,6 +13,8 @@ const dotenv = require('dotenv');
 const timeout = require('connect-timeout');
 const compression = require('compression');
 const v1Router = require('./src/routes/v1');
+const swaggerUi = require('swagger-ui-express');
+const swaggerSpec = require('./src/swagger');
 const {verifyMultiSignerThreshold,} = require('./src/multisigner-verifier');
 const { poolGet, poolRun, poolAll } = require('./src/db');
 const xss = require('xss');
@@ -107,6 +109,13 @@ app.use(rejectNestedObjects);
 
 // Enable HTTP response compression for responses exceeding 1KB (1024 bytes)
 app.use(compression({ threshold: 1024 }));
+
+// API documentation — available at /api-docs
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+app.get('/api-docs.json', (_req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.send(swaggerSpec);
+});
 
 scheduleCleanupJob(prisma);
 
@@ -227,6 +236,66 @@ const registerLocalUser = async ({ username, address }) => {
   );
 };
 
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     summary: Resolve a Stellar federation address or account ID
+ *     description: >
+ *       Implements the Stellar federation protocol. Use `type=name` (default) to
+ *       resolve a human-readable address such as `alice*localhost` to an account
+ *       ID, or `type=id` to reverse-lookup a public key to its federation address.
+ *     tags:
+ *       - Federation
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: >
+ *           The query value. For `type=name` this is a federation address
+ *           (`alice*localhost` or just `alice`); for `type=id` this is a
+ *           Stellar public key (G…).
+ *         example: alice*localhost
+ *       - in: query
+ *         name: type
+ *         required: false
+ *         schema:
+ *           type: string
+ *           enum: [name, id]
+ *           default: name
+ *         description: >
+ *           Resolution direction. Omit or set to `name` to look up by
+ *           federation address; set to `id` to look up by public key.
+ *     responses:
+ *       200:
+ *         description: Resolved federation record.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/FederationResponse'
+ *       304:
+ *         description: Not modified (ETag matched).
+ *       400:
+ *         description: Missing or invalid query parameters.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       404:
+ *         description: Address or name tag not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       500:
+ *         description: Database lookup failed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ */
 app.get('/federation', etagCache, async (req, res, next) => {
   const { q, type } = req.query;
   const queryValue = typeof q === 'string' ? q.trim() : '';
@@ -394,6 +463,73 @@ const verifyFreighterRegistrationSignature = ({
  * - Fetches account signers and thresholds from Horizon
  * - Validates that provided signature(s) meet minimum threshold
  * - Ensures authorization requirements are satisfied
+ */
+/**
+ * @openapi
+ * /register:
+ *   post:
+ *     summary: Register a new Stellar name tag
+ *     description: >
+ *       Associates a human-readable username with a Stellar public key. Supports
+ *       optional memo fields and signature verification for both single-signer
+ *       (Freighter SEP-0053) and multi-signer accounts.
+ *     tags:
+ *       - Registration
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/RegisterRequest'
+ *     responses:
+ *       201:
+ *         description: Name tag registered successfully.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/RegisterResponse'
+ *       400:
+ *         description: Validation error (missing fields, invalid key format, bad memo, etc.).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       401:
+ *         description: Signature verification failed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       403:
+ *         description: Username is reserved.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       404:
+ *         description: Account not found on Horizon (multi-sig verification).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       409:
+ *         description: Username or address is already registered.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       415:
+ *         description: Unsupported Media Type — request must be application/json.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       500:
+ *         description: Internal server error.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
  */
 app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next) => {
   if (!req.is('application/json')) {
@@ -575,6 +711,79 @@ app.post('/register', idempotencyMiddleware(redisClient), async (req, res, next)
 
 app.all('/register', (req, res) => res.status(405).json({ error: "Method Not Allowed" }));
 
+/**
+ * @openapi
+ * /lookup:
+ *   get:
+ *     summary: Look up a username by address or search for users
+ *     description: >
+ *       Provide `address` for an exact reverse-lookup (public key → username), or
+ *       `search` for a paginated, case-insensitive search across usernames and
+ *       addresses. Exactly one of the two parameters is required.
+ *     tags:
+ *       - Lookup
+ *     parameters:
+ *       - in: query
+ *         name: address
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Exact Stellar public key to look up.
+ *         example: GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ
+ *       - in: query
+ *         name: search
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Partial username or address for paginated search.
+ *         example: alice
+ *       - in: query
+ *         name: page
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           default: 1
+ *         description: Page number (applies only to `search` queries).
+ *       - in: query
+ *         name: limit
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 10
+ *         description: Results per page (applies only to `search` queries).
+ *     responses:
+ *       200:
+ *         description: >
+ *           For `address` queries: a single user object.
+ *           For `search` queries: a paginated list of matching users.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               oneOf:
+ *                 - $ref: '#/components/schemas/LookupUser'
+ *                 - $ref: '#/components/schemas/LookupListResponse'
+ *       400:
+ *         description: Neither `address` nor `search` was provided.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       404:
+ *         description: No user found for the given address.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       500:
+ *         description: Database lookup failed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ */
 app.get('/lookup', async (req, res, next) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
   const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
@@ -737,7 +946,7 @@ app.use((err, _req, _res, next) => {
 
 // Global error handling middleware
 // eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   const statusCode = err.statusCode || 500;
   const errorMessage = err.message || 'Internal server error';
 
