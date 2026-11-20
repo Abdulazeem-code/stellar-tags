@@ -198,6 +198,32 @@ model PaymentIntent {
   @@map("payment_intents")
 }
 
+// #1044/#1046 — A shareable "please pay me" request. Unlike PaymentIntent
+// (bulk routing), this records who asked for what, whether the linked payment
+// arrived, and when the request stops being payable. `memo` is generated at
+// creation when the caller does not supply one so the Horizon listener can
+// match an on-chain payment back to the request (#1045); the SSE stream
+// (#1046) reads `status`/`transactionHash` to snapshot and broadcast changes.
+model PaymentRequest {
+  id              String    @id @default(uuid())
+  tag             String
+  destination     String
+  amount          String
+  asset           String    @default("XLM")
+  memoType        String?   @map("memo_type")
+  memo            String    @unique
+  description     String?
+  status          String    @default("pending")
+  expiresAt       DateTime  @map("expires_at")
+  paidAt          DateTime? @map("paid_at")
+  transactionHash String?   @map("transaction_hash")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  @@index([destination, status])
+  @@index([status, expiresAt])
+  @@map("payment_requests")
+}
+
 // AuditLog model for tracking all mutating admin actions and security events.
 model AuditLog {
   id         String   @id @default(uuid())
