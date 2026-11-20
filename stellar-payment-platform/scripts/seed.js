@@ -3,6 +3,7 @@ const { StrKey } = require('@stellar/stellar-sdk');
 require('dotenv').config();
 
 const { prisma } = require('../prismaClient');
+const { logger } = require('../src/logger');
 
 const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 const SEED_COUNT = 50;
@@ -36,8 +37,8 @@ const normalizeNameTag = (value) => {
 
 const seedDatabase = async () => {
   try {
-    console.log('Starting database seeding...');
-    console.log(`Generating ${SEED_COUNT} mock entries...`);
+    logger.info('Starting database seeding...');
+    logger.info(`Generating ${SEED_COUNT} mock entries...`);
 
     let inserted = 0;
     let skipped = 0;
@@ -52,27 +53,27 @@ const seedDatabase = async () => {
           data: { username, address, createdAt },
         });
         inserted++;
-        console.log(`✓ Inserted: ${username} -> ${address}`);
+        logger.info(`✓ Inserted: ${username} -> ${address}`);
       } catch (error) {
         // P2002 — unique constraint violation (duplicate username or address)
         if (error.code === 'P2002') {
           skipped++;
-          console.log(`⊘ Skipped (duplicate): ${username}`);
+          logger.info(`⊘ Skipped (duplicate): ${username}`);
         } else {
-          console.error(`✗ Error inserting ${username}:`, error.message);
+          logger.error(`✗ Error inserting ${username}:`, error.message);
         }
       }
     }
 
-    console.log('\n=== Seeding Complete ===');
-    console.log(`Total entries generated: ${SEED_COUNT}`);
-    console.log(`Successfully inserted: ${inserted}`);
-    console.log(`Skipped (duplicates): ${skipped}`);
+    logger.info('\n=== Seeding Complete ===');
+    logger.info(`Total entries generated: ${SEED_COUNT}`);
+    logger.info(`Successfully inserted: ${inserted}`);
+    logger.info(`Skipped (duplicates): ${skipped}`);
 
     const count = await prisma.user.count();
-    console.log(`Total entries in database: ${count}`);
+    logger.info(`Total entries in database: ${count}`);
   } catch (error) {
-    console.error('Fatal error during seeding:', error);
+    logger.error('Fatal error during seeding:', error);
     process.exitCode = 1;
   } finally {
     await prisma.$disconnect();

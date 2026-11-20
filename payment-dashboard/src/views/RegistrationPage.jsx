@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { API_BASE, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
+import { API_BASE, apiErrorMessage, normalizeNameTag, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -181,7 +181,7 @@ function RegistrationPage({
           const data = await response.json().catch(() => null);
           if (!response.ok) {
             throw new Error(
-              (data && (data.error || data.detail || data.message)) || "Registration failed.",
+              apiErrorMessage(data, "Registration failed."),
             );
           }
           return data;

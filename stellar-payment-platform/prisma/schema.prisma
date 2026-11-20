@@ -10,7 +10,8 @@ datasource db {
 }
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["metrics"]
 }
 
 // Federation registry mapping a human-readable username (e.g. "lekan*localhost")
@@ -23,7 +24,28 @@ model User {
   memo      String?
   createdAt DateTime  @default(now()) @map("created_at")
   flaggedAt DateTime? @map("flagged_at")
+  deletedAt DateTime? @map("deleted_at")
+  webhooks  Webhook[] // <-- add this line
 
-  @@map("username_registry")
   @@index([username])
+  @@map("username_registry")
+}
+
+// Webhook registrations: merchants/users register a URL that receives POST
+// notifications whenever a payment is successfully routed to one of their
+// registered Stellar addresses.
+model Webhook {
+  id           String    @id @default(uuid())
+  username     String
+  user         User      @relation(fields: [username], references: [username], onDelete: Cascade)
+  url          String
+  secret       String // HMAC-SHA256 signing secret for payload verification
+  createdAt    DateTime  @default(now()) @map("created_at")
+  lastSentAt   DateTime? @map("last_sent_at")
+  failingSince DateTime? @map("failing_since")
+
+  @@unique([username, url])
+  @@index([username])
+  @@index([lastSentAt])
+  @@map("webhooks")
 }

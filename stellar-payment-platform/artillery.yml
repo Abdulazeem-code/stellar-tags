@@ -1,0 +1,16 @@
+config:
+  target: "{{ $processEnvironment.TARGET_URL || 'http://localhost:5000' }}"
+  phases:
+    - duration: 60
+      arrivalCount: 50
+      name: "Load test read-only endpoints over 60 seconds"
+
+scenarios:
+  - name: "Read-only endpoints scenario"
+    flow:
+      - get:
+          url: "/health"
+      - get:
+          url: "/lookup?search=test"
+      - get:
+          url: "/users"

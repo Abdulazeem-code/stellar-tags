@@ -1,3 +1,5 @@
+'use strict';
+
 const swaggerJsdoc = require('swagger-jsdoc');
 
 const options = {
@@ -7,12 +9,44 @@ const options = {
       title: 'Stellar Tags API',
       version: '1.0.0',
       description:
-        'Federation, registration, and lookup API for Stellar name tags (stellar-tags).',
+        'REST API for the Stellar Tags payment platform. Provides username registration and federation lookups that map human-readable tags to Stellar addresses.',
+      contact: {
+        name: 'Stellar Tags',
+        url: 'https://stellar-tags.vercel.app',
+      },
     },
     servers: [
       {
-        url: process.env.API_BASE_URL || 'http://localhost:5000',
-        description: 'Active server',
+        url: 'http://localhost:{port}',
+        description: 'Local development server',
+        variables: {
+          port: {
+            default: '5000',
+            description: 'Port the server listens on (defaults to 5000)',
+          },
+        },
+      },
+      {
+        url: 'https://stellar-tags-production.up.railway.app',
+        description: 'Production server',
+      },
+    ],
+    tags: [
+      {
+        name: 'Federation',
+        description: 'Stellar federation protocol — resolve username tags to Stellar addresses',
+      },
+      {
+        name: 'Registration',
+        description: 'Register new username–address mappings',
+      },
+      {
+        name: 'Lookup',
+        description: 'Reverse-lookup and search users by address or keyword',
+      },
+      {
+        name: 'Health',
+        description: 'Server liveness check',
       },
     ],
     components: {
@@ -23,24 +57,22 @@ const options = {
           properties: {
             stellar_address: {
               type: 'string',
-              description: 'Human-readable Stellar federation address (e.g. alice*localhost).',
-              example: 'alice*localhost',
+              example: 'alice*stellar-tags-production.up.railway.app',
+              description: 'Fully-qualified Stellar federation address (username*domain)',
             },
             account_id: {
               type: 'string',
-              description: 'Stellar public key (G…).',
               example: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+              description: 'Stellar public key (G…) associated with this tag',
             },
             memo_type: {
               type: 'string',
               enum: ['text', 'id', 'hash'],
-              description: 'Optional memo type attached to this address.',
-              example: 'text',
+              description: 'Type of Stellar memo attached to this account (omitted when absent)',
             },
             memo: {
               type: 'string',
-              description: 'Optional memo value paired with memo_type.',
-              example: 'payment-ref',
+              description: 'Memo value matching memo_type (omitted when absent)',
             },
           },
         },
@@ -50,36 +82,34 @@ const options = {
           properties: {
             username: {
               type: 'string',
-              description: 'Desired name tag (minimum 3 characters, profanity-free).',
+              minLength: 3,
               example: 'alice',
+              description:
+                'Desired username. Must be ≥ 3 characters. A domain suffix (*domain) is appended automatically if omitted.',
             },
             address: {
               type: 'string',
-              description: 'Stellar public key to associate with this username.',
               example: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
-            },
-            memo_type: {
-              type: 'string',
-              enum: ['text', 'id', 'hash'],
-              description: 'Optional memo type (required when memo is provided).',
-              example: 'text',
-            },
-            memo: {
-              type: 'string',
-              description: 'Optional memo value (required when memo_type is provided).',
-              example: 'payment-ref',
+              description: 'Stellar public key (must start with G)',
             },
             signature: {
               type: 'string',
               description:
-                'Base64-encoded SEP-0053 signature or signer public key (for multi-sig flows).',
-              example: 'base64EncodedSignatureString==',
+                'Optional. Base64-encoded SEP-0053 signature or raw ed25519 public key for multi-signer verification.',
             },
             signerAddress: {
               type: 'string',
               description:
-                'Public key of the signer when it differs from the account address (Freighter flow).',
-              example: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+                'Optional. Stellar public key of the signer when using Freighter signature flow.',
+            },
+            memo_type: {
+              type: 'string',
+              enum: ['text', 'id', 'hash'],
+              description: 'Optional. Stellar memo type to associate with this registration.',
+            },
+            memo: {
+              type: 'string',
+              description: 'Optional. Memo value (required when memo_type is provided).',
             },
           },
         },
@@ -87,8 +117,14 @@ const options = {
           type: 'object',
           required: ['ok', 'username', 'address', 'federation_address'],
           properties: {
-            ok: { type: 'boolean', example: true },
-            username: { type: 'string', example: 'alice*localhost' },
+            ok: {
+              type: 'boolean',
+              example: true,
+            },
+            username: {
+              type: 'string',
+              example: 'alice*localhost',
+            },
             address: {
               type: 'string',
               example: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
@@ -97,11 +133,17 @@ const options = {
               type: 'string',
               example: 'alice*localhost',
             },
-            memo_type: { type: 'string', example: 'text' },
-            memo: { type: 'string', example: 'payment-ref' },
+            memo_type: {
+              type: 'string',
+              description: 'Included only when memo was supplied at registration',
+            },
+            memo: {
+              type: 'string',
+              description: 'Included only when memo was supplied at registration',
+            },
             verification: {
               type: 'object',
-              description: 'Multi-signer verification details (present when a signature was provided).',
+              description: 'Included only when a signature was provided',
               properties: {
                 accountId: { type: 'string' },
                 signerCount: { type: 'integer' },
@@ -112,50 +154,82 @@ const options = {
             },
           },
         },
-        LookupUser: {
+        LookupResponse: {
           type: 'object',
           required: ['username', 'address'],
           properties: {
-            username: { type: 'string', example: 'alice*localhost' },
+            username: {
+              type: 'string',
+              example: 'alice*localhost',
+            },
             address: {
               type: 'string',
               example: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
             },
-            created_at: {
-              type: 'string',
-              format: 'date-time',
-              example: '2024-01-15T10:30:00.000Z',
-            },
           },
         },
-        LookupListResponse: {
+        LookupPagedResponse: {
           type: 'object',
           required: ['data', 'totalCount', 'totalPages', 'currentPage'],
           properties: {
             data: {
               type: 'array',
-              items: { $ref: '#/components/schemas/LookupUser' },
+              items: {
+                type: 'object',
+                properties: {
+                  username: { type: 'string', example: 'alice*localhost' },
+                  address: {
+                    type: 'string',
+                    example: 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
+                  },
+                  created_at: {
+                    type: 'string',
+                    format: 'date-time',
+                    example: '2024-01-15T10:30:00.000Z',
+                  },
+                },
+              },
             },
             totalCount: { type: 'integer', example: 42 },
             totalPages: { type: 'integer', example: 5 },
             currentPage: { type: 'integer', example: 1 },
           },
         },
+        HealthResponse: {
+          type: 'object',
+          required: ['status'],
+          properties: {
+            status: {
+              type: 'string',
+              example: 'ok',
+            },
+          },
+        },
         ErrorResponse: {
           type: 'object',
           required: ['success', 'error'],
           properties: {
-            success: { type: 'boolean', example: false },
-            error: { type: 'string', example: 'Descriptive error message.' },
-            statusCode: { type: 'integer', example: 400 },
+            success: {
+              type: 'boolean',
+              example: false,
+            },
+            error: {
+              type: 'string',
+              example: 'Missing required parameter',
+            },
+            statusCode: {
+              type: 'integer',
+              example: 400,
+            },
           },
         },
       },
     },
   },
+  // Scan server.js for JSDoc @swagger annotations
   apis: ['./server.js'],
 };
 
 const swaggerSpec = swaggerJsdoc(options);
 
-module.exports = swaggerSpec;
+module.exports = { swaggerSpec };

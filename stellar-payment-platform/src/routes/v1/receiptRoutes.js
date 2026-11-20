@@ -2,16 +2,18 @@ const express = require('express');
 const { Horizon } = require('@stellar/stellar-sdk');
 const PDFDocument = require('pdfkit');
 
+const { ApiError } = require('../../errors');
+
 const router = express.Router();
 
 const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 const TX_HASH_RE = /^[a-fA-F0-9]{64}$/;
 
-router.get('/receipts/:txHash', async (req, res) => {
+router.get('/receipts/:txHash', async (req, res, next) => {
   const { txHash } = req.params;
 
   if (!TX_HASH_RE.test(txHash)) {
-    return res.status(400).json({ detail: 'Invalid transaction hash format' });
+    return next(new ApiError('INVALID_INPUT', 'Invalid transaction hash format'));
   }
 
   let tx;
@@ -25,9 +27,11 @@ router.get('/receipts/:txHash', async (req, res) => {
     ]);
   } catch (err) {
     if (err && err.response && err.response.status === 404) {
-      return res.status(404).json({ detail: 'Transaction not found' });
+      return next(new ApiError('NOT_FOUND', 'Transaction not found'));
     }
-    return res.status(500).json({ detail: 'Failed to fetch transaction' });
+    return next(
+      new ApiError('INTERNAL_ERROR', 'Failed to fetch transaction', { statusCode: 500, cause: err }),
+    );
   }
 
   const timestamp = tx.created_at
