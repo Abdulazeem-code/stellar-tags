@@ -3271,6 +3271,54 @@ fn test_migrate_user_record_no_op_cases() {
     assert_eq!(record.accumulated_amount, 1_000);
 }
 
+/// A partially present legacy record migrates the available value and
+/// initializes the missing counter to zero without leaving stale keys.
+#[test]
+fn test_migrate_user_record_with_one_legacy_key() {
+    let (env, client, contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let spending_only = Address::generate(&env);
+    let volume_only = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+    set_realistic_ledger_time(&env);
+
+    let legacy_window_start = env.ledger().timestamp() - 60;
+    let spending_only_key = DataKey::UserSpending(spending_only.clone());
+    let spending_only_volume_key = DataKey::UserVolume(spending_only.clone());
+    let volume_only_spending_key = DataKey::UserSpending(volume_only.clone());
+    let volume_only_key = DataKey::UserVolume(volume_only.clone());
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &spending_only_key,
+            &pack_legacy_spending_for_test(&env, legacy_window_start, 1_200),
+        );
+        env.storage().persistent().set(&volume_only_key, &7_500i128);
+    });
+
+    client.migrate_user_record(&spending_only);
+    client.migrate_user_record(&volume_only);
+
+    let spending_record = client.get_user_record(&spending_only);
+    assert_eq!(spending_record.accumulated_amount, 1_200);
+    assert_eq!(spending_record.volume, 0);
+    assert_eq!(spending_record.last_reset_time, legacy_window_start);
+
+    let volume_record = client.get_user_record(&volume_only);
+    assert_eq!(volume_record.accumulated_amount, 0);
+    assert_eq!(volume_record.volume, 7_500);
+    assert_eq!(volume_record.last_reset_time, env.ledger().timestamp());
+
+    env.as_contract(&contract_id, || {
+        assert!(env.storage().persistent().has(&DataKey::UserRecord(spending_only.clone())));
+        assert!(!env.storage().persistent().has(&spending_only_key));
+        assert!(!env.storage().persistent().has(&spending_only_volume_key));
+        assert!(env.storage().persistent().has(&DataKey::UserRecord(volume_only.clone())));
+        assert!(!env.storage().persistent().has(&volume_only_spending_key));
+        assert!(!env.storage().persistent().has(&volume_only_key));
+    });
+}
+
 #[test]
 #[ignore]
 fn test_refund_ledger_and_withdrawal() {
