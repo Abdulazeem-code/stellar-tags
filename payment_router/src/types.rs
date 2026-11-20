@@ -1,4 +1,20 @@
-use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, String, Vec};
+
+/// Status of a pending dead man's switch claim.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmsClaimStatus {
+    /// The address that initiated the claim (backup admin or council member).
+    pub claimant: Address,
+    /// Unix timestamp when the claim was initiated.
+    pub initiated_at: u64,
+    /// Unix timestamp when the 72-hour grace period ends.
+    pub grace_period_end: u64,
+    /// The candidate admin address that will become admin if claim succeeds.
+    pub candidate_admin: Address,
+    /// The claim tier (1 = backup admin, 2 = council multi-sig).
+    pub tier: u32,
+}
 
 /// A user's rolling 24-hour spending record.
 ///
@@ -14,11 +30,11 @@ pub struct UserSpending {
     pub accumulated_amount: i128,
 }
 
-/// A user's combined routing stats, unpacked from the packed `BytesN<40>`
-/// `UserRecord` ledger value (issue #663).
+/// A user's combined routing stats, unpacked from the packed `BytesN<72>`
+/// `UserRecord` ledger value (issues #663 and #894).
 ///
 /// Returned by [`PaymentRouter::get_user_record`] so a client can read both
-/// counters in a single view call instead of two.
+/// counters and the packed flag bitmap in a single view call.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserRecord {
@@ -28,6 +44,38 @@ pub struct UserRecord {
     pub volume: i128,
     /// Unix timestamp (seconds) at which the 24-hour window last reset.
     pub last_reset_time: u64,
+    /// Packed 256-bit boolean flag bitmap (issue #894). Bit `i` records the
+    /// state of user flag `i` (e.g. KYC verified, rate-limited, VIP tier,
+    /// active subscription). Stored alongside the counters in a single
+    /// persistent ledger entry to minimize storage rent.
+    pub flags: BytesN<32>,
+}
+
+impl UserRecord {
+    /// Returns `true` when the flag at `bit` (0..=255) is set in the packed
+    /// bitmap.
+    pub fn has_flag(&self, bit: u8) -> bool {
+        let byte = (bit / 8) as usize;
+        let offset = bit % 8;
+        self.flags.to_array().get(byte).copied().unwrap_or(0) >> offset & 1 == 1
+    }
+
+    /// Sets the flag at `bit` (0..=255) to `val` on `self`.
+    ///
+    /// An `Env` is required to reconstruct the packed bitmap bytes.
+    pub fn set_flag(&mut self, env: &Env, bit: u8, val: bool) {
+        let byte = (bit / 8) as usize;
+        let offset = bit % 8;
+        let mut buf = self.flags.to_array();
+        if byte < buf.len() {
+            if val {
+                buf[byte] |= 1u8 << offset;
+            } else {
+                buf[byte] &= !(1u8 << offset);
+            }
+        }
+        self.flags = BytesN::from_array(env, &buf);
+    }
 }
 
 /// A single transfer instruction for use with [`PaymentRouter::route_payments`].
@@ -55,6 +103,18 @@ pub struct MetaPayment {
     pub recipient: Address,
     pub token_address: Address,
     pub amount: i128,
+}
+
+/// A single leg in a split swap route.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitRoute {
+    /// DEX contract address for this split.
+    pub dex_address: Address,
+    /// Basis points weight allocated to this split (out of 10,000 total).
+    pub weight_bps: u32,
+    /// Minimum acceptable output tokens from this split swap.
+    pub min_amount_out: i128,
 }
 
 /// A single swap-routed transfer instruction for use with
@@ -102,6 +162,26 @@ pub struct SwapQuote {
     pub max_slippage_bps: i128,
 }
 
+/// A signed maker quote for a direct cross-currency settlement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Quote {
+    /// Unique identifier used to prevent replaying a settled quote.
+    pub quote_id: String,
+    /// Maker that authorizes the settlement and supplies the output tokens.
+    pub maker: Address,
+    /// Token the sender pays to the maker.
+    pub token_in: Address,
+    /// Token the maker pays to the recipient.
+    pub token_out: Address,
+    /// Input amount paid by the sender.
+    pub amount_in: i128,
+    /// Output amount paid by the maker.
+    pub amount_out: i128,
+    /// Unix timestamp after which the quote cannot be settled.
+    pub expires_at: u64,
+}
+
 /// Describes which administrative parameter change a timelock entry represents.
 /// Each variant carries all the arguments needed to apply that change when the
 /// delay period is over.
@@ -131,6 +211,8 @@ pub enum ActionType {
     DeregisterDex(Address),
     /// Update the maximum tolerated swap slippage.
     SetMaxSlippageBps(i128),
+    /// Update the maximum tolerated slippage for one token pair.
+    SetPairMaxSlippageBps(Address, Address, i128),
     /// Configure the multi-signature admin group for contract upgrades.
     SetMultisigConfig(Vec<Address>, u32),
 }

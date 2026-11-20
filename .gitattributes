@@ -13,3 +13,6 @@
 .husky/post-checkout text eol=lf
 .husky/post-commit text eol=lf
 .husky/pre-push text eol=lf
+
+# Generated contract packages must keep LF endings so drift checks pass on Linux CI.
+packages/** text eol=lf

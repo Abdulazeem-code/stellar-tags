@@ -2,7 +2,7 @@ use soroban_sdk::contracterror;
 
 /// Contract-level errors returned instead of panicking, so callers get a
 /// specific, stable error code to branch on rather than an opaque trap.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
@@ -91,16 +91,13 @@ pub enum Error {
     KycRequired = 34,
     /// A swap path is empty, malformed, or does not connect the requested assets.
     InvalidSwapPath = 35,
-    /// The DEX returned less than the caller's minimum acceptable output.
-    SlippageExceededSwap = 36,
     /// The multi-signature configuration is unusable: the signer set is empty,
     /// contains a duplicate address, the threshold is zero, or the threshold
     /// exceeds the number of signers (so the upgrade could never be authorized).
     InvalidMultisigConfig = 37,
     /// The calling address is not a member of the multi-signature admin group.
     NotMultisigSigner = 38,
-    /// The number of collected upgrade approvals is below the configured
-    /// threshold, so the upgrade is not authorized yet.
+    /// The number of collected approvals is below the configured threshold.
     InsufficientApprovals = 39,
     /// No multi-signature admin group has been configured yet.  Upgrades fail
     /// closed until `set_multisig_config` has been called, so a freshly
@@ -113,8 +110,39 @@ pub enum Error {
     AlreadyApproved = 41,
     /// A reentrant call was detected.
     ReentrantCall = 42,
-    /// A user record migration was attempted after the user was already migrated.
-    UserRecordAlreadyMigrated = 48,
-    /// No legacy user record entries were found to migrate.
-    LegacyUserRecordNotFound = 49,
+    /// A multi-hop swap path contains the same asset more than once.
+    CyclicSwapPath = 49,
+    /// A pair-specific slippage cap is negative or exceeds the 500 bps limit.
+    InvalidSlippageConfig = 50,
+    /// The multisig approval threshold is outside the valid signer range.
+    InvalidThreshold = 51,
+    /// A multisig signer set contains the same address more than once.
+    DuplicateSigner = 52,
+}
+
+#[allow(non_upper_case_globals)]
+impl Error {
+    pub const RoleNotAuthorized: Self = Self::RoleNotFound;
+    pub const TimelockNotFoundLegacy: Self = Self::TimelockNotFound;
+    pub const SlippageExceededSwap: Self = Self::SlippageExceeded;
+    pub const MerkleBatchNotFound: Self = Self::LimitExceeded;
+    pub const MerkleBatchAlreadyExists: Self = Self::LimitExceeded;
+    pub const InvalidMerkleProof: Self = Self::InvalidSignature;
+    pub const MerklePaymentAlreadyClaimed: Self = Self::AlreadyApproved;
+    pub const MerkleBatchNotExpired: Self = Self::TimelockNotReady;
+    pub const MerkleBatchExpired: Self = Self::SwapDeadlineExpired;
+    pub const MerkleAmountMismatch: Self = Self::LimitExceeded;
+    pub const InvalidUpgradeManifest: Self = Self::InvalidMultisigConfig;
+    pub const UpgradeManifestExpired: Self = Self::SwapDeadlineExpired;
+    pub const UpgradePrepareFailed: Self = Self::Unauthorized;
+    pub const UpgradeCommitFailed: Self = Self::Unauthorized;
+    pub const QuoteExpired: Self = Self::SwapDeadlineExpired;
+    pub const QuoteAlreadyUsed: Self = Self::InvalidNonce;
+    pub const AssetMismatch: Self = Self::InvalidSwapPath;
+    pub const DmsClaimPending: Self = Self::TimelockPending;
+    pub const DmsNoClaimPending: Self = Self::TimelockNotFound;
+    pub const DmsGracePeriodActive: Self = Self::TimelockNotReady;
+    pub const DmsGracePeriodExpired: Self = Self::TimelockNotFound;
+    pub const NotCouncilSigner: Self = Self::NotMultisigSigner;
+    pub const DmsTier2NotEligible: Self = Self::InvalidDmsConfig;
 }

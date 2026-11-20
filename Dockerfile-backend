@@ -67,7 +67,7 @@ COPY --from=builder --chown=node:node /app/prisma ./prisma
 COPY --from=builder --chown=node:node /app/package.json ./package.json
 COPY --from=builder --chown=node:node \
 	/app/server.js /app/horizonListener.js /app/prismaClient.js \
-	/app/mount-versioning.js /app/startup.sh ./
+	/app/startup.sh ./
 # Only the health probe from scripts/: it has to follow the server onto https
 # when mTLS is enabled, which a bare wget cannot do (#736).
 COPY --from=builder --chown=node:node /app/scripts/healthcheck.js ./scripts/healthcheck.js

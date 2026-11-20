@@ -235,4 +235,47 @@ describe('authenticateUsernameOwner', () => {
       ['alice*localhost'],
     );
   });
+
+  describe('with allowPublicKeySignature: false', () => {
+    it('refuses a bare public key instead of consulting the multi-signer path', async () => {
+      // A public key is not a signature; decoded as one it cannot verify.
+      sdk.__mockVerify.mockReturnValue(false);
+
+      await expect(
+        authenticateUsernameOwner({
+          username: 'alice',
+          signature: VALID_ADDRESS,
+          operation: 'unregister',
+          allowPublicKeySignature: false,
+        }),
+      ).rejects.toMatchObject({ statusCode: 401 });
+      expect(verifyMultiSignerThreshold).not.toHaveBeenCalled();
+    });
+
+    it('accepts a signed "<operation>:<username>" message from the owner', async () => {
+      const result = await authenticateUsernameOwner({
+        username: 'alice',
+        signature: BASE64_SIGNATURE,
+        signerAddress: VALID_ADDRESS,
+        operation: 'unregister',
+        allowPublicKeySignature: false,
+      });
+
+      expect(result.address).toBe(VALID_ADDRESS);
+      const [messageHash] = sdk.__mockVerify.mock.calls[0];
+      expect(messageHash).toEqual(hashMessage('unregister:alice*localhost'));
+    });
+
+    it('refuses a valid signature from another account', async () => {
+      await expect(
+        authenticateUsernameOwner({
+          username: 'alice',
+          signature: BASE64_SIGNATURE,
+          signerAddress: OTHER_ADDRESS,
+          operation: 'unregister',
+          allowPublicKeySignature: false,
+        }),
+      ).rejects.toMatchObject({ statusCode: 401 });
+    });
+  });
 });

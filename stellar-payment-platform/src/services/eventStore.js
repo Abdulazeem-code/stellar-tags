@@ -33,42 +33,48 @@ const PaymentEventTypes = {
  */
 async function appendEvent({ paymentId, eventType, data, metadata = {}, userId = null }) {
   try {
-    // Get the next sequence number for this aggregate
-    const lastEvent = await prisma.paymentEvent.findFirst({
-      where: { aggregateId: paymentId },
-      orderBy: { sequence: "desc" },
-      select: { sequence: true },
-    });
-
-    const nextSequence = lastEvent ? lastEvent.sequence + 1 : 1;
-
-    // Append event to the store
-    const event = await prisma.paymentEvent.create({
-      data: {
-        paymentId,
-        eventType,
-        aggregateId: paymentId,
-        sequence: nextSequence,
-        eventData: data,
-        metadata: {
-          ...metadata,
-          timestamp: new Date().toISOString(),
+    // OutboxMessage and PaymentEvent commit together, never between broker I/O.
+    const event = await prisma.$transaction(async (tx) => {
+      const lastEvent = await tx.paymentEvent.findFirst({
+        where: { aggregateId: paymentId },
+        orderBy: { sequence: "desc" },
+        select: { sequence: true },
+      });
+      const nextSequence = lastEvent ? lastEvent.sequence + 1 : 1;
+      const timestamp = new Date().toISOString();
+      const saved = await tx.paymentEvent.create({
+        data: {
+          paymentId,
+          eventType,
+          aggregateId: paymentId,
+          sequence: nextSequence,
+          eventData: data,
+          metadata: { ...metadata, timestamp },
+          userId,
         },
-        userId,
-      },
+      });
+      await tx.outboxMessage.create({
+        data: {
+          eventType,
+          payload: {
+            paymentId,
+            eventId: saved.id,
+            eventType,
+            eventData: data,
+            metadata: { ...metadata, timestamp },
+            userId,
+            sequence: nextSequence,
+          },
+        },
+      });
+      return saved;
     });
 
-    logger.info(
-      { paymentId, eventType, sequence: nextSequence },
-      "Event appended to event store"
-    );
-
+    logger.info({ paymentId, eventType, sequence: event.sequence }, "Event appended to event store");
     return event;
   } catch (error) {
-    // Handle unique constraint violation (concurrent writes)
     if (error.code === "P2002") {
       logger.warn({ paymentId, eventType }, "Concurrent event write detected, retrying");
-      // Retry logic could be implemented here
       throw new Error("Concurrent modification detected", { cause: error });
     }
     logger.error({ error, paymentId, eventType }, "Failed to append event");

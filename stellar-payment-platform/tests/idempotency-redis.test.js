@@ -149,3 +149,26 @@ test('logs a release error after a client disconnects', async () => {
     log.mockRestore();
   }
 });
+
+test('prevents race conditions under simulated high concurrency (50 parallel requests with identical idempotency key)', async () => {
+  const redis = new FakeRedis();
+  const { app, getCalls } = buildApp(redis);
+
+  const results = await Promise.all(
+    Array.from({ length: 50 }, (_, i) =>
+      request(app)
+        .post('/payments')
+        .set('Idempotency-Key', 'concurrent-key')
+        .send({ amount: 10, i })
+    )
+  );
+
+  const creations = results.filter(
+    (res) => res.status === 201 && !res.headers['x-idempotent-replay']
+  );
+  expect(creations).toHaveLength(1);
+  expect(getCalls()).toBe(1);
+
+  const duplicateCreations = creations.length - 1;
+  expect(duplicateCreations).toBe(0);
+});

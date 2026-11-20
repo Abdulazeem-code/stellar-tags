@@ -1,14 +1,18 @@
 #![no_std]
 pub mod access;
 mod archival;
+pub mod dead_mans_switch;
 pub mod errors;
 pub mod fees;
 pub mod rate_limit;
 pub mod storage;
+pub mod swaps;
+pub mod timelock;
 pub mod types;
 
 pub use access::*;
 use archival::{ArchiveLeaf, ArchiveMetadata, ArchiveRecordType};
+pub use dead_mans_switch::*;
 pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
@@ -41,6 +45,7 @@ impl PaymentRouter {
     pub const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
     pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = storage::DEFAULT_MAX_SLIPPAGE_BPS;
     pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = storage::MAX_SLIPPAGE_BPS_LIMIT;
+    pub const MAX_PAIR_SLIPPAGE_BPS: i128 = storage::MAX_PAIR_SLIPPAGE_BPS;
     pub const DAY_IN_LEDGERS: u32 = storage::DAY_IN_LEDGERS;
     pub const INSTANCE_BUMP_AMOUNT: u32 = storage::INSTANCE_BUMP_AMOUNT;
     pub const INSTANCE_LIFETIME_THRESHOLD: u32 = storage::INSTANCE_LIFETIME_THRESHOLD;
@@ -87,6 +92,21 @@ impl PaymentRouter {
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
         access::require_fee_authority(env)
     }
+    #[allow(dead_code)]
+    #[inline]
+    fn require_fee_manager(env: &Env) -> Result<Address, Error> {
+        access::require_role(env, Role::FeeManager)
+    }
+    #[allow(dead_code)]
+    #[inline]
+    fn require_security_officer(env: &Env) -> Result<Address, Error> {
+        access::require_role(env, Role::SecurityOfficer)
+    }
+    #[allow(dead_code)]
+    #[inline]
+    fn require_upgrade_manager(env: &Env) -> Result<Address, Error> {
+        access::require_role(env, Role::UpgradeManager)
+    }
     #[inline]
     fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
         access::load_multisig_config(env)
@@ -94,6 +114,15 @@ impl PaymentRouter {
     #[inline]
     fn validate_multisig_config(signers: &Vec<Address>, threshold: u32) -> Result<u32, Error> {
         access::validate_multisig_config(signers, threshold)
+    }
+    #[inline]
+    fn approve_multisig_config_internal(
+        env: &Env,
+        signers: &Vec<Address>,
+        threshold: u32,
+        signer: Address,
+    ) -> Result<u32, Error> {
+        access::approve_multisig_config(env, signers, threshold, signer)
     }
     #[inline]
     fn load_effective_approvals(
@@ -116,19 +145,23 @@ impl PaymentRouter {
         access::apply_upgrade(env, new_wasm_hash);
     }
     #[inline]
-    fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
-        access::store_multisig_config(env, signers, threshold);
-    }
-    #[inline]
-    fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
-        access::validate_queued_action(env, action)
+    fn store_multisig_config(
+        env: &Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        access::store_multisig_config(env, signers, threshold)
     }
     #[inline]
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
         fees::load_fee_config(env)
     }
     #[inline]
-    fn load_user_record(env: &Env, sender: &Address, current_time: u64) -> (u64, i128, i128, bool) {
+    fn load_user_record(
+        env: &Env,
+        sender: &Address,
+        current_time: u64,
+    ) -> (u64, i128, i128, BytesN<32>, bool) {
         storage::load_user_record(env, sender, current_time)
     }
     #[inline]
@@ -170,6 +203,22 @@ impl PaymentRouter {
     #[inline]
     fn require_circuit_closed(env: &Env) -> Result<(), Error> {
         access::require_circuit_closed(env)
+    }
+    #[inline]
+    fn get_pause_level_internal(env: &Env) -> PauseLevel {
+        access::get_pause_level(env)
+    }
+    #[inline]
+    fn set_pause_level_internal(env: &Env, level: PauseLevel) {
+        access::set_pause_level(env, level);
+    }
+    #[inline]
+    fn require_not_fully_halted(env: &Env) -> Result<(), Error> {
+        access::require_not_fully_halted(env)
+    }
+    #[inline]
+    fn require_swaps_not_paused(env: &Env) -> Result<(), Error> {
+        access::require_swaps_not_paused(env)
     }
     #[inline]
     fn calculate_fee(amount: i128, effective_fee_bps: i128, fee_cap: i128) -> (i128, i128) {
@@ -244,16 +293,34 @@ impl PaymentRouter {
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
     }
 
+    /// Resolve the token-pair override, falling back to the legacy global cap.
+    /// Corrupt or out-of-range persisted overrides fail closed.
+    fn pair_max_slippage_bps(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<i128, Error> {
+        let configured: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairSlippage(token_in.clone(), token_out.clone()));
+        match configured {
+            Some(bps) if (0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&bps) => Ok(bps),
+            Some(_) => Err(Error::InvalidSlippageConfig),
+            None => Ok(Self::max_slippage_bps(env)),
+        }
+    }
+
     /// Returns whether a DEX router has been approved for swap routing.
-    fn is_dex_registered_internal(env: &Env, dex: &Address) -> bool {
+    pub(crate) fn is_dex_registered_internal(env: &Env, dex: &Address) -> bool {
         env.storage()
             .persistent()
             .get(&DataKey::RegisteredDex(dex.clone()))
             .unwrap_or(false)
     }
 
-    /// Invokes the DEX adapter and returns the amount it claims to have
-    /// delivered.
+    /// Invokes the DEX adapter and returns the output asset and amount it
+    /// claims to have delivered.
     ///
     /// A reverting, missing, or mistyped DEX call is reported as
     /// [`Error::SwapFailed`] instead of trapping, so the caller can abort with
@@ -261,14 +328,14 @@ impl PaymentRouter {
     /// the Soroban host reverts every balance and storage change made earlier
     /// in the same transaction.
     #[allow(clippy::too_many_arguments)]
-    fn invoke_dex_swap(
+    pub(crate) fn invoke_dex_swap(
         env: &Env,
         dex: &Address,
         sell_token: &Address,
         buy_token: &Address,
         amount_in: i128,
         min_amount_out: i128,
-    ) -> Result<i128, Error> {
+    ) -> Result<(Address, i128), Error> {
         let fn_name = Symbol::new(env, "swap");
         let args = vec![
             env,
@@ -279,11 +346,11 @@ impl PaymentRouter {
             env.current_contract_address().into_val(env),
         ];
 
-        let res: Result<Result<i128, SdkError>, Result<InvokeError, InvokeError>> =
+        let res: Result<Result<(Address, i128), SdkError>, Result<InvokeError, InvokeError>> =
             env.try_invoke_contract(dex, &fn_name, args);
 
         match res {
-            Ok(Ok(amount_out)) => Ok(amount_out),
+            Ok(Ok(output)) => Ok(output),
             Ok(Err(_)) | Err(_) => Err(Error::SwapFailed),
         }
     }
@@ -368,6 +435,24 @@ impl PaymentRouter {
         payload.append(&amount.to_xdr(env));
         payload.append(&nonce.to_xdr(env));
         payload.append(&deadline.to_xdr(env));
+        let hash = env.crypto().sha256(&payload);
+        Bytes::from(&hash)
+    }
+
+    /// Builds the domain-separated message for a signed maker quote.
+    fn build_quote_message(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        quote: &Quote,
+        maker_pubkey: &BytesN<32>,
+    ) -> Bytes {
+        let mut payload = Bytes::new(env);
+        payload.append(&env.current_contract_address().to_xdr(env));
+        payload.append(&sender.to_xdr(env));
+        payload.append(&recipient.to_xdr(env));
+        payload.append(&quote.clone().to_xdr(env));
+        payload.append(&Bytes::from_slice(env, &maker_pubkey.to_array()));
         let hash = env.crypto().sha256(&payload);
         Bytes::from(&hash)
     }
@@ -870,7 +955,7 @@ impl PaymentRouter {
         // stays in the queue for the admin to retry or cancel.  Upgrades are
         // gated on the M-of-N threshold here as well as in `upgrade`, so
         // routing an upgrade through the timelock is not a way around it.
-        Self::validate_queued_action(&env, &entry.action)?;
+        access::validate_queued_action(&env, &entry.action)?;
 
         // Remove the entry before applying the action (checks-effects-interactions).
         env.storage().persistent().remove(&key);
@@ -906,7 +991,7 @@ impl PaymentRouter {
                 Self::apply_upgrade(&env, &new_wasm_hash);
             }
             ActionType::SetMultisigConfig(signers, threshold) => {
-                Self::store_multisig_config(&env, signers, threshold);
+                Self::store_multisig_config(&env, signers, threshold)?;
             }
             ActionType::RegisterDex(dex) => {
                 let key = DataKey::RegisteredDex(dex.clone());
@@ -927,6 +1012,15 @@ impl PaymentRouter {
                     .instance()
                     .set(&DataKey::MaxSlippageBps, &max_slippage_bps);
             }
+            ActionType::SetPairMaxSlippageBps(token_in, token_out, bps) => {
+                let key = DataKey::PairSlippage(token_in, token_out);
+                env.storage().persistent().set(&key, &bps);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
         }
 
         env.storage().instance().extend_ttl(
@@ -939,6 +1033,16 @@ impl PaymentRouter {
 
         log!(&env, "Timelock action executed for nonce {}", nonce);
         Ok(())
+    }
+
+    /// Executes a batch of previously queued timelock actions identified by
+    /// `nonces`, in order.
+    ///
+    /// Each nonce is applied exactly as [`Self::execute_action`] would apply
+    /// it; the first failure aborts the whole batch, reverting every action
+    /// already applied in the same transaction.
+    pub fn execute_batch_actions(env: Env, nonces: Vec<u64>) -> Result<(), Error> {
+        timelock::execute_batch_actions(&env, nonces)
     }
 
     /// Cancels a pending timelock entry before it can be executed.
@@ -1452,11 +1556,14 @@ impl PaymentRouter {
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         Self::require_role(&env, Role::Pauser)?;
 
-        env.storage().instance().set(&DataKey::Paused, &paused);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
+        // Convert the boolean to a tiered level for backward compatibility.
+        // `true` → `FullHalt`, `false` → `None`.
+        let level = if paused {
+            PauseLevel::FullHalt
+        } else {
+            PauseLevel::None
+        };
+        Self::set_pause_level_internal(&env, level);
 
         env.events().publish((symbol_short!("pause"),), (paused,));
 
@@ -1477,10 +1584,52 @@ impl PaymentRouter {
         Self::set_pause(env, paused)
     }
 
-    /// Returns whether the contract is currently paused.
+    /// Sets the tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `PauseLevel::None` (0) — all routing enabled.
+    /// - `PauseLevel::SwapsOnly` (1) — DEX swap calls blocked; direct payments continue.
+    /// - `PauseLevel::FullHalt` (2) — all routing blocked (equivalent to `set_pause(true)`).
+    ///
+    /// Pauser role is required. This call is NOT timelocked so the Pauser can
+    /// react immediately to an exploit.
+    ///
+    /// # Panics
+    /// Panics if the current Pauser does not authorize the call.
+    pub fn set_pause_level(env: Env, level: PauseLevel) -> Result<(), Error> {
+        Self::require_role(&env, Role::Pauser)?;
+
+        Self::set_pause_level_internal(&env, level);
+
+        env.events()
+            .publish((Symbol::new(&env, "pause_level"),), (level as u32,));
+
+        Ok(())
+    }
+
+    /// Returns the current tiered circuit-breaker pause level (issue #890).
+    ///
+    /// - `0` = None (fully operational)
+    /// - `1` = SwapsOnly (swaps halted, direct payments active)
+    /// - `2` = FullHalt (all routing halted)
     ///
     /// # Returns
-    /// `true` if paused, `false` if unpaused or not yet initialized.
+    /// The active [`PauseLevel`].
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_pause_level(env: Env) -> PauseLevel {
+        Self::get_pause_level_internal(&env)
+    }
+
+    /// Returns whether the contract is currently paused.
+    ///
+    /// Returns `true` only when the pause level is `FullHalt`.  Under
+    /// `SwapsOnly`, direct payments still work so this returns `false` to
+    /// preserve backward compatibility for callers that only need to know
+    /// whether core transfers are allowed.
+    ///
+    /// # Returns
+    /// `true` if fully halted, `false` otherwise.
     ///
     /// # Panics
     /// Does not panic.
@@ -1522,13 +1671,14 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_user_record(env: Env, user: Address) -> UserRecord {
         let current_time = env.ledger().timestamp();
-        let (last_reset_time, accumulated_amount, volume, _) =
+        let (last_reset_time, accumulated_amount, volume, flags, _) =
             Self::load_user_record(&env, &user, current_time);
 
         UserRecord {
             accumulated_amount,
             volume,
             last_reset_time,
+            flags,
         }
     }
 
@@ -1575,17 +1725,27 @@ impl PaymentRouter {
         let (last_reset_time, accumulated_amount) =
             legacy_spending.unwrap_or((env.ledger().timestamp(), 0));
 
-        // The legacy `UserVolume` already counts every amount in the current
-        // window, so do not add the spending amount to it during migration.
-        env.storage().persistent().set(
-            &record_key,
-            &pack_user_record(&env, last_reset_time, accumulated_amount, legacy_volume),
-        );
-        env.storage().persistent().extend_ttl(
-            &record_key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
+            // The legacy `UserVolume` already counts every amount in the
+            // current window (each payment incremented both counters), so the
+            // window balance must not be added again here.
+            // Legacy data carries no flags, so the bitmap starts zeroed.
+            let zero_flags = BytesN::from_array(&env, &[0u8; 32]);
+            env.storage().persistent().set(
+                &record_key,
+                &pack_user_record(
+                    &env,
+                    last_reset_time,
+                    accumulated_amount,
+                    legacy_volume,
+                    &zero_flags,
+                ),
+            );
+            env.storage().persistent().extend_ttl(
+                &record_key,
+                Self::PERSISTENT_LIFETIME_THRESHOLD,
+                Self::PERSISTENT_BUMP_AMOUNT,
+            );
+        }
 
         env.storage().persistent().remove(&spending_key);
         env.storage().persistent().remove(&volume_key);
@@ -2375,6 +2535,108 @@ impl PaymentRouter {
         env.ledger().timestamp().saturating_sub(last) >= timeout
     }
 
+    // ── Dead Man's Switch — Operator Heartbeat (issue #889) ──────────────────
+
+    /// Appoints `operator` as the designated heartbeat renewal address.
+    ///
+    /// The operator can call `renew_heartbeat` to reset the DMS clock without
+    /// holding any other admin privileges.  This avoids exposing cold-storage
+    /// admin keys for routine monthly renewals.
+    ///
+    /// Only one operator may be designated at a time; calling this again
+    /// overwrites the previous designation.
+    ///
+    /// # Parameters
+    /// - `operator`: Address to designate as the heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    /// - `Error::Unauthorized` — caller is not the admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn set_heartbeat_operator(env: Env, operator: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::set_heartbeat_operator_internal(&env, &operator);
+
+        env.events()
+            .publish((Symbol::new(&env, "hb_operator_set"), admin), operator);
+
+        log!(&env, "Heartbeat operator set");
+        Ok(())
+    }
+
+    /// Removes the designated heartbeat operator.
+    ///
+    /// After removal, only the primary admin (`ping`) or a routed payment can
+    /// reset the DMS clock.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::NotInitialized` — contract has no admin.
+    ///
+    /// # Panics
+    /// Panics if the admin does not authorize the call.
+    pub fn remove_heartbeat_operator(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        dead_mans_switch::remove_heartbeat_operator_internal(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "hb_operator_rm"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Heartbeat operator removed");
+        Ok(())
+    }
+
+    /// Returns the currently designated heartbeat operator, if any.
+    ///
+    /// # Returns
+    /// `Some(operator)` if one is configured, otherwise `None`.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn get_heartbeat_operator(env: Env) -> Option<Address> {
+        dead_mans_switch::get_heartbeat_operator_internal(&env)
+    }
+
+    /// Renews the dead man's switch heartbeat on behalf of the configured
+    /// heartbeat operator (issue #889).
+    ///
+    /// The `operator` address must match the stored `DataKey::HeartbeatOperator`
+    /// and must authorize this call.  The operator may **only** reset the
+    /// heartbeat timestamp — it cannot modify the backup admin address, the
+    /// DMS timeout, or any other contract parameter.
+    ///
+    /// # Parameters
+    /// - `operator`: The address claiming operator privileges.  Must match the
+    ///   configured heartbeat operator.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `Error::Unauthorized` — `operator` does not match the stored operator
+    ///   or no operator has been configured.
+    /// - `Error::InvalidDmsConfig` — the dead man's switch is not currently
+    ///   armed (no heartbeat timestamp exists).
+    ///
+    /// # Panics
+    /// Panics if `operator` does not authorize the call.
+    pub fn renew_heartbeat(env: Env, operator: Address) -> Result<(), Error> {
+        dead_mans_switch::renew_heartbeat(&env, &operator)
+    }
+
     /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
     ///
     /// # Parameters
@@ -2495,6 +2757,98 @@ impl PaymentRouter {
         Ok(())
     }
 
+    /// Settles a maker-signed cross-currency quote. The sender pays the
+    /// quoted input to the maker, who supplies the quoted output directly to
+    /// the recipient.
+    ///
+    /// The maker must authorize the settlement, and `signature` must be a
+    /// valid Ed25519 signature over the domain-separated quote payload using
+    /// `maker_pubkey`. Each `quote_id` can be settled only once.
+    pub fn route_payment_with_quote(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        quote: Quote,
+        maker_pubkey: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+        if quote.token_in == quote.token_out
+            || quote.amount_in <= 0
+            || quote.amount_out <= 0
+            || quote.quote_id.len() == 0
+        {
+            return Err(Error::InvalidSwapParams);
+        }
+        if env.ledger().timestamp() > quote.expires_at {
+            return Err(Error::QuoteExpired);
+        }
+
+        let used_quote_key = DataKey::UsedQuote(quote.maker.clone(), quote.quote_id.clone());
+        if env.storage().persistent().has(&used_quote_key) {
+            return Err(Error::QuoteAlreadyUsed);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if quote.amount_in > max_amount || quote.amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, quote.amount_in)?;
+        let _ = Self::load_fee_config(&env)?;
+
+        let message = Self::build_quote_message(&env, &sender, &recipient, &quote, &maker_pubkey);
+        env.crypto()
+            .ed25519_verify(&maker_pubkey, &message, &signature);
+
+        sender.require_auth();
+        quote.maker.require_auth();
+        Self::check_rate_limit(&env, &sender)?;
+
+        let input_token = token::Client::new(&env, &quote.token_in);
+        let output_token = token::Client::new(&env, &quote.token_out);
+        if input_token.balance(&sender) < quote.amount_in
+            || output_token.balance(&quote.maker) < quote.amount_out
+        {
+            return Err(Error::InsufficientBalance);
+        }
+
+        Self::accrue_user_record(&env, &sender, quote.amount_in)?;
+        env.storage().persistent().set(&used_quote_key, &true);
+        env.storage().persistent().extend_ttl(
+            &used_quote_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        input_token.transfer(&sender, &quote.maker, &quote.amount_in);
+        output_token.transfer(&quote.maker, &recipient, &quote.amount_out);
+        Self::bump_heartbeat(&env);
+
+        Ok(quote.amount_out)
+    }
+
     /// Swaps `token_in` through a caller-supplied DEX path and routes the
     /// resulting `token_out` to the recipient. The DEX adapter must return the
     /// received output and any unused input as `[received, unused]`; unused
@@ -2602,9 +2956,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): direct payments are only
+        // blocked at FullHalt.  SwapsOnly leaves them unaffected.
+        Self::require_not_fully_halted(&env)?;
 
         // Pre-validate the whole batch before authorizing or moving any
         // funds, so a rejected payment never triggers an auth rollback.
@@ -2791,7 +3145,8 @@ impl PaymentRouter {
     // The swap itself is a cross-contract call into a registered DEX adapter,
     // which must expose:
     //
-    //   swap(sell_token, buy_token, amount_in, min_amount_out, recipient) -> i128
+    //   swap(sell_token, buy_token, amount_in, min_amount_out, recipient)
+    //       -> (output_token, amount_out)
     //   quote(sell_token, buy_token, amount_in) -> i128
     //
     // By the time `swap` runs, the router has already transferred `amount_in`
@@ -2825,6 +3180,10 @@ impl PaymentRouter {
         fee_cap: i128,
     ) -> Result<i128, Error> {
         swap.sender.require_auth();
+
+        // Tiered circuit breaker: swap routing is halted under any pause
+        // level other than `None`, before any DEX or balance check.
+        access::require_swaps_not_paused(env)?;
 
         // --- Validate the swap parameters -----------------------------------
         if swap.sell_token == swap.buy_token {
@@ -2899,7 +3258,7 @@ impl PaymentRouter {
         // router's balance.
         sell_token_client.transfer(&contract_address, &swap.dex, &swap.amount_in);
 
-        Self::invoke_dex_swap(
+        let (output_token, _) = Self::invoke_dex_swap(
             env,
             &swap.dex,
             &swap.sell_token,
@@ -2907,6 +3266,9 @@ impl PaymentRouter {
             swap.amount_in,
             swap.min_amount_out,
         )?;
+        if output_token != swap.buy_token {
+            return Err(Error::AssetMismatch);
+        }
 
         // --- Verify the output against both slippage guards -------------------
         // The balance delta is authoritative: a DEX cannot claim an output it
@@ -2917,7 +3279,8 @@ impl PaymentRouter {
             return Err(Error::SlippageExceeded);
         }
         if swap.expected_amount_out > 0 {
-            let max_slippage_bps = Self::max_slippage_bps(env);
+            let max_slippage_bps =
+                Self::pair_max_slippage_bps(env, &swap.sell_token, &swap.buy_token)?;
             let slippage_floor = Self::slippage_floor(swap.expected_amount_out, max_slippage_bps);
             if amount_out < slippage_floor {
                 log!(
@@ -3003,13 +3366,60 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
         Self::process_single_swap_payment(&env, &payment, &platform_treasury, fee_bps, fee_cap)
+    }
+
+    /// Routes a payment through multiple DEX pools using split routing.
+    ///
+    /// Splits volume across multiple DEX pools according to `splits` weights (which must sum
+    /// to exactly 10,000 bps = 100%), executes swaps sequentially within the atomic transaction,
+    /// and aggregates total output tokens for the recipient (minus platform fee).
+    ///
+    /// # Parameters
+    /// - `sender`: Address paying with `sell_token`. Must authorize the call.
+    /// - `recipient`: Destination address receiving `buy_token`.
+    /// - `sell_token`: Contract address of token being sold.
+    /// - `buy_token`: Contract address of token being purchased.
+    /// - `amount_in`: Total amount of `sell_token` to divide and swap.
+    /// - `splits`: Array of [`SplitRoute`] specifying dex_address, weight_bps, and min_amount_out.
+    ///
+    /// # Returns
+    /// The net amount of `buy_token` delivered to recipient after platform fee.
+    pub fn route_split_payment_with_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        sell_token: Address,
+        buy_token: Address,
+        amount_in: i128,
+        splits: Vec<SplitRoute>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        Self::require_swaps_not_paused(&env)?;
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        swaps::process_split_payment_with_swap(
+            &env,
+            &sender,
+            &recipient,
+            &sell_token,
+            &buy_token,
+            amount_in,
+            &splits,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+        )
     }
 
     /// Routes several swap-routed payments in a single transaction. If any
@@ -3033,9 +3443,9 @@ impl PaymentRouter {
         if Self::is_frozen_internal(&env) {
             return Err(Error::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
-        }
+        // Tiered circuit breaker (issue #890): swap routing is blocked at
+        // both SwapsOnly and FullHalt (i.e. any non-None level).
+        Self::require_swaps_not_paused(&env)?;
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
 
@@ -3092,13 +3502,168 @@ impl PaymentRouter {
             return Err(Error::InvalidSwapParams);
         }
 
-        let max_slippage_bps = Self::max_slippage_bps(&env);
+        let max_slippage_bps = Self::pair_max_slippage_bps(&env, &sell_token, &buy_token)?;
 
         Ok(SwapQuote {
             amount_out,
             min_amount_out: Self::slippage_floor(amount_out, max_slippage_bps),
             max_slippage_bps,
         })
+    }
+
+    /// Routes a payment through a multi-hop swap path on a registered DEX.
+    ///
+    /// `path` must begin with `token_in` and end with `token_out`; `floors`
+    /// supplies the per-hop `min_amount_out` floors. The DEX is invoked once
+    /// per hop, and the final delivered amount is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_multihop_swap(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        dex: Address,
+        amount_in: i128,
+        path: Vec<Address>,
+        floors: Vec<i128>,
+    ) -> Result<i128, Error> {
+        let _guard = ReentrancyGuard::new(&env)?;
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+        if sender == recipient {
+            return Err(Error::InvalidRecipient);
+        }
+        if Self::is_blacklisted(env.clone(), recipient.clone()) {
+            return Err(Error::Blacklisted);
+        }
+
+        let hop_count = path.len().saturating_sub(1);
+        if !(2..=4).contains(&hop_count) || floors.len() != hop_count {
+            return Err(Error::InvalidSwapPath);
+        }
+        for i in 0..path.len() {
+            let asset = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            for j in (i + 1)..path.len() {
+                if path.get(j).as_ref() == Some(&asset) {
+                    return Err(Error::CyclicSwapPath);
+                }
+            }
+        }
+        for floor in floors.iter() {
+            if floor <= 0 {
+                return Err(Error::InvalidSwapParams);
+            }
+        }
+        if !Self::is_dex_registered_internal(&env, &dex) {
+            return Err(Error::DexNotRegistered);
+        }
+
+        let max_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxAmount)
+            .unwrap_or(Self::MAX_AMOUNT);
+        let min_limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLimit)
+            .unwrap_or(0);
+        if amount_in <= 0 || amount_in > max_amount || amount_in < min_limit {
+            return Err(Error::LimitExceeded);
+        }
+        Self::verify_kyc_for_amount(&env, &sender, amount_in)?;
+        sender.require_auth();
+        Self::check_rate_limit(&env, &sender)?;
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+        let user_volume = Self::accrue_user_record(&env, &sender, amount_in)?;
+        let effective_fee_bps = if user_volume > Self::VOLUME_THRESHOLD {
+            fee_bps / 2
+        } else {
+            fee_bps
+        };
+        let contract_address = env.current_contract_address();
+        let first_token = path.get(0).ok_or(Error::InvalidSwapPath)?;
+        let input_client = token::Client::new(&env, &first_token);
+        if input_client.balance(&sender) < amount_in {
+            return Err(Error::InsufficientBalance);
+        }
+        input_client.transfer(&sender, &contract_address, &amount_in);
+
+        let mut current_amount = amount_in;
+        for i in 0..hop_count {
+            let token_in = path.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_out = path.get(i + 1).ok_or(Error::InvalidSwapPath)?;
+            let floor = floors.get(i).ok_or(Error::InvalidSwapPath)?;
+            let token_in_client = token::Client::new(&env, &token_in);
+            let token_out_client = token::Client::new(&env, &token_out);
+            let input_before = token_in_client.balance(&contract_address);
+            let output_before = token_out_client.balance(&contract_address);
+            token_in_client.transfer(&contract_address, &dex, &current_amount);
+            let hop_path = vec![&env, token_in.clone(), token_out.clone()];
+            let result = DexRouterClient::new(&env, &dex).swap_exact_tokens_for_tokens(
+                &token_in,
+                &token_out,
+                &current_amount,
+                &floor,
+                &hop_path,
+                &contract_address,
+            );
+            if result.len() != 2 {
+                return Err(Error::InvalidSwapPath);
+            }
+            let reported_out: i128 = result.get(0).ok_or(Error::SwapFailed)?;
+            let reported_unused: i128 = result.get(1).ok_or(Error::SwapFailed)?;
+            let input_after = token_in_client.balance(&contract_address);
+            let output_after = token_out_client.balance(&contract_address);
+            let actual_unused = input_after - (input_before - current_amount);
+            let actual_out = output_after - output_before;
+            if reported_unused < 0
+                || reported_unused > current_amount
+                || actual_unused != reported_unused
+                || reported_out != actual_out
+                || actual_out < floor
+                || actual_out <= 0
+            {
+                return Err(Error::SlippageExceeded);
+            }
+            if actual_unused > 0 {
+                token_in_client.transfer(&contract_address, &sender, &actual_unused);
+            }
+            env.events().publish(
+                (
+                    Symbol::new(&env, "swap_hop"),
+                    dex.clone(),
+                    token_in,
+                    token_out,
+                ),
+                (current_amount, actual_out, actual_unused, floor),
+            );
+            current_amount = actual_out;
+        }
+
+        let final_token = path.get(path.len() - 1).ok_or(Error::InvalidSwapPath)?;
+        let output_client = token::Client::new(&env, &final_token);
+        let (fee_amount, remainder) =
+            Self::calculate_fee(current_amount, effective_fee_bps, fee_cap);
+        if fee_amount > 0 {
+            output_client.transfer(&contract_address, &platform_treasury, &fee_amount);
+        }
+        if remainder > 0 {
+            match output_client.try_transfer(&contract_address, &recipient, &remainder) {
+                Ok(Ok(())) => {}
+                _ => Self::credit_refund_balance(&env, &sender, &final_token, remainder),
+            }
+        }
+        env.events().publish(
+            (symbol_short!("routed"), sender.clone(), recipient.clone()),
+            remainder,
+        );
+        Self::bump_heartbeat(&env);
+        Ok(remainder)
     }
 
     // ── Swap configuration (sensitive; timelock-gated) ──────────────────────
@@ -3229,6 +3794,39 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_max_slippage_bps(env: Env) -> i128 {
         Self::max_slippage_bps(&env)
+    }
+
+    /// Returns the configured cap for `(token_in, token_out)`, or the global
+    /// cap when no pair override exists. Invalid stored overrides fail closed.
+    pub fn get_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+    ) -> Result<i128, Error> {
+        Self::pair_max_slippage_bps(&env, &token_in, &token_out)
+    }
+
+    /// Sets a pair-specific slippage cap. Prefer the timelocked
+    /// `SetPairMaxSlippageBps` action for production configuration.
+    pub fn set_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        max_slippage_bps: i128,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        if !(0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&max_slippage_bps) {
+            return Err(Error::InvalidSlippageConfig);
+        }
+        let key = DataKey::PairSlippage(token_in, token_out);
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
     }
 
     /// Returns the available internal refund balance for a user and token.
@@ -3390,9 +3988,8 @@ impl PaymentRouter {
     // single admin key, because that fallback is the vulnerability being fixed.
 
     // The admin is the root of trust for this call only: it can re-point the
-    // group but still cannot upgrade the contract by itself. Prefer
-    // `queue_action(ActionType::SetMultisigConfig(…))` to put the 24-hour
-    // timelock in front of a rotation, which this direct setter bypasses.
+    // group but still cannot upgrade the contract by itself. Both direct and
+    // timelocked rotations require the existing group's approval threshold.
     /// Configures the multi-signature admin group that authorizes upgrades.
     ///
     /// The signer set is replaced wholesale: addresses that are not in
@@ -3403,14 +4000,15 @@ impl PaymentRouter {
     /// # Parameters
     /// - `signers`: The N addresses whose signatures count. Must be non-empty
     ///   and free of duplicates.
-    /// - `threshold`: The M signers required to authorize an upgrade, in
-    ///   `1..=signers.len()`.
+    /// - `threshold`: The M signers required to authorize an upgrade. At least
+    ///   two approvals are required when the signer set has two or more members.
     ///
     /// # Returns
-    /// `Ok(())` on success, `Err(Error::InvalidMultisigConfig)` if the signer
-    /// set is empty or holds a duplicate, or the threshold is zero or larger
-    /// than the set, or `Err(Error::NotInitialized)` if the contract has no
-    /// admin set yet.
+    /// `Ok(())` on success, `Err(Error::InvalidThreshold)` if the threshold
+    /// is outside the quorum bounds, `Err(Error::DuplicateSigner)` if a signer
+    /// occurs more than once, or `Err(Error::InsufficientApprovals)` if the
+    /// existing group has not approved the rotation, or
+    /// `Err(Error::NotInitialized)` if the contract has no admin set yet.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
@@ -3423,7 +4021,7 @@ impl PaymentRouter {
         admin.require_auth();
 
         let validated = Self::validate_multisig_config(&signers, threshold)?;
-        Self::store_multisig_config(&env, signers, validated);
+        Self::store_multisig_config(&env, signers, validated)?;
 
         env.events()
             .publish((Symbol::new(&env, "multisig_config_set"), admin), validated);
@@ -3434,6 +4032,18 @@ impl PaymentRouter {
             validated
         );
         Ok(())
+    }
+
+    /// Records an existing multisig member's approval of a proposed signer
+    /// set and threshold. The current threshold must approve before the admin
+    /// can apply the change with `set_multisig_config`.
+    pub fn approve_multisig_config(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+        signer: Address,
+    ) -> Result<u32, Error> {
+        Self::approve_multisig_config_internal(&env, &signers, threshold, signer)
     }
 
     /// Returns the current multi-signature admin group.
@@ -3468,7 +4078,7 @@ impl PaymentRouter {
         }
         signer.require_auth();
 
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let key = ExtraKey::UpgradeApproval(new_wasm_hash.clone());
         let mut approvals: Vec<Address> = env
             .storage()
             .persistent()
@@ -3528,7 +4138,7 @@ impl PaymentRouter {
         }
         signer.require_auth();
 
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let key = ExtraKey::UpgradeApproval(new_wasm_hash.clone());
         let mut approvals: Vec<Address> = env
             .storage()
             .persistent()
@@ -3582,7 +4192,7 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        let key = DataKey::UpgradeApproval(new_wasm_hash.clone());
+        let key = ExtraKey::UpgradeApproval(new_wasm_hash.clone());
         if env.storage().persistent().has(&key) {
             env.storage().persistent().remove(&key);
         }

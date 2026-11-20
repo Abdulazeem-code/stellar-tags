@@ -1,4 +1,4 @@
-const { errorBody } = require('../errors');
+const { ApiError, errorBody } = require('../errors');
 
 const TOKEN_BUCKET_LUA = `
   local key = KEYS[1]
@@ -38,7 +38,46 @@ const TOKEN_BUCKET_LUA = `
 `;
 
 /**
- * Creates a Token Bucket rate limiter middleware backed by Redis.
+ * In-memory fallback for token bucket rate limiting when Redis is not configured
+ * or temporarily unreachable.
+ */
+class MemoryTokenBucketStore {
+  constructor(maxKeys = 10000) {
+    this.buckets = new Map();
+    this.maxKeys = maxKeys;
+  }
+
+  consume(key, capacity, refillRate, now, requested = 1) {
+    let bucket = this.buckets.get(key);
+    if (!bucket) {
+      bucket = { tokens: capacity, lastRefill: now };
+    } else {
+      const timePassed = Math.max(0, now - bucket.lastRefill);
+      const refillAmount = timePassed * refillRate;
+      if (refillAmount > 0) {
+        bucket.tokens = Math.min(capacity, bucket.tokens + refillAmount);
+        bucket.lastRefill = now;
+      }
+    }
+
+    let allowed = 0;
+    if (bucket.tokens >= requested) {
+      bucket.tokens -= requested;
+      allowed = 1;
+    }
+
+    if (this.buckets.size >= this.maxKeys && !this.buckets.has(key)) {
+      const oldestKey = this.buckets.keys().next().value;
+      this.buckets.delete(oldestKey);
+    }
+    this.buckets.set(key, bucket);
+
+    return [allowed, Math.floor(bucket.tokens), capacity, bucket.lastRefill];
+  }
+}
+
+/**
+ * Creates a Token Bucket rate limiter middleware backed by Redis with in-memory fallback.
  * @param {Object} redisClient - IORedis or Redis client instance.
  * @param {Object} options - Configuration options.
  * @param {number} options.capacity - Maximum tokens in the bucket (e.g. max requests).
@@ -46,6 +85,8 @@ const TOKEN_BUCKET_LUA = `
  * @param {function} options.keyGenerator - Function(req) that returns the key (IP or user ID).
  * @param {string} options.prefix - Redis key prefix.
  * @param {function} options.skip - Function(req) that returns true if the request should be skipped.
+ * @param {boolean} options.failClosedOnRedisError - Whether to reject requests if configured Redis fails.
+ * @param {MemoryTokenBucketStore} [options.memoryStore] - In-memory store fallback.
  */
 const createTokenBucketLimiter = (redisClient, options = {}) => {
   const {
@@ -55,6 +96,8 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
     keyGenerator = (req) => req.ip || req.connection?.remoteAddress || '',
     skip = () => false,
     failClosedOnRedisError = false,
+    memoryStore = new MemoryTokenBucketStore(),
+    message,
   } = options;
 
   return async (req, res, next) => {
@@ -62,57 +105,50 @@ const createTokenBucketLimiter = (redisClient, options = {}) => {
       return next();
     }
 
-    if (!redisClient) {
-      // Fallback if redis is not available
-      if (failClosedOnRedisError) {
-        return next({ code: "SERVICE_UNAVAILABLE", statusCode: 503 });
+    const id = keyGenerator(req);
+    if (!id) return next();
+
+    const key = `${prefix}${id}`;
+    const now = Math.floor(Date.now() / 1000); // Current time in seconds
+    const requested = 1;
+
+    let result;
+    if (redisClient) {
+      try {
+        if (typeof redisClient.eval === 'function') {
+          result = await redisClient.eval(TOKEN_BUCKET_LUA, 1, key, capacity, refillRate, now, requested);
+        } else if (typeof redisClient.sendCommand === 'function') {
+          result = await redisClient.sendCommand(['EVAL', TOKEN_BUCKET_LUA, '1', key, String(capacity), String(refillRate), String(now), String(requested)]);
+        }
+      } catch (err) {
+        req.log?.error(err, 'Token bucket rate limiter failed');
+        if (failClosedOnRedisError) {
+          return next(new ApiError('SERVICE_UNAVAILABLE', 'Rate limiting is unavailable', { cause: err }));
+        }
+        result = memoryStore.consume(key, capacity, refillRate, now, requested);
       }
-      return next();
+    } else {
+      result = memoryStore.consume(key, capacity, refillRate, now, requested);
     }
 
-    try {
-      const id = keyGenerator(req);
-      if (!id) return next();
+    if (!result) return next();
 
-      const key = `${prefix}${id}`;
-      const now = Math.floor(Date.now() / 1000); // Current time in seconds
-      const requested = 1;
+    const [allowed, remainingTokens, maxCapacity] = result;
+    const resetTime = Math.ceil((maxCapacity - remainingTokens) / refillRate) + now;
 
-      // Evaluate Lua script
-      let result;
-      if (typeof redisClient.eval === 'function') {
-        result = await redisClient.eval(TOKEN_BUCKET_LUA, 1, key, capacity, refillRate, now, requested);
-      } else if (typeof redisClient.sendCommand === 'function') {
-        // Fallback for redis v4 if it doesn't support eval directly the same way
-        result = await redisClient.sendCommand(['EVAL', TOKEN_BUCKET_LUA, '1', key, String(capacity), String(refillRate), String(now), String(requested)]);
-      }
-      
-      if (!result) return next();
+    res.setHeader('X-RateLimit-Limit', maxCapacity);
+    res.setHeader('X-RateLimit-Remaining', remainingTokens);
+    res.setHeader('X-RateLimit-Reset', resetTime);
 
-      const [allowed, remainingTokens, maxCapacity, lastRefill] = result;
-      const resetTime = Math.ceil((maxCapacity - remainingTokens) / refillRate) + now;
-
-      res.setHeader('X-RateLimit-Limit', maxCapacity);
-      res.setHeader('X-RateLimit-Remaining', remainingTokens);
-      res.setHeader('X-RateLimit-Reset', resetTime);
-
-      if (allowed === 1) {
-        return next();
-      } else {
-        res.setHeader('Retry-After', Math.ceil(1 / refillRate));
-        return res.status(429).json(
-          errorBody('RATE_LIMITED', 'Too many requests, please try again later.', { correlationId: req.correlationId })
-        );
-      }
-    } catch (err) {
-      // On error, let the request pass through to avoid blocking legitimate traffic
-      req.log?.error(err, 'Token bucket rate limiter failed');
-      if (failClosedOnRedisError) {
-        return next({ code: "SERVICE_UNAVAILABLE", statusCode: 503 });
-      }
+    if (allowed === 1) {
       return next();
+    } else {
+      res.setHeader('Retry-After', Math.ceil(1 / refillRate));
+      const payload = message || errorBody('RATE_LIMITED', 'Too many requests, please try again later.', { correlationId: req.correlationId });
+      return res.status(429).json(payload);
     }
   };
 };
 
-module.exports = { createTokenBucketLimiter };
+module.exports = { createTokenBucketLimiter, MemoryTokenBucketStore };
+
