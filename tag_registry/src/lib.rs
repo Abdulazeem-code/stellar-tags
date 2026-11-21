@@ -67,8 +67,7 @@ impl TagRegistry {
         if registration_period_ledgers == 0
             || registration_period_ledgers
                 .checked_add(grace_period_ledgers)
-                .filter(|period| *period < MAX_ENTRY_TTL)
-                .is_none()
+                .is_none_or(|period| period >= MAX_ENTRY_TTL)
         {
             return Err(Error::InvalidPeriod);
         }
@@ -306,13 +305,14 @@ fn get_config(env: &Env) -> Result<Config, Error> {
 }
 
 fn validate_tag(tag: &String) -> Result<(), Error> {
-    let bytes = tag.to_bytes();
-    let len = bytes.len();
+    let len = tag.len();
     if !(3..=32).contains(&len) {
         return Err(Error::InvalidTag);
     }
-    for byte in bytes.iter() {
-        if !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-') {
+    let mut bytes = [0u8; 32];
+    tag.copy_into_slice(&mut bytes[..len as usize]);
+    for byte in &bytes[..len as usize] {
+        if !matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-') {
             return Err(Error::InvalidTag);
         }
     }
