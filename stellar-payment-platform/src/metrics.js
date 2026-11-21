@@ -135,6 +135,11 @@ const dlqMessagesTotal = new client.Counter({
   help: 'Total payment retry jobs moved to the dead letter queue',
 });
 
+const paymentRequestsPaidTotal = new client.Counter({
+  name: 'stellar_tags_payment_requests_paid_total',
+  help: 'Total payment requests marked paid by on-chain payment matching',
+});
+
 /**
  * Express middleware that tracks request count and latency.
  * Attach to app BEFORE route handlers.
@@ -191,4 +196,5 @@ module.exports = {
   redisConnectionsActive,
   dlqDepth,
   dlqMessagesTotal,
+  paymentRequestsPaidTotal,
 };
