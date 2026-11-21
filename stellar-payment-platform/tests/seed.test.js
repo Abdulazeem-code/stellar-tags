@@ -44,6 +44,7 @@ const mockPrisma = () => {
     user: model(),
     webhook: model(),
     paymentIntent: model(),
+    paymentRequest: model(),
     apiKey: model(),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };
