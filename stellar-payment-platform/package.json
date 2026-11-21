@@ -64,6 +64,7 @@
     "seed": "node scripts/seed.js"
   },
   "dependencies": {
+    "@apollo/server": "^4.13.0",
     "@apollo/server": "^5.5.1",
     "@apollo/subgraph": "^2.15.1",
     "@as-integrations/express4": "^1.1.2",
@@ -88,6 +89,9 @@
     "dataloader": "^2.2.3",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "generic-pool": "^3.9.0",
+    "graphql": "^16.15.0",
     "ffjavascript": "0.3.1",
     "graphql": "^16.14.2",
     "graphql-depth-limit": "^1.1.0",
