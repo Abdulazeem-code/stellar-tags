@@ -13,6 +13,7 @@ members = [
     "payment_proxy",
     "timelock_escrow",
     "twap_oracle",
+    "tag_registry",
 ]
 exclude = [
     "payment_router/fuzz",
