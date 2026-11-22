@@ -10,6 +10,7 @@ const paymentRoutes = require('./paymentRoutes');
 const sseRoutes = require('./sseRoutes');
 const contractRoutes = require('./contractRoutes');
 const federationRoutes = require('./federationRoutes');
+const paymentRequestRoutes = require('./paymentRequestRoutes');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -33,6 +34,7 @@ module.exports = (redisClient) => {
   router.use('/', paymentRoutes(redisClient));
   router.use('/', statsRoutes(redisClient));
   router.use('/', federationRoutes(redisClient));
+  router.use('/', paymentRequestRoutes(redisClient));
 
   router.use('/', adminRoutes);
 
