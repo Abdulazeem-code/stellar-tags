@@ -14,6 +14,7 @@ members = [
     "timelock_escrow",
     "twap_oracle",
     "tag_registry",
+    "subscription",
 ]
 exclude = [
     "payment_router/fuzz",
