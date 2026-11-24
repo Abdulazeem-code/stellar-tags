@@ -9,8 +9,8 @@
 // `retry:` hint below) and re-sends `Last-Event-ID` for free.
 //
 // Stream key: `payment:<paymentId>` — an opaque identifier that may be a
-// Payment id or a PaymentIntent id; publishers decide which key they publish
-// under and clients subscribe to the same key.
+// Payment id, a PaymentIntent id or a PaymentRequest id (#1046); publishers
+// decide which key they publish under and clients subscribe to the same key.
 //
 // Client event flow:
 //   1. Client opens  GET /payments/<paymentId>/events   (EventSource).
@@ -53,6 +53,13 @@ const HEARTBEAT_INTERVAL_MS =
 
 /** Reconnection delay advertised to EventSource clients via `retry:`. */
 const RETRY_MS = 3_000;
+
+/**
+ * Payload discriminator for updates about a PaymentRequest (#1046). Payment and
+ * PaymentIntent updates keep the legacy shape (no `type`), so existing clients
+ * are unaffected.
+ */
+const PAYMENT_REQUEST_EVENT_TYPE = 'payment_request';
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -207,7 +214,7 @@ const getSseClientCount = () => {
  * @returns {boolean}
  */
 const isSseStreamPath = (path) =>
-  /\/payments\/[^/]+\/events\/?$/.test(path || '');
+  /\/(?:payments|payment-requests)\/[^/]+\/events\/?$/.test(path || '');
 
 // ---------------------------------------------------------------------------
 // Broadcast helpers
@@ -281,6 +288,29 @@ const publishPaymentUpdate = async (redisPublisher, paymentId, payload = {}) => 
     '[sse] Published payment update to Redis channel',
   );
 };
+
+/**
+ * Publish a PaymentRequest status change through the payment channel (#1046).
+ *
+ * Adds `type: 'payment_request'` so a client can tell a request event from a
+ * plain payment event, and reuses publishPaymentUpdate for the Redis transport:
+ * the Horizon listener/matcher publishes, every API node subscribed through
+ * initSse() fans the event out to its own streams.
+ *
+ * @param {import('ioredis').Redis} redisPublisher - ioredis client in normal (publish) mode.
+ * @param {string} requestId                       - PaymentRequest id.
+ * @param {object} payload                         - { status, transactionHash?, paidAt? }.
+ * @returns {Promise<void>}
+ */
+const publishPaymentRequestUpdate = async (
+  redisPublisher,
+  requestId,
+  payload = {},
+) =>
+  publishPaymentUpdate(redisPublisher, requestId, {
+    ...payload,
+    type: PAYMENT_REQUEST_EVENT_TYPE,
+  });
 
 // ---------------------------------------------------------------------------
 // Init / close
@@ -397,7 +427,9 @@ module.exports = {
   sendClientEvent,
   emitPaymentUpdate,
   publishPaymentUpdate,
+  publishPaymentRequestUpdate,
   getSseClientCount,
   isSseStreamPath,
   REDIS_CHANNEL,
+  PAYMENT_REQUEST_EVENT_TYPE,
 };

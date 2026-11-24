@@ -320,16 +320,23 @@ strictly one-way (server → client), so clients use the browser's `EventSource`
 and reconnection is handled natively — no custom retry logic, and the server
 advertises its preferred reconnect delay with a `retry:` hint.
 - **Path Parameter:** `paymentId` (string, 1-128 chars of `[A-Za-z0-9_-]`) -
-  payment or payment-intent id.
+  payment, payment-intent or payment-request id (#1046).
 - **Returns:** a `text/event-stream` response that stays open until the client
   disconnects, emitting:
   - `connected` - `{ paymentId }`, sent as soon as the stream opens.
   - `snapshot` - `{ paymentId, status, transactionHash? }`, the last known
     status, so a client that just (re)connected converges immediately instead
-    of waiting for the next transition.
+    of waiting for the next transition. For a payment request the snapshot is
+    `{ paymentId, status, transactionHash?, paidAt?, expiresAt?,
+    type: "payment_request" }`; a pending request past its `expiresAt` reports
+    `status: "expired"`.
   - `payment-update` - `{ paymentId, status, ... }` on every status change.
     Publishers (e.g. the Horizon listener) push these to Redis, so every API
-    node fans them out to its own connected streams.
+    node fans them out to its own connected streams. Payment request updates
+    carry `type: "payment_request"` and are published when the matcher marks a
+    request `paid` or the request is cancelled/expired.
+- **Alias:** `GET /payment-requests/:id/events` serves the same stream for a
+  payment request id.
 - **Client usage:** open `new EventSource(url)` with
   `url = "${API_BASE}/api/payments/<id>/events"`; a ready-made wrapper
   (handlers + teardown) lives in `payment-dashboard/src/lib/paymentEvents.js`.
