@@ -196,7 +196,7 @@ jobs:
 
       - name: Build contracts to WASM
         run: |
-          for crate in payment_router payment_proxy twap_oracle yield_escrow subscription; do
+          for crate in payment_router payment_proxy twap_oracle yield_escrow split_bill; do
             echo "::group::$crate"
             (cd "$crate" && cargo build --target wasm32-unknown-unknown --release)
             echo "::endgroup::"
