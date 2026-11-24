@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Stellar Tags API",
-    "description": "API Blueprint Collection for Stellar Tags (/lookup, /register, and /health), following standardized JSON response and error envelopes according to JSend/API error specifications.",
+    "description": "API Blueprint Collection for Stellar Tags (/lookup, /register, /health and payment requests), following standardized JSON response and error envelopes according to JSend/API error specifications.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -94,6 +94,770 @@
         "description": "Looks up a user's details by their Stellar address or name."
       },
       "response": []
+    },
+    {
+      "name": "Payment Requests",
+      "description": "One-off invoices for a tag. Create and cancel need a signature of \"payment-request:<tag>\" (see docs/api-reference.md#payment-requests). The read-only requests work against the seed data from `npm run db:seed`: `paymentRequestId` defaults to the first seeded request. Webhook events sent for payment requests: payment_request.paid, payment_request.expired, payment_request.cancelled.",
+      "item": [
+        {
+          "name": "Create Payment Request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}",
+                "type": "text",
+                "description": "Required. Reuse the same key to safely retry."
+              },
+              {
+                "key": "X-Stellar-Signature",
+                "value": "{{stellarSignature}}",
+                "type": "text",
+                "description": "Base64 SEP-53 signature of \"payment-request:<tag>\" made with the tag's account key."
+              },
+              {
+                "key": "X-Stellar-Signer",
+                "value": "{{stellarSigner}}",
+                "type": "text",
+                "description": "The G... address that signed."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tag\": \"{{tag}}\",\n  \"amount\": \"25\",\n  \"asset\": \"XLM\",\n  \"memo\": \"invoice-{{$timestamp}}\",\n  \"description\": \"Order #42\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{apiUrl}}/payment-requests",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "payment-requests"
+              ]
+            },
+            "description": "Creates a pending payment request. Fill the `tag`, `stellarSignature` and `stellarSigner` collection variables first. Saves the new id to `paymentRequestId`."
+          },
+          "response": [
+            {
+              "name": "201 Created",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json",
+                    "type": "text"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{$guid}}",
+                    "type": "text",
+                    "description": "Required. Reuse the same key to safely retry."
+                  },
+                  {
+                    "key": "X-Stellar-Signature",
+                    "value": "{{stellarSignature}}",
+                    "type": "text",
+                    "description": "Base64 SEP-53 signature of \"payment-request:<tag>\" made with the tag's account key."
+                  },
+                  {
+                    "key": "X-Stellar-Signer",
+                    "value": "{{stellarSigner}}",
+                    "type": "text",
+                    "description": "The G... address that signed."
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"tag\": \"{{tag}}\",\n  \"amount\": \"25\",\n  \"asset\": \"XLM\",\n  \"memo\": \"invoice-{{$timestamp}}\",\n  \"description\": \"Order #42\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                },
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests"
+                  ]
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"ok\": true,\n  \"data\": {\n    \"id\": \"2c80a413-18d7-5a51-990e-449b21996106\",\n    \"tag\": \"alice*localhost\",\n    \"destination\": \"GDQNY3PBOJOKYZSRMK2S7LHHGWZIUISD4QORETLMXEWXBI7KFZZMKTL3\",\n    \"amount\": \"25\",\n    \"asset\": \"XLM\",\n    \"memoType\": \"text\",\n    \"memo\": \"invoice-42\",\n    \"description\": \"Order #42\",\n    \"status\": \"pending\",\n    \"expiresAt\": \"2026-11-25T12:00:00.000Z\",\n    \"paidAt\": null,\n    \"transactionHash\": null,\n    \"createdAt\": \"2026-11-24T12:00:00.000Z\"\n  },\n  \"link\": \"https://localhost:5000/pay/alice?amount=25&memo=invoice-42&memoType=text&requestId=2c80a413-18d7-5a51-990e-449b21996106\",\n  \"sep7\": \"web+stellar:pay?destination=GDQNY3PBOJOKYZSRMK2S7LHHGWZIUISD4QORETLMXEWXBI7KFZZMKTL3&amount=25&memo=invoice-42&memo_type=text\"\n}"
+            },
+            {
+              "name": "401 Missing signature",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json",
+                    "type": "text"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{$guid}}",
+                    "type": "text",
+                    "description": "Required. Reuse the same key to safely retry."
+                  },
+                  {
+                    "key": "X-Stellar-Signature",
+                    "value": "{{stellarSignature}}",
+                    "type": "text",
+                    "description": "Base64 SEP-53 signature of \"payment-request:<tag>\" made with the tag's account key."
+                  },
+                  {
+                    "key": "X-Stellar-Signer",
+                    "value": "{{stellarSigner}}",
+                    "type": "text",
+                    "description": "The G... address that signed."
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"tag\": \"{{tag}}\",\n  \"amount\": \"25\",\n  \"asset\": \"XLM\",\n  \"memo\": \"invoice-{{$timestamp}}\",\n  \"description\": \"Order #42\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                },
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests"
+                  ]
+                }
+              },
+              "status": "Unauthorized",
+              "code": 401,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"UNAUTHENTICATED\",\n    \"message\": \"Sign \\\"payment-request:alice*localhost\\\" with the account key and send it as X-Stellar-Signature.\"\n  },\n  \"correlation_id\": \"3f2a9c1e-0000-4000-8000-000000000000\"\n}"
+            },
+            {
+              "name": "422 Invalid amount",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json",
+                    "type": "text"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{$guid}}",
+                    "type": "text",
+                    "description": "Required. Reuse the same key to safely retry."
+                  },
+                  {
+                    "key": "X-Stellar-Signature",
+                    "value": "{{stellarSignature}}",
+                    "type": "text",
+                    "description": "Base64 SEP-53 signature of \"payment-request:<tag>\" made with the tag's account key."
+                  },
+                  {
+                    "key": "X-Stellar-Signer",
+                    "value": "{{stellarSigner}}",
+                    "type": "text",
+                    "description": "The G... address that signed."
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"tag\": \"{{tag}}\",\n  \"amount\": \"25\",\n  \"asset\": \"XLM\",\n  \"memo\": \"invoice-{{$timestamp}}\",\n  \"description\": \"Order #42\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                },
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests"
+                  ]
+                }
+              },
+              "status": "Unprocessable Entity",
+              "code": 422,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"VALIDATION_FAILED\",\n    \"message\": \"amount must be a positive decimal with at most 7 decimal places\"\n  },\n  \"correlation_id\": \"3f2a9c1e-0000-4000-8000-000000000000\"\n}"
+            }
+          ],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  pm.collectionVariables.set('paymentRequestId', pm.response.json().data.id);",
+                  "}",
+                  "pm.test('status is 201', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Payment Request",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "payment-requests",
+                "{{paymentRequestId}}"
+              ]
+            },
+            "description": "Returns one payment request. A pending request past expiresAt is reported as expired."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"ok\": true,\n  \"data\": {\n    \"id\": \"2c80a413-18d7-5a51-990e-449b21996106\",\n    \"tag\": \"alice*localhost\",\n    \"destination\": \"GDQNY3PBOJOKYZSRMK2S7LHHGWZIUISD4QORETLMXEWXBI7KFZZMKTL3\",\n    \"amount\": \"25\",\n    \"asset\": \"XLM\",\n    \"memoType\": \"text\",\n    \"memo\": \"invoice-42\",\n    \"description\": \"Order #42\",\n    \"status\": \"pending\",\n    \"expiresAt\": \"2026-11-25T12:00:00.000Z\",\n    \"paidAt\": null,\n    \"transactionHash\": null,\n    \"createdAt\": \"2026-11-24T12:00:00.000Z\"\n  }\n}"
+            },
+            {
+              "name": "404 Not Found",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}"
+                  ]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"NOT_FOUND\",\n    \"message\": \"Payment request not found\"\n  },\n  \"correlation_id\": \"3f2a9c1e-0000-4000-8000-000000000000\"\n}"
+            }
+          ],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('has a status', () => pm.expect(pm.response.json().data.status).to.be.oneOf(['pending','paid','expired','cancelled']));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel Payment Request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Stellar-Signature",
+                "value": "{{stellarSignature}}",
+                "type": "text",
+                "description": "Base64 SEP-53 signature of \"payment-request:<tag>\" made with the tag's account key."
+              },
+              {
+                "key": "X-Stellar-Signer",
+                "value": "{{stellarSigner}}",
+                "type": "text",
+                "description": "The G... address that signed."
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/cancel",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "payment-requests",
+                "{{paymentRequestId}}",
+                "cancel"
+              ]
+            },
+            "description": "Cancels a pending request and sends payment_request.cancelled. Needs the same signature as create."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "X-Stellar-Signature",
+                    "value": "{{stellarSignature}}",
+                    "type": "text",
+                    "description": "Base64 SEP-53 signature of \"payment-request:<tag>\" made with the tag's account key."
+                  },
+                  {
+                    "key": "X-Stellar-Signer",
+                    "value": "{{stellarSigner}}",
+                    "type": "text",
+                    "description": "The G... address that signed."
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/cancel",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}",
+                    "cancel"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"ok\": true,\n  \"data\": {\n    \"id\": \"2c80a413-18d7-5a51-990e-449b21996106\",\n    \"tag\": \"alice*localhost\",\n    \"destination\": \"GDQNY3PBOJOKYZSRMK2S7LHHGWZIUISD4QORETLMXEWXBI7KFZZMKTL3\",\n    \"amount\": \"25\",\n    \"asset\": \"XLM\",\n    \"memoType\": \"text\",\n    \"memo\": \"invoice-42\",\n    \"description\": \"Order #42\",\n    \"status\": \"cancelled\",\n    \"expiresAt\": \"2026-11-25T12:00:00.000Z\",\n    \"paidAt\": null,\n    \"transactionHash\": null,\n    \"createdAt\": \"2026-11-24T12:00:00.000Z\"\n  }\n}"
+            },
+            {
+              "name": "409 Conflict",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "X-Stellar-Signature",
+                    "value": "{{stellarSignature}}",
+                    "type": "text",
+                    "description": "Base64 SEP-53 signature of \"payment-request:<tag>\" made with the tag's account key."
+                  },
+                  {
+                    "key": "X-Stellar-Signer",
+                    "value": "{{stellarSigner}}",
+                    "type": "text",
+                    "description": "The G... address that signed."
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/cancel",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}",
+                    "cancel"
+                  ]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"CONFLICT\",\n    \"message\": \"Cannot cancel a paid payment request\"\n  },\n  \"correlation_id\": \"3f2a9c1e-0000-4000-8000-000000000000\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Payment Request QR (PNG)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/qr.png?size=512&format=link",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "payment-requests",
+                "{{paymentRequestId}}",
+                "qr.png"
+              ],
+              "query": [
+                {
+                  "key": "size",
+                  "value": "512",
+                  "description": "128 to 1024, clamped. Default 512."
+                },
+                {
+                  "key": "format",
+                  "value": "link",
+                  "description": "link (HTTPS pay link, default) or sep7 (web+stellar:pay URI)."
+                }
+              ]
+            },
+            "description": "QR code as image/png. Cache-Control is public, max-age=300 while pending and no-store afterwards."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/qr.png?size=512&format=link",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}",
+                    "qr.png"
+                  ],
+                  "query": [
+                    {
+                      "key": "size",
+                      "value": "512",
+                      "description": "128 to 1024, clamped. Default 512."
+                    },
+                    {
+                      "key": "format",
+                      "value": "link",
+                      "description": "link (HTTPS pay link, default) or sep7 (web+stellar:pay URI)."
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "image/png"
+                },
+                {
+                  "key": "Cache-Control",
+                  "value": "public, max-age=300"
+                }
+              ],
+              "body": "<binary PNG>"
+            }
+          ],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('is a PNG', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('image/png'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Payment Request QR (SVG, SEP-7)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/qr.svg?size=256&format=sep7",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "payment-requests",
+                "{{paymentRequestId}}",
+                "qr.svg"
+              ],
+              "query": [
+                {
+                  "key": "size",
+                  "value": "256",
+                  "description": "128 to 1024, clamped. Default 512."
+                },
+                {
+                  "key": "format",
+                  "value": "sep7",
+                  "description": "link (HTTPS pay link, default) or sep7 (web+stellar:pay URI)."
+                }
+              ]
+            },
+            "description": "QR code as image/svg+xml encoding the web+stellar:pay URI."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/qr.svg?size=256&format=sep7",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}",
+                    "qr.svg"
+                  ],
+                  "query": [
+                    {
+                      "key": "size",
+                      "value": "256",
+                      "description": "128 to 1024, clamped. Default 512."
+                    },
+                    {
+                      "key": "format",
+                      "value": "sep7",
+                      "description": "link (HTTPS pay link, default) or sep7 (web+stellar:pay URI)."
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "image/svg+xml; charset=utf-8"
+                },
+                {
+                  "key": "Cache-Control",
+                  "value": "no-store"
+                }
+              ],
+              "body": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"256\" viewBox=\"0 0 41 41\" shape-rendering=\"crispEdges\">...</svg>"
+            }
+          ],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('is an SVG', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('image/svg+xml'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Payment Request QR (bad format)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/qr.png?format=bitcoin",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "payment-requests",
+                "{{paymentRequestId}}",
+                "qr.png"
+              ],
+              "query": [
+                {
+                  "key": "format",
+                  "value": "bitcoin",
+                  "description": "Invalid on purpose."
+                }
+              ]
+            },
+            "description": "An unknown format returns 400."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/qr.png?format=bitcoin",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}",
+                    "qr.png"
+                  ],
+                  "query": [
+                    {
+                      "key": "format",
+                      "value": "bitcoin",
+                      "description": "Invalid on purpose."
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"INVALID_INPUT\",\n    \"message\": \"format must be link or sep7\"\n  },\n  \"correlation_id\": \"3f2a9c1e-0000-4000-8000-000000000000\"\n}"
+            }
+          ],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Payment Request Events (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/events",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "payment-requests",
+                "{{paymentRequestId}}",
+                "events"
+              ]
+            },
+            "description": "Server-Sent Events stream. Postman shows events as they arrive; with curl use `curl -N`. Emits connected, snapshot, then payment-update on paid / cancelled / expired."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "Accept",
+                    "value": "text/event-stream",
+                    "type": "text"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiUrl}}/payment-requests/{{paymentRequestId}}/events",
+                  "host": [
+                    "{{apiUrl}}"
+                  ],
+                  "path": [
+                    "payment-requests",
+                    "{{paymentRequestId}}",
+                    "events"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "text/event-stream"
+                }
+              ],
+              "body": "event: connected\ndata: {\"paymentId\":\"2c80a413-18d7-5a51-990e-449b21996106\"}\n\nevent: snapshot\ndata: {\"paymentId\":\"2c80a413-18d7-5a51-990e-449b21996106\",\"status\":\"pending\",\"type\":\"payment_request\",\"expiresAt\":\"2026-11-25T12:00:00.000Z\"}\n\nevent: payment-update\ndata: {\"paymentId\":\"2c80a413-18d7-5a51-990e-449b21996106\",\"status\":\"paid\",\"type\":\"payment_request\",\"transactionHash\":\"3389e9f0...\",\"paidAt\":\"2026-11-24T11:59:58.000Z\"}\n"
+            }
+          ]
+        }
+      ]
     }
   ],
   "variable": [
@@ -101,6 +865,36 @@
       "key": "baseUrl",
       "value": "http://localhost:5000",
       "type": "string"
+    },
+    {
+      "key": "apiUrl",
+      "value": "{{baseUrl}}/api/v1",
+      "type": "string",
+      "description": "Versioned API root used by the Payment Requests folder."
+    },
+    {
+      "key": "paymentRequestId",
+      "value": "2c80a413-18d7-5a51-990e-449b21996106",
+      "type": "string",
+      "description": "Defaults to the first seeded payment request; Create Payment Request overwrites it."
+    },
+    {
+      "key": "tag",
+      "value": "alice*localhost",
+      "type": "string",
+      "description": "Tag to create requests for. You must hold its account key."
+    },
+    {
+      "key": "stellarSignature",
+      "value": "",
+      "type": "string",
+      "description": "Base64 signature of \"payment-request:<tag>\" (see docs/payment-requests.md step 4)."
+    },
+    {
+      "key": "stellarSigner",
+      "value": "",
+      "type": "string",
+      "description": "G... address that made stellarSignature."
     }
   ]
 }
