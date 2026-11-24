@@ -21,6 +21,9 @@ jest.mock('../prismaClient', () => ({
 jest.mock('../src/services/ownershipService', () => ({
   authenticateUsernameOwner: jest.fn(),
 }));
+jest.mock('../src/sse/paymentRequestEvents', () => ({
+  notifyPaymentRequestUpdate: jest.fn().mockResolvedValue(true),
+}));
 jest.mock('../src/webhookWorker', () => ({
   dispatchPaymentRequestWebhooks: jest.fn().mockResolvedValue(null),
 }));
@@ -32,6 +35,7 @@ const { prisma } = require('../prismaClient');
 const { authenticateUsernameOwner } = require('../src/services/ownershipService');
 const { buildErrorHandler } = require('../src/middleware/errorHandler');
 const { dispatchPaymentRequestWebhooks } = require('../src/webhookWorker');
+const { notifyPaymentRequestUpdate } = require('../src/sse/paymentRequestEvents');
 const buildRouter = require('../src/routes/v1/paymentRequestRoutes');
 
 const ISSUER = `G${'A'.repeat(55)}`;
@@ -167,6 +171,7 @@ describe('payment request routes', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('cancelled');
+    expect(notifyPaymentRequestUpdate).toHaveBeenCalledWith({ requestId: 'request-1', status: 'cancelled' });
     expect(dispatchPaymentRequestWebhooks).toHaveBeenCalledWith(expect.objectContaining({
       status: 'cancelled',
       request: expect.objectContaining({ id: 'request-1', status: 'cancelled' }),

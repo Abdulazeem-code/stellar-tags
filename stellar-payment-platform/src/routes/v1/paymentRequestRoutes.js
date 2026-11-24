@@ -18,6 +18,7 @@ const { createSignatureRateLimiter } = require('../../middleware/signatureRateLi
 const { paymentRequestBodySchema } = require('../../schemas');
 const { buildPaymentLink, toSep7Uri } = require('../../utils/paymentLink');
 const { dispatchPaymentRequestWebhooks } = require('../../webhookWorker');
+const { notifyPaymentRequestUpdate } = require('../../sse/paymentRequestEvents');
 
 const profanityFilter = new Filter();
 const DEFAULT_EXPIRY_MS = 24 * 60 * 60 * 1000;
@@ -244,6 +245,7 @@ module.exports = (redisClient) => {
       where: { id: request.id },
       data: { status: 'cancelled' },
     });
+    notifyPaymentRequestUpdate({ requestId: updated.id, status: 'cancelled' });
     // The cancel already succeeded; a webhook problem must not fail the request.
     dispatchPaymentRequestWebhooks({ prisma, request: updated, status: 'cancelled' }).catch((error) =>
       logger.error({ err: error, paymentRequestId: updated.id }, '[payment-request] cancelled webhook dispatch failed'),

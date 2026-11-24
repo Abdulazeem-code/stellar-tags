@@ -8,6 +8,7 @@
 const cron = require('node-cron');
 const { logger } = require('./logger');
 const { dispatchPaymentRequestWebhooks } = require('./webhookWorker');
+const { notifyPaymentRequestUpdate } = require('./sse/paymentRequestEvents');
 
 const EXPIRY_CRON = process.env.PAYMENT_REQUEST_EXPIRY_CRON || '* * * * *';
 const EXPIRY_BATCH_SIZE = 500;
@@ -21,6 +22,7 @@ const EXPIRY_BATCH_SIZE = 500;
  */
 async function runPaymentRequestExpirySweep(prisma, options = {}) {
   const dispatch = options.dispatch || dispatchPaymentRequestWebhooks;
+  const notify = options.notify || notifyPaymentRequestUpdate;
   const now = options.now || new Date();
 
   const due = await prisma.paymentRequest.findMany({
@@ -38,6 +40,7 @@ async function runPaymentRequestExpirySweep(prisma, options = {}) {
     });
     if (updated.count !== 1) continue;
     expired += 1;
+    await notify({ requestId: request.id, status: 'expired' });
 
     try {
       await dispatch({ prisma, request: { ...request, status: 'expired' }, status: 'expired' });

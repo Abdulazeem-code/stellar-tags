@@ -326,8 +326,9 @@ describe('expiry sweep', () => {
       },
     };
     const dispatch = jest.fn().mockResolvedValue(null);
+    const notify = jest.fn().mockResolvedValue(true);
 
-    const result = await runPaymentRequestExpirySweep(prisma, { dispatch, now: new Date('2026-01-03T00:00:00Z') });
+    const result = await runPaymentRequestExpirySweep(prisma, { dispatch, notify, now: new Date('2026-01-03T00:00:00Z') });
 
     expect(result).toEqual({ expired: 1 });
     expect(prisma.paymentRequest.findMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -337,6 +338,8 @@ describe('expiry sweep', () => {
       where: { id: 'req-123', status: 'pending' },
       data: { status: 'expired' },
     });
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith({ requestId: 'req-123', status: 'expired' });
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(dispatch.mock.calls[0][0]).toMatchObject({ status: 'expired', request: { id: 'req-123', status: 'expired' } });
   });
