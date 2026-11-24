@@ -21,7 +21,13 @@ jest.mock('../src/middleware/signatureRateLimit', () => ({
   createSignatureRateLimiter: () => (req, res, next) => next(),
 }));
 
+// qrcode renders far slower inside Jest's sandbox than in Node (about 2.5s vs
+// 60ms for 1024px), so route tests stick to small images and the size clamp is
+// checked on the schema. The longer timeout is headroom for slow CI runners.
+jest.setTimeout(20000);
+
 const { prisma } = require('../prismaClient');
+const { paymentRequestQrQuerySchema } = require('../src/schemas');
 const { buildErrorHandler } = require('../src/middleware/errorHandler');
 const buildRouter = require('../src/routes/v1/paymentRequestRoutes');
 
@@ -49,6 +55,9 @@ const binary = (res, callback) => {
   res.on('end', () => callback(null, Buffer.concat(chunks)));
 };
 
+// Width from the IHDR chunk; avoids decoding large images just to check size.
+const pngWidth = (buffer) => buffer.readUInt32BE(16);
+
 const decodePng = (buffer) => {
   const png = PNG.sync.read(buffer);
   const result = jsQR(new Uint8ClampedArray(png.data), png.width, png.height);
@@ -70,9 +79,12 @@ describe('GET /payment-requests/:id/qr.(png|svg)', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toBe('image/png');
     expect(res.headers['cache-control']).toBe('public, max-age=300');
+    expect(pngWidth(res.body)).toBe(512);
 
-    const { text, width } = decodePng(res.body);
-    expect(width).toBe(512);
+    // Decode a small copy: jsqr on a 512px image is slow under coverage.
+    const small = await request(app).get('/payment-requests/req-qr-1/qr.png?size=200').buffer(true).parse(binary);
+    const { text, width } = decodePng(small.body);
+    expect(width).toBe(200);
     const link = new URL(text);
     expect(link.origin + link.pathname).toBe('https://pay.example.com/pay/alice');
     expect(link.searchParams.get('amount')).toBe('12.5');
@@ -82,7 +94,7 @@ describe('GET /payment-requests/:id/qr.(png|svg)', () => {
 
   test('format=sep7 encodes the web+stellar:pay URI', async () => {
     const res = await request(app)
-      .get('/payment-requests/req-qr-1/qr.png?format=sep7')
+      .get('/payment-requests/req-qr-1/qr.png?format=sep7&size=200')
       .buffer(true)
       .parse(binary);
 
@@ -109,13 +121,22 @@ describe('GET /payment-requests/:id/qr.(png|svg)', () => {
     ['5000', 1024],
     ['300', 300],
     ['abc', 512],
-  ])('size=%s is clamped to %i', async (size, expected) => {
+    [undefined, 512],
+  ])('schema clamps size=%s to %i', (size, expected) => {
+    expect(paymentRequestQrQuerySchema.parse({ size }).size).toBe(expected);
+  });
+
+  test.each([
+    ['64', 128],
+    ['300', 300],
+  ])('PNG for size=%s is %i px wide', async (size, expected) => {
     const res = await request(app)
       .get(`/payment-requests/req-qr-1/qr.png?size=${size}`)
       .buffer(true)
       .parse(binary);
     expect(res.status).toBe(200);
-    expect(decodePng(res.body).width).toBe(expected);
+    expect(res.headers['content-type']).toBe('image/png');
+    expect(pngWidth(res.body)).toBe(expected);
   });
 
   test('unknown id returns 404', async () => {
