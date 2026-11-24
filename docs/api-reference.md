@@ -385,3 +385,45 @@ trusting the payload.
 See [docs/webhook-signature-verification.md](webhook-signature-verification.md)
 for step-by-step verification examples in Node.js, Python, and Go.
 
+
+## Webhook events
+
+Webhooks are registered per tag and receive every event unless their `events`
+list narrows it (use `*` for all). All events share the same envelope, queue,
+retry policy (`MAX_RETRY_ATTEMPTS`, exponential backoff), HMAC signing and dead
+letter queue.
+
+| Event | When it is sent |
+|---|---|
+| `payment.received` | A payment lands on the tag's Stellar account. |
+| `payment_request.paid` | A pending payment request is matched to a payment (memo, asset and amount). |
+| `payment_request.expired` | A pending payment request passes its `expiresAt` (checked every minute). |
+| `payment_request.cancelled` | The owner cancels a pending request with `POST /payment-requests/:id/cancel`. |
+
+`payment_request.*` payload:
+
+```json
+{
+  "event": "payment_request.paid",
+  "event_id": "6f1c2d1e-...-paid",
+  "timestamp": "2026-11-24T12:00:00.000Z",
+  "network": "testnet",
+  "data": {
+    "request_id": "6f1c2d1e-...",
+    "tag": "alice*stellartags.xyz",
+    "amount_requested": "25",
+    "amount_paid": "25.0000000",
+    "asset": "XLM",
+    "memo": "invoice-42",
+    "transaction_hash": "3389e9f0...",
+    "paid_at": "2026-11-24T11:59:58.000Z"
+  }
+}
+```
+
+- `event_id` is `<request_id>-<paid|expired|cancelled>`. It is the same on every
+  retry, so use it to de-duplicate.
+- `amount_paid` can be higher than `amount_requested` (overpayments still settle
+  the request).
+- For `payment_request.expired` and `payment_request.cancelled`, `amount_paid`,
+  `transaction_hash` and `paid_at` are `null`.

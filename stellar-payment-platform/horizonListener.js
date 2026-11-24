@@ -6,6 +6,7 @@ const { createRedisConnection } = require('./src/config/redis');
 const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
+  dispatchPaymentRequestWebhooks,
   scheduleWebhookRetryJob,
   closeWebhookQueue,
 } = require('./src/webhookWorker');
@@ -119,7 +120,10 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
-          matchPayment(prisma, payment).catch((err) =>
+          matchPayment(prisma, payment, {
+            onPaid: (request, { amountPaid }) =>
+              dispatchPaymentRequestWebhooks({ prisma, request, status: 'paid', amountPaid }),
+          }).catch((err) =>
             logger.error({ err }, '[listener] Payment request matcher failed'),
           );
           createPaymentWithOutbox(prisma, {

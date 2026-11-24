@@ -31,6 +31,7 @@ jest.mock('../src/fraudDetection', () => ({ PAYMENT_STREAM: 'payments' }));
 
 jest.mock('../src/webhookWorker', () => ({
   dispatchPaymentWebhooks: jest.fn(),
+  dispatchPaymentRequestWebhooks: jest.fn(),
   scheduleWebhookRetryJob: jest.fn(),
   closeWebhookQueue: jest.fn().mockResolvedValue(undefined),
 }));

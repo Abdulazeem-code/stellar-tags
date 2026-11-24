@@ -24,6 +24,8 @@ const normalizeAsset = (payment) => {
 
 /**
  * Match one incoming Horizon payment operation to a pending payment request.
+ * `options.onPaid(request, { amountPaid })` runs once for each request that
+ * this call moved to paid (used to send payment_request.paid webhooks).
  * @returns {Promise<string[]>} IDs of requests transitioned to paid
  */
 async function matchPayment(prisma, payment, options = {}) {
@@ -102,6 +104,22 @@ async function matchPayment(prisma, payment, options = {}) {
       if (updated.count === 1) {
         paidIds.push(request.id);
         paymentRequestsPaidTotal.inc();
+        if (typeof options.onPaid === 'function') {
+          const paidRequest = {
+            ...request,
+            status: 'paid',
+            paidAt: now,
+            transactionHash: payment.transaction_hash,
+          };
+          try {
+            await options.onPaid(paidRequest, { amountPaid: payment.amount });
+          } catch (error) {
+            logger.error(
+              { err: error, paymentRequestId: request.id },
+              '[payment-request-matcher] onPaid hook failed',
+            );
+          }
+        }
       }
     } catch (error) {
       logger.error(

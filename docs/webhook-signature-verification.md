@@ -16,6 +16,20 @@ been tampered with in transit.
 
 > Prefer `Stellar-Signature` / `Stellar-Timestamp` for new integrations.
 
+## Events
+
+The same headers and signing scheme are used for every event:
+
+| Event | Sent when |
+|---|---|
+| `payment.received` | A payment lands on the tag's account. |
+| `payment_request.paid` | A payment request is paid. |
+| `payment_request.expired` | A payment request expires unpaid. |
+| `payment_request.cancelled` | A payment request is cancelled by its owner. |
+
+Payloads are described in [api-reference.md](api-reference.md#webhook-events).
+Use `event_id` to de-duplicate retries.
+
 ## How the signature is computed
 
 Legacy scheme (body only, still sent for backward compatibility):

@@ -416,6 +416,91 @@ const dispatchPaymentWebhooks = async ({ prisma, payment, queue }) => {
   }));
 };
 
+// ── Payment request events (#1047) ───────────────────────────────────────
+
+const PAYMENT_REQUEST_WEBHOOK_EVENTS = Object.freeze({
+  paid: 'payment_request.paid',
+  expired: 'payment_request.expired',
+  cancelled: 'payment_request.cancelled',
+});
+
+const toIsoOrNull = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+/**
+ * Build the payload for a payment_request.* event. `event_id` is
+ * `<requestId>-<status>`, so retries and duplicate dispatches share one id and
+ * one BullMQ job id, and merchants can de-duplicate on it.
+ */
+const buildPaymentRequestPayload = ({ request, status, amountPaid = null, now = new Date() }) => {
+  const event = PAYMENT_REQUEST_WEBHOOK_EVENTS[status];
+  if (!event) {
+    throw new Error(`Unsupported payment request webhook status: ${status}`);
+  }
+  const isPaid = status === 'paid';
+  return {
+    event,
+    event_id: `${request.id}-${status}`,
+    timestamp: now.toISOString(),
+    network: process.env.HORIZON_NETWORK || 'testnet',
+    data: {
+      request_id: request.id,
+      tag: request.tag,
+      amount_requested: request.amount,
+      amount_paid: isPaid ? (amountPaid ?? request.amount) : null,
+      asset: request.asset,
+      memo: request.memo ?? null,
+      transaction_hash: isPaid ? (request.transactionHash || null) : null,
+      paid_at: isPaid ? toIsoOrNull(request.paidAt) : null,
+    },
+  };
+};
+
+/**
+ * Send a payment_request.paid / expired / cancelled event to the recipient's
+ * webhooks. Uses the same queue, retry, HMAC signing and DLQ path as
+ * payment.received.
+ *
+ * @param {object} params
+ * @param {object} params.prisma
+ * @param {object} params.request   - PaymentRequest row after the transition.
+ * @param {string} [params.status]  - paid | expired | cancelled (defaults to request.status).
+ * @param {string} [params.amountPaid] - Amount actually received (paid only).
+ * @param {object} [params.queue]   - BullMQ queue override (tests).
+ * @returns {Promise<object|null>} the payload, or null when nothing was sent.
+ */
+const dispatchPaymentRequestWebhooks = async ({
+  prisma,
+  request,
+  status,
+  amountPaid,
+  queue,
+}) => {
+  if (!request?.id || !request.destination) return null;
+  const resolvedStatus = status || request.status;
+  if (!PAYMENT_REQUEST_WEBHOOK_EVENTS[resolvedStatus]) return null;
+
+  const webhooks = await fetchWebhooksForAddress(prisma, request.destination);
+  if (!webhooks.length) return null;
+
+  const payload = buildPaymentRequestPayload({ request, status: resolvedStatus, amountPaid });
+  const deliveryQueue = queue || getWebhookQueue();
+  await Promise.all(webhooks.map(async (webhook) => {
+    if (!webhookEventMatches(webhook, payload.event)) {
+      logger.info(`[webhook-worker] Skipping webhook id=${webhook.id} url=${webhook.url} for event=${payload.event} due to subscription filter`);
+      return;
+    }
+    await enqueueWebhookDelivery(webhook, payload, deliveryQueue);
+    logger.info(
+      `[webhook-queue] Enqueued event=${payload.event_id} webhook=${webhook.id} recipient=${request.destination}`,
+    );
+  }));
+  return payload;
+};
+
 const closeWebhookQueue = async () => {
   const resources = [webhookWorker, webhookQueue].filter(Boolean);
   await Promise.all(resources.map((resource) => resource.close()));
@@ -544,6 +629,9 @@ const replayFromDLQ = async (prisma, dqlId) => {
 
 module.exports = {
   dispatchPaymentWebhooks,
+  dispatchPaymentRequestWebhooks,
+  buildPaymentRequestPayload,
+  PAYMENT_REQUEST_WEBHOOK_EVENTS,
   enqueueWebhookDelivery,
   startWebhookWorker,
   closeWebhookQueue,
