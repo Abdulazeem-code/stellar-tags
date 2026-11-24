@@ -21,6 +21,12 @@ jest.mock('../prismaClient', () => ({
 jest.mock('../src/services/ownershipService', () => ({
   authenticateUsernameOwner: jest.fn(),
 }));
+jest.mock('../src/sse/paymentRequestEvents', () => ({
+  notifyPaymentRequestUpdate: jest.fn().mockResolvedValue(true),
+}));
+jest.mock('../src/webhookWorker', () => ({
+  dispatchPaymentRequestWebhooks: jest.fn().mockResolvedValue(null),
+}));
 jest.mock('../src/middleware/signatureRateLimit', () => ({
   createSignatureRateLimiter: () => (req, res, next) => next(),
 }));
@@ -28,6 +34,8 @@ jest.mock('../src/middleware/signatureRateLimit', () => ({
 const { prisma } = require('../prismaClient');
 const { authenticateUsernameOwner } = require('../src/services/ownershipService');
 const { buildErrorHandler } = require('../src/middleware/errorHandler');
+const { dispatchPaymentRequestWebhooks } = require('../src/webhookWorker');
+const { notifyPaymentRequestUpdate } = require('../src/sse/paymentRequestEvents');
 const buildRouter = require('../src/routes/v1/paymentRequestRoutes');
 
 const ISSUER = `G${'A'.repeat(55)}`;
@@ -139,5 +147,48 @@ describe('payment request routes', () => {
       .send({});
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('CONFLICT');
+  });
+
+  test('cancelling sends the payment_request.cancelled webhook', async () => {
+    const pending = {
+      id: 'request-1',
+      tag: 'alice*localhost',
+      destination: ISSUER,
+      amount: '10',
+      asset: 'XLM',
+      memo: 'invoice-42',
+      status: 'pending',
+      expiresAt: new Date(Date.now() + 86400000),
+    };
+    prisma.paymentRequest.findUnique.mockResolvedValue(pending);
+    prisma.paymentRequest.update.mockResolvedValue({ ...pending, status: 'cancelled' });
+
+    const res = await request(buildApp())
+      .post('/payment-requests/request-1/cancel')
+      .set('X-Stellar-Signature', 'signed-message')
+      .set('X-Stellar-Signer', ISSUER)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.status).toBe('cancelled');
+    expect(notifyPaymentRequestUpdate).toHaveBeenCalledWith({ requestId: 'request-1', status: 'cancelled' });
+    expect(dispatchPaymentRequestWebhooks).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'cancelled',
+      request: expect.objectContaining({ id: 'request-1', status: 'cancelled' }),
+    }));
+  });
+
+  test('a webhook failure does not fail the cancel', async () => {
+    const pending = { id: 'request-1', tag: 'alice*localhost', destination: ISSUER, status: 'pending', expiresAt: new Date(Date.now() + 86400000) };
+    prisma.paymentRequest.findUnique.mockResolvedValue(pending);
+    prisma.paymentRequest.update.mockResolvedValue({ ...pending, status: 'cancelled' });
+    dispatchPaymentRequestWebhooks.mockRejectedValueOnce(new Error('redis down'));
+
+    const res = await request(buildApp())
+      .post('/payment-requests/request-1/cancel')
+      .set('X-Stellar-Signature', 'signed-message')
+      .set('X-Stellar-Signer', ISSUER)
+      .send({});
+    expect(res.status).toBe(200);
   });
 });

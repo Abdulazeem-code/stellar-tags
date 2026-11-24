@@ -6,6 +6,8 @@ const { createRedisConnection } = require('./src/config/redis');
 const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
+  dispatchPaymentRequestWebhooks,
+  startWebhookWorker,
   scheduleWebhookRetryJob,
   closeWebhookQueue,
 } = require('./src/webhookWorker');
@@ -16,6 +18,7 @@ const {
 const { publishPaymentUpdate } = require('./src/sse');
 const { createPaymentWithOutbox } = require('./src/services/settlementOutbox');
 const { matchPayment } = require('./src/services/paymentRequestMatcher');
+const { notifyPaymentRequestUpdate } = require('./src/sse/paymentRequestEvents');
 
 
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
@@ -119,7 +122,18 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
-          matchPayment(prisma, payment).catch((err) =>
+          matchPayment(prisma, payment, {
+            onPaid: (request, { amountPaid }) => Promise.all([
+              dispatchPaymentRequestWebhooks({ prisma, request, status: 'paid', amountPaid }),
+              notifyPaymentRequestUpdate({
+                redisPublisher,
+                requestId: request.id,
+                status: 'paid',
+                transactionHash: request.transactionHash,
+                paidAt: request.paidAt,
+              }),
+            ]),
+          }).catch((err) =>
             logger.error({ err }, '[listener] Payment request matcher failed'),
           );
           createPaymentWithOutbox(prisma, {
@@ -273,6 +287,14 @@ const main = async () => {
 
   // Initial sync
   await syncWatchedAccounts();
+
+  // Deliver queued webhooks (payment.received and payment_request.*). The API
+  // process only enqueues, so without a worker nothing is ever sent.
+  try {
+    startWebhookWorker({ prisma });
+  } catch (err) {
+    logger.error('Failed to start webhook worker:', err.message);
+  }
 
   // Schedule webhook retry / liveness pings
   try {

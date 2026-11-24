@@ -31,6 +31,8 @@ jest.mock('../src/fraudDetection', () => ({ PAYMENT_STREAM: 'payments' }));
 
 jest.mock('../src/webhookWorker', () => ({
   dispatchPaymentWebhooks: jest.fn(),
+  dispatchPaymentRequestWebhooks: jest.fn(),
+  startWebhookWorker: jest.fn(),
   scheduleWebhookRetryJob: jest.fn(),
   closeWebhookQueue: jest.fn().mockResolvedValue(undefined),
 }));
@@ -58,8 +60,10 @@ const {
   watchAccount,
   syncWatchedAccounts,
   shutdown,
+  main,
   activeStreams,
 } = require('../horizonListener');
+const { startWebhookWorker } = require('../src/webhookWorker');
 
 const mockCloseStream = jest.fn();
 const mockStream = jest.fn(() => mockCloseStream);
@@ -206,5 +210,14 @@ describe('Horizon listener publishes status updates to SSE (#730)', () => {
 
     expect(publishPaymentUpdate).not.toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalled();
+  });
+});
+
+describe('Horizon listener startup', () => {
+  test('starts the webhook delivery worker', async () => {
+    prisma.user.findMany.mockResolvedValue([]);
+    const { syncInterval } = await main();
+    clearInterval(syncInterval);
+    expect(startWebhookWorker).toHaveBeenCalledWith({ prisma });
   });
 });

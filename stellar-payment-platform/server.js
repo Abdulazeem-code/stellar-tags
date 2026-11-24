@@ -19,6 +19,7 @@ const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
 const { scheduleReconciliationJob, scheduleLedgerReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
+const { schedulePaymentRequestExpiryJob } = require("./src/payment-request-expiry-cron");
 const { correlationId } = require("./middleware/correlation");
 const dotenv = require("dotenv");
 const timeout = require("connect-timeout");
@@ -331,6 +332,8 @@ scheduleSoftDeletePurgeJob(prisma);
 scheduleReconciliationJob(prisma);
 // Event-driven ledger reconciliation of stale PENDING payments (issue #933)
 scheduleLedgerReconciliationJob(prisma);
+// Persist expired payment requests and send payment_request.expired (#1047)
+schedulePaymentRequestExpiryJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
 // RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
