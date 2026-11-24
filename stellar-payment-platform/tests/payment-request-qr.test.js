@@ -1,0 +1,145 @@
+'use strict';
+
+const request = require('supertest');
+const express = require('express');
+const jsQR = require('jsqr');
+const { PNG } = require('pngjs');
+
+jest.mock('@stellar/stellar-sdk', () => ({
+  StrKey: { isValidEd25519PublicKey: (value) => /^G[A-Z2-7]{55}$/.test(value || '') },
+}));
+jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }) }));
+jest.mock('../prismaClient', () => ({
+  prisma: {
+    user: { findUnique: jest.fn() },
+    paymentRequest: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
+  },
+  isPrismaConnectionError: () => false,
+}));
+jest.mock('../src/services/ownershipService', () => ({ authenticateUsernameOwner: jest.fn() }));
+jest.mock('../src/middleware/signatureRateLimit', () => ({
+  createSignatureRateLimiter: () => (req, res, next) => next(),
+}));
+
+const { prisma } = require('../prismaClient');
+const { buildErrorHandler } = require('../src/middleware/errorHandler');
+const buildRouter = require('../src/routes/v1/paymentRequestRoutes');
+
+const DESTINATION = `G${'A'.repeat(55)}`;
+const pending = {
+  id: 'req-qr-1',
+  tag: 'alice*localhost',
+  destination: DESTINATION,
+  amount: '12.5',
+  asset: 'XLM',
+  memoType: 'text',
+  memo: 'invoice-9',
+  status: 'pending',
+  expiresAt: new Date(Date.now() + 86400000),
+};
+
+const app = express()
+  .use('/', buildRouter(null))
+  .use(buildErrorHandler(() => false));
+
+// supertest buffers image/png but not image/svg+xml, so collect raw bytes.
+const binary = (res, callback) => {
+  const chunks = [];
+  res.on('data', (chunk) => chunks.push(chunk));
+  res.on('end', () => callback(null, Buffer.concat(chunks)));
+};
+
+const decodePng = (buffer) => {
+  const png = PNG.sync.read(buffer);
+  const result = jsQR(new Uint8ClampedArray(png.data), png.width, png.height);
+  return { text: result?.data, width: png.width };
+};
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  delete process.env.PUBLIC_API_URL;
+  delete process.env.DOMAIN;
+  prisma.paymentRequest.findUnique.mockResolvedValue(pending);
+});
+
+describe('GET /payment-requests/:id/qr.(png|svg)', () => {
+  test('PNG encodes the HTTPS pay link by default', async () => {
+    process.env.PUBLIC_API_URL = 'https://pay.example.com';
+    const res = await request(app).get('/payment-requests/req-qr-1/qr.png').buffer(true).parse(binary);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('image/png');
+    expect(res.headers['cache-control']).toBe('public, max-age=300');
+
+    const { text, width } = decodePng(res.body);
+    expect(width).toBe(512);
+    const link = new URL(text);
+    expect(link.origin + link.pathname).toBe('https://pay.example.com/pay/alice');
+    expect(link.searchParams.get('amount')).toBe('12.5');
+    expect(link.searchParams.get('memo')).toBe('invoice-9');
+    expect(link.searchParams.get('requestId')).toBe('req-qr-1');
+  });
+
+  test('format=sep7 encodes the web+stellar:pay URI', async () => {
+    const res = await request(app)
+      .get('/payment-requests/req-qr-1/qr.png?format=sep7')
+      .buffer(true)
+      .parse(binary);
+
+    expect(res.status).toBe(200);
+    const { text } = decodePng(res.body);
+    expect(text.startsWith('web+stellar:pay?')).toBe(true);
+    const params = new URLSearchParams(text.slice('web+stellar:pay?'.length));
+    expect(params.get('destination')).toBe(DESTINATION);
+    expect(params.get('amount')).toBe('12.5');
+    expect(params.get('memo')).toBe('invoice-9');
+  });
+
+  test('SVG returns image/svg+xml', async () => {
+    const res = await request(app).get('/payment-requests/req-qr-1/qr.svg').buffer(true).parse(binary);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('image/svg+xml; charset=utf-8');
+    const svg = res.body.toString('utf8');
+    expect(svg).toMatch(/^<svg[^>]+width="512"/);
+  });
+
+  test.each([
+    ['64', 128],
+    ['5000', 1024],
+    ['300', 300],
+    ['abc', 512],
+  ])('size=%s is clamped to %i', async (size, expected) => {
+    const res = await request(app)
+      .get(`/payment-requests/req-qr-1/qr.png?size=${size}`)
+      .buffer(true)
+      .parse(binary);
+    expect(res.status).toBe(200);
+    expect(decodePng(res.body).width).toBe(expected);
+  });
+
+  test('unknown id returns 404', async () => {
+    prisma.paymentRequest.findUnique.mockResolvedValue(null);
+    const res = await request(app).get('/payment-requests/missing/qr.png');
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+  });
+
+  test('bad format returns 400', async () => {
+    const res = await request(app).get('/payment-requests/req-qr-1/qr.svg?format=bitcoin');
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_INPUT');
+    expect(prisma.paymentRequest.findUnique).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['paid', { status: 'paid' }],
+    ['cancelled', { status: 'cancelled' }],
+    ['expired', { expiresAt: new Date(Date.now() - 1000) }],
+  ])('%s requests are served with no-store', async (_label, override) => {
+    prisma.paymentRequest.findUnique.mockResolvedValue({ ...pending, ...override });
+    const res = await request(app).get('/payment-requests/req-qr-1/qr.svg');
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+});

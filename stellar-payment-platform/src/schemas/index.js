@@ -200,6 +200,33 @@ const paymentRequestBodySchema = z
   .loose();
 
 /**
+ * GET /payment-requests/:id/qr.(png|svg) query.
+ *
+ * - `size`   pixels, clamped to 128..1024 (default 512), like `limit` elsewhere
+ * - `format` link (default, HTTPS pay link) | sep7 (web+stellar:pay URI)
+ */
+const QR_MIN_SIZE = 128;
+const QR_MAX_SIZE = 1024;
+const QR_DEFAULT_SIZE = 512;
+
+const paymentRequestQrQuerySchema = z
+  .object({
+    size: z
+      .any()
+      .optional()
+      .transform((value) => {
+        const parsed = parseInt(value, 10);
+        if (Number.isNaN(parsed)) return QR_DEFAULT_SIZE;
+        return Math.min(QR_MAX_SIZE, Math.max(QR_MIN_SIZE, parsed));
+      }),
+    format: z
+      .enum(['link', 'sep7'], { error: 'format must be link or sep7' })
+      .optional()
+      .default('link'),
+  })
+  .loose();
+
+/**
  * GET /admin/export query.
  *
  * - `format`    csv (default) | json
@@ -377,6 +404,10 @@ module.exports = {
   adminBlockBodySchema,
   exportQuerySchema,
   paymentRequestBodySchema,
+  paymentRequestQrQuerySchema,
+  QR_MIN_SIZE,
+  QR_MAX_SIZE,
+  QR_DEFAULT_SIZE,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
   adminDlqQuerySchema,

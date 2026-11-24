@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
+const QRCode = require('qrcode');
 const xss = require('xss');
 const Filter = require('bad-words');
 const { StrKey } = require('@stellar/stellar-sdk');
@@ -15,7 +16,7 @@ const { requireJson } = require('../../middleware/requireJson');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { createSignatureRateLimiter } = require('../../middleware/signatureRateLimit');
-const { paymentRequestBodySchema } = require('../../schemas');
+const { paymentRequestBodySchema, paymentRequestQrQuerySchema } = require('../../schemas');
 const { buildPaymentLink, toSep7Uri } = require('../../utils/paymentLink');
 
 const profanityFilter = new Filter();
@@ -65,6 +66,27 @@ const getBaseUrl = (req) => {
   if (/^(localhost|127\.0\.0\.1)(:|$)/i.test(host)) return `https://${host}`;
   return `${req.protocol}://${host}`;
 };
+
+const buildLinks = (req, request) => ({
+  link: buildPaymentLink({
+    baseUrl: getBaseUrl(req),
+    tag: request.tag,
+    amount: request.amount,
+    asset: request.asset,
+    memo: request.memo,
+    memoType: request.memoType,
+    requestId: request.id,
+  }),
+  sep7: toSep7Uri({
+    destination: request.destination,
+    amount: request.amount,
+    asset: request.asset,
+    memo: request.memo,
+    memoType: request.memoType,
+  }),
+});
+
+const QR_CONTENT_TYPES = { png: 'image/png', svg: 'image/svg+xml' };
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -175,23 +197,7 @@ module.exports = (redisClient) => {
       }
       if (!created) throw new ApiError('CONFLICT', 'Could not generate a unique memo');
 
-      const baseUrl = getBaseUrl(req);
-      const link = buildPaymentLink({
-        baseUrl,
-        tag,
-        amount: created.amount,
-        asset: created.asset,
-        memo: created.memo,
-        memoType: created.memoType,
-        requestId: created.id,
-      });
-      const sep7 = toSep7Uri({
-        destination: created.destination,
-        amount: created.amount,
-        asset: created.asset,
-        memo: created.memo,
-        memoType: created.memoType,
-      });
+      const { link, sep7 } = buildLinks(req, created);
 
       return res.status(201).json({
         ok: true,
@@ -201,6 +207,30 @@ module.exports = (redisClient) => {
       });
     }),
   );
+
+  router.get('/payment-requests/:id/qr.:ext(png|svg)', asyncHandler(async (req, res) => {
+    const parsed = paymentRequestQrQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      throw new ApiError('INVALID_INPUT', parsed.error.issues[0]?.message || 'Invalid query parameters');
+    }
+    const { size, format } = parsed.data;
+
+    const request = await prisma.paymentRequest.findUnique({ where: { id: req.params.id } });
+    if (!request) throw new ApiError('NOT_FOUND', 'Payment request not found');
+
+    const { link, sep7 } = buildLinks(req, request);
+    const text = format === 'sep7' ? sep7 : link;
+    const options = { errorCorrectionLevel: 'M', width: size, margin: 4 };
+    // qrcode floors (modules * (width / modules)), which float error can drop to
+    // width - 1; the extra half pixel makes the PNG exactly `size` wide.
+    const body = req.params.ext === 'png'
+      ? await QRCode.toBuffer(text, { ...options, width: size + 0.5, type: 'png' })
+      : await QRCode.toString(text, { ...options, type: 'svg' });
+
+    res.set('Cache-Control', computedStatus(request) === 'pending' ? 'public, max-age=300' : 'no-store');
+    res.type(QR_CONTENT_TYPES[req.params.ext]);
+    return res.send(body);
+  }));
 
   router.get('/payment-requests/:id', asyncHandler(async (req, res) => {
     const request = await prisma.paymentRequest.findUnique({ where: { id: req.params.id } });
