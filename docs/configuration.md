@@ -12,6 +12,7 @@ Environment variables, logging and internal mTLS for the server and dashboard.
 - `PORT` - (Optional) The port for the Node.js server to listen on. Defaults to `5000`.
 - `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default) or `public`. Also selects the `NETWORK_PASSPHRASE` published for SEP-10.
 - `STELLAR_TAG_DOMAIN` - (Optional) Extra origin to add to the CORS allow-list. Also the default for federation and SEP-10 discovery domains.
+- `PAY_PAGE_URL` - (Optional) Origin of the dashboard, which serves the `/pay/<tag>` page (for example `https://app.example.com`). Payment request links and QR codes point here. Falls back to `PUBLIC_API_URL`, then `DOMAIN`, then the API's own host, which is only right when the dashboard and API share a host.
 - `SEP10_SIGNING_SECRET` - (Optional) Secret key (`S...`) of the dedicated SEP-10 server signing account. SEP-10 is **disabled** when this is unset: startup logs one info line, `stellar.toml` is unchanged and no auth endpoint is advertised. An invalid value fails startup fast; the value is never logged. Only the derived `SIGNING_KEY` is exposed.
 - `SEP10_HOME_DOMAIN` - (Optional) Home domain whose `stellar.toml` is discovered by wallets. Defaults to `STELLAR_TAG_DOMAIN`; required (via either variable) when SEP-10 is enabled.
 - `SEP10_WEB_AUTH_DOMAIN` - (Optional) Host that serves the auth endpoint. Defaults to `SEP10_HOME_DOMAIN`; the published `WEB_AUTH_ENDPOINT` is `https://<this domain>/auth`.

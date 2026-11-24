@@ -60,7 +60,9 @@ const serializeRequest = (request) => ({
 });
 
 const getBaseUrl = (req) => {
-  const configured = process.env.PUBLIC_API_URL || process.env.DOMAIN;
+  // The /pay page is served by the dashboard, which is usually on a different
+  // host from the API, so PAY_PAGE_URL (the dashboard origin) wins.
+  const configured = process.env.PAY_PAGE_URL || process.env.PUBLIC_API_URL || process.env.DOMAIN;
   if (configured) {
     return /^https?:\/\//i.test(configured) ? configured : `https://${configured}`;
   }

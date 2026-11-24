@@ -462,7 +462,9 @@ Creates a pending payment request.
 - **Returns:** `201` with `{ ok: true, data: <request>, link, sep7 }`, where
   `link` is the HTTPS pay link
   (`https://<host>/pay/<name>?amount=…&memo=…&memoType=…&requestId=…`) and
-  `sep7` is a `web+stellar:pay?destination=…&amount=…&memo=…` URI for wallets.
+  `sep7` is a `web+stellar:pay?destination=…&amount=…&memo=…&memo_type=MEMO_TEXT` URI for wallets.
+  `<host>` is `PAY_PAGE_URL` (the dashboard, which serves the `/pay` page), falling back to
+  `PUBLIC_API_URL`, then `DOMAIN`, then the request's host.
 - **Status Codes:**
   - `201 Created`: Request created.
   - `400 Bad Request`: Missing or invalid `Idempotency-Key`, or bad signer address.

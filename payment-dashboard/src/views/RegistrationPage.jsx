@@ -3,7 +3,7 @@ import toast from 'react-hot-toast';
 import Icon from '../components/Icon';
 import { useDebounce } from '../useDebounce';
 import { checkTag, validateTag, TAG_MAX } from '../lib/tags';
-import { signMessage, walletName, connectedWalletId } from '../lib/wallets';
+import { signMessage, walletName, connectedWalletId, normaliseSignature } from '../lib/wallets';
 import {
   API_BASE,
   apiErrorMessage,
@@ -16,32 +16,6 @@ const MEMO_PLACEHOLDER = {
   id: '64-bit unsigned integer',
   hash: '64-character hex string',
 };
-
-// Wallets return the signature as a base64 string, a Buffer-like object or a
-// Uint8Array depending on the wallet. The API wants base64.
-function normaliseSignature(result) {
-  if (result && result.error) throw new Error(result.error.message || result.error);
-  const raw = typeof result === 'string' ? result : result?.signedMessage || result?.signature;
-  if (!raw || typeof raw !== 'object') return raw;
-
-  let bytes;
-  if (raw.type === 'Buffer' && Array.isArray(raw.data)) {
-    bytes = new Uint8Array(raw.data);
-  } else if (raw instanceof Uint8Array) {
-    bytes = raw;
-  } else if (raw.buffer instanceof ArrayBuffer) {
-    bytes = new Uint8Array(raw.buffer);
-  } else {
-    bytes = new Uint8Array(Object.values(raw));
-  }
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-  // Some wallets hand back the ASCII bytes of an already base64 signature.
-  if (binary.length >= 80 && binary.length <= 90 && /^[a-zA-Z0-9+/]+={0,2}$/.test(binary)) {
-    return binary;
-  }
-  return btoa(binary);
-}
 
 function validateMemo(memoType, memo) {
   if (memoType && !memo) return 'Enter a memo value, or set the type back to None.';
