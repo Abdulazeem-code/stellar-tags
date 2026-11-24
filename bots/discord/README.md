@@ -144,7 +144,7 @@ docker logs -f stellar-discord-bot
 /resolve tag:alice*stellar-tags.org public:true
 ```
 Embed Output:
-- **Title**: `🔍 Resolved Stellar Tag: alice`
+- **Title**: `Resolved Stellar Tag: alice`
 - **Short Address**: `GDQ4X7...6U6C7G`
 - **Memo**: `PlatformPayment (text)`
 - **Full Stellar Account ID**: `GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G`

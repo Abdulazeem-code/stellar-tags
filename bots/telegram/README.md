@@ -115,7 +115,7 @@ docker logs -f stellar-telegram-bot
 ```
 Reply:
 ```
-🔍 Resolved Stellar Tag: alice
+Resolved Stellar Tag: alice
 
 • Address: GDQ4X7...6U6C7G
 • Full Account ID:

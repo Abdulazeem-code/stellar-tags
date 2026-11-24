@@ -4,7 +4,6 @@ const {
   validateAmount,
   parseAsset,
   buildSep7PayUri,
-  isValidAddress,
 } = require('../src/services/sep7');
 
 const TEST_DESTINATION = 'GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G';

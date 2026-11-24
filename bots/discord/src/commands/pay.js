@@ -51,7 +51,7 @@ module.exports = {
     if (!amountVal.valid) {
       const errorEmbed = new EmbedBuilder()
         .setColor(0xed4245)
-        .setTitle('⚠️ Invalid Amount')
+        .setTitle('Invalid Amount')
         .setDescription(amountVal.error);
       return await interaction.editReply({ embeds: [errorEmbed] });
     }
@@ -61,7 +61,7 @@ module.exports = {
     if (!assetVal.valid) {
       const errorEmbed = new EmbedBuilder()
         .setColor(0xed4245)
-        .setTitle('⚠️ Invalid Asset')
+        .setTitle('Invalid Asset')
         .setDescription(assetVal.error);
       return await interaction.editReply({ embeds: [errorEmbed] });
     }
@@ -89,11 +89,11 @@ module.exports = {
 
       const displayAsset = assetVal.assetCode || 'XLM';
       const embed = new EmbedBuilder()
-        .setTitle(`💳 Payment Request for ${tag}`)
+        .setTitle(`Payment Request for ${tag}`)
         .setColor(0x5865f2)
         .setDescription(
           `Click below to open the transaction directly in your Stellar wallet, or scan the QR code with a SEP-0007 compatible mobile wallet (Freighter, LOBSTR, Albedo).\n\n` +
-          `🔗 **[Open in Stellar Wallet](${sep7Uri})**\n\n` +
+          `[Open in Stellar Wallet](${sep7Uri})\n\n` +
           `\`${sep7Uri}\``,
         )
         .addFields(
@@ -119,19 +119,19 @@ module.exports = {
 
       if (err.code === 'TAG_NOT_FOUND') {
         errorEmbed
-          .setTitle('❌ Tag Not Found')
+          .setTitle('Tag Not Found')
           .setDescription(`Tag \`${tag}\` was not found. Cannot generate payment request.`);
       } else if (err.code === 'TAG_BLOCKED') {
         errorEmbed
-          .setTitle('🚫 Tag Blocked')
+          .setTitle('Tag Blocked')
           .setDescription(`Tag \`${tag}\` is blocked. Payments to this recipient are disabled.`);
       } else if (err.code === 'SERVICE_UNAVAILABLE') {
         errorEmbed
-          .setTitle('🔌 Service Unavailable')
+          .setTitle('Service Unavailable')
           .setDescription('The federation API is currently unreachable. Please try again later.');
       } else {
         errorEmbed
-          .setTitle('⚠️ Payment Generation Failed')
+          .setTitle('Payment Generation Failed')
           .setDescription(err.message || 'An unexpected error occurred while generating payment URI.');
       }
 

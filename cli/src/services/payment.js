@@ -37,7 +37,7 @@ async function submitPayment(params, deps = {}) {
   try {
     const KeypairClass = deps.Keypair || StellarSdk.Keypair;
     sourceKeypair = KeypairClass.fromSecret(secretKey);
-  } catch (err) {
+  } catch {
     const error = new Error('Invalid secret key format.');
     error.exitCode = EXIT_CODES.USER_ERROR;
     throw error;

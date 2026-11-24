@@ -20,7 +20,7 @@ module.exports = {
     const isPublic = interaction.options.getBoolean('public') ?? false;
 
     const embed = new EmbedBuilder()
-      .setTitle('🌟 Stellar Tags Discord Bot')
+      .setTitle('Stellar Tags Discord Bot')
       .setColor(0x5865f2)
       .setDescription(
         'Resolve Stellar Tags and generate SEP-0007 payment links without leaving Discord!\n\n' +
@@ -28,13 +28,13 @@ module.exports = {
       )
       .addFields(
         {
-          name: '🔍 `/resolve tag:<tag> [public:<true|false>]`',
+          name: '/resolve tag:<tag> [public:<true|false>]',
           value:
             'Looks up the Stellar account ID, shortened address, and attached memo for a tag.\n' +
             '*Example:* `/resolve tag:alice` or `/resolve tag:alice*stellar-tags.org`',
         },
         {
-          name: '💳 `/pay tag:<tag> amount:<n> [asset:<asset>] [public:<true|false>]`',
+          name: '/pay tag:<tag> amount:<n> [asset:<asset>] [public:<true|false>]',
           value:
             'Generates a clickable SEP-0007 payment link and QR code.\n' +
             '*Example:* `/pay tag:alice amount:10`\n' +
@@ -42,7 +42,7 @@ module.exports = {
             '*Example:* `/pay tag:carol amount:20 asset:EURC:GA5Z...`',
         },
         {
-          name: 'ℹ️ Ephemeral vs Public Replies',
+          name: 'Ephemeral vs Public Replies',
           value:
             'By default, bot replies are **ephemeral** (only visible to you). Add `public:true` to share the resolution or payment link with the entire channel.',
         },

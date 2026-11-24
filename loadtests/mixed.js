@@ -1,3 +1,4 @@
+/* global open, __ENV */
 import http from 'k6/http';
 import { check } from 'k6';
 import { getBaseUrl, parseDuration, parseVUs, createStages, defaultThresholds } from './common.js';
@@ -19,9 +20,10 @@ if (usernames.length === 0 || addresses.length === 0) {
   throw new Error('usernames.txt or addresses.txt is empty. Please run "node export-data.js" to populate them.');
 }
 
+const env = typeof __ENV !== 'undefined' ? __ENV : {};
 const BASE_URL = getBaseUrl();
-const VUS = parseVUs(__ENV.VUS, 25);
-const DURATION = parseDuration(__ENV.DURATION, '30s');
+const VUS = parseVUs(env.VUS, 25);
+const DURATION = parseDuration(env.DURATION, '30s');
 
 export const options = {
   stages: createStages(VUS, DURATION),

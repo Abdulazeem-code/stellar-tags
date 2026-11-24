@@ -1,4 +1,3 @@
-const { Command } = require('commander');
 const { resolveTag } = require('../services/api');
 const { EXIT_CODES } = require('../constants');
 
@@ -6,7 +5,7 @@ function registerResolveCommand(program, deps = {}) {
   program
     .command('resolve <tag>')
     .description('Resolve a Stellar tag to its Stellar address and memo via public federation')
-    .action(async (tag, cmdObj) => {
+    .action(async (tag) => {
       const globalOpts = program.opts();
       const resolveFn = deps.resolveTag || resolveTag;
 

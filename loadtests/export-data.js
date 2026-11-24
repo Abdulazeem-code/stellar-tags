@@ -28,14 +28,10 @@ const LAST_NAMES = [
   'varga', 'whitfield', 'zhang',
 ];
 
-const ALIAS_ADDRESS_COUNT = 3;
-const ALIASES_PER_ADDRESS = 3;
-
 function deriveDeterministicSeedUsers() {
   const users = [];
   const domain = process.env.STELLAR_TAGS_DOMAIN || 'localhost';
 
-  let aliasIdx = 0;
   for (let i = 0; i < USER_COUNT; i++) {
     const fn = FIRST_NAMES[i % FIRST_NAMES.length];
     const ln = LAST_NAMES[Math.floor(i / FIRST_NAMES.length) % LAST_NAMES.length];
@@ -80,7 +76,7 @@ async function exportFromDbOrSeed() {
         console.log(`Exported ${exportedUsers.length} records from local database.`);
       }
     }
-  } catch (err) {
+  } catch {
     // Database connection not available or not configured
   }
 

@@ -1,7 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createCli } = require('../src/index');
-const { EXIT_CODES } = require('../src/constants');
 
 const TEST_DESTINATION = 'GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G';
 const TEST_SECRET = 'SBCEMG2Y35547UAKQ34V52SNHZ67AKP3T56AOUC77QJ6C7E2Y35547UA'; // Test dummy secret key

@@ -55,7 +55,7 @@ test('bot handles /pay command and generates QR response', async () => {
 
   let sentPhotoCaption = '';
   const mockDeps = {
-    resolveTag: async (tag) => ({
+    resolveTag: async () => ({
       accountId: 'GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G',
       stellarAddress: 'GDQ4X7B2QWYRDB6S2Y5R6G6U4E6U6C7G6U6C7G6U6C7G6U6C7G6U6C7G',
       memo: 'PayMemo',
@@ -101,7 +101,7 @@ test('bot handles /pay with unknown tag gracefully', async () => {
 
   let repliedText = '';
   const mockDeps = {
-    resolveTag: async (tag) => {
+    resolveTag: async () => {
       const err = new Error('Tag not found');
       err.code = 'TAG_NOT_FOUND';
       throw err;

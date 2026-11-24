@@ -134,24 +134,24 @@ Below is the summary output from a local test run of `mixed.js` against the loca
            * default: Up to 25 looping VUs for 50s over 3 stages (gracefulRampDown: 30s, gracefulStop: 30s)
 
 
-     ✓ federation status is 200
-     ✓ lookup status is 200
-     ✓ stellar.toml status is 200
-     ✓ health status is 200
+     [PASS] federation status is 200
+     [PASS] lookup status is 200
+     [PASS] stellar.toml status is 200
+     [PASS] health status is 200
 
-     checks.........................: 100.00% ✓ 4320     ✗ 0   
+     checks.........................: 100.00% 4320 pass, 0 fail
      data_received..................: 1.8 MB  36 kB/s
      data_sent......................: 452 kB  9.0 kB/s
-     http_req_blocked...............: avg=42.1µs   min=1.2µs   med=4.8µs   max=3.12ms   p(90)=8.2µs    p(95)=12.4µs  
-     http_req_connecting............: avg=18.4µs   min=0s      med=0s      max=1.89ms   p(90)=0s       p(95)=0s      
-   ✓ http_req_duration..............: avg=14.82ms  min=1.12ms  med=9.44ms  max=88.41ms  p(90)=28.61ms  p(95)=41.12ms 
+     http_req_blocked...............: avg=42.1us   min=1.2us   med=4.8us   max=3.12ms   p(90)=8.2us    p(95)=12.4us  
+     http_req_connecting............: avg=18.4us   min=0s      med=0s      max=1.89ms   p(90)=0s       p(95)=0s      
+   [PASS] http_req_duration.........: avg=14.82ms  min=1.12ms  med=9.44ms  max=88.41ms  p(90)=28.61ms  p(95)=41.12ms 
        { name:GET /federation }.....: avg=15.11ms  min=1.24ms  med=9.85ms  max=88.41ms  p(90)=29.40ms  p(95)=42.80ms 
        { name:GET /lookup }.........: avg=16.20ms  min=1.89ms  med=10.12ms max=64.12ms  p(90)=31.10ms  p(95)=44.20ms 
        { name:GET /.well-known/stellar.toml } : avg=6.85ms min=0.98ms med=4.20ms max=32.10ms p(90)=12.40ms p(95)=18.10ms 
        { name:GET /health }.........: avg=4.12ms   min=0.85ms  med=2.90ms  max=21.40ms  p(90)=7.80ms   p(95)=11.20ms 
-   ✓ http_req_failed................: 0.00%   ✓ 0        ✗ 4320
-     http_req_receiving.............: avg=88.2µs   min=10.1µs  med=45.2µs  max=4.12ms   p(90)=115.1µs  p(95)=180.2µs 
-     http_req_sending...............: avg=31.4µs   min=4.2µs   med=18.1µs  max=2.01ms   p(90)=48.1µs   p(95)=75.2µs  
+   [PASS] http_req_failed...........: 0.00%   0 fail, 4320 pass
+     http_req_receiving.............: avg=88.2us   min=10.1us  med=45.2us  max=4.12ms   p(90)=115.1us  p(95)=180.2us 
+     http_req_sending...............: avg=31.4us   min=4.2us   med=18.1us  max=2.01ms   p(90)=48.1us   p(95)=75.2us  
      http_req_tls_handshaking.......: avg=0s       min=0s      med=0s      max=0s       p(90)=0s       p(95)=0s      
      http_req_waiting...............: avg=14.70ms  min=1.02ms  med=9.32ms  max=88.10ms  p(90)=28.40ms  p(95)=40.80ms 
      http_reqs......................: 4320    86.4/s
@@ -161,7 +161,7 @@ Below is the summary output from a local test run of `mixed.js` against the loca
      vus_max........................: 25      min=25     max=25
 
 running (0m50.0s), 00/25 VUs, 4320 complete and 0 interrupted iterations
-default ✓ [======================================] 00/25 VUs  50s
+default [PASS] [======================================] 00/25 VUs  50s
 ```
 
 ### Reading the Summary

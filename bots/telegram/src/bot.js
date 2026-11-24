@@ -3,7 +3,7 @@ const { resolveTag, shortenAddress } = require('./services/federation');
 const { buildSep7PayUri, validateAmount, parseAsset } = require('./services/sep7');
 const { generateQrBuffer } = require('./services/qr');
 
-const HELP_MESSAGE = `*Stellar Tags Bot* 🌟
+const HELP_MESSAGE = `*Stellar Tags Bot*
 Pay or resolve Stellar Tags directly from Telegram!
 
 *Commands:*
@@ -58,7 +58,7 @@ function createBot(config, deps = {}) {
     const parts = text.trim().split(/\s+/).slice(1);
 
     if (parts.length === 0 || !parts[0]) {
-      return ctx.reply('⚠️ Please provide a tag to resolve.\nUsage: `/resolve <tag>`\nExample: `/resolve alice`', {
+      return ctx.reply('Please provide a tag to resolve.\nUsage: `/resolve <tag>`\nExample: `/resolve alice`', {
         parse_mode: 'Markdown',
       });
     }
@@ -69,7 +69,7 @@ function createBot(config, deps = {}) {
       const resolved = await resolveFn(tag, config);
       const shortened = shortenAddress(resolved.stellarAddress);
 
-      let reply = `🔍 *Resolved Stellar Tag:* \`${tag}\`\n\n`;
+      let reply = `*Resolved Stellar Tag:* \`${tag}\`\n\n`;
       reply += `• *Address:* \`${shortened}\`\n`;
       reply += `• *Full Account ID:*\n\`${resolved.stellarAddress}\`\n`;
 
@@ -82,21 +82,21 @@ function createBot(config, deps = {}) {
       await ctx.reply(reply, { parse_mode: 'Markdown' });
     } catch (err) {
       if (err.code === 'TAG_NOT_FOUND') {
-        return ctx.reply(`❌ Tag \`${tag}\` was not found. Please check spelling or verify the tag exists.`, {
+        return ctx.reply(`Tag \`${tag}\` was not found. Please check spelling or verify the tag exists.`, {
           parse_mode: 'Markdown',
         });
       }
       if (err.code === 'TAG_BLOCKED') {
-        return ctx.reply(`🚫 Tag \`${tag}\` is blocked or suspended.`, {
+        return ctx.reply(`Tag \`${tag}\` is blocked or suspended.`, {
           parse_mode: 'Markdown',
         });
       }
       if (err.code === 'SERVICE_UNAVAILABLE') {
-        return ctx.reply(`🔌 Federation API service is currently unavailable. Please try again later.`, {
+        return ctx.reply(`Federation API service is currently unavailable. Please try again later.`, {
           parse_mode: 'Markdown',
         });
       }
-      return ctx.reply(`⚠️ Failed to resolve tag: ${err.message || 'Unknown error'}`);
+      return ctx.reply(`Failed to resolve tag: ${err.message || 'Unknown error'}`);
     }
   });
 
@@ -107,7 +107,7 @@ function createBot(config, deps = {}) {
 
     if (parts.length < 2) {
       return ctx.reply(
-        '⚠️ Missing arguments.\nUsage: `/pay <tag> <amount> [asset]`\nExample: `/pay alice 10` or `/pay bob 25 USDC`',
+        'Missing arguments.\nUsage: `/pay <tag> <amount> [asset]`\nExample: `/pay alice 10` or `/pay bob 25 USDC`',
         { parse_mode: 'Markdown' },
       );
     }
@@ -117,13 +117,13 @@ function createBot(config, deps = {}) {
     // Validate amount
     const amountVal = validateAmount(amountRaw);
     if (!amountVal.valid) {
-      return ctx.reply(`⚠️ ${amountVal.error}`);
+      return ctx.reply(`Error: ${amountVal.error}`);
     }
 
     // Validate asset
     const assetVal = parseAsset(assetRaw);
     if (!assetVal.valid) {
-      return ctx.reply(`⚠️ ${assetVal.error}`);
+      return ctx.reply(`Error: ${assetVal.error}`);
     }
 
     try {
@@ -144,14 +144,14 @@ function createBot(config, deps = {}) {
       const qrBuffer = await qrFn(sep7Uri);
 
       const displayAsset = assetVal.assetCode || 'XLM';
-      let caption = `💳 *Payment Request for* \`${tag}\`\n\n`;
+      let caption = `*Payment Request for* \`${tag}\`\n\n`;
       caption += `• *Amount:* \`${amountVal.normalized} ${displayAsset}\`\n`;
       caption += `• *Recipient:* \`${shortenAddress(resolved.stellarAddress)}\`\n`;
       if (resolved.memo) {
         caption += `• *Memo (${resolved.memoType || 'text'}):* \`${resolved.memo}\`\n`;
       }
       caption += `• *Network:* \`${config.network}\`\n\n`;
-      caption += `🔗 *SEP-07 Payment Link:*\n[Open in Stellar Wallet](${sep7Uri})\n\n`;
+      caption += `*SEP-07 Payment Link:*\n[Open in Stellar Wallet](${sep7Uri})\n\n`;
       caption += `Scan the QR code with any SEP-7 compatible Stellar wallet (e.g. LOBSTR, Freighter, Albedo).`;
 
       await ctx.replyWithPhoto(new InputFile(qrBuffer, 'sep7-payment-qr.png'), {
@@ -160,21 +160,21 @@ function createBot(config, deps = {}) {
       });
     } catch (err) {
       if (err.code === 'TAG_NOT_FOUND') {
-        return ctx.reply(`❌ Tag \`${tag}\` was not found. Cannot generate payment link.`, {
+        return ctx.reply(`Tag \`${tag}\` was not found. Cannot generate payment link.`, {
           parse_mode: 'Markdown',
         });
       }
       if (err.code === 'TAG_BLOCKED') {
-        return ctx.reply(`🚫 Tag \`${tag}\` is blocked. Payments to this tag are not permitted.`, {
+        return ctx.reply(`Tag \`${tag}\` is blocked. Payments to this tag are not permitted.`, {
           parse_mode: 'Markdown',
         });
       }
       if (err.code === 'SERVICE_UNAVAILABLE') {
-        return ctx.reply(`🔌 Federation API is currently unavailable. Please try again later.`, {
+        return ctx.reply(`Federation API is currently unavailable. Please try again later.`, {
           parse_mode: 'Markdown',
         });
       }
-      return ctx.reply(`⚠️ Failed to generate payment link: ${err.message || 'Unknown error'}`);
+      return ctx.reply(`Failed to generate payment link: ${err.message || 'Unknown error'}`);
     }
   });
 

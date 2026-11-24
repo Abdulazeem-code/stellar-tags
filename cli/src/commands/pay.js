@@ -72,7 +72,7 @@ function registerPayCommand(program, deps = {}) {
         if (globalOpts.json) {
           console.log(JSON.stringify(result, null, 2));
         } else {
-          console.log('Payment Successful! 🚀');
+          console.log('Payment Successful!');
           console.log(`Transaction Hash: ${result.hash}`);
           console.log(`Network:          ${result.network}`);
           console.log(`To (${tag}):      ${result.to}`);

@@ -36,7 +36,7 @@ module.exports = {
       const shortened = shortenAddress(resolved.stellarAddress);
 
       const embed = new EmbedBuilder()
-        .setTitle(`🔍 Resolved Stellar Tag: ${tag}`)
+        .setTitle(`Resolved Stellar Tag: ${tag}`)
         .setColor(0x00ae86)
         .addFields(
           { name: 'Short Address', value: `\`${shortened}\``, inline: true },
@@ -52,19 +52,19 @@ module.exports = {
 
       if (err.code === 'TAG_NOT_FOUND') {
         errorEmbed
-          .setTitle('❌ Tag Not Found')
+          .setTitle('Tag Not Found')
           .setDescription(`Tag \`${tag}\` was not found. Please verify the tag name or domain.`);
       } else if (err.code === 'TAG_BLOCKED') {
         errorEmbed
-          .setTitle('🚫 Tag Blocked')
+          .setTitle('Tag Blocked')
           .setDescription(`Tag \`${tag}\` is blocked or suspended.`);
       } else if (err.code === 'SERVICE_UNAVAILABLE') {
         errorEmbed
-          .setTitle('🔌 Service Unavailable')
+          .setTitle('Service Unavailable')
           .setDescription('The federation lookup service is currently unreachable. Please try again later.');
       } else {
         errorEmbed
-          .setTitle('⚠️ Resolution Failed')
+          .setTitle('Resolution Failed')
           .setDescription(err.message || 'An unexpected error occurred while resolving the tag.');
       }
 

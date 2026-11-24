@@ -14,8 +14,8 @@ function createMockInteraction(commandName, options = {}) {
     commandName,
     isChatInputCommand: () => true,
     options: {
-      getString: (name, required) => options[name] ?? null,
-      getBoolean: (name, required) => options[name] ?? null,
+      getString: (name) => options[name] ?? null,
+      getBoolean: (name) => options[name] ?? null,
     },
     deferReply: async ({ ephemeral } = {}) => {
       deferred = true;
@@ -77,7 +77,7 @@ test('resolve command handles unknown tag error', async () => {
   await resolveCommand.execute(interaction, config, mockDeps);
 
   const embed = interaction._state.editReplyData.embeds[0];
-  assert.equal(embed.data.title, '❌ Tag Not Found');
+  assert.equal(embed.data.title, 'Tag Not Found');
   assert.ok(embed.data.description.includes('missing_user'));
 });
 
@@ -125,7 +125,7 @@ test('pay command handles invalid amount', async () => {
   await payCommand.execute(interaction, config);
 
   const embed = interaction._state.editReplyData.embeds[0];
-  assert.equal(embed.data.title, '⚠️ Invalid Amount');
+  assert.equal(embed.data.title, 'Invalid Amount');
 });
 
 test('help command returns usage embed', async () => {
@@ -136,5 +136,5 @@ test('help command returns usage embed', async () => {
 
   assert.equal(interaction._state.replyData.ephemeral, true);
   const embed = interaction._state.replyData.embeds[0];
-  assert.equal(embed.data.title, '🌟 Stellar Tags Discord Bot');
+  assert.equal(embed.data.title, 'Stellar Tags Discord Bot');
 });

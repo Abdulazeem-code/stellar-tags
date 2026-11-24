@@ -5,7 +5,7 @@ function registerLookupCommand(program, deps = {}) {
   program
     .command('lookup <address>')
     .description('Look up registered tag and account details for a Stellar G... address')
-    .action(async (address, cmdObj) => {
+    .action(async (address) => {
       const globalOpts = program.opts();
       const lookupFn = deps.lookupAddress || lookupAddress;
 
