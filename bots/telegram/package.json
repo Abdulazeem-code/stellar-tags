@@ -1,0 +1,24 @@
+{
+  "name": "stellar-tags-telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for resolving Stellar Tags and generating SEP-0007 payment links",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "keywords": [
+    "stellar",
+    "telegram",
+    "bot",
+    "sep-7",
+    "federation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "grammy": "^1.34.0",
+    "qrcode": "^1.5.4"
+  }
+}
