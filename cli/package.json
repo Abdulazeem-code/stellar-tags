@@ -1,0 +1,28 @@
+{
+  "name": "stellar-tags",
+  "version": "1.0.0",
+  "description": "Command-line tool to resolve Stellar tags, look up addresses, build SEP-7 payment links, and submit payments",
+  "main": "src/index.js",
+  "bin": {
+    "stellar-tags": "./bin/stellar-tags.js"
+  },
+  "scripts": {
+    "start": "node ./bin/stellar-tags.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "keywords": [
+    "stellar",
+    "cli",
+    "stellar-tags",
+    "sep-7",
+    "federation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.0.0",
+    "commander": "^13.1.0",
+    "dotenv": "^16.4.7",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
