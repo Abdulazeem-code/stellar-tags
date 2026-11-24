@@ -66,6 +66,7 @@ const decodePng = (buffer) => {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  delete process.env.PAY_PAGE_URL;
   delete process.env.PUBLIC_API_URL;
   delete process.env.DOMAIN;
   prisma.paymentRequest.findUnique.mockResolvedValue(pending);
@@ -90,6 +91,17 @@ describe('GET /payment-requests/:id/qr.(png|svg)', () => {
     expect(link.searchParams.get('amount')).toBe('12.5');
     expect(link.searchParams.get('memo')).toBe('invoice-9');
     expect(link.searchParams.get('requestId')).toBe('req-qr-1');
+  });
+
+  test('PAY_PAGE_URL points the pay link at the dashboard, ahead of PUBLIC_API_URL', async () => {
+    process.env.PAY_PAGE_URL = 'https://app.example.com';
+    process.env.PUBLIC_API_URL = 'https://api.example.com';
+    const res = await request(app).get('/payment-requests/req-qr-1/qr.svg');
+    expect(res.status).toBe(200);
+    const small = await request(app).get('/payment-requests/req-qr-1/qr.png?size=200').buffer(true).parse(binary);
+    const link = new URL(decodePng(small.body).text);
+    expect(link.origin).toBe('https://app.example.com');
+    expect(link.pathname).toBe('/pay/alice');
   });
 
   test('format=sep7 encodes the web+stellar:pay URI', async () => {

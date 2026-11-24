@@ -120,7 +120,20 @@ describe('payment link utilities', () => {
     expect(uri).toContain('asset_code=USDC');
     expect(uri).toContain(`asset_issuer=${ISSUER}`);
     expect(uri).toContain('memo=invoice-42');
-    expect(uri).toContain('memo_type=text');
+    expect(uri).toContain('memo_type=MEMO_TEXT');
+  });
+
+  test('uses SEP-7 memo type names and base64 for hash memos', () => {
+    const params = (uri) => new URLSearchParams(uri.slice('web+stellar:pay?'.length));
+    const hex = 'ab'.repeat(32);
+
+    const id = params(toSep7Uri({ destination: ISSUER, amount: '1', memo: '42', memoType: 'id' }));
+    expect(id.get('memo_type')).toBe('MEMO_ID');
+    expect(id.get('memo')).toBe('42');
+
+    const hash = params(toSep7Uri({ destination: ISSUER, amount: '1', memo: hex, memoType: 'hash' }));
+    expect(hash.get('memo_type')).toBe('MEMO_HASH');
+    expect(hash.get('memo')).toBe(Buffer.from(hex, 'hex').toString('base64'));
   });
 
   test('validates SEP-7 destination and memo', () => {

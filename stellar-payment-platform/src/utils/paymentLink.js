@@ -6,6 +6,8 @@ const { normalizeNameTag, validateMemo } = require('../utils');
 
 const invalid = (message) => new ApiError('INVALID_INPUT', message);
 
+const SEP7_MEMO_TYPES = { text: 'MEMO_TEXT', id: 'MEMO_ID', hash: 'MEMO_HASH' };
+
 const validateAmount = (amount) => {
   if (typeof amount !== 'string') {
     throw invalid('amount must be a positive decimal string');
@@ -152,8 +154,15 @@ const toSep7Uri = ({
     params.set('asset_code', normalizedAsset.slice(0, separator));
     params.set('asset_issuer', normalizedAsset.slice(separator + 1));
   }
-  if (memo !== undefined) params.set('memo', memo);
-  if (memoType !== undefined) params.set('memo_type', memoType);
+  if (memo !== undefined) {
+    // SEP-0007 names memo types MEMO_TEXT / MEMO_ID / MEMO_HASH and wants hash
+    // memos base64-encoded. Wallets that follow the spec drop a memo whose type
+    // they do not recognise, and a payment without its memo never matches.
+    const type = memoType || 'text';
+    const sep7Type = SEP7_MEMO_TYPES[type];
+    params.set('memo', type === 'hash' ? Buffer.from(memo, 'hex').toString('base64') : memo);
+    if (sep7Type) params.set('memo_type', sep7Type);
+  }
 
   return `web+stellar:pay?${params.toString()}`;
 };

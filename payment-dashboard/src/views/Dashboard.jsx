@@ -4,6 +4,8 @@ import { networks } from '@stellar-tags/payment-router';
 import Icon from '../components/Icon';
 import ConnectPrompt from '../components/ConnectPrompt';
 import RecentAddresses from '../components/RecentAddresses';
+import RequestPaymentForm from '../components/RequestPaymentForm';
+import { qrDataUrl } from '../lib/paymentLinks';
 import { useRecentAddresses } from '../useRecentAddresses';
 import { signTransaction } from '../lib/wallets';
 import { SOROBAN_RPC, submitAndWait } from '../lib/soroban';
@@ -344,8 +346,21 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
 
 function ReceivePanel({ receive, userPublicKey, onNavigate }) {
   const [copied, setCopied] = useState('');
+  const [qr, setQr] = useState({ address: '', url: '' });
   const tag = fullTag(receive.tag);
   const address = receive.address || userPublicKey || '';
+
+  // Drawn locally so the address is never sent to a third-party QR service.
+  useEffect(() => {
+    if (!address) return undefined;
+    let active = true;
+    qrDataUrl(address)
+      .then((url) => active && setQr({ address, url }))
+      .catch(() => active && setQr({ address, url: '' }));
+    return () => {
+      active = false;
+    };
+  }, [address]);
 
   const copy = async (value, label) => {
     try {
@@ -367,49 +382,51 @@ function ReceivePanel({ receive, userPublicKey, onNavigate }) {
   }
 
   return (
-    <div className="receive">
-      <div className="receive__qr">
-        <img
-          src={`https://api.qrserver.com/v1/create-qr-code/?size=176x176&margin=8&data=${encodeURIComponent(address)}`}
-          alt="QR code of your wallet address"
-          width="176"
-          height="176"
-        />
-      </div>
-      <div className="receive__fields">
-        {tag ? (
+    <div className="stack">
+      <div className="receive">
+        <div className="receive__qr">
+          {qr.address === address && qr.url ? (
+            <img src={qr.url} alt="QR code of your wallet address" width="176" height="176" />
+          ) : (
+            <span className="pay-qr__empty dither-12" aria-hidden="true" />
+          )}
+        </div>
+        <div className="receive__fields">
+          {tag ? (
+            <div className="copy-field">
+              <span className="eyebrow">Your tag</span>
+              <div className="copy-field__row">
+                <span className="mono text-paper">{tag}</span>
+                <button type="button" className="icon-button" onClick={() => copy(tag, 'Tag')}>
+                  <Icon name={copied === 'Tag' ? 'check' : 'copy'} size={16} label="Copy tag" />
+                </button>
+              </div>
+            </div>
+          ) : receive.loading ? (
+            <div className="skeleton-list" aria-busy="true">
+              <span className="skeleton dither-12" />
+            </div>
+          ) : (
+            <div className="notice notice--info">
+              <span>No tag yet. Claim one so people can pay you by name.</span>
+              <button type="button" className="btn btn--ghost btn--sm" onClick={() => onNavigate('register')}>
+                Claim a tag
+              </button>
+            </div>
+          )}
           <div className="copy-field">
-            <span className="eyebrow">Your tag</span>
+            <span className="eyebrow">Wallet address</span>
             <div className="copy-field__row">
-              <span className="mono text-paper">{tag}</span>
-              <button type="button" className="icon-button" onClick={() => copy(tag, 'Tag')}>
-                <Icon name={copied === 'Tag' ? 'check' : 'copy'} size={16} label="Copy tag" />
+              <span className="mono break">{address}</span>
+              <button type="button" className="icon-button" onClick={() => copy(address, 'Address')}>
+                <Icon name={copied === 'Address' ? 'check' : 'copy'} size={16} label="Copy address" />
               </button>
             </div>
           </div>
-        ) : receive.loading ? (
-          <div className="skeleton-list" aria-busy="true">
-            <span className="skeleton dither-12" />
-          </div>
-        ) : (
-          <div className="notice notice--info">
-            <span>No tag yet. Claim one so people can pay you by name.</span>
-            <button type="button" className="btn btn--ghost btn--sm" onClick={() => onNavigate('register')}>
-              Claim a tag
-            </button>
-          </div>
-        )}
-        <div className="copy-field">
-          <span className="eyebrow">Wallet address</span>
-          <div className="copy-field__row">
-            <span className="mono break">{address}</span>
-            <button type="button" className="icon-button" onClick={() => copy(address, 'Address')}>
-              <Icon name={copied === 'Address' ? 'check' : 'copy'} size={16} label="Copy address" />
-            </button>
-          </div>
+          {receive.error && <p className="notice notice--error">{receive.error}</p>}
         </div>
-        {receive.error && <p className="notice notice--error">{receive.error}</p>}
       </div>
+      {receive.tag && <RequestPaymentForm tag={receive.tag} address={address} />}
     </div>
   );
 }
