@@ -375,6 +375,218 @@ the backlog grows past `DLQ_ALERT_THRESHOLD`, and when it keeps rising for 15
 minutes.
 
 
+## Payment requests
+
+A payment request is a one-off invoice for a tag: a fixed amount and asset, a
+unique memo, and an expiry. The Horizon listener watches the tag's account and
+marks the request `paid` when a payment arrives with the request's memo, the
+same asset, and at least the requested amount. Walkthrough:
+[payment-requests.md](payment-requests.md).
+
+All paths are served under `/api/v1` (and the `/api` alias).
+
+**Statuses:** `pending` → `paid` | `expired` | `cancelled`. A pending request
+past its `expiresAt` is reported as `expired` on every read, even before the
+expiry sweep stores it.
+
+**Request object** (returned as `data` by every endpoint below):
+
+```json
+{
+  "id": "2c80a413-18d7-5a51-990e-449b21996106",
+  "tag": "alice*stellartags.xyz",
+  "destination": "GD...",
+  "amount": "25",
+  "asset": "XLM",
+  "memoType": "text",
+  "memo": "invoice-42",
+  "description": "Order #42",
+  "status": "pending",
+  "expiresAt": "2026-11-25T12:00:00.000Z",
+  "paidAt": null,
+  "transactionHash": null,
+  "createdAt": "2026-11-24T12:00:00.000Z"
+}
+```
+
+**Signing.** Creating and cancelling a request prove ownership of the tag.
+Sign the text `payment-request:<tag>` (for example
+`payment-request:alice*stellartags.xyz`, the full lower-case tag) with the
+tag's Stellar account key as a Freighter-style signed message (SEP-53:
+ed25519 over `sha256("Stellar Signed Message:\n" + message)`), base64-encode
+it, and send it as `X-Stellar-Signature`, with the account address in
+`X-Stellar-Signer`. Freighter's `signMessage` produces this directly; from
+Node.js:
+
+```js
+const crypto = require('crypto');
+const { Keypair } = require('@stellar/stellar-sdk');
+
+const keypair = Keypair.fromSecret(process.env.STELLAR_SECRET);
+const message = 'payment-request:alice*stellartags.xyz';
+const hash = crypto.createHash('sha256')
+  .update(Buffer.concat([Buffer.from('Stellar Signed Message:\n'), Buffer.from(message)]))
+  .digest();
+console.log(keypair.sign(hash).toString('base64')); // X-Stellar-Signature
+console.log(keypair.publicKey());                   // X-Stellar-Signer
+```
+
+The same signature works for every create and cancel on that tag.
+
+### `POST /payment-requests`
+Creates a pending payment request.
+- **Headers:**
+  - `Content-Type: application/json` (required)
+  - `Idempotency-Key` (required) - Any unique string up to 128 characters. A
+    retry with the same key and body returns the first response.
+  - `X-Stellar-Signature` (required) - See *Signing* above. `signature` in the
+    body is also accepted.
+  - `X-Stellar-Signer` - The signing address. `signerAddress` in the body is
+    also accepted.
+- **Body Parameters (JSON):**
+  - `tag` (string, required) - The tag to be paid. A bare name (`alice`) is
+    completed with the server's domain.
+  - `amount` (string or number, required) - Positive decimal, at most 7
+    decimal places.
+  - `asset` (string, optional) - `XLM` (default, `native` is an alias) or
+    `CODE:ISSUER`.
+  - `memo` (string, optional, max 28) - Your own reference. Must be unique
+    across all payment requests. When omitted, a random 20-character text
+    memo is generated.
+  - `memoType` (string, optional) - `text` (default), `id` or `hash`.
+    `memo_type` is also accepted.
+  - `description` (string, optional, max 140) - Shown to the payer. HTML is
+    stripped and profanity is rejected.
+  - `expiresAt` (ISO 8601 string, optional) - Defaults to 24 hours from now,
+    at most 30 days ahead. `expires_at` is also accepted.
+- **Returns:** `201` with `{ ok: true, data: <request>, link, sep7 }`, where
+  `link` is the HTTPS pay link
+  (`https://<host>/pay/<name>?amount=…&memo=…&memoType=…&requestId=…`) and
+  `sep7` is a `web+stellar:pay?destination=…&amount=…&memo=…` URI for wallets.
+- **Status Codes:**
+  - `201 Created`: Request created.
+  - `400 Bad Request`: Missing or invalid `Idempotency-Key`, or bad signer address.
+  - `401 Unauthorized`: Missing signature, or the signature does not verify.
+  - `404 Not Found`: Tag not found.
+  - `409 Conflict`: The supplied `memo` is already used, or the same
+    `Idempotency-Key` is in flight.
+  - `415 Unsupported Media Type`: Body is not JSON.
+  - `422 Unprocessable Entity`: Invalid amount, asset, memo, description or
+    `expiresAt` (`VALIDATION_FAILED`).
+  - `429 Too Many Requests`: Rate limit exceeded.
+
+```bash
+curl -X POST http://localhost:5000/api/v1/payment-requests \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H "X-Stellar-Signature: $SIGNATURE" \
+  -H "X-Stellar-Signer: $ADDRESS" \
+  -d '{"tag":"alice","amount":"25","asset":"XLM","memo":"invoice-42","description":"Order #42"}'
+```
+
+### `GET /payment-requests/:id`
+Returns one payment request. Public: anyone with the id can read it.
+- **Path Parameter:** `id` (string) - The request id.
+- **Returns:** `{ ok: true, data: <request> }`.
+- **Status Codes:**
+  - `200 OK`: Found.
+  - `404 Not Found`: Unknown id.
+  - `429 Too Many Requests`: Rate limit exceeded.
+
+```bash
+curl http://localhost:5000/api/v1/payment-requests/$REQUEST_ID
+```
+
+### `POST /payment-requests/:id/cancel`
+Cancels a pending request. Payments that arrive later with its memo are
+ignored. Sends the `payment_request.cancelled` webhook.
+- **Path Parameter:** `id` (string) - The request id.
+- **Headers:** `X-Stellar-Signature` (required) and `X-Stellar-Signer`, signed
+  for the request's tag. `signature` / `signerAddress` in a JSON body are also
+  accepted.
+- **Returns:** `{ ok: true, data: <request> }` with `status: "cancelled"`.
+- **Status Codes:**
+  - `200 OK`: Cancelled.
+  - `400 Bad Request`: Bad signer address.
+  - `401 Unauthorized`: Missing signature, or the signature does not verify.
+  - `404 Not Found`: Unknown id, or the tag no longer exists.
+  - `409 Conflict`: The request is already `paid`, `expired` or `cancelled`.
+  - `429 Too Many Requests`: Rate limit exceeded.
+
+```bash
+curl -X POST http://localhost:5000/api/v1/payment-requests/$REQUEST_ID/cancel \
+  -H "X-Stellar-Signature: $SIGNATURE" \
+  -H "X-Stellar-Signer: $ADDRESS"
+```
+
+### `GET /payment-requests/:id/qr.png` and `GET /payment-requests/:id/qr.svg`
+Returns a QR code for the request, ready for an `<img>` tag.
+- **Path Parameter:** `id` (string) - The request id.
+- **Query Parameters:**
+  - `size` (integer, optional) - Width in pixels, `128` to `1024`, default
+    `512`. Values outside the range are clamped; non-numbers use the default.
+  - `format` (string, optional) - `link` (default, the HTTPS pay link) or
+    `sep7` (the `web+stellar:pay` URI, for wallets that scan directly).
+- **Returns:** `image/png` or `image/svg+xml`. Error correction level `M`.
+  `Cache-Control: public, max-age=300` while the request is pending,
+  `no-store` once it is paid, expired or cancelled.
+- **Status Codes:**
+  - `200 OK`: Image returned.
+  - `400 Bad Request`: `format` is not `link` or `sep7`.
+  - `404 Not Found`: Unknown id.
+  - `429 Too Many Requests`: Rate limit exceeded.
+
+```bash
+curl -o invoice.png "http://localhost:5000/api/v1/payment-requests/$REQUEST_ID/qr.png?size=256&format=sep7"
+```
+
+### `GET /payment-requests/:id/events`
+Server-Sent Events stream for one request; an alias of
+[`GET /payments/:paymentId/events`](#get-paymentspaymentidevents). It sends a
+`snapshot` with the current status on connect and a `payment-update`
+(`type: "payment_request"`) when the request is paid, cancelled or expires.
+- **Status Codes:** `200 OK`, `400 Bad Request` (invalid id),
+  `429 Too Many Requests` (per-IP stream budget).
+
+```bash
+curl -N http://localhost:5000/api/v1/payment-requests/$REQUEST_ID/events
+```
+
+### Payment request webhooks
+Webhooks registered for the tag (`POST /webhooks`) receive these events,
+signed and retried exactly like `payment.received` (see
+[webhook-signature-verification.md](webhook-signature-verification.md)):
+
+| Event | Sent when |
+|---|---|
+| `payment_request.paid` | The request is matched to a payment. |
+| `payment_request.expired` | The request passes `expiresAt` unpaid (checked every minute). |
+| `payment_request.cancelled` | The owner cancels the request. |
+
+```json
+{
+  "event": "payment_request.paid",
+  "event_id": "2c80a413-18d7-5a51-990e-449b21996106-paid",
+  "timestamp": "2026-11-24T12:00:00.000Z",
+  "network": "testnet",
+  "data": {
+    "request_id": "2c80a413-18d7-5a51-990e-449b21996106",
+    "tag": "alice*stellartags.xyz",
+    "amount_requested": "25",
+    "amount_paid": "25.0000000",
+    "asset": "XLM",
+    "memo": "invoice-42",
+    "transaction_hash": "3389e9f0...",
+    "paid_at": "2026-11-24T11:59:58.000Z"
+  }
+}
+```
+
+`event_id` is `<request_id>-<paid|expired|cancelled>` and does not change
+between retries, so use it to de-duplicate. For `expired` and `cancelled`,
+`amount_paid`, `transaction_hash` and `paid_at` are `null`.
+
+
 ## Webhook signature verification
 
 Every webhook delivery includes an HMAC-SHA256 signature in the
