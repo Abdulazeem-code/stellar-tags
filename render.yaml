@@ -22,3 +22,8 @@ services:
         fromDatabase:
           name: stellar-tags-db
           property: connectionString
+      # Run the Horizon listener inside the API so payment requests turn to
+      # "paid" without a separate worker. Keep this service at one instance:
+      # each instance would run its own listener and duplicate webhooks.
+      - key: RUN_HORIZON_LISTENER
+        value: "true"

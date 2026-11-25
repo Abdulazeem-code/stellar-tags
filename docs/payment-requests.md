@@ -25,6 +25,11 @@ accounts, matches payments to requests, and delivers webhooks:
 docker compose exec backend npm run listener
 ```
 
+Alternatively, start the API with `RUN_HORIZON_LISTENER=true` and it runs the
+listener in its own process; that is how the Render deployment works, so the
+hosted site does not depend on a separate worker. Run it in one place only.
+Webhook delivery needs Redis (`REDIS_URL`) in either mode.
+
 Set a few shell variables used below:
 
 ```bash
