@@ -24,7 +24,7 @@ jest.mock('../prismaClient', () => ({
 }));
 
 jest.mock('../src/config/redis', () => ({
-  createRedisConnection: jest.fn(() => ({ quit: jest.fn() })),
+  createRedisConnection: jest.fn(() => ({ quit: jest.fn(), on: jest.fn() })),
 }));
 
 jest.mock('../src/fraudDetection', () => ({ PAYMENT_STREAM: 'payments' }));
@@ -59,6 +59,7 @@ const { publishPaymentUpdate } = require('../src/sse');
 const {
   watchAccount,
   syncWatchedAccounts,
+  stop,
   shutdown,
   main,
   activeStreams,
@@ -155,8 +156,45 @@ describe('Horizon listener publishes status updates to SSE (#730)', () => {
     });
   });
 
-  it('publishes a payment update when an on-chain payment is detected', async () => {
-    watchAccount('GPUBLISH');
+  it('emits the update in-process when Redis is not configured', async () => {
+    const { emitPaymentUpdate } = require('../src/sse');
+    watchAccount('GLOCAL');
+
+    mockStream.mock.calls[0][0].onmessage({
+      type: 'payment',
+      transaction_hash: 'deadbeef',
+      from: 'GFROM',
+      to: 'GTO',
+      amount: '1.5',
+      asset_type: 'native',
+      created_at: '2026-01-01T00:00:00Z',
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(publishPaymentUpdate).not.toHaveBeenCalled();
+    expect(emitPaymentUpdate).toHaveBeenCalledWith('PAY-123', expect.objectContaining({
+      status: 'completed',
+      transactionHash: 'deadbeef',
+    }));
+  });
+
+  it('publishes a payment update to Redis when Redis is configured', async () => {
+    let isolated;
+    process.env.REDIS_URL = 'redis://redis.test:6379';
+    jest.isolateModules(() => {
+      isolated = {
+        listener: require('../horizonListener'),
+        sse: require('../src/sse'),
+        stellar: require('../src/services/stellarService'),
+        prisma: require('../prismaClient').prisma,
+      };
+    });
+    delete process.env.REDIS_URL;
+    isolated.stellar.horizon.payments.mockReturnValue({ forAccount: mockForAccount });
+    isolated.prisma.payment.create.mockResolvedValue(await prisma.payment.create());
+    const { watchAccount: watchIsolated } = isolated.listener;
+    const { publishPaymentUpdate: publishIsolated, emitPaymentUpdate: emitIsolated } = isolated.sse;
+    watchIsolated('GPUBLISH');
 
     const options = mockStream.mock.calls[0][0];
     options.onmessage({
@@ -172,12 +210,13 @@ describe('Horizon listener publishes status updates to SSE (#730)', () => {
     // Flush prisma.payment.create(...).then(publishPaymentUpdate)
     await new Promise((resolve) => setImmediate(resolve));
 
-    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(prisma.outboxMessage.create).toHaveBeenCalledWith({
+    expect(isolated.prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(isolated.prisma.outboxMessage.create).toHaveBeenCalledWith({
       data: { eventType: 'payment.created', payload: expect.objectContaining({ paymentId: 'PAY-123' }) },
     });
-    expect(publishPaymentUpdate).toHaveBeenCalledTimes(1);
-    const [, paymentId, payload] = publishPaymentUpdate.mock.calls[0];
+    expect(emitIsolated).not.toHaveBeenCalled();
+    expect(publishIsolated).toHaveBeenCalledTimes(1);
+    const [, paymentId, payload] = publishIsolated.mock.calls[0];
     expect(paymentId).toBe('PAY-123');
     expect(payload).toMatchObject({
       status: 'completed',
@@ -213,11 +252,68 @@ describe('Horizon listener publishes status updates to SSE (#730)', () => {
   });
 });
 
+describe('Horizon listener health check', () => {
+  test('asks Horizon for the newest ledger with calls the SDK actually has', async () => {
+    let isolated;
+    jest.isolateModules(() => {
+      isolated = {
+        stellar: require('../src/services/stellarService'),
+        listener: require('../horizonListener'),
+      };
+    });
+    const [check] = isolated.stellar.createBreaker.mock.calls[0];
+
+    // Only order/limit/call exist on the builder, as in @stellar/stellar-sdk;
+    // a missing method (the old ledgers().latest()) makes this throw.
+    const call = jest.fn().mockResolvedValue({ records: [{ sequence: 1 }] });
+    const limit = jest.fn(() => ({ call }));
+    const order = jest.fn(() => ({ limit }));
+    isolated.stellar.horizon.ledgers = jest.fn(() => ({ order }));
+
+    await expect(check()).resolves.toEqual({ records: [{ sequence: 1 }] });
+    expect(order).toHaveBeenCalledWith('desc');
+    expect(limit).toHaveBeenCalledWith(1);
+  });
+});
+
 describe('Horizon listener startup', () => {
-  test('starts the webhook delivery worker', async () => {
+  afterEach(() => {
+    delete process.env.REDIS_URL;
+  });
+
+  test('starts the webhook delivery worker when Redis is configured', async () => {
+    process.env.REDIS_URL = 'redis://redis.test:6379';
     prisma.user.findMany.mockResolvedValue([]);
     const { syncInterval } = await main();
     clearInterval(syncInterval);
     expect(startWebhookWorker).toHaveBeenCalledWith({ prisma });
+  });
+
+  test('skips webhook delivery, with a warning, when Redis is not configured', async () => {
+    const { logger } = require('../src/logger');
+    const { scheduleWebhookRetryJob } = require('../src/webhookWorker');
+    jest.clearAllMocks();
+    prisma.user.findMany.mockResolvedValue([]);
+    const { syncInterval } = await main();
+    clearInterval(syncInterval);
+    expect(startWebhookWorker).not.toHaveBeenCalled();
+    expect(scheduleWebhookRetryJob).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('webhooks will not be delivered'));
+  });
+
+  test('stop() closes streams without disconnecting Prisma or exiting', async () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    jest.clearAllMocks();
+    horizon.payments.mockReturnValue({ forAccount: mockForAccount });
+    mockStream.mockImplementation(() => mockCloseStream);
+    watchAccount('GSTOP');
+
+    await stop();
+
+    expect(mockCloseStream).toHaveBeenCalledTimes(1);
+    expect(activeStreams.size).toBe(0);
+    expect(prisma.$disconnect).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+    exitSpy.mockRestore();
   });
 });

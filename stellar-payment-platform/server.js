@@ -20,6 +20,11 @@ const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
 const { scheduleReconciliationJob, scheduleLedgerReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
 const { schedulePaymentRequestExpiryJob } = require("./src/payment-request-expiry-cron");
+const {
+  isInProcessListenerRunning,
+  startInProcessListener,
+  stopInProcessListener,
+} = require("./src/inProcessListener");
 const { correlationId } = require("./middleware/correlation");
 const dotenv = require("dotenv");
 const timeout = require("connect-timeout");
@@ -510,6 +515,11 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
   closeSse().then(() => {
     server.close(async () => {
       clearTimeout(timer);
+      // Stop the in-process Horizon listener before Prisma goes away. Only
+      // await when one runs, so shutdown takes no extra async hop otherwise.
+      if (isInProcessListenerRunning()) {
+        await stopInProcessListener();
+      }
       try {
         await prismaClient.$disconnect();
       } catch (err) {
@@ -584,6 +594,10 @@ if (require.main === module) {
     // routes are ordinary Express handlers and CORS is enforced by the
     // regular cors() middleware already in the chain.
     initSse();
+
+    // With RUN_HORIZON_LISTENER=true the API also runs the Horizon listener,
+    // so payment requests turn to paid without a separate worker process.
+    startInProcessListener();
 
     process.on("SIGTERM", (sig) =>
       gracefulShutdown(server, prisma, sig, redisClient),
