@@ -92,6 +92,15 @@ try {
       findUnique: async () => null,
       count: async () => 0,
     },
+    paymentRequest: {
+      create: async (args) => args.data || {},
+      findUnique: async () => null,
+      findFirst: async () => null,
+      findMany: async () => [],
+      update: async () => ({}),
+      updateMany: async () => ({ count: 0 }),
+      count: async () => 0,
+    },
     $transaction: async (arg) => {
       if (typeof arg === 'function') {
         return arg(prisma);
@@ -115,10 +124,20 @@ const withTransaction = async (callback) => {
  * instead of 500 when Postgres is unreachable.
  */
 function isPrismaConnectionError(error) {
+  if (!error) return false;
+  const name = error.name || error.constructor?.name || '';
+  if (name === 'PrismaClientInitializationError') return true;
+  const causeName = error.cause?.name || error.cause?.constructor?.name || '';
+  if (causeName === 'PrismaClientInitializationError') return true;
   const code = typeof error?.code === 'string' ? error.code : '';
   if (code.startsWith('P10')) return true;
   const causeCode = typeof error?.cause?.code === 'string' ? error.cause.code : '';
-  return causeCode.startsWith('P10');
+  if (causeCode.startsWith('P10')) return true;
+  const msg = typeof error?.message === 'string' ? error.message : '';
+  if (msg.includes("Can't reach database server") || msg.includes("connection refused")) return true;
+  const causeMsg = typeof error?.cause?.message === 'string' ? error.cause.message : '';
+  if (causeMsg.includes("Can't reach database server") || causeMsg.includes("connection refused")) return true;
+  return false;
 }
 
 module.exports = { prisma, isPrismaConnectionError, withTransaction };

@@ -186,7 +186,11 @@ describe('federation (real PostgreSQL)', () => {
 
       // Unregistering soft-deletes the row and invalidates the cache entry, so
       // the next lookup must reach Postgres instead of replaying the cache.
-      const del = await request(app).delete('/api/v1/register/revoked');
+      // Signature verification is stubbed in this suite; any value passes.
+      const del = await request(app)
+        .delete('/api/v1/register/revoked')
+        .set('X-Stellar-Signature', 'c3R1Yi1zaWduYXR1cmU=')
+        .set('X-Stellar-Signer', address);
       expect(del.status).toBe(200);
 
       const afterDelete = await byName('revoked');

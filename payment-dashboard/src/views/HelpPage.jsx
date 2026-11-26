@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react';
 import Icon from '../components/Icon';
-import { DEFAULT_FEDERATION_DOMAIN } from './shared';
 
 const TOPICS = [
   { id: 'all', label: 'All' },
@@ -14,7 +13,7 @@ const FAQ = [
   {
     topic: 'tags',
     q: 'What is a tag?',
-    a: `A short name like you*${DEFAULT_FEDERATION_DOMAIN} that points at your Stellar address. It is served over SEP-0002 federation, so any wallet that supports federation can resolve it.`,
+    a: 'A short name like you that points at your Stellar address. It is served over SEP-0002 federation, so any wallet that supports federation can resolve it.',
   },
   {
     topic: 'tags',

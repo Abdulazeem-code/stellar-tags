@@ -1,24 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
-import { Client as PaymentRouterClient, networks } from '@stellar-tags/payment-router';
+import { networks } from '@stellar-tags/payment-router';
 import Icon from '../components/Icon';
 import ConnectPrompt from '../components/ConnectPrompt';
 import RecentAddresses from '../components/RecentAddresses';
+import RequestPaymentForm from '../components/RequestPaymentForm';
+import { qrDataUrl } from '../lib/paymentLinks';
 import { useRecentAddresses } from '../useRecentAddresses';
 import { signTransaction } from '../lib/wallets';
+import { SOROBAN_RPC, submitAndWait } from '../lib/soroban';
 import { dailyVolume, fetchAccountPayments, relativeTime } from '../lib/payments';
 import {
   API_BASE,
-  DEFAULT_FEDERATION_DOMAIN,
   TOKEN_ADDRESS,
+  TREASURY_ADDRESS,
   apiErrorMessage,
   errorMessage,
   formatShortAddress,
   fullTag,
+  loadStellarSdk,
   resolveRecipient,
 } from './shared';
 
-const SOROBAN_RPC = 'https://soroban-testnet.stellar.org';
 const QUICK_AMOUNTS = [10, 50, 100, 250];
 
 function splitBalance(value) {
@@ -140,20 +143,74 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
       toast.loading('Simulating the payment_router call...', { id: toastId });
       const amountStroops = BigInt(Math.floor(amountValue * 10000000));
 
-      // Build and simulate the payment through the type-safe client generated
-      // from the contract ABI (packages/types).
-      const client = new PaymentRouterClient({ ...networks.testnet, rpcUrl: SOROBAN_RPC });
+      const { Contract, nativeToScVal, rpc: sdkRpc, TransactionBuilder } =
+        await loadStellarSdk();
+      const server = new sdkRpc.Server(SOROBAN_RPC);
+      const account = await server.getAccount(userPublicKey);
+      const contract = new Contract(networks.testnet.contractId);
 
+      // Build and simulate the route_payment call. The deployed testnet contract
+      // (CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER) expects 5 parameters:
+      // (sender, recipient, platform_treasury, token_address, amount).
+      // If upgraded in the future, fallback to 4 parameters (sender, recipient, token_address, amount).
       let assembledTransaction;
       try {
-        assembledTransaction = await client.route_payment({
-          sender: userPublicKey,
-          recipient: recipientAddress,
-          token_address: TOKEN_ADDRESS,
-          amount: amountStroops,
-        });
+        const tx5 = new TransactionBuilder(account, {
+          fee: '100',
+          networkPassphrase: networks.testnet.networkPassphrase,
+        })
+          .addOperation(
+            contract.call(
+              'route_payment',
+              nativeToScVal(userPublicKey, { type: 'address' }),
+              nativeToScVal(recipientAddress, { type: 'address' }),
+              nativeToScVal(TREASURY_ADDRESS, { type: 'address' }),
+              nativeToScVal(TOKEN_ADDRESS, { type: 'address' }),
+              nativeToScVal(amountStroops, { type: 'i128' }),
+            ),
+          )
+          .setTimeout(300)
+          .build();
+
+        const sim5 = await server.simulateTransaction(tx5);
+        if (sdkRpc.Api.isSimulationSuccess(sim5)) {
+          assembledTransaction = sdkRpc.assembleTransaction(tx5, sim5).build();
+        } else {
+          const simErr = String(sim5.error || '');
+          if (simErr.includes('MismatchingParameterLen') || simErr.includes('UnexpectedSize')) {
+            const tx4 = new TransactionBuilder(account, {
+              fee: '100',
+              networkPassphrase: networks.testnet.networkPassphrase,
+            })
+              .addOperation(
+                contract.call(
+                  'route_payment',
+                  nativeToScVal(userPublicKey, { type: 'address' }),
+                  nativeToScVal(recipientAddress, { type: 'address' }),
+                  nativeToScVal(TOKEN_ADDRESS, { type: 'address' }),
+                  nativeToScVal(amountStroops, { type: 'i128' }),
+                ),
+              )
+              .setTimeout(300)
+              .build();
+            const sim4 = await server.simulateTransaction(tx4);
+            if (!sdkRpc.Api.isSimulationSuccess(sim4)) {
+              throw new Error(`Simulation failed: ${sim4.error || 'rejected by network'}`);
+            }
+            assembledTransaction = sdkRpc.assembleTransaction(tx4, sim4).build();
+          } else {
+            throw new Error(`Simulation failed: ${sim5.error || 'rejected by network'}`);
+          }
+        }
       } catch (err) {
-        throw new Error(`Simulation failed: ${err.message}`, { cause: err });
+        if (/account not found/i.test(err?.message || '')) {
+          throw new Error('Your account does not exist on testnet yet. Fund it with Friendbot first.', { cause: err });
+        }
+        throw err;
+      }
+      if (assembledTransaction.result?.isErr?.()) {
+        const reason = assembledTransaction.result.unwrapErr()?.message;
+        throw new Error(`The payment_router contract refused this payment${reason ? `: ${reason}` : '.'}`);
       }
 
       toast.loading('Approve the transaction in your wallet...', { id: toastId });
@@ -164,26 +221,9 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
         throw new Error(`Wallet signature failed: ${err?.message || 'rejected'}`, { cause: err });
       }
 
-      toast.loading('Submitting to Stellar testnet...', { id: toastId });
-      const rpcResponse = await fetch(SOROBAN_RPC, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'sendTransaction',
-          params: { transaction: signedXdr },
-        }),
-      });
-      const rpcData = await rpcResponse.json();
-      if (rpcData.error) throw new Error(`RPC error: ${rpcData.error.message}`);
+      toast.loading('Waiting for the ledger to confirm...', { id: toastId });
+      const txHash = await submitAndWait(signedXdr, networks.testnet.networkPassphrase);
 
-      const txStatus = rpcData.result?.status;
-      if (txStatus !== 'PENDING' && txStatus !== 'SUCCESS') {
-        throw new Error(`The network rejected the transaction: ${txStatus || 'unknown'}`);
-      }
-
-      const txHash = rpcData.result?.hash;
       const explorerUrl = txHash ? `https://stellar.expert/explorer/testnet/tx/${txHash}` : null;
       toast.success(
         (t) => (
@@ -226,7 +266,7 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
             value={recipient}
             onChange={(event) => setRecipient(event.target.value)}
             onFocus={() => setShowRecent(true)}
-            placeholder={`name, name*${DEFAULT_FEDERATION_DOMAIN} or G...`}
+            placeholder="name or G..."
             autoComplete="off"
             spellCheck="false"
             required
@@ -304,9 +344,23 @@ function SendPanel({ userPublicKey, onRefreshBalance }) {
   );
 }
 
-function ReceivePanel({ receive, onNavigate }) {
+function ReceivePanel({ receive, userPublicKey, onNavigate }) {
   const [copied, setCopied] = useState('');
+  const [qr, setQr] = useState({ address: '', url: '' });
   const tag = fullTag(receive.tag);
+  const address = receive.address || userPublicKey || '';
+
+  // Drawn locally so the address is never sent to a third-party QR service.
+  useEffect(() => {
+    if (!address) return undefined;
+    let active = true;
+    qrDataUrl(address)
+      .then((url) => active && setQr({ address, url }))
+      .catch(() => active && setQr({ address, url: '' }));
+    return () => {
+      active = false;
+    };
+  }, [address]);
 
   const copy = async (value, label) => {
     try {
@@ -318,7 +372,7 @@ function ReceivePanel({ receive, onNavigate }) {
     }
   };
 
-  if (receive.loading) {
+  if (!address) {
     return (
       <div className="skeleton-list" aria-busy="true">
         <span className="skeleton dither-12" />
@@ -328,45 +382,51 @@ function ReceivePanel({ receive, onNavigate }) {
   }
 
   return (
-    <div className="receive">
-      <div className="receive__qr">
-        <img
-          src={`https://api.qrserver.com/v1/create-qr-code/?size=176x176&margin=8&data=${encodeURIComponent(receive.address)}`}
-          alt="QR code of your wallet address"
-          width="176"
-          height="176"
-        />
-      </div>
-      <div className="receive__fields">
-        {tag ? (
+    <div className="stack">
+      <div className="receive">
+        <div className="receive__qr">
+          {qr.address === address && qr.url ? (
+            <img src={qr.url} alt="QR code of your wallet address" width="176" height="176" />
+          ) : (
+            <span className="pay-qr__empty dither-12" aria-hidden="true" />
+          )}
+        </div>
+        <div className="receive__fields">
+          {tag ? (
+            <div className="copy-field">
+              <span className="eyebrow">Your tag</span>
+              <div className="copy-field__row">
+                <span className="mono text-paper">{tag}</span>
+                <button type="button" className="icon-button" onClick={() => copy(tag, 'Tag')}>
+                  <Icon name={copied === 'Tag' ? 'check' : 'copy'} size={16} label="Copy tag" />
+                </button>
+              </div>
+            </div>
+          ) : receive.loading ? (
+            <div className="skeleton-list" aria-busy="true">
+              <span className="skeleton dither-12" />
+            </div>
+          ) : (
+            <div className="notice notice--info">
+              <span>No tag yet. Claim one so people can pay you by name.</span>
+              <button type="button" className="btn btn--ghost btn--sm" onClick={() => onNavigate('register')}>
+                Claim a tag
+              </button>
+            </div>
+          )}
           <div className="copy-field">
-            <span className="eyebrow">Your tag</span>
+            <span className="eyebrow">Wallet address</span>
             <div className="copy-field__row">
-              <span className="mono text-paper">{tag}</span>
-              <button type="button" className="icon-button" onClick={() => copy(tag, 'Tag')}>
-                <Icon name={copied === 'Tag' ? 'check' : 'copy'} size={16} label="Copy tag" />
+              <span className="mono break">{address}</span>
+              <button type="button" className="icon-button" onClick={() => copy(address, 'Address')}>
+                <Icon name={copied === 'Address' ? 'check' : 'copy'} size={16} label="Copy address" />
               </button>
             </div>
           </div>
-        ) : (
-          <div className="notice notice--info">
-            <span>No tag yet. Claim one so people can pay you by name.</span>
-            <button type="button" className="btn btn--ghost btn--sm" onClick={() => onNavigate('register')}>
-              Claim a tag
-            </button>
-          </div>
-        )}
-        <div className="copy-field">
-          <span className="eyebrow">Wallet address</span>
-          <div className="copy-field__row">
-            <span className="mono break">{receive.address}</span>
-            <button type="button" className="icon-button" onClick={() => copy(receive.address, 'Address')}>
-              <Icon name={copied === 'Address' ? 'check' : 'copy'} size={16} label="Copy address" />
-            </button>
-          </div>
+          {receive.error && <p className="notice notice--error">{receive.error}</p>}
         </div>
-        {receive.error && <p className="notice notice--error">{receive.error}</p>}
       </div>
+      {receive.tag && <RequestPaymentForm tag={receive.tag} address={address} />}
     </div>
   );
 }
@@ -383,7 +443,15 @@ function Dashboard({
 }) {
   const [tab, setTab] = useState('send');
   const [showBalance, setShowBalance] = useState(true);
-  const [receiveData, setReceiveData] = useState({ key: '', address: '', tag: '', error: '' });
+  const [receiveData, setReceiveData] = useState(() => {
+    const cachedTag = typeof window !== 'undefined' && userPublicKey ? localStorage.getItem(`stellar_tag_${userPublicKey}`) || '' : '';
+    return {
+      key: cachedTag ? userPublicKey : '',
+      address: userPublicKey || '',
+      tag: cachedTag,
+      error: '',
+    };
+  });
   const [activityData, setActivityData] = useState({ key: '', rows: [], error: '' });
   const [activityNonce, setActivityNonce] = useState(0);
 
@@ -391,19 +459,27 @@ function Dashboard({
     if (!userPublicKey) return undefined;
     let active = true;
 
+    const cachedTag = localStorage.getItem(`stellar_tag_${userPublicKey}`) || '';
+
     const load = async () => {
       try {
-        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`);
+        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`, {
+          signal: AbortSignal.timeout(6000),
+        });
         const rawBody = await response.text();
         const data = rawBody ? JSON.parse(rawBody) : null;
         if (!active) return;
 
         if (response.ok && data) {
-          setReceiveData({ key: userPublicKey, address: data.address, tag: data.username, error: '' });
+          if (data.username) {
+            localStorage.setItem(`stellar_tag_${userPublicKey}`, data.username);
+          }
+          setReceiveData({ key: userPublicKey, address: data.address || userPublicKey, tag: data.username || '', error: '' });
           onRegistrationStateChange('existing');
           return;
         }
         if (response.status === 404) {
+          localStorage.removeItem(`stellar_tag_${userPublicKey}`);
           setReceiveData({ key: userPublicKey, address: userPublicKey, tag: '', error: '' });
           // "skipped", not "new", so the app does not keep redirecting to registration.
           onRegistrationStateChange('skipped');
@@ -412,13 +488,13 @@ function Dashboard({
         throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`));
       } catch (error) {
         if (!active) return;
-        setReceiveData({
+        setReceiveData((prev) => ({
           key: userPublicKey,
           address: userPublicKey,
-          tag: '',
-          error: errorMessage(error, 'Unable to load receive details.'),
-        });
-        onRegistrationStateChange('unknown');
+          tag: prev.tag || '',
+          error: prev.tag ? '' : errorMessage(error, 'Unable to load receive details.'),
+        }));
+        onRegistrationStateChange(cachedTag ? 'existing' : 'unknown');
       }
     };
 
@@ -540,7 +616,7 @@ function Dashboard({
           {tab === 'send' ? (
             <SendPanel userPublicKey={userPublicKey} onRefreshBalance={onRefreshBalance} />
           ) : (
-            <ReceivePanel receive={receive} onNavigate={onNavigate} />
+            <ReceivePanel receive={receive} userPublicKey={userPublicKey} onNavigate={onNavigate} />
           )}
         </div>
       </section>

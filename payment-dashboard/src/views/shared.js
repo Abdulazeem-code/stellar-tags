@@ -33,12 +33,11 @@ export const normalizeNameTag = (value) => {
 };
 
 /**
- * The full name*domain form of a username. The API stores and returns
- * usernames with the domain already attached, so only bare names get one.
+ * The display name of a tag without the domain suffix.
  */
 export const fullTag = (username) => {
   if (!username) return '';
-  return username.includes('*') ? username : `${username}*${DEFAULT_FEDERATION_DOMAIN}`;
+  return username.split('*')[0];
 };
 
 export const resolveRecipient = async (inputValue) => {

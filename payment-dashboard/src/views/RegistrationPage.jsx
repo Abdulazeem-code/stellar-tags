@@ -3,10 +3,9 @@ import toast from 'react-hot-toast';
 import Icon from '../components/Icon';
 import { useDebounce } from '../useDebounce';
 import { checkTag, validateTag, TAG_MAX } from '../lib/tags';
-import { signMessage, walletName, connectedWalletId } from '../lib/wallets';
+import { signMessage, walletName, connectedWalletId, normaliseSignature } from '../lib/wallets';
 import {
   API_BASE,
-  DEFAULT_FEDERATION_DOMAIN,
   apiErrorMessage,
   formatShortAddress,
   fullTag,
@@ -17,32 +16,6 @@ const MEMO_PLACEHOLDER = {
   id: '64-bit unsigned integer',
   hash: '64-character hex string',
 };
-
-// Wallets return the signature as a base64 string, a Buffer-like object or a
-// Uint8Array depending on the wallet. The API wants base64.
-function normaliseSignature(result) {
-  if (result && result.error) throw new Error(result.error.message || result.error);
-  const raw = typeof result === 'string' ? result : result?.signedMessage || result?.signature;
-  if (!raw || typeof raw !== 'object') return raw;
-
-  let bytes;
-  if (raw.type === 'Buffer' && Array.isArray(raw.data)) {
-    bytes = new Uint8Array(raw.data);
-  } else if (raw instanceof Uint8Array) {
-    bytes = raw;
-  } else if (raw.buffer instanceof ArrayBuffer) {
-    bytes = new Uint8Array(raw.buffer);
-  } else {
-    bytes = new Uint8Array(Object.values(raw));
-  }
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-  // Some wallets hand back the ASCII bytes of an already base64 signature.
-  if (binary.length >= 80 && binary.length <= 90 && /^[a-zA-Z0-9+/]+={0,2}$/.test(binary)) {
-    return binary;
-  }
-  return btoa(binary);
-}
 
 function validateMemo(memoType, memo) {
   if (memoType && !memo) return 'Enter a memo value, or set the type back to None.';
@@ -98,17 +71,30 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
   const [memoError, setMemoError] = useState('');
   const [status, setStatus] = useState({ tone: '', text: '' });
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [existing, setExisting] = useState({ key: '', tag: '' });
+  const [existing, setExisting] = useState(() => {
+    const cached = typeof window !== 'undefined' && userPublicKey ? localStorage.getItem(`stellar_tag_${userPublicKey}`) || '' : '';
+    return { key: cached ? userPublicKey : '', tag: cached };
+  });
 
   useEffect(() => {
     if (!userPublicKey) return undefined;
     let active = true;
-    fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`)
+    fetch(`${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`, {
+      signal: AbortSignal.timeout(6000),
+    })
       .then(async (response) => {
         const data = response.ok ? await response.json().catch(() => null) : null;
-        if (active) setExisting({ key: userPublicKey, tag: data?.username || '' });
+        if (active) {
+          if (data?.username) {
+            localStorage.setItem(`stellar_tag_${userPublicKey}`, data.username);
+            setExisting({ key: userPublicKey, tag: data.username });
+          } else if (response.status === 404) {
+            localStorage.removeItem(`stellar_tag_${userPublicKey}`);
+            setExisting({ key: userPublicKey, tag: '' });
+          }
+        }
       })
-      .catch(() => active && setExisting({ key: userPublicKey, tag: '' }));
+      .catch(() => active && setExisting((prev) => (prev.key ? prev : { key: userPublicKey, tag: '' })));
     return () => {
       active = false;
     };
@@ -128,7 +114,7 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
   // (the API can take a while to wake up).
   const checking = Boolean(cleaned) && (cleaned !== debounced.trim() || availability.for !== debounced);
   const shown = checking ? { state: 'checking', text: 'Checking...' } : availability;
-  const full = `${(cleaned || 'yourname').toLowerCase()}*${DEFAULT_FEDERATION_DOMAIN}`;
+  const full = (cleaned || 'yourname').toLowerCase();
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -196,6 +182,7 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
 
       setStatus({ tone: 'ok', text: `${full} is yours.` });
       toast.success(`${full} is yours.`);
+      localStorage.setItem(`stellar_tag_${address}`, cleaned.toLowerCase());
       setExisting({ key: address, tag: cleaned.toLowerCase() });
       onRegistered?.();
     } catch (error) {
@@ -223,7 +210,7 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
 
         <div className="form__group">
           <label htmlFor="username">Username</label>
-          <div className={`field field--joined ${ruleError ? 'is-invalid' : ''}`}>
+          <div className={`field ${ruleError ? 'is-invalid' : ''}`}>
             <input
               id="username"
               value={username}
@@ -235,7 +222,6 @@ function RegistrationPage({ userPublicKey, onConnectWallet, onRegistered, onDone
               aria-describedby="username-status"
               aria-invalid={Boolean(ruleError)}
             />
-            <span className="field__suffix">*{DEFAULT_FEDERATION_DOMAIN}</span>
           </div>
           <p id="username-status" className={`tag-check__status tag-check__status--${shown.state}`} aria-live="polite">
             <span className="dot" aria-hidden="true" />

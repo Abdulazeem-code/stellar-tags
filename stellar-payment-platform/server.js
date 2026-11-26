@@ -19,11 +19,19 @@ const { scheduleCleanupJob } = require("./src/cleanup-cron");
 const { scheduleSoftDeletePurgeJob } = require("./src/soft-delete-purge-cron");
 const { scheduleReconciliationJob, scheduleLedgerReconciliationJob } = require("./src/reconciliation-cron");
 const { schedulePoolMonitoring } = require("./src/db-pool-monitor");
+const { schedulePaymentRequestExpiryJob } = require("./src/payment-request-expiry-cron");
+const {
+  isInProcessListenerRunning,
+  startInProcessListener,
+  stopInProcessListener,
+} = require("./src/inProcessListener");
 const { correlationId } = require("./middleware/correlation");
 const dotenv = require("dotenv");
 const timeout = require("connect-timeout");
 const compression = require("compression");
 const { logger, httpLogger } = require("./src/logger");
+const { getSep10Config } = require("./src/config/sep10");
+const { buildStellarToml } = require("./src/utils/stellarToml");
 const {
   metricsMiddleware,
   getMetrics,
@@ -55,6 +63,14 @@ const { createHttpServer, describeTlsStatus } = require("./src/config/tls");
 const { requireMutualTls, serviceIdentity } = require("./src/middleware/mtls");
 
 dotenv.config();
+
+// SEP-10 is opt-in. Validate the signing key here so a bad secret aborts the
+// boot rather than publishing a broken SIGNING_KEY. The disabled state is
+// announced once, without ever logging the secret itself.
+const sep10Config = getSep10Config();
+if (!sep10Config.enabled) {
+  logger.info("SEP-10 disabled: SEP10_SIGNING_SECRET is not set.");
+}
 
 // #295 ΓÇö Only report to Sentry when a DSN is configured, so local/dev/test
 // runs without SENTRY_DSN never try to reach out to Sentry.
@@ -155,6 +171,16 @@ const corsOptions = {
   credentials: true,
   optionsSuccessStatus: 204,
 };
+
+// SEP-10 requires wildcard CORS on the root auth endpoint. This must run before
+// the global CORS policy so browser wallets from any origin can preflight it;
+// /auth sub-paths (email OTP, API keys) keep the existing policy.
+app.options("/auth", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  return res.status(204).end();
+});
 
 app.use(cors(corsOptions));
 
@@ -311,6 +337,8 @@ scheduleSoftDeletePurgeJob(prisma);
 scheduleReconciliationJob(prisma);
 // Event-driven ledger reconciliation of stale PENDING payments (issue #933)
 scheduleLedgerReconciliationJob(prisma);
+// Persist expired payment requests and send payment_request.expired (#1047)
+schedulePaymentRequestExpiryJob(prisma);
 const poolMonitor = schedulePoolMonitoring(prisma);
 
 // RESERVED_USERNAMES is imported from ./src/utils at the top of the file.
@@ -426,7 +454,11 @@ app.get("/.well-known/stellar.toml", (_req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader("Content-Type", "text/plain");
   res.send(
-    `FEDERATION_SERVER="${process.env.FEDERATION_SERVER_URL || `https://${process.env.STELLAR_TAG_DOMAIN}/federation`}"\n`,
+    buildStellarToml({
+      federationServerUrl: process.env.FEDERATION_SERVER_URL,
+      domain: process.env.STELLAR_TAG_DOMAIN,
+      sep10: sep10Config,
+    }),
   );
 });
 
@@ -483,6 +515,11 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
   closeSse().then(() => {
     server.close(async () => {
       clearTimeout(timer);
+      // Stop the in-process Horizon listener before Prisma goes away. Only
+      // await when one runs, so shutdown takes no extra async hop otherwise.
+      if (isInProcessListenerRunning()) {
+        await stopInProcessListener();
+      }
       try {
         await prismaClient.$disconnect();
       } catch (err) {
@@ -557,6 +594,10 @@ if (require.main === module) {
     // routes are ordinary Express handlers and CORS is enforced by the
     // regular cors() middleware already in the chain.
     initSse();
+
+    // With RUN_HORIZON_LISTENER=true the API also runs the Horizon listener,
+    // so payment requests turn to paid without a separate worker process.
+    startInProcessListener();
 
     process.on("SIGTERM", (sig) =>
       gracefulShutdown(server, prisma, sig, redisClient),

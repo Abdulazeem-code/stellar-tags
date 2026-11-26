@@ -5,6 +5,7 @@ import AppShell from './components/AppShell';
 import ConnectWalletModal from './components/ConnectWalletModal';
 import { HORIZON_BASE, API_BASE, errorMessage } from './views/shared';
 import { connectedWalletId, disconnectWallet, walletName } from './lib/wallets';
+import { isPayPath } from './lib/paymentLinks';
 
 const Landing = lazy(() => import('./views/Landing.jsx'));
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
@@ -12,10 +13,12 @@ const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
 const AnalyticsPage = lazy(() => import('./views/AnalyticsPage.jsx'));
 const HistoryPage = lazy(() => import('./views/HistoryPage.jsx'));
 const RegistrationPage = lazy(() => import('./views/RegistrationPage.jsx'));
+const PayPage = lazy(() => import('./views/PayPage.jsx'));
 
 const VIEWS = ['home', 'dashboard', 'register', 'history', 'analytics', 'help'];
 
 const TITLES = {
+  pay: { eyebrow: 'Payment', title: 'Pay' },
   dashboard: { eyebrow: 'Wallet', title: 'Dashboard' },
   register: { eyebrow: 'Identity', title: 'Your tag' },
   history: { eyebrow: 'Ledger', title: 'Transaction history' },
@@ -23,9 +26,12 @@ const TITLES = {
   help: { eyebrow: 'Support', title: 'Help center' },
 };
 
+// Views live in the hash (#dashboard); payment links are real paths
+// (/pay/<tag>?...) so they survive being shared and scanned.
 const viewFromHash = () => {
   const hash = window.location.hash.replace('#', '');
-  return VIEWS.includes(hash) ? hash : 'home';
+  if (VIEWS.includes(hash)) return hash;
+  return isPayPath() ? 'pay' : 'home';
 };
 
 function ViewFallback() {
@@ -74,14 +80,20 @@ function App() {
   useEffect(() => {
     const syncView = () => setActiveView(viewFromHash());
     window.addEventListener('hashchange', syncView);
-    return () => window.removeEventListener('hashchange', syncView);
+    window.addEventListener('popstate', syncView);
+    return () => {
+      window.removeEventListener('hashchange', syncView);
+      window.removeEventListener('popstate', syncView);
+    };
   }, []);
 
   const handleNavigate = useCallback((view) => {
     setActiveView(view);
     const hash = view === 'home' ? '' : view;
-    if (window.location.hash.replace('#', '') !== hash) {
-      window.history.pushState(null, '', hash ? `#${hash}` : window.location.pathname);
+    // Leaving a payment link goes back to the app root.
+    const base = isPayPath() ? '/' : window.location.pathname;
+    if (isPayPath() || window.location.hash.replace('#', '') !== hash) {
+      window.history.pushState(null, '', hash ? `${base}#${hash}` : base);
     }
     window.scrollTo({ top: 0 });
   }, []);
@@ -114,12 +126,25 @@ function App() {
       connectResolver.current = null;
       toast.success(`${walletName(id)} connected.`);
 
+      if (localStorage.getItem(`stellar_tag_${publicKey}`)) {
+        setRegistrationState('existing');
+      }
+
       try {
-        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(publicKey)}`);
+        const response = await fetch(`${API_BASE}/lookup?address=${encodeURIComponent(publicKey)}`, {
+          signal: AbortSignal.timeout(6000),
+        });
         if (response.ok) {
+          const data = await response.json().catch(() => null);
+          if (data?.username) {
+            localStorage.setItem(`stellar_tag_${publicKey}`, data.username);
+          }
           setRegistrationState('existing');
         } else if (response.status === 404) {
+          localStorage.removeItem(`stellar_tag_${publicKey}`);
           setRegistrationState('new');
+          // Someone paying a link does not need a tag: keep them on the page.
+          if (viewFromHash() === 'pay') return;
           handleNavigate('register');
           return;
         }
@@ -193,7 +218,9 @@ function App() {
   };
 
   let content;
-  if (activeView === 'register') {
+  if (activeView === 'pay') {
+    content = <PayPage userPublicKey={userPublicKey} onConnectWallet={handleConnectWallet} />;
+  } else if (activeView === 'register') {
     content = (
       <RegistrationPage
         userPublicKey={userPublicKey}

@@ -183,6 +183,49 @@ const adminBlockBodySchema = z
   })
   .loose();
 
+const paymentRequestBodySchema = z
+  .object({
+    tag: z.string({ error: 'tag is required' }).trim().min(1, 'tag is required').max(256),
+    amount: z.union([z.string(), z.number()])
+      .transform((value) => String(value))
+      .pipe(z.string().trim().min(1)),
+    asset: z.string().trim().min(1).max(32).optional().default('XLM'),
+    memoType: z.enum(['text', 'id', 'hash']).optional(),
+    memo_type: z.enum(['text', 'id', 'hash']).optional(),
+    memo: z.string().trim().max(28).optional(),
+    description: z.string().trim().max(140).optional(),
+    expiresAt: z.string().trim().min(1).optional(),
+    expires_at: z.string().trim().min(1).optional(),
+  })
+  .loose();
+
+/**
+ * GET /payment-requests/:id/qr.(png|svg) query.
+ *
+ * - `size`   pixels, clamped to 128..1024 (default 512), like `limit` elsewhere
+ * - `format` link (default, HTTPS pay link) | sep7 (web+stellar:pay URI)
+ */
+const QR_MIN_SIZE = 128;
+const QR_MAX_SIZE = 1024;
+const QR_DEFAULT_SIZE = 512;
+
+const paymentRequestQrQuerySchema = z
+  .object({
+    size: z
+      .any()
+      .optional()
+      .transform((value) => {
+        const parsed = parseInt(value, 10);
+        if (Number.isNaN(parsed)) return QR_DEFAULT_SIZE;
+        return Math.min(QR_MAX_SIZE, Math.max(QR_MIN_SIZE, parsed));
+      }),
+    format: z
+      .enum(['link', 'sep7'], { error: 'format must be link or sep7' })
+      .optional()
+      .default('link'),
+  })
+  .loose();
+
 /**
  * GET /admin/export query.
  *
@@ -360,6 +403,11 @@ module.exports = {
   verifyEmailConfirmBodySchema,
   adminBlockBodySchema,
   exportQuerySchema,
+  paymentRequestBodySchema,
+  paymentRequestQrQuerySchema,
+  QR_MIN_SIZE,
+  QR_MAX_SIZE,
+  QR_DEFAULT_SIZE,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
   adminDlqQuerySchema,

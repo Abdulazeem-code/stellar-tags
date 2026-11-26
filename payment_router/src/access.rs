@@ -1,61 +1,30 @@
 use crate::errors::Error;
 use crate::storage::{
-    DataKey, PauseLevel, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
+    DataKey, ExtraKey, PauseLevel, Role, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use crate::types::ActionType;
+use core::cmp::Ordering;
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
-
-// ── Rate Counter Packing Helpers ─────────────────────────────────────────────
-
-/// Packs a `(window, invocations)` pair into an 8-byte big-endian value.
-/// The first 4 bytes hold the window, the last 4 bytes hold the invocation count.
-pub fn pack_rate_counter(env: &Env, window: u32, invocations: u32) -> Bytes {
-    let mut buf = [0u8; 8];
-    buf[0..4].copy_from_slice(&window.to_be_bytes());
-    buf[4..8].copy_from_slice(&invocations.to_be_bytes());
-    Bytes::from_array(env, &buf)
-}
-
-/// Unpacks an 8-byte big-endian rate counter into `(window, invocations)`.
-pub fn unpack_rate_counter(packed: &Bytes) -> (u32, u32) {
-    let mut window_bytes = [0u8; 4];
-    let mut invocation_bytes = [0u8; 4];
-    for i in 0..4 {
-        window_bytes[i] = packed.get(i as u32).unwrap_or(0);
-        invocation_bytes[i] = packed.get((i + 4) as u32).unwrap_or(0);
-    }
-    (
-        u32::from_be_bytes(window_bytes),
-        u32::from_be_bytes(invocation_bytes),
-    )
-}
-
-/// Returns the current rate-limit window, derived from the ledger sequence.
-pub fn current_window(env: &Env) -> u32 {
-    env.ledger().sequence()
-}
-
 // ── Role-Based Access Control (RBAC) Helpers ─────────────────────────────────
 
 pub fn set_role_internal(env: &Env, role: Role, account: &Address) {
     if let Some(previous) = env
         .storage()
         .instance()
-        .get::<DataKey, Address>(&DataKey::Role(role.clone()))
+        .get::<DataKey, Address>(&DataKey::Role(role))
     {
         if &previous != account {
             env.storage()
                 .persistent()
-                .set(&DataKey::UserRole(previous, role.clone()), &false);
+                .set(&DataKey::UserRole(previous, role), &false);
         }
     }
-    env.storage()
-        .instance()
-        .set(&DataKey::Role(role.clone()), account);
+    env.storage().instance().set(&DataKey::Role(role), account);
     env.storage()
         .persistent()
-        .set(&DataKey::UserRole(account.clone(), role.clone()), &true);
+        .set(&DataKey::UserRole(account.clone(), role), &true);
     env.storage().persistent().extend_ttl(
         &DataKey::UserRole(account.clone(), role),
         PERSISTENT_LIFETIME_THRESHOLD,
@@ -67,12 +36,10 @@ pub fn remove_role_internal(env: &Env, role: Role, account: &Address) {
     if let Some(current) = env
         .storage()
         .instance()
-        .get::<DataKey, Address>(&DataKey::Role(role.clone()))
+        .get::<DataKey, Address>(&DataKey::Role(role))
     {
         if current == *account {
-            env.storage()
-                .instance()
-                .remove(&DataKey::Role(role.clone()));
+            env.storage().instance().remove(&DataKey::Role(role));
         }
     }
     env.storage()
@@ -81,7 +48,7 @@ pub fn remove_role_internal(env: &Env, role: Role, account: &Address) {
 }
 
 pub fn apply_role_grant(env: &Env, grantee: &Address, role: Role) {
-    set_role_internal(env, role.clone(), grantee);
+    set_role_internal(env, role, grantee);
     env.events().publish(
         (Symbol::new(env, "role_assigned"), role, grantee.clone()),
         env.ledger().timestamp(),
@@ -89,7 +56,7 @@ pub fn apply_role_grant(env: &Env, grantee: &Address, role: Role) {
 }
 
 pub fn apply_role_revoke(env: &Env, grantee: &Address, role: Role) {
-    remove_role_internal(env, role.clone(), grantee);
+    remove_role_internal(env, role, grantee);
     env.events().publish(
         (Symbol::new(env, "role_revoked"), role, grantee.clone()),
         env.ledger().timestamp(),
@@ -100,7 +67,7 @@ pub fn require_role(env: &Env, role: Role) -> Result<Address, Error> {
     let addr = if let Some(role_addr) = env
         .storage()
         .instance()
-        .get::<DataKey, Address>(&DataKey::Role(role.clone()))
+        .get::<DataKey, Address>(&DataKey::Role(role))
     {
         role_addr
     } else {
@@ -121,12 +88,12 @@ pub fn has_role_internal(env: &Env, account: &Address, role: Role) -> bool {
     let granted: bool = env
         .storage()
         .persistent()
-        .get(&DataKey::UserRole(account.clone(), role.clone()))
+        .get(&DataKey::UserRole(account.clone(), role))
         .unwrap_or(false);
     if granted {
         return true;
     }
-    let designated: Option<Address> = env.storage().instance().get(&DataKey::Role(role.clone()));
+    let designated: Option<Address> = env.storage().instance().get(&DataKey::Role(role));
     match designated {
         Some(primary) => &primary == account,
         None => {
@@ -275,7 +242,7 @@ pub fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
     let threshold: u32 = env
         .storage()
         .instance()
-        .get(&DataKey::MultisigThreshold)
+        .get(&ExtraKey::MultisigThreshold)
         .ok_or(Error::MultisigNotInitialized)?;
     let signers: Vec<Address> = env
         .storage()
@@ -286,26 +253,102 @@ pub fn load_multisig_config(env: &Env) -> Result<(Vec<Address>, u32), Error> {
 }
 
 pub fn validate_multisig_config(signers: &Vec<Address>, threshold: u32) -> Result<u32, Error> {
-    if signers.is_empty() {
-        return Err(Error::InvalidMultisigConfig);
-    }
-    if threshold == 0 || threshold > signers.len() {
-        return Err(Error::InvalidMultisigConfig);
+    let min_threshold = if signers.len() >= 2 { 2 } else { 1 };
+    if signers.is_empty() || threshold < min_threshold || threshold > signers.len() {
+        return Err(Error::InvalidThreshold);
     }
     for i in 0..signers.len() {
         for j in (i + 1)..signers.len() {
             if signers.get(i) == signers.get(j) {
-                return Err(Error::InvalidMultisigConfig);
+                return Err(Error::DuplicateSigner);
             }
         }
     }
     Ok(threshold)
 }
 
+fn compare_bytes(left: &Bytes, right: &Bytes) -> Ordering {
+    let common = core::cmp::min(left.len(), right.len());
+    let mut index = 0u32;
+    while index < common {
+        match left.get(index).cmp(&right.get(index)) {
+            Ordering::Equal => index += 1,
+            ordering => return ordering,
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+/// Returns the signer addresses in lexicographic XDR order.
+///
+/// # Panics
+///
+/// Panics if a signer address cannot be read from the supplied vector.
+pub fn sorted_multisig_signers(env: &Env, signers: &Vec<Address>) -> Vec<Address> {
+    let mut sorted: Vec<Address> = Vec::new(env);
+    let mut index = 0u32;
+    while index < signers.len() {
+        let signer = signers.get(index).unwrap();
+        let signer_xdr = signer.clone().to_xdr(env);
+        let mut insert_at = sorted.len();
+        let mut current = 0u32;
+        while current < sorted.len() {
+            let existing_xdr = sorted.get(current).unwrap().to_xdr(env);
+            if compare_bytes(&signer_xdr, &existing_xdr) == Ordering::Less {
+                insert_at = current;
+                break;
+            }
+            current += 1;
+        }
+        sorted.insert(insert_at, signer);
+        index += 1;
+    }
+    sorted
+}
+
+fn multisig_config_hash(env: &Env, signers: &Vec<Address>, threshold: u32) -> BytesN<32> {
+    env.crypto()
+        .sha256(&(signers.clone(), threshold).to_xdr(env))
+}
+
+pub fn approve_multisig_config(
+    env: &Env,
+    signers: &Vec<Address>,
+    threshold: u32,
+    signer: Address,
+) -> Result<u32, Error> {
+    validate_multisig_config(signers, threshold)?;
+    let (current_signers, _) = load_multisig_config(env)?;
+    if !current_signers.contains(&signer) {
+        return Err(Error::NotMultisigSigner);
+    }
+    signer.require_auth();
+
+    let sorted_signers = sorted_multisig_signers(env, signers);
+    let key =
+        DataKey::MultisigConfigApproval(multisig_config_hash(env, &sorted_signers, threshold));
+    let mut approvals: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if approvals.contains(&signer) {
+        return Err(Error::AlreadyApproved);
+    }
+    approvals.push_back(signer);
+    env.storage().persistent().set(&key, &approvals);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+    Ok(approvals.len())
+}
+
 pub fn load_upgrade_approvals(env: &Env, new_wasm_hash: &BytesN<32>) -> Vec<Address> {
     env.storage()
         .persistent()
-        .get(&DataKey::UpgradeApproval(new_wasm_hash.clone()))
+        .get(&ExtraKey::UpgradeApproval(new_wasm_hash.clone()))
         .unwrap_or_else(|| Vec::new(env))
 }
 
@@ -345,20 +388,51 @@ pub fn apply_upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
         .update_current_contract_wasm(new_wasm_hash.clone());
     env.storage()
         .persistent()
-        .remove(&DataKey::UpgradeApproval(new_wasm_hash.clone()));
-    mark_proposal_executed(env, new_wasm_hash);
+        .remove(&ExtraKey::UpgradeApproval(new_wasm_hash.clone()));
 }
 
-pub fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
+pub fn store_multisig_config(
+    env: &Env,
+    signers: Vec<Address>,
+    threshold: u32,
+) -> Result<(), Error> {
+    validate_multisig_config(&signers, threshold)?;
+    let has_signers = env.storage().instance().has(&DataKey::MultisigSigners);
+    let has_threshold = env.storage().instance().has(&DataKey::MultisigThreshold);
+    if has_signers || has_threshold {
+        let (current_signers, current_threshold) = load_multisig_config(env)?;
+        let sorted_signers = sorted_multisig_signers(env, &signers);
+        let key =
+            DataKey::MultisigConfigApproval(multisig_config_hash(env, &sorted_signers, threshold));
+        let stored: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut approvals = 0u32;
+        for i in 0..stored.len() {
+            if let Some(approver) = stored.get(i) {
+                if current_signers.contains(&approver) {
+                    approvals += 1;
+                }
+            }
+        }
+        if approvals < current_threshold {
+            return Err(Error::InsufficientApprovals);
+        }
+        env.storage().persistent().remove(&key);
+    }
+    env.storage().instance().set(
+        &DataKey::MultisigSigners,
+        &sorted_multisig_signers(env, &signers),
+    );
     env.storage()
         .instance()
-        .set(&DataKey::MultisigSigners, &signers);
-    env.storage()
-        .instance()
-        .set(&DataKey::MultisigThreshold, &threshold);
+        .set(&ExtraKey::MultisigThreshold, &threshold);
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    Ok(())
 }
 
 pub fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {

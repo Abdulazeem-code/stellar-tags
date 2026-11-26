@@ -34,4 +34,8 @@ test = false
 doc = false
 bench = false
 
+[patch.crates-io]
+ethnum = { path = "../ethnum-patch" }
+
+
 

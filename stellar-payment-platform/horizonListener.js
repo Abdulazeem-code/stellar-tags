@@ -6,6 +6,8 @@ const { createRedisConnection } = require('./src/config/redis');
 const { PAYMENT_STREAM } = require('./src/fraudDetection');
 const {
   dispatchPaymentWebhooks,
+  dispatchPaymentRequestWebhooks,
+  startWebhookWorker,
   scheduleWebhookRetryJob,
   closeWebhookQueue,
 } = require('./src/webhookWorker');
@@ -13,8 +15,10 @@ const {
   horizon,
   createBreaker,
 } = require('./src/services/stellarService');
-const { publishPaymentUpdate } = require('./src/sse');
+const { publishPaymentUpdate, emitPaymentUpdate } = require('./src/sse');
 const { createPaymentWithOutbox } = require('./src/services/settlementOutbox');
+const { matchPayment } = require('./src/services/paymentRequestMatcher');
+const { notifyPaymentRequestUpdate } = require('./src/sse/paymentRequestEvents');
 
 
 const NETWORK = process.env.HORIZON_NETWORK || 'testnet';
@@ -27,6 +31,13 @@ const HORIZON_URLS = {
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
+// Webhook delivery runs on BullMQ, which needs Redis. Without it the worker
+// would retry a connection to 127.0.0.1:6379 forever, so webhooks are skipped
+// (with a warning) and only status updates are sent. Read at call time so a
+// process can be configured after this module loads.
+const webhooksEnabled = () =>
+  Boolean(process.env.REDIS_URL || process.env.REDIS_CLUSTER_NODES);
+
 // Dedicated ioredis publisher for cross-process SSE payment events.
 // When REDIS_URL is absent real-time updates are silently disabled.
 const redisPublisher = process.env.REDIS_URL ? createRedisConnection() : null;
@@ -36,12 +47,14 @@ if (redisPublisher) {
   );
 } else {
   logger.warn(
-    '[listener] REDIS_URL not set — real-time SSE payment updates are disabled.',
+    '[listener] REDIS_URL not set: SSE payment updates only reach clients of this process (in-process mode).',
   );
 }
 
 const healthCheckBreaker = createBreaker(
-  () => horizon.ledgers().latest().call(),
+  // Newest ledger. (The SDK has no ledgers().latest(); calling it threw on
+  // every sync, so the listener never watched a single account.)
+  () => horizon.ledgers().order('desc').limit(1).call(),
   { timeout: 5000, volumeThreshold: 3 },
 );
 
@@ -118,6 +131,22 @@ const watchAccount = (accountId) => {
       onmessage: (payment) => {
         if (payment.type === 'payment' || payment.type_i === 1) {
           logger.info(formatPayment(payment, accountId));
+          matchPayment(prisma, payment, {
+            onPaid: (request, { amountPaid }) => Promise.all([
+              webhooksEnabled()
+                ? dispatchPaymentRequestWebhooks({ prisma, request, status: 'paid', amountPaid })
+                : null,
+              notifyPaymentRequestUpdate({
+                redisPublisher,
+                requestId: request.id,
+                status: 'paid',
+                transactionHash: request.transactionHash,
+                paidAt: request.paidAt,
+              }),
+            ]),
+          }).catch((err) =>
+            logger.error({ err }, '[listener] Payment request matcher failed'),
+          );
           createPaymentWithOutbox(prisma, {
             transactionHash: payment.transaction_hash,
             fromAddress: payment.from,
@@ -125,10 +154,8 @@ const watchAccount = (accountId) => {
             amount: parseFloat(payment.amount),
             assetCode: payment.asset_type === 'native' ? 'XLM' : payment.asset_code,
             status: 'completed'
-          }).then((created) =>
-            // Fan the new payment out to connected SSE clients via Redis, so
-            // every API process can stream the status update (#730).
-            publishPaymentUpdate(redisPublisher, created.id, {
+          }).then((created) => {
+            const update = {
               status: created.status,
               transactionHash: created.transactionHash,
               fromAddress: created.fromAddress,
@@ -136,10 +163,19 @@ const watchAccount = (accountId) => {
               amount: created.amount,
               assetCode: created.assetCode,
               detectedAt: created.createdAt,
-            }).catch((publishErr) =>
+            };
+            // Without Redis the listener can only reach streams in its own
+            // process, which is the API when it runs in-process.
+            if (!redisPublisher) {
+              emitPaymentUpdate(created.id, update);
+              return undefined;
+            }
+            // Fan the new payment out to connected SSE clients via Redis, so
+            // every API process can stream the status update (#730).
+            return publishPaymentUpdate(redisPublisher, created.id, update).catch((publishErr) =>
               logger.error({ err: publishErr }, 'Failed to publish payment status update'),
-            ),
-          ).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
+            );
+          }).catch(err => logger.error({ err }, 'Failed to insert payment to DB'));
         }
       },
       onerror: (error) => {
@@ -228,8 +264,10 @@ const syncWatchedAccounts = async () => {
 };
 
 
-const shutdown = async () => {
-  logger.info(`\n[${timestamp()}] Shutting down Horizon listener...`);
+// Closes streams, timers and queues but leaves Prisma and the process alone,
+// so the API can stop an in-process listener as part of its own shutdown.
+const stop = async () => {
+  logger.info(`[${timestamp()}] Stopping Horizon listener...`);
 
   if (syncInterval) {
     clearInterval(syncInterval);
@@ -254,6 +292,11 @@ const shutdown = async () => {
     }
   }
   if (fraudStream) await fraudStream.quit();
+};
+
+// Standalone process shutdown (npm run listener).
+const shutdown = async () => {
+  await stop();
   await prisma.$disconnect();
   process.exit(0);
 };
@@ -270,11 +313,25 @@ const main = async () => {
   // Initial sync
   await syncWatchedAccounts();
 
-  // Schedule webhook retry / liveness pings
-  try {
-    scheduleWebhookRetryJob({ prisma });
-  } catch (err) {
-    logger.error('Failed to schedule webhook retry job:', err.message);
+  if (webhooksEnabled()) {
+    // Deliver queued webhooks (payment.received and payment_request.*). The API
+    // process only enqueues, so without a worker nothing is ever sent.
+    try {
+      startWebhookWorker({ prisma });
+    } catch (err) {
+      logger.error('Failed to start webhook worker:', err.message);
+    }
+
+    // Schedule webhook retry / liveness pings
+    try {
+      scheduleWebhookRetryJob({ prisma });
+    } catch (err) {
+      logger.error('Failed to schedule webhook retry job:', err.message);
+    }
+  } else {
+    logger.warn(
+      '[listener] Redis is not configured (REDIS_URL / REDIS_CLUSTER_NODES): webhooks will not be delivered. Payment matching and status updates still run.',
+    );
   }
 
   // Periodically check for newly registered accounts.
@@ -300,6 +357,7 @@ if (require.main === module) {
 module.exports = {
   watchAccount,
   syncWatchedAccounts,
+  stop,
   shutdown,
   main,
   activeStreams,

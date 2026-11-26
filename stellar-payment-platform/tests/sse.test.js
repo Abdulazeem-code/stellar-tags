@@ -26,6 +26,7 @@ jest.mock('../prismaClient', () => ({
   prisma: {
     payment: { findUnique: jest.fn() },
     paymentIntent: { findUnique: jest.fn() },
+    paymentRequest: { findUnique: jest.fn() },
   },
   isPrismaConnectionError: jest.fn().mockReturnValue(false),
 }));
@@ -52,10 +53,14 @@ const {
   closeSse,
   emitPaymentUpdate,
   publishPaymentUpdate,
+  publishPaymentRequestUpdate,
   getSseClientCount,
   isSseStreamPath,
   REDIS_CHANNEL,
 } = require('../src/sse');
+const {
+  notifyPaymentRequestUpdate,
+} = require('../src/sse/paymentRequestEvents');
 const sseRoutes = require('../src/routes/v1/sseRoutes');
 
 const createApp = () => {
@@ -159,6 +164,7 @@ describe('GET /payments/:paymentId/events', () => {
     jest.clearAllMocks();
     prisma.payment.findUnique.mockResolvedValue(null);
     prisma.paymentIntent.findUnique.mockResolvedValue(null);
+    prisma.paymentRequest.findUnique.mockResolvedValue(null);
   });
 
   it('opens a text/event-stream with retry hint and connected event', async () => {
@@ -236,6 +242,66 @@ describe('GET /payments/:paymentId/events', () => {
     await closeSse();
   });
 
+  it('falls back to the payment request for the snapshot', async () => {
+    const paidAt = new Date('2026-11-19T10:00:00.000Z');
+    prisma.paymentRequest.findUnique.mockResolvedValue({
+      status: 'paid',
+      transactionHash: 'tx-request',
+      paidAt,
+      expiresAt: new Date('2026-11-20T10:00:00.000Z'),
+    });
+
+    const stream = await openStream('/api/v1/payment-requests/REQ-1/events');
+    const snapshot = await stream.waitFor((m) => m.event === 'snapshot');
+
+    expect(snapshot.data).toEqual({
+      paymentId: 'REQ-1',
+      status: 'paid',
+      transactionHash: 'tx-request',
+      paidAt: paidAt.toISOString(),
+      expiresAt: '2026-11-20T10:00:00.000Z',
+      type: 'payment_request',
+    });
+
+    stream.close();
+    await closeSse();
+  });
+
+  it('reports a pending payment request past expiresAt as expired', async () => {
+    prisma.paymentRequest.findUnique.mockResolvedValue({
+      status: 'pending',
+      transactionHash: null,
+      paidAt: null,
+      expiresAt: new Date(Date.now() - 1000),
+    });
+
+    const stream = await openStream('/api/v1/payment-requests/REQ-OLD/events');
+    const snapshot = await stream.waitFor((m) => m.event === 'snapshot');
+
+    expect(snapshot.data).toMatchObject({
+      paymentId: 'REQ-OLD',
+      status: 'expired',
+      type: 'payment_request',
+    });
+    expect(snapshot.data.paidAt).toBeUndefined();
+
+    stream.close();
+    await closeSse();
+  });
+
+  it('exposes the alias stream path and rejects malformed request ids', async () => {
+    const stream = await openStream('/api/v1/payment-requests/REQ-ALIAS/events');
+    const connected = await stream.waitFor((m) => m.event === 'connected');
+    expect(connected.data).toEqual({ paymentId: 'REQ-ALIAS' });
+    stream.close();
+    await closeSse();
+
+    const res = await request(app).get(
+      '/api/v1/payment-requests/bad$id!/events',
+    );
+    expect(res.statusCode).toBe(400);
+  });
+
   it('streams without a snapshot when the payment does not exist yet', async () => {
     const stream = await openStream('/api/v1/payments/UNKNOWN/events');
     await stream.waitFor((m) => m.event === 'connected');
@@ -290,6 +356,7 @@ describe('payment-update delivery', () => {
     jest.clearAllMocks();
     prisma.payment.findUnique.mockResolvedValue(null);
     prisma.paymentIntent.findUnique.mockResolvedValue(null);
+    prisma.paymentRequest.findUnique.mockResolvedValue(null);
   });
 
   afterEach(async () => {
@@ -324,6 +391,30 @@ describe('payment-update delivery', () => {
     bystander.close();
   });
 
+  it('delivers a payment request update with the request discriminator', async () => {
+    const stream = await openStream('/api/v1/payment-requests/REQ-LIVE/events');
+    await stream.waitFor((m) => m.event === 'connected');
+
+    await notifyPaymentRequestUpdate({
+      redisPublisher: null,
+      requestId: 'REQ-LIVE',
+      status: 'paid',
+      transactionHash: 'tx-live',
+      paidAt: new Date('2026-11-19T12:00:00.000Z'),
+    });
+
+    const update = await stream.waitFor((m) => m.event === 'payment-update');
+    expect(update.data).toEqual({
+      paymentId: 'REQ-LIVE',
+      status: 'paid',
+      transactionHash: 'tx-live',
+      paidAt: '2026-11-19T12:00:00.000Z',
+      type: 'payment_request',
+    });
+
+    stream.close();
+  });
+
   it('ignores invalid payment ids and reports zero deliveries', () => {
     expect(emitPaymentUpdate('', { status: 'completed' })).toBe(0);
     expect(emitPaymentUpdate(null, { status: 'completed' })).toBe(0);
@@ -346,6 +437,7 @@ describe('cross-process fan-out (Redis)', () => {
     jest.clearAllMocks();
     prisma.payment.findUnique.mockResolvedValue(null);
     prisma.paymentIntent.findUnique.mockResolvedValue(null);
+    prisma.paymentRequest.findUnique.mockResolvedValue(null);
   });
 
   afterEach(async () => {
@@ -395,6 +487,38 @@ describe('cross-process fan-out (Redis)', () => {
     stream.close();
   });
 
+  it('fans out a payment request update across processes', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    initSse();
+
+    const stream = await openStream('/api/v1/payment-requests/REQ-REDIS/events');
+    await stream.waitFor((m) => m.event === 'connected');
+
+    const subscriber = createRedisConnection.mock.results[0].value;
+    subscriber.emit(
+      'message',
+      REDIS_CHANNEL,
+      JSON.stringify({
+        paymentId: 'REQ-REDIS',
+        status: 'paid',
+        transactionHash: 'tx-redis',
+        paidAt: '2026-11-19T12:00:00.000Z',
+        type: 'payment_request',
+      }),
+    );
+
+    const update = await stream.waitFor((m) => m.event === 'payment-update');
+    expect(update.data).toEqual({
+      paymentId: 'REQ-REDIS',
+      status: 'paid',
+      transactionHash: 'tx-redis',
+      paidAt: '2026-11-19T12:00:00.000Z',
+      type: 'payment_request',
+    });
+
+    stream.close();
+  });
+
   it('skips malformed messages and messages without a payment id', async () => {
     process.env.REDIS_URL = 'redis://localhost:6379';
     initSse();
@@ -435,6 +559,91 @@ describe('cross-process fan-out (Redis)', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('publishPaymentRequestUpdate tags the message as a payment request', async () => {
+    const publisher = { publish: jest.fn().mockResolvedValue(1) };
+
+    await publishPaymentRequestUpdate(publisher, 'REQ-P', {
+      status: 'paid',
+      transactionHash: 'tx-1',
+    });
+
+    expect(publisher.publish).toHaveBeenCalledWith(
+      REDIS_CHANNEL,
+      JSON.stringify({
+        paymentId: 'REQ-P',
+        status: 'paid',
+        transactionHash: 'tx-1',
+        type: 'payment_request',
+      }),
+    );
+  });
+
+  it('notifyPaymentRequestUpdate publishes through Redis when available', async () => {
+    const publisher = { publish: jest.fn().mockResolvedValue(1) };
+
+    await notifyPaymentRequestUpdate({
+      redisPublisher: publisher,
+      requestId: 'REQ-R',
+      status: 'paid',
+      transactionHash: 'tx-r',
+      paidAt: '2026-11-19T12:00:00.000Z',
+    });
+
+    expect(publisher.publish).toHaveBeenCalledWith(
+      REDIS_CHANNEL,
+      JSON.stringify({
+        paymentId: 'REQ-R',
+        status: 'paid',
+        transactionHash: 'tx-r',
+        paidAt: '2026-11-19T12:00:00.000Z',
+        type: 'payment_request',
+      }),
+    );
+  });
+
+  it('notifyPaymentRequestUpdate falls back in-process when Redis publish fails', async () => {
+    const publisher = {
+      publish: jest.fn().mockRejectedValue(new Error('redis down')),
+    };
+
+    const stream = await openStream('/api/v1/payment-requests/REQ-FB/events');
+    await stream.waitFor((m) => m.event === 'connected');
+
+    await expect(
+      notifyPaymentRequestUpdate({
+        redisPublisher: publisher,
+        requestId: 'REQ-FB',
+        status: 'paid',
+      }),
+    ).resolves.toBe(true);
+
+    const update = await stream.waitFor((m) => m.event === 'payment-update');
+    expect(update.data).toMatchObject({
+      paymentId: 'REQ-FB',
+      status: 'paid',
+      type: 'payment_request',
+    });
+
+    stream.close();
+  });
+
+  it('notifyPaymentRequestUpdate ignores unknown statuses and missing ids', async () => {
+    const publisher = { publish: jest.fn() };
+
+    await expect(
+      notifyPaymentRequestUpdate({
+        redisPublisher: publisher,
+        requestId: 'REQ-X',
+        status: 'refunded',
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      notifyPaymentRequestUpdate({ requestId: '', status: 'paid' }),
+    ).resolves.toBe(false);
+
+    expect(publisher.publish).not.toHaveBeenCalled();
+  });
+
   it('is not initialized twice in a row', () => {
     process.env.REDIS_URL = 'redis://localhost:6379';
     expect(initSse()).toBe(true);
@@ -465,6 +674,11 @@ describe('isSseStreamPath', () => {
     expect(isSseStreamPath('/payments/abc/events')).toBe(true);
     expect(isSseStreamPath('/api/v1/payments/abc/events')).toBe(true);
     expect(isSseStreamPath('/api/payments/abc/events/')).toBe(true);
+  });
+
+  it('matches payment request stream paths', () => {
+    expect(isSseStreamPath('/payment-requests/abc/events')).toBe(true);
+    expect(isSseStreamPath('/api/v1/payment-requests/abc/events/')).toBe(true);
   });
 
   it('does not match other payment or API paths', () => {

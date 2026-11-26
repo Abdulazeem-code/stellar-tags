@@ -30,8 +30,12 @@ CLI="${STELLAR_CLI:-}"
 if [[ -z "$CLI" ]]; then
   if command -v stellar >/dev/null 2>&1; then
     CLI="stellar"
+  elif command -v stellar.exe >/dev/null 2>&1; then
+    CLI="stellar.exe"
   elif command -v soroban >/dev/null 2>&1; then
     CLI="soroban"
+  elif command -v soroban.exe >/dev/null 2>&1; then
+    CLI="soroban.exe"
   else
     echo "error: neither 'stellar' nor 'soroban' CLI found on PATH." >&2
     echo "       Install it from https://github.com/stellar/stellar-cli or set STELLAR_CLI." >&2
@@ -41,9 +45,21 @@ fi
 
 echo "Using CLI: $CLI"
 
+# Locate Cargo
+CARGO="cargo"
+if ! command -v cargo >/dev/null 2>&1; then
+  if command -v cargo.exe >/dev/null 2>&1; then
+    CARGO="cargo.exe"
+  elif [[ -f "$HOME/.cargo/bin/cargo.exe" ]]; then
+    CARGO="$HOME/.cargo/bin/cargo.exe"
+  elif [[ -f "/c/Users/$USER/.cargo/bin/cargo.exe" ]]; then
+    CARGO="/c/Users/$USER/.cargo/bin/cargo.exe"
+  fi
+fi
+
 # --- 2. Build the contract WASM ---------------------------------------------
 echo "Building payment_router contract (wasm32-unknown-unknown, release)..."
-cargo build --manifest-path "$CONTRACT_DIR/Cargo.toml" --target wasm32-unknown-unknown --release
+"$CARGO" build --manifest-path "$CONTRACT_DIR/Cargo.toml" --target wasm32-unknown-unknown --release
 
 # `payment_router` is a workspace member, so cargo writes the artifact to the
 # workspace target directory rather than to one under the crate. Look in both
