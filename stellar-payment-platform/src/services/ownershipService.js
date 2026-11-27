@@ -9,8 +9,8 @@
  * webhook routes and the activity endpoint share one implementation.
  */
 
-const crypto = require('crypto');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { verifySignedMessage } = require('./signedMessage');
 const { prisma } = require('../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../multisigner-verifier');
 const { poolGet } = require('../db');
@@ -31,21 +31,8 @@ const verifyFreighterSignedMessage = ({ message, signature, signerAddress, publi
 
   const keypair = Keypair.fromPublicKey(claimedSigner);
 
-  let signatureBuffer;
-  if (Buffer.isBuffer(signature)) {
-    signatureBuffer = signature;
-  } else if (typeof signature === 'string') {
-    signatureBuffer = Buffer.from(signature, 'base64');
-  } else {
-    throw new Error('Invalid message signature format.');
-  }
-
-  const prefix = Buffer.from('Stellar Signed Message:\n', 'utf8');
-  const messageBytes = Buffer.from(message, 'utf8');
-  const payload = Buffer.concat([prefix, messageBytes]);
-  const messageHash = crypto.createHash('sha256').update(payload).digest();
-
-  if (!keypair.verify(messageHash, signatureBuffer)) {
+  // Same wallet formats as registration (see signedMessage.js).
+  if (!verifySignedMessage(keypair, message, signature)) {
     throw httpError('Signature verification failed.', 401);
   }
 
