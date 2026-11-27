@@ -139,6 +139,51 @@ describe('GET /federation — SEP-0002 compliance', () => {
       );
     });
 
+    // Tags are stored as name*localhost. An outside wallet resolving the tag on
+    // the API's public domain must find the same record.
+    const storedOnly = (stored) => async ({ where }) =>
+      where.username === stored
+        ? { address: ACCOUNT_ID, memoType: null, memo: null, flaggedAt: null }
+        : null;
+
+    test('resolves name*<this API host> to the stored name*localhost tag', async () => {
+      prisma.user.findFirst.mockImplementation(storedOnly('dave*localhost'));
+
+      const res = await request(app)
+        .get('/federation')
+        .set('Host', 'stellar-tags.onrender.com')
+        .query({ q: 'dave*stellar-tags.onrender.com', type: 'name' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.account_id).toBe(ACCOUNT_ID);
+      expect(prisma.user.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ username: 'dave*localhost' }) }),
+      );
+    });
+
+    test('resolves name*<STELLAR_TAG_DOMAIN> to the stored tag', async () => {
+      process.env.STELLAR_TAG_DOMAIN = 'tags.example.com';
+      try {
+        prisma.user.findFirst.mockImplementation(storedOnly('erin*localhost'));
+        const res = await request(app).get('/federation').query({ q: 'erin*tags.example.com', type: 'name' });
+        expect(res.status).toBe(200);
+        expect(res.body.account_id).toBe(ACCOUNT_ID);
+      } finally {
+        delete process.env.STELLAR_TAG_DOMAIN;
+      }
+    });
+
+    test('does not resolve a tag on a domain this API does not serve', async () => {
+      prisma.user.findFirst.mockImplementation(storedOnly('frank*localhost'));
+
+      const res = await request(app)
+        .get('/federation')
+        .set('Host', 'stellar-tags.onrender.com')
+        .query({ q: 'frank*someone-else.example', type: 'name' });
+
+      expect(res.status).toBe(404);
+    });
+
     test('falls back to the built-in registry for a seeded name', async () => {
       prisma.user.findFirst.mockResolvedValue(null);
 

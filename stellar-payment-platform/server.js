@@ -32,6 +32,7 @@ const compression = require("compression");
 const { logger, httpLogger } = require("./src/logger");
 const { getSep10Config } = require("./src/config/sep10");
 const { buildStellarToml } = require("./src/utils/stellarToml");
+const { federationServerUrl } = require("./src/utils/publicDomain");
 const {
   metricsMiddleware,
   getMetrics,
@@ -460,13 +461,14 @@ app.get("/.well-known/jwks.json", (_req, res) => {
  *       200:
  *         description: Success
  */
-app.get("/.well-known/stellar.toml", (_req, res) => {
+app.get("/.well-known/stellar.toml", (req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.setHeader("Content-Type", "text/plain");
   res.send(
     buildStellarToml({
-      federationServerUrl: process.env.FEDERATION_SERVER_URL,
-      domain: process.env.STELLAR_TAG_DOMAIN,
+      // FEDERATION_SERVER_URL, else STELLAR_TAG_DOMAIN, else this request's
+      // host, so the document never publishes "https://undefined/federation".
+      federationServerUrl: federationServerUrl(req),
       sep10: sep10Config,
     }),
   );

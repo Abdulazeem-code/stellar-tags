@@ -70,6 +70,7 @@ const shouldFallbackToLocalRegistry = (error) => {
 };
 
 module.exports = {
+  DEFAULT_FEDERATION_DOMAIN,
   normalizeNameTag,
   validateMemo,
   RESERVED_NAMES,

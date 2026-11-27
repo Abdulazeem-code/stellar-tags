@@ -178,6 +178,39 @@ describe('GET /.well-known/stellar.toml', () => {
     });
   });
 
+  // Render had no STELLAR_TAG_DOMAIN and published "https://undefined/federation".
+  it('falls back to the request host when STELLAR_TAG_DOMAIN is not set', async () => {
+    await withEnv({}, async () => {
+      const response = await request(loadApp())
+        .get('/.well-known/stellar.toml')
+        .set('Host', 'stellar-tags.onrender.com');
+
+      expect(response.status).toBe(200);
+      expect(response.text).toBe('FEDERATION_SERVER="https://stellar-tags.onrender.com/federation"\n');
+      expect(response.text).not.toContain('undefined');
+    });
+  });
+
+  it('uses plain http for a local development host', async () => {
+    await withEnv({}, async () => {
+      const response = await request(loadApp())
+        .get('/.well-known/stellar.toml')
+        .set('Host', 'localhost:5000');
+
+      expect(response.text).toBe('FEDERATION_SERVER="http://localhost:5000/federation"\n');
+    });
+  });
+
+  it('FEDERATION_SERVER_URL still overrides everything', async () => {
+    await withEnv(
+      { STELLAR_TAG_DOMAIN: 'example.com', FEDERATION_SERVER_URL: 'https://fed.example.com/custom' },
+      async () => {
+        const response = await request(loadApp()).get('/.well-known/stellar.toml');
+        expect(response.text).toBe('FEDERATION_SERVER="https://fed.example.com/custom"\n');
+      },
+    );
+  });
+
   it('publishes parseable SEP-10 discovery fields when enabled', async () => {
     await withEnv(
       {
