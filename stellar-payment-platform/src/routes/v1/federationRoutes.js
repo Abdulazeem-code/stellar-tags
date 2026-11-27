@@ -12,6 +12,7 @@ const { ApiError } = require('../../errors');
 const { federationQuerySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { resolveFederationId, resolveFederationName } = require('../../services/federationService');
+const { storedAliasOf } = require('../../utils/publicDomain');
 const { createTokenBucketLimiter } = require('../../middleware/tokenBucketLimiter');
 
 module.exports = (redisClient) => {
@@ -59,7 +60,12 @@ router.get('/federation', ipLimiter, etagCache, validateSchema({ query: federati
         const cacheKey = federationNameKey(queryName);
 
         const cached = await federationLookupCached(cacheKey, async () => {
-          return await resolveFederationName(queryName);
+          const found = await resolveFederationName(queryName);
+          if (found) return found;
+          // Tags are stored as name*localhost; `name*<this API's domain>` is
+          // the same tag as seen by an outside wallet (see publicDomain.js).
+          const alias = storedAliasOf(queryName, req);
+          return alias ? resolveFederationName(alias) : null;
         });
 
         if (!cached) {
