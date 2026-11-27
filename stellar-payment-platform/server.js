@@ -167,7 +167,17 @@ const corsOptions = {
     return callback(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  // Every custom header the dashboard sends must be listed, or the browser's
+  // preflight fails and the request never leaves it ("Failed to fetch"). The
+  // payment-request form sends the ownership signature and an idempotency key.
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Idempotency-Key",
+    "X-Idempotency-Key",
+    "X-Stellar-Signature",
+    "X-Stellar-Signer",
+  ],
   credentials: true,
   optionsSuccessStatus: 204,
 };
